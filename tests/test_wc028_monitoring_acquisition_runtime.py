@@ -24,6 +24,12 @@ from athena_context.artifacts import (
     ArtifactWriteReceipt,
 )
 from athena_context.contracts import (
+    MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+    MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION,
+    MONITORING_IDENTITY_PROOF_AUDIENCE,
+    MONITORING_IDENTITY_PROOF_MAXIMUM_LIFETIME_SECONDS,
+    MONITORING_IDENTITY_PROOF_REQUIRED_ROLE,
+    MONITORING_IDENTITY_PROOF_TOKEN_VERSION,
     TrustedKeyRecord,
     compute_artifact_digest,
     sha256_hex,
@@ -31,13 +37,13 @@ from athena_context.contracts import (
 from athena_context.monitoring_acquisition_runtime import (
     AzureManagedIdentityJsonTransport,
     AzureMonitoringAcquisitionPort,
+    AzureMonitoringCredentialBoundClient,
     MonitoringAcquisitionJobError,
     MonitoringEvidenceCommitPort,
     MonitoringRuntimeTrustedKey,
     Wc028MonitoringAcquisitionJobConfiguration,
     _build_acquisition_receipt_verifier,
     _coverage_descriptor,
-    _CredentialBoundAcquisitionClock,
     _result,
     _validate_acquisition_authority_preflight,
     _validate_monitoring_intent_key_lifecycle,
@@ -86,6 +92,11 @@ IP_FLOW_ROLE_ID = (
     f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/NetworkWatcherRG/"
     "providers/Microsoft.Authorization/roleDefinitions/"
     "3728cdf6-4efd-5282-bdfc-63b7872fd801"
+)
+RESOURCE_HEALTH_ROLE_ID = (
+    f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg-athena-demo-workload/"
+    "providers/Microsoft.Authorization/roleDefinitions/"
+    "0790d6f2-9553-5b63-84ac-56596b7e4072"
 )
 VM_ID = (
     f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg-athena-demo-workload/"
@@ -154,7 +165,7 @@ def _configuration_payload() -> dict[str, object]:
             "requiredCoverageScopeDigests": [DIGEST_B],
         },
         "acquisitionAuthority": {
-            "schemaVersion": "athena.wc028MonitoringAcquisitionAuthority.v3",
+            "schemaVersion": "athena.wc028MonitoringAcquisitionAuthority.v4",
             "monitoringReaderIdentityId": COLLECTOR_ID,
             "monitoringReaderPrincipalId": COLLECTOR_PRINCIPAL_ID,
             "monitoringReaderClientId": CLIENT_ID,
@@ -164,10 +175,16 @@ def _configuration_payload() -> dict[str, object]:
             "receiptSigningKeyId": COLLECTOR_KEY_ID,
             "contextBindingDigest": DIGEST_A,
             "requiredCoverageScopeDigests": [DIGEST_B],
+            "identityProofAudience": MONITORING_IDENTITY_PROOF_AUDIENCE,
+            "identityProofTokenVersion": MONITORING_IDENTITY_PROOF_TOKEN_VERSION,
+            "identityProofRequiredRole": MONITORING_IDENTITY_PROOF_REQUIRED_ROLE,
+            "identityProofMaximumLifetimeSeconds": (
+                MONITORING_IDENTITY_PROOF_MAXIMUM_LIFETIME_SECONDS
+            ),
             "authorityDigest": DIGEST_C,
         },
         "monitoringCollectorContract": {
-            "schemaVersion": "athena.wc028MonitoringCollectorContract.v4",
+            "schemaVersion": MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
             "collectorIdentityClientId": CLIENT_ID,
             "collectorIdentityResourceId": COLLECTOR_ID,
             "collectorTenantId": TENANT_ID,
@@ -186,8 +203,19 @@ def _configuration_payload() -> dict[str, object]:
                 "Microsoft.Network/networkWatchers/ipFlowVerify/action",
                 "Microsoft.Network/networkWatchers/ipFlowVerify/read",
             ],
+            "resourceHealthRoleDefinitionId": RESOURCE_HEALTH_ROLE_ID,
+            "resourceHealthScopeIds": [VM_ID],
+            "resourceHealthAllowedOperations": [
+                "Microsoft.ResourceHealth/AvailabilityStatuses/read"
+            ],
+            "identityProofAudience": MONITORING_IDENTITY_PROOF_AUDIENCE,
+            "identityProofTokenVersion": MONITORING_IDENTITY_PROOF_TOKEN_VERSION,
+            "identityProofRequiredRole": MONITORING_IDENTITY_PROOF_REQUIRED_ROLE,
+            "identityProofMaximumLifetimeSeconds": (
+                MONITORING_IDENTITY_PROOF_MAXIMUM_LIFETIME_SECONDS
+            ),
             "handoffSchemaVersion": "athena.wc028MonitoringEvidenceHandoff.v2",
-            "acquisitionReceiptSchemaVersion": ("athena.wc028MonitoringAcquisitionReceipt.v3"),
+            "acquisitionReceiptSchemaVersion": MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION,
         },
         "approvedChangeScope": {"schemaVersion": "synthetic"},
         "expectedActiveContextAuthorityDigest": DIGEST_A,
@@ -264,6 +292,24 @@ def test_configuration_rejects_source_identity_and_scope_substitution() -> None:
     with pytest.raises(ValidationError, match="collector contract schema"):
         Wc028MonitoringAcquisitionJobConfiguration.model_validate(downgraded_contract)
 
+    substituted_ip_flow_role = _configuration_payload()
+    contract = cast(
+        dict[str, object],
+        substituted_ip_flow_role["monitoringCollectorContract"],
+    )
+    contract["ipFlowVerifyRoleDefinitionId"] = RESOURCE_HEALTH_ROLE_ID
+    with pytest.raises(ValidationError, match="IP Flow Verify role"):
+        Wc028MonitoringAcquisitionJobConfiguration.model_validate(substituted_ip_flow_role)
+
+    substituted_resource_health_role = _configuration_payload()
+    contract = cast(
+        dict[str, object],
+        substituted_resource_health_role["monitoringCollectorContract"],
+    )
+    contract["resourceHealthRoleDefinitionId"] = IP_FLOW_ROLE_ID
+    with pytest.raises(ValidationError, match="Resource Health role"):
+        Wc028MonitoringAcquisitionJobConfiguration.model_validate(substituted_resource_health_role)
+
 
 def test_configuration_rejects_deployment_binding_substitution(
     monkeypatch: pytest.MonkeyPatch,
@@ -333,7 +379,7 @@ def test_authority_digest_and_freshness_fail_before_external_reads() -> None:
         required_coverage_scope_digests=(DIGEST_B,),
     )
     authority = SimpleNamespace(
-        schema_version="athena.wc028MonitoringAcquisitionAuthority.v3",
+        schema_version="athena.wc028MonitoringAcquisitionAuthority.v4",
         authority_digest=DIGEST_C,
         monitoring_reader_identity_id=COLLECTOR_ID.casefold(),
         monitoring_reader_principal_id=COLLECTOR_PRINCIPAL_ID,
@@ -346,11 +392,17 @@ def test_authority_digest_and_freshness_fail_before_external_reads() -> None:
         required_coverage_scope_digests=(DIGEST_B,),
         max_freshness_seconds=600,
         receipt_signing_key_id=COLLECTOR_KEY_ID,
+        identity_proof_audience=MONITORING_IDENTITY_PROOF_AUDIENCE,
+        identity_proof_token_version=MONITORING_IDENTITY_PROOF_TOKEN_VERSION,
+        identity_proof_required_role=MONITORING_IDENTITY_PROOF_REQUIRED_ROLE,
+        identity_proof_maximum_lifetime_seconds=(
+            MONITORING_IDENTITY_PROOF_MAXIMUM_LIFETIME_SECONDS
+        ),
     )
     contract = SimpleNamespace(
-        schema_version="athena.wc028MonitoringCollectorContract.v4",
+        schema_version=MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
         handoff_schema_version="athena.wc028MonitoringEvidenceHandoff.v2",
-        acquisition_receipt_schema_version=("athena.wc028MonitoringAcquisitionReceipt.v3"),
+        acquisition_receipt_schema_version=MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION,
         collector_identity_resource_id=COLLECTOR_ID.casefold(),
         collector_identity_client_id=CLIENT_ID,
         collector_tenant_id=TENANT_ID,
@@ -364,6 +416,17 @@ def test_authority_digest_and_freshness_fail_before_external_reads() -> None:
         evidence_container_name="monitoring-evidence",
         signing_key_resource_id=COLLECTOR_KEY_ID,
         ip_flow_verify_scope_id=NETWORK_WATCHER_ID.casefold(),
+        ip_flow_verify_allowed_operations=(
+            "Microsoft.Network/networkWatchers/ipFlowVerify/action",
+            "Microsoft.Network/networkWatchers/ipFlowVerify/read",
+        ),
+        resource_health_allowed_operations=("Microsoft.ResourceHealth/AvailabilityStatuses/read",),
+        identity_proof_audience=MONITORING_IDENTITY_PROOF_AUDIENCE,
+        identity_proof_token_version=MONITORING_IDENTITY_PROOF_TOKEN_VERSION,
+        identity_proof_required_role=MONITORING_IDENTITY_PROOF_REQUIRED_ROLE,
+        identity_proof_maximum_lifetime_seconds=(
+            MONITORING_IDENTITY_PROOF_MAXIMUM_LIFETIME_SECONDS
+        ),
         maximum_evidence_age_seconds=600,
         compute_artifact_digest_value=lambda: DIGEST_C,
     )
@@ -442,19 +505,6 @@ def test_receipt_verifier_reuses_hardened_identity_and_key_policy(
     assert captured["maximum_receipt_age_seconds"] == 300
 
 
-def test_credential_bound_clock_keeps_source_claims_at_verification_time() -> None:
-    values = iter((NOW, NOW + timedelta(seconds=1)))
-    clock = _CredentialBoundAcquisitionClock(clock=lambda: next(values))
-
-    with pytest.raises(MonitoringAcquisitionJobError, match="verification time"):
-        clock.source_collection_time()
-
-    assert clock.runtime_now() == NOW
-    assert clock.source_collection_time() == NOW
-    assert clock.runtime_now() == NOW + timedelta(seconds=1)
-    assert clock.source_collection_time() == NOW
-
-
 def test_monitoring_intent_key_lifecycle_is_enforced() -> None:
     private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     public_key = private_key.public_key()
@@ -529,9 +579,9 @@ def test_job_composes_hardened_coordinator_transaction_and_commit_port(
     )
     change_scope = object()
     collector_contract = SimpleNamespace(
-        schema_version="athena.wc028MonitoringCollectorContract.v4",
+        schema_version=MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
         handoff_schema_version="athena.wc028MonitoringEvidenceHandoff.v2",
-        acquisition_receipt_schema_version=("athena.wc028MonitoringAcquisitionReceipt.v3"),
+        acquisition_receipt_schema_version=MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION,
         collector_identity_resource_id=COLLECTOR_ID.casefold(),
         collector_identity_client_id=CLIENT_ID,
         collector_tenant_id=TENANT_ID,
@@ -544,11 +594,22 @@ def test_job_composes_hardened_coordinator_transaction_and_commit_port(
         evidence_container_name="monitoring-evidence",
         signing_key_resource_id=COLLECTOR_KEY_ID,
         ip_flow_verify_scope_id=NETWORK_WATCHER_ID.casefold(),
+        ip_flow_verify_allowed_operations=(
+            "Microsoft.Network/networkWatchers/ipFlowVerify/action",
+            "Microsoft.Network/networkWatchers/ipFlowVerify/read",
+        ),
+        resource_health_allowed_operations=("Microsoft.ResourceHealth/AvailabilityStatuses/read",),
+        identity_proof_audience=MONITORING_IDENTITY_PROOF_AUDIENCE,
+        identity_proof_token_version=MONITORING_IDENTITY_PROOF_TOKEN_VERSION,
+        identity_proof_required_role=MONITORING_IDENTITY_PROOF_REQUIRED_ROLE,
+        identity_proof_maximum_lifetime_seconds=(
+            MONITORING_IDENTITY_PROOF_MAXIMUM_LIFETIME_SECONDS
+        ),
         maximum_evidence_age_seconds=600,
         compute_artifact_digest_value=lambda: DIGEST_B,
     )
     acquisition_authority = SimpleNamespace(
-        schema_version="athena.wc028MonitoringAcquisitionAuthority.v3",
+        schema_version="athena.wc028MonitoringAcquisitionAuthority.v4",
         authority_digest=DIGEST_C,
         monitoring_reader_identity_id=COLLECTOR_ID.casefold(),
         monitoring_reader_principal_id=COLLECTOR_PRINCIPAL_ID,
@@ -568,6 +629,12 @@ def test_job_composes_hardened_coordinator_transaction_and_commit_port(
         max_freshness_seconds=600,
         receipt_signing_key_id=COLLECTOR_KEY_ID,
         deployment_identity_contract_digest=DIGEST_A,
+        identity_proof_audience=MONITORING_IDENTITY_PROOF_AUDIENCE,
+        identity_proof_token_version=MONITORING_IDENTITY_PROOF_TOKEN_VERSION,
+        identity_proof_required_role=MONITORING_IDENTITY_PROOF_REQUIRED_ROLE,
+        identity_proof_maximum_lifetime_seconds=(
+            MONITORING_IDENTITY_PROOF_MAXIMUM_LIFETIME_SECONDS
+        ),
     )
     embedded = {
         "PublishedMonitoringIntent": monitoring_intent,
@@ -664,11 +731,7 @@ def test_job_composes_hardened_coordinator_transaction_and_commit_port(
         captured["adapter"] = kwargs
         return acquisition_adapter
 
-    monkeypatch.setattr(
-        runtime_module,
-        "CredentialBoundMonitoringAcquisitionAdapter",
-        build_acquisition_adapter,
-    )
+    monkeypatch.setattr(runtime_module, "AzureMonitoringAdapter", build_acquisition_adapter)
 
     stores: list[tuple[dict[str, object], object]] = []
 
@@ -720,14 +783,7 @@ def test_job_composes_hardened_coordinator_transaction_and_commit_port(
     assert coordinator_arguments["expected_collector_contract_digest"] == DIGEST_B
     adapter_arguments = cast(dict[str, object], captured["adapter"])
     assert adapter_arguments["reviewed_collector_contract"] is collector_contract
-    assert adapter_arguments["acquisition_port"] is captured["port"]
-    runtime_clock = cast(Any, adapter_arguments["utc_now"])
-    source_clock = cast(
-        Any,
-        cast(dict[str, object], captured["port"])["clock"],
-    )
-    assert runtime_clock() == NOW
-    assert source_clock() == NOW
+    assert callable(adapter_arguments["client_factory"])
     commit_arguments = cast(dict[str, object], captured["commit"])
     assert commit_arguments["key_resolver"] is key_resolver
     assert commit_arguments["reviewed_collector_contract"] is collector_contract
@@ -826,6 +882,67 @@ def test_transport_rejects_untrusted_hosts_and_nonstandard_json(
         )
 
 
+def test_runtime_source_clients_use_the_adapter_managed_identity() -> None:
+    class _Credential:
+        def __init__(self) -> None:
+            self.scopes: list[str] = []
+
+        def get_token(self, scope: str) -> object:
+            self.scopes.append(scope)
+            return SimpleNamespace(token=f"synthetic-source-token-{len(self.scopes)}")
+
+    class _Port:
+        collector_identity_resource_id = COLLECTOR_ID.casefold()
+
+        def __init__(self) -> None:
+            self.tokens: list[str] = []
+
+        def _call(self, request: object, *, access_token: str) -> object:
+            self.tokens.append(access_token)
+            return request
+
+        query_log_analytics = _call
+        query_activity_log = _call
+        query_resource_graph_changes = _call
+        query_resource_health = _call
+        query_ip_flow_verify = _call
+
+    credential = _Credential()
+    port = _Port()
+    client = AzureMonitoringCredentialBoundClient(
+        credential=cast(Any, credential),
+        reviewed_contract=cast(
+            Any,
+            SimpleNamespace(
+                schema_version=MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+                collector_identity_resource_id=COLLECTOR_ID,
+            ),
+        ),
+        acquisition_port=cast(Any, port),
+    )
+    request = cast(Any, object())
+
+    assert client.query_log_analytics(request) is request
+    assert client.query_activity_log(request) is request
+    assert client.query_resource_graph_changes(request) is request
+    assert client.query_resource_health(request) is request
+    assert client.query_ip_flow_verify(request) is request
+    assert credential.scopes == [
+        "https://api.loganalytics.io/.default",
+        "https://management.azure.com/.default",
+        "https://management.azure.com/.default",
+        "https://management.azure.com/.default",
+        "https://management.azure.com/.default",
+    ]
+    assert port.tokens == [
+        "synthetic-source-token-1",
+        "synthetic-source-token-2",
+        "synthetic-source-token-3",
+        "synthetic-source-token-4",
+        "synthetic-source-token-5",
+    ]
+
+
 class _Request:
     def __init__(self, payload: dict[str, object]) -> None:
         self.payload = payload
@@ -867,7 +984,6 @@ def _port(transport: _Transport) -> AzureMonitoringAcquisitionPort:
             NSG_RULE_ID.casefold(),
         ),
         transport=transport,
-        clock=lambda: NOW,
     )
 
 
@@ -875,6 +991,7 @@ def test_adapter_rejects_identity_and_workspace_before_source_query() -> None:
     transport = _Transport()
     request = {
         "monitoringReaderIdentityId": CONTEXT_ID,
+        "schemaVersion": "athena.wc028LogAnalyticsQueryRequest.v2",
         "queryTargetResourceId": WORKSPACE_ID,
     }
     with pytest.raises(MonitoringAcquisitionJobError, match="another monitoring identity"):
@@ -935,12 +1052,15 @@ def test_log_analytics_adapter_maps_one_exact_reviewed_execution() -> None:
             _Request(
                 {
                     "monitoringReaderIdentityId": COLLECTOR_ID,
+                    "schemaVersion": "athena.wc028LogAnalyticsQueryRequest.v2",
                     "queryTargetResourceId": WORKSPACE_ID,
                     "expectedColumns": list(columns),
                     "table": "Heartbeat",
                     "query": "Heartbeat | summarize heartbeatCount=count()",
                     "windowStart": _iso(start),
                     "windowEnd": _iso(NOW),
+                    "collectorExecutionTime": _iso(NOW),
+                    "coverageScope": {"resourceIds": [VM_ID]},
                     "requestDigest": DIGEST_A,
                 }
             ),
@@ -979,6 +1099,7 @@ def test_log_analytics_adapter_maps_one_exact_reviewed_execution() -> None:
             _Request(
                 {
                     "monitoringReaderIdentityId": COLLECTOR_ID,
+                    "schemaVersion": "athena.wc028LogAnalyticsQueryRequest.v2",
                     "queryTargetResourceId": WORKSPACE_ID,
                     "expectedColumns": list(columns),
                     "table": "Heartbeat",
@@ -986,6 +1107,8 @@ def test_log_analytics_adapter_maps_one_exact_reviewed_execution() -> None:
                     "queryDigest": DIGEST_B,
                     "windowStart": _iso(start),
                     "windowEnd": _iso(NOW),
+                    "collectorExecutionTime": _iso(NOW),
+                    "coverageScope": {"resourceIds": [VM_ID]},
                     "requestDigest": DIGEST_A,
                 }
             ),
@@ -998,6 +1121,256 @@ def test_log_analytics_adapter_maps_one_exact_reviewed_execution() -> None:
     assert proof_result.aggregate_completeness_proof.raw_input_row_count == 12
     assert proof_result.aggregate_completeness_proof.request_digest == DIGEST_A
     assert proof_result.aggregate_completeness_proof.query_digest == DIGEST_B
+
+
+def test_empty_traffic_analytics_preserves_pre_authorized_scope() -> None:
+    start = NOW - timedelta(minutes=5)
+    columns = (
+        "subjectResourceCandidates",
+        "pathId",
+        "decision",
+        "direction",
+        "protocol",
+        "sourceResourceCandidates",
+        "destinationResourceCandidates",
+        "sourceAddress",
+        "destinationAddress",
+        "sourcePort",
+        "destinationPort",
+        "enforcementResourceId",
+        "ruleResourceId",
+        "observedStart",
+        "observedEnd",
+    )
+    coverage_scope = {
+        "resourceIds": [VM_ID, BACKEND_VM_ID],
+        "pathId": PATH_ID,
+        "direction": "outbound",
+        "fiveTupleDigest": DIGEST_A,
+    }
+    transport = _ResponseTransport(
+        {
+            "tables": [
+                {
+                    "columns": [{"name": item} for item in columns],
+                    "rows": [],
+                }
+            ]
+        }
+    )
+
+    result = _port(cast(Any, transport)).query_log_analytics(
+        cast(
+            Any,
+            _Request(
+                {
+                    "monitoringReaderIdentityId": COLLECTOR_ID,
+                    "schemaVersion": "athena.wc028LogAnalyticsQueryRequest.v2",
+                    "queryTargetResourceId": WORKSPACE_ID,
+                    "expectedColumns": list(columns),
+                    "table": "NTANetAnalytics",
+                    "query": "NTANetAnalytics | summarize synthetic=count()",
+                    "queryDigest": DIGEST_B,
+                    "windowStart": _iso(start),
+                    "windowEnd": _iso(NOW),
+                    "collectorExecutionTime": _iso(NOW),
+                    "coverageScope": coverage_scope,
+                    "requestDigest": DIGEST_C,
+                }
+            ),
+        ),
+        access_token=ACCESS_TOKEN,
+    )
+
+    assert result.rows == ()
+    assert result.coverage_descriptor is not None
+    assert result.coverage_descriptor.resource_ids == tuple(
+        sorted((BACKEND_VM_ID.casefold(), VM_ID.casefold()))
+    )
+    assert result.coverage_descriptor.path_id == PATH_ID
+    assert result.coverage_descriptor.direction == "outbound"
+    assert result.coverage_descriptor.five_tuple_digest == DIGEST_A
+
+
+def test_nonempty_traffic_analytics_adds_fixed_limitation_without_reauthorizing() -> None:
+    start = NOW - timedelta(minutes=5)
+    columns = (
+        "subjectResourceCandidates",
+        "pathId",
+        "decision",
+        "direction",
+        "protocol",
+        "sourceResourceCandidates",
+        "destinationResourceCandidates",
+        "sourceAddress",
+        "destinationAddress",
+        "sourcePort",
+        "destinationPort",
+        "enforcementResourceId",
+        "ruleResourceId",
+        "observedStart",
+        "observedEnd",
+    )
+    transport = _ResponseTransport(
+        {
+            "tables": [
+                {
+                    "columns": [{"name": item} for item in columns],
+                    "rows": [
+                        [
+                            [VM_ID],
+                            PATH_ID,
+                            "denied",
+                            "outbound",
+                            "Tcp",
+                            [VM_ID],
+                            [BACKEND_VM_ID],
+                            "10.0.1.4",
+                            "10.0.2.4",
+                            49152,
+                            1433,
+                            NSG_RULE_ID.rsplit("/securityRules/", maxsplit=1)[0],
+                            NSG_RULE_ID,
+                            _iso(start),
+                            _iso(NOW),
+                        ]
+                    ],
+                }
+            ]
+        }
+    )
+    authority_scope = {
+        "resourceIds": [VM_ID, BACKEND_VM_ID],
+        "pathId": PATH_ID,
+        "direction": "outbound",
+        "fiveTupleDigest": DIGEST_A,
+    }
+
+    result = _port(cast(Any, transport)).query_log_analytics(
+        cast(
+            Any,
+            _Request(
+                {
+                    "monitoringReaderIdentityId": COLLECTOR_ID,
+                    "schemaVersion": "athena.wc028LogAnalyticsQueryRequest.v2",
+                    "queryTargetResourceId": WORKSPACE_ID,
+                    "expectedColumns": list(columns),
+                    "table": "NTANetAnalytics",
+                    "query": "NTANetAnalytics | summarize synthetic=count()",
+                    "queryDigest": DIGEST_B,
+                    "windowStart": _iso(start),
+                    "windowEnd": _iso(NOW),
+                    "collectorExecutionTime": _iso(NOW),
+                    "coverageScope": authority_scope,
+                    "requestDigest": DIGEST_C,
+                }
+            ),
+        ),
+        access_token=ACCESS_TOKEN,
+    )
+
+    assert len(result.rows) == 1
+    assert result.rows[0].traffic_analytics_limitation == "aggregatedNotPacketCausal"
+    assert result.coverage_descriptor is not None
+    assert result.coverage_descriptor.five_tuple_digest == DIGEST_A
+
+
+def test_connection_monitor_compares_typed_authority_scope() -> None:
+    start = NOW - timedelta(minutes=5)
+    columns = (
+        "subjectResourceId",
+        "pathId",
+        "monitorResourceId",
+        "sourceResourceId",
+        "destinationResourceId",
+        "sourceAddress",
+        "destinationAddress",
+        "direction",
+        "protocol",
+        "sourcePort",
+        "destinationPort",
+        "status",
+        "testConfigurationReference",
+        "testConfigurationDigest",
+        "observedStart",
+        "observedEnd",
+    )
+    tuple_payload = {
+        "direction": "outbound",
+        "protocol": "Tcp",
+        "sourceResourceId": VM_ID.casefold(),
+        "destinationResourceId": BACKEND_VM_ID.casefold(),
+        "sourceAddress": "10.0.1.4",
+        "destinationAddress": "10.0.2.4",
+        "sourcePort": 49152,
+        "destinationPort": 1433,
+    }
+    coverage_scope = {
+        "resourceIds": [VM_ID, BACKEND_VM_ID],
+        "pathId": PATH_ID,
+        "direction": "outbound",
+        "fiveTupleDigest": compute_artifact_digest(tuple_payload),
+        "endpointTestReference": "synthetic-web-db-test",
+        "endpointTestDigest": DIGEST_B,
+    }
+    transport = _ResponseTransport(
+        {
+            "tables": [
+                {
+                    "columns": [{"name": item} for item in columns],
+                    "rows": [
+                        [
+                            VM_ID,
+                            PATH_ID,
+                            NETWORK_WATCHER_ID,
+                            VM_ID,
+                            BACKEND_VM_ID,
+                            "10.0.1.4",
+                            "10.0.2.4",
+                            "outbound",
+                            "Tcp",
+                            49152,
+                            1433,
+                            "failed",
+                            "synthetic-web-db-test",
+                            DIGEST_B,
+                            _iso(start),
+                            _iso(NOW),
+                        ]
+                    ],
+                }
+            ]
+        }
+    )
+
+    result = _port(cast(Any, transport)).query_log_analytics(
+        cast(
+            Any,
+            _Request(
+                {
+                    "monitoringReaderIdentityId": COLLECTOR_ID,
+                    "schemaVersion": "athena.wc028LogAnalyticsQueryRequest.v2",
+                    "queryTargetResourceId": WORKSPACE_ID,
+                    "expectedColumns": list(columns),
+                    "table": "NWConnectionMonitorTestResult",
+                    "query": "NWConnectionMonitorTestResult | take 1",
+                    "queryDigest": DIGEST_A,
+                    "windowStart": _iso(start),
+                    "windowEnd": _iso(NOW),
+                    "collectorExecutionTime": _iso(NOW),
+                    "coverageScope": coverage_scope,
+                    "requestDigest": DIGEST_C,
+                }
+            ),
+        ),
+        access_token=ACCESS_TOKEN,
+    )
+
+    assert len(result.rows) == 1
+    assert result.coverage_descriptor is not None
+    assert result.coverage_descriptor.resource_ids == tuple(
+        sorted((BACKEND_VM_ID.casefold(), VM_ID.casefold()))
+    )
 
 
 def test_activity_and_resource_graph_adapters_preserve_exact_change_scope() -> None:

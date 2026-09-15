@@ -35,7 +35,7 @@ bounded bytes and SHA-256 digest are identical.
 
 `acquisitionRuntimeConfigurationJson` uses
 `athena.wc028MonitoringAcquisitionJobConfiguration.v1`. It embeds the exact signed monitoring
-intent and references, published runtime binding, acquisition authority v3, collector contract v4,
+intent and references, published runtime binding, acquisition authority v4, collector contract v6,
 and approved change scope. It also binds:
 
 - the WC-024 collector resource, client, and principal identities;
@@ -45,10 +45,11 @@ and approved change scope. It also binds:
 - the monitoring-intent and collector signing-key trust anchors; and
 - the active-context and acquisition-authority digests.
 
-The runtime delegates managed-identity acquisition to the hardened credential-bound adapter. That
-adapter obtains and cryptographically verifies the required ARM and Log Analytics audience tokens,
-passes each verified bearer token only to its matching source call, and binds the resulting
-credential proofs into acquisition receipt v3.
+The runtime delegates managed-identity acquisition to the hardened production adapter. That
+adapter verifies the collector identity through the Athena-owned proof audience, creates every
+Azure source client from the same verified `ManagedIdentityCredential`, binds Log Analytics
+request v2 to the authority-selected coverage scope, and persists the resulting identity proof
+into acquisition receipt v4.
 
 For `Heartbeat` and `VMConnection`, a signed query may return a second result table to prove that a
 zero aggregate came from positive input and complete ingestion. The table must contain exactly one

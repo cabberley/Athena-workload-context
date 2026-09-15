@@ -14,6 +14,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
+from azure.identity import ManagedIdentityCredential
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from athena_context.artifacts import (
@@ -35,6 +36,10 @@ from athena_context.azure_adapters import (
 from athena_context.contracts import (
     MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
     MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION,
+    MONITORING_IDENTITY_PROOF_AUDIENCE,
+    MONITORING_IDENTITY_PROOF_MAXIMUM_LIFETIME_SECONDS,
+    MONITORING_IDENTITY_PROOF_REQUIRED_ROLE,
+    MONITORING_IDENTITY_PROOF_TOKEN_VERSION,
     ApprovedChangeScope,
     ChangeEvidencePersistenceHandoff,
     CorrelationRequest,
@@ -63,11 +68,13 @@ from athena_context.eventing.change_ingestion import KeyVaultChangeEvidenceSigne
 from athena_context.monitoring_acquisition import (
     ActivityLogQueryRequest,
     ActivityLogQueryResult,
-    CredentialBoundMonitoringAcquisitionAdapter,
+    AzureMonitoringAdapter,
+    AzureMonitoringClients,
     IpFlowVerifyRequest,
     IpFlowVerifyResult,
     LogAnalyticsQueryRequest,
     LogAnalyticsQueryResult,
+    LogCoverageDescriptor,
     MonitoringAcquisitionAuthority,
     MonitoringAcquisitionCoordinator,
     MonitoringAcquisitionError,
@@ -105,6 +112,15 @@ _GUID_PATTERN = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0
 _MAX_CONFIGURATION_BYTES = 512 * 1024
 _MAX_RESPONSE_BYTES = 256 * 1024
 _MAX_ROWS = 500
+_ARM_SCOPE = "https://management.azure.com/.default"
+_LOG_ANALYTICS_SCOPE = "https://api.loganalytics.io/.default"
+_IP_FLOW_VERIFY_ROLE_DEFINITION_GUID = "3728cdf6-4efd-5282-bdfc-63b7872fd801"
+_RESOURCE_HEALTH_ROLE_DEFINITION_GUID = "0790d6f2-9553-5b63-84ac-56596b7e4072"
+_IP_FLOW_VERIFY_ALLOWED_OPERATIONS = (
+    "Microsoft.Network/networkWatchers/ipFlowVerify/action",
+    "Microsoft.Network/networkWatchers/ipFlowVerify/read",
+)
+_RESOURCE_HEALTH_ALLOWED_OPERATIONS = ("Microsoft.ResourceHealth/AvailabilityStatuses/read",)
 
 
 class MonitoringAcquisitionJobError(RuntimeError):
@@ -301,7 +317,20 @@ class Wc028MonitoringAcquisitionJobConfiguration(_StrictRuntimeModel):
         collector_principal_id = str(contract.get("monitoringReaderPrincipalId", "")).casefold()
         collector_tenant_id = str(contract.get("collectorTenantId", "")).casefold()
         context_principal_id = str(contract.get("athenaContextPrincipalId", "")).casefold()
-        exact_bindings = (
+        network_watcher_scope_root = self.network_watcher_resource_id.split(
+            "/providers/microsoft.network/networkwatchers/",
+            maxsplit=1,
+        )[0]
+        workload_resource_group_id = str(contract.get("workloadResourceGroupId", "")).casefold()
+        expected_ip_flow_role_definition_id = (
+            f"{network_watcher_scope_root}/providers/microsoft.authorization/"
+            f"roledefinitions/{_IP_FLOW_VERIFY_ROLE_DEFINITION_GUID}"
+        )
+        expected_resource_health_role_definition_id = (
+            f"{workload_resource_group_id}/providers/microsoft.authorization/"
+            f"roledefinitions/{_RESOURCE_HEALTH_ROLE_DEFINITION_GUID}"
+        )
+        exact_bindings: tuple[tuple[object, object, str], ...] = (
             (
                 contract.get("schemaVersion"),
                 MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
@@ -353,9 +382,49 @@ class Wc028MonitoringAcquisitionJobConfiguration(_StrictRuntimeModel):
                 "collector contract signing key",
             ),
             (
+                str(contract.get("ipFlowVerifyRoleDefinitionId", "")).casefold(),
+                expected_ip_flow_role_definition_id,
+                "collector contract IP Flow Verify role",
+            ),
+            (
                 str(contract.get("ipFlowVerifyScopeId", "")).casefold(),
                 self.network_watcher_resource_id,
                 "collector contract IP Flow Verify scope",
+            ),
+            (
+                _configuration_tuple(contract.get("ipFlowVerifyAllowedOperations")),
+                _IP_FLOW_VERIFY_ALLOWED_OPERATIONS,
+                "collector contract IP Flow Verify operations",
+            ),
+            (
+                str(contract.get("resourceHealthRoleDefinitionId", "")).casefold(),
+                expected_resource_health_role_definition_id,
+                "collector contract Resource Health role",
+            ),
+            (
+                _configuration_tuple(contract.get("resourceHealthAllowedOperations")),
+                _RESOURCE_HEALTH_ALLOWED_OPERATIONS,
+                "collector contract Resource Health operations",
+            ),
+            (
+                contract.get("identityProofAudience"),
+                MONITORING_IDENTITY_PROOF_AUDIENCE,
+                "collector contract identity proof audience",
+            ),
+            (
+                contract.get("identityProofTokenVersion"),
+                MONITORING_IDENTITY_PROOF_TOKEN_VERSION,
+                "collector contract identity proof token version",
+            ),
+            (
+                contract.get("identityProofRequiredRole"),
+                MONITORING_IDENTITY_PROOF_REQUIRED_ROLE,
+                "collector contract identity proof role",
+            ),
+            (
+                contract.get("identityProofMaximumLifetimeSeconds"),
+                MONITORING_IDENTITY_PROOF_MAXIMUM_LIFETIME_SECONDS,
+                "collector contract identity proof lifetime",
             ),
             (
                 contract.get("physicalIdentitySeparationEnforced"),
@@ -364,7 +433,7 @@ class Wc028MonitoringAcquisitionJobConfiguration(_StrictRuntimeModel):
             ),
             (
                 authority.get("schemaVersion"),
-                "athena.wc028MonitoringAcquisitionAuthority.v3",
+                "athena.wc028MonitoringAcquisitionAuthority.v4",
                 "acquisition authority schema",
             ),
             (
@@ -396,6 +465,26 @@ class Wc028MonitoringAcquisitionJobConfiguration(_StrictRuntimeModel):
                 str(authority.get("athenaContextPrincipalId", "")).casefold(),
                 context_principal_id,
                 "acquisition context principal",
+            ),
+            (
+                authority.get("identityProofAudience"),
+                MONITORING_IDENTITY_PROOF_AUDIENCE,
+                "acquisition identity proof audience",
+            ),
+            (
+                authority.get("identityProofTokenVersion"),
+                MONITORING_IDENTITY_PROOF_TOKEN_VERSION,
+                "acquisition identity proof token version",
+            ),
+            (
+                authority.get("identityProofRequiredRole"),
+                MONITORING_IDENTITY_PROOF_REQUIRED_ROLE,
+                "acquisition identity proof role",
+            ),
+            (
+                authority.get("identityProofMaximumLifetimeSeconds"),
+                MONITORING_IDENTITY_PROOF_MAXIMUM_LIFETIME_SECONDS,
+                "acquisition identity proof lifetime",
             ),
             (
                 authority.get("receiptSigningKeyId"),
@@ -550,37 +639,6 @@ def load_wc028_monitoring_acquisition_job_configuration(
 def _utc_now_milliseconds() -> datetime:
     value = datetime.now(UTC)
     return value.replace(microsecond=(value.microsecond // 1000) * 1000)
-
-
-class _CredentialBoundAcquisitionClock:
-    """Share the credential verification time with source result claims."""
-
-    def __init__(
-        self,
-        *,
-        clock: Callable[[], datetime] | None = None,
-    ) -> None:
-        self._clock = _utc_now_milliseconds if clock is None else clock
-        self._collection_time: datetime | None = None
-
-    def runtime_now(self) -> datetime:
-        current = self._clock()
-        if (
-            not isinstance(current, datetime)
-            or current.utcoffset() != UTC.utcoffset(current)
-            or current.microsecond % 1000
-        ):
-            raise MonitoringAcquisitionJobError("acquisition runtime clock is not millisecond UTC")
-        if self._collection_time is None:
-            self._collection_time = current
-        return current
-
-    def source_collection_time(self) -> datetime:
-        if self._collection_time is None:
-            raise MonitoringAcquisitionJobError(
-                "credential verification time is unavailable before source I/O"
-            )
-        return self._collection_time
 
 
 def _validate_monitoring_intent_key_lifecycle(
@@ -751,6 +809,10 @@ def _field(mapping: Mapping[str, object], name: str, label: str) -> object:
     return mapping[name]
 
 
+def _configuration_tuple(value: object) -> tuple[object, ...]:
+    return tuple(value) if isinstance(value, list | tuple) else ()
+
+
 def _model_payload(model: object) -> Mapping[str, object]:
     dump = getattr(model, "model_dump", None)
     if not callable(dump):
@@ -858,17 +920,6 @@ class AzureMonitoringAcquisitionPort:
     network_watcher_resource_id: str
     authorized_resource_ids: tuple[str, ...]
     transport: _JsonTransport
-    clock: Any = _utc_now_milliseconds
-
-    def _now(self) -> datetime:
-        value = self.clock()
-        if (
-            not isinstance(value, datetime)
-            or value.utcoffset() != UTC.utcoffset(value)
-            or value.microsecond % 1000
-        ):
-            raise MonitoringAcquisitionJobError("acquisition adapter clock is not millisecond UTC")
-        return value
 
     def _validate_identity(self, request: Mapping[str, object]) -> None:
         if (
@@ -912,6 +963,13 @@ class AzureMonitoringAcquisitionPort:
     ) -> LogAnalyticsQueryResult:
         request = _model_payload(request_model)
         self._validate_identity(request)
+        if (
+            _field(request, "schemaVersion", "log request")
+            != "athena.wc028LogAnalyticsQueryRequest.v2"
+        ):
+            raise MonitoringAcquisitionJobError(
+                "production Log Analytics acquisition requires request schema v2"
+            )
         if str(_field(request, "queryTargetResourceId", "log request")).casefold() != (
             self.workspace_resource_id
         ):
@@ -973,6 +1031,8 @@ class AzureMonitoringAcquisitionPort:
             if len(values) != len(columns):
                 raise MonitoringAcquisitionJobError("Log Analytics row width is invalid")
             row = {"rowKind": row_kind, **dict(zip(columns, values, strict=True))}
+            if row_kind == "trafficAnalytics":
+                row["trafficAnalyticsLimitation"] = "aggregatedNotPacketCausal"
             row["observedStart"] = _azure_utc_milliseconds(
                 _field(row, "observedStart", "Log Analytics row"),
                 label="Log Analytics observedStart",
@@ -989,7 +1049,10 @@ class AzureMonitoringAcquisitionPort:
             **_response_base(
                 request,
                 source_identity_id=self.collector_identity_resource_id,
-                collected_at=self._now(),
+                collected_at=_azure_utc_milliseconds(
+                    _field(request, "collectorExecutionTime", "log request"),
+                    label="Log Analytics collectorExecutionTime",
+                ),
                 columns=columns,
                 response_bytes=response_bytes,
                 truncated=len(rows) == _MAX_ROWS or "error" in response,
@@ -1003,9 +1066,38 @@ class AzureMonitoringAcquisitionPort:
         )
         if aggregate_proof is not None:
             result_payload["aggregateCompletenessProof"] = aggregate_proof
-        descriptor = _coverage_descriptor(table_name, rows)
-        if descriptor is not None:
-            result_payload["coverageDescriptor"] = descriptor
+        coverage_scope = _mapping(
+            _field(request, "coverageScope", "log request"),
+            "Log Analytics coverageScope",
+        )
+        descriptor = {
+            name: coverage_scope[name]
+            for name in (
+                "resourceIds",
+                "pathId",
+                "direction",
+                "fiveTupleDigest",
+                "endpointTestReference",
+                "endpointTestDigest",
+            )
+            if name in coverage_scope
+        }
+        if "resourceIds" not in descriptor:
+            raise MonitoringAcquisitionJobError("Log Analytics coverage scope omitted resourceIds")
+        authorized_descriptor = _result(LogCoverageDescriptor, descriptor)
+        if table_name == "NWConnectionMonitorTestResult" and rows:
+            observed_descriptor_payload = _coverage_descriptor(table_name, rows)
+            if observed_descriptor_payload is None:
+                raise AssertionError("Connection Monitor descriptor was not produced")
+            observed_descriptor = _result(
+                LogCoverageDescriptor,
+                observed_descriptor_payload,
+            )
+            if observed_descriptor != authorized_descriptor:
+                raise MonitoringAcquisitionJobError(
+                    "Connection Monitor rows conflict with the authority-approved coverage scope"
+                )
+        result_payload["coverageDescriptor"] = descriptor
         return _result(LogAnalyticsQueryResult, result_payload)
 
     def query_activity_log(
@@ -1123,7 +1215,10 @@ class AzureMonitoringAcquisitionPort:
                 **_response_base(
                     request,
                     source_identity_id=self.collector_identity_resource_id,
-                    collected_at=self._now(),
+                    collected_at=_azure_utc_milliseconds(
+                        _field(request, "windowEnd", "activity request"),
+                        label="Activity Log windowEnd",
+                    ),
                     columns=columns,
                     response_bytes=response_bytes,
                     truncated=truncated or source_row_count >= _MAX_ROWS,
@@ -1251,7 +1346,10 @@ class AzureMonitoringAcquisitionPort:
                 **_response_base(
                     request,
                     source_identity_id=self.collector_identity_resource_id,
-                    collected_at=self._now(),
+                    collected_at=_azure_utc_milliseconds(
+                        _field(request, "windowEnd", "Resource Graph request"),
+                        label="Resource Graph windowEnd",
+                    ),
                     columns=columns,
                     response_bytes=response_bytes,
                     truncated=truncated or len(values) == _MAX_ROWS,
@@ -1475,7 +1573,10 @@ class AzureMonitoringAcquisitionPort:
                 **_response_base(
                     request,
                     source_identity_id=self.collector_identity_resource_id,
-                    collected_at=self._now(),
+                    collected_at=_azure_utc_milliseconds(
+                        _field(request, "windowEnd", "Resource Health request"),
+                        label="Resource Health windowEnd",
+                    ),
                     columns=columns,
                     response_bytes=total_bytes,
                     truncated=truncated or len(rows) >= _MAX_ROWS,
@@ -1552,13 +1653,95 @@ class AzureMonitoringAcquisitionPort:
                 "source": "ipFlowVerify",
                 "requestDigest": _field(request, "requestDigest", "IP Flow request"),
                 "sourceIdentityId": self.collector_identity_resource_id,
-                "collectedAt": self._now(),
+                "collectedAt": _azure_utc_milliseconds(
+                    _field(request, "checkedAt", "IP Flow request"),
+                    label="IP Flow checkedAt",
+                ),
                 "checkedAt": _field(request, "checkedAt", "IP Flow request"),
                 "access": _field(response, "access", "IP Flow Verify response"),
                 "ruleResourceId": rule_resource_id,
                 "responseBytes": response_bytes,
                 "limitation": "pointInTimeNotHistorical",
             },
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class AzureMonitoringCredentialBoundClient:
+    """Use the proof-verified adapter credential for every runtime Azure source call."""
+
+    credential: ManagedIdentityCredential
+    reviewed_contract: MonitoringCollectorContract
+    acquisition_port: AzureMonitoringAcquisitionPort
+
+    def __post_init__(self) -> None:
+        if (
+            self.reviewed_contract.schema_version
+            != MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION
+            or self.acquisition_port.collector_identity_resource_id
+            != self.reviewed_contract.collector_identity_resource_id.casefold().rstrip("/")
+        ):
+            raise MonitoringAcquisitionJobError(
+                "runtime Azure client does not match the reviewed collector contract"
+            )
+
+    def _access_token(self, scope: str) -> str:
+        try:
+            access_token = self.credential.get_token(scope)
+        except Exception as exc:
+            raise MonitoringAcquisitionJobError(
+                "managed identity source token acquisition failed"
+            ) from exc
+        token = getattr(access_token, "token", None)
+        if type(token) is not str or not token or token != token.strip() or len(token) > 32 * 1024:
+            raise MonitoringAcquisitionJobError(
+                "managed identity returned an invalid source access token"
+            )
+        return token
+
+    def query_log_analytics(
+        self,
+        request: LogAnalyticsQueryRequest,
+    ) -> LogAnalyticsQueryResult:
+        return self.acquisition_port.query_log_analytics(
+            request,
+            access_token=self._access_token(_LOG_ANALYTICS_SCOPE),
+        )
+
+    def query_activity_log(
+        self,
+        request: ActivityLogQueryRequest,
+    ) -> ActivityLogQueryResult:
+        return self.acquisition_port.query_activity_log(
+            request,
+            access_token=self._access_token(_ARM_SCOPE),
+        )
+
+    def query_resource_graph_changes(
+        self,
+        request: ResourceGraphChangeQueryRequest,
+    ) -> ResourceGraphChangeQueryResult:
+        return self.acquisition_port.query_resource_graph_changes(
+            request,
+            access_token=self._access_token(_ARM_SCOPE),
+        )
+
+    def query_resource_health(
+        self,
+        request: ResourceHealthQueryRequest,
+    ) -> ResourceHealthQueryResult:
+        return self.acquisition_port.query_resource_health(
+            request,
+            access_token=self._access_token(_ARM_SCOPE),
+        )
+
+    def query_ip_flow_verify(
+        self,
+        request: IpFlowVerifyRequest,
+    ) -> IpFlowVerifyResult:
+        return self.acquisition_port.query_ip_flow_verify(
+            request,
+            access_token=self._access_token(_ARM_SCOPE),
         )
 
 
@@ -1698,9 +1881,9 @@ def _validate_acquisition_authority_preflight(
         raise MonitoringAcquisitionJobError(
             "monitoring acquisition authority is not the configured authority"
         )
-    if acquisition_authority.schema_version != ("athena.wc028MonitoringAcquisitionAuthority.v3"):
+    if acquisition_authority.schema_version != ("athena.wc028MonitoringAcquisitionAuthority.v4"):
         raise MonitoringAcquisitionJobError(
-            "production monitoring acquisition requires authority schema v3"
+            "production monitoring acquisition requires authority schema v4"
         )
     if (
         collector_contract.schema_version
@@ -1733,6 +1916,14 @@ def _validate_acquisition_authority_preflight(
         or collector_contract.athena_context_principal_id
         != acquisition_authority.athena_context_principal_id
         or collector_contract.physical_identity_separation_enforced is not True
+        or collector_contract.identity_proof_audience
+        != acquisition_authority.identity_proof_audience
+        or collector_contract.identity_proof_token_version
+        != acquisition_authority.identity_proof_token_version
+        or collector_contract.identity_proof_required_role
+        != acquisition_authority.identity_proof_required_role
+        or collector_contract.identity_proof_maximum_lifetime_seconds
+        != acquisition_authority.identity_proof_maximum_lifetime_seconds
         or acquisition_authority.context_binding_digest != context_binding.binding_digest
         or acquisition_authority.required_coverage_scope_digests
         != context_binding.required_coverage_scope_digests
@@ -1757,6 +1948,10 @@ def _validate_acquisition_authority_preflight(
         or collector_contract.ip_flow_verify_scope_id is None
         or collector_contract.ip_flow_verify_scope_id.casefold().rstrip("/")
         != configuration.network_watcher_resource_id
+        or collector_contract.ip_flow_verify_allowed_operations
+        != _IP_FLOW_VERIFY_ALLOWED_OPERATIONS
+        or collector_contract.resource_health_allowed_operations
+        != _RESOURCE_HEALTH_ALLOWED_OPERATIONS
     ):
         raise MonitoringAcquisitionJobError(
             "collector contract changed the deployed evidence trust boundary"
@@ -2107,7 +2302,6 @@ def run_wc028_monitoring_acquisition_job(
         monitoring_intent_signature_verifier=intent_verifier.verify_preimage,
         monitoring_intent_asset_loader=load_intent_assets,
     )
-    acquisition_clock = _CredentialBoundAcquisitionClock()
     transport = AzureManagedIdentityJsonTransport(
         timeout_seconds=configuration.http_timeout_seconds,
         retry_limit=configuration.http_retry_limit,
@@ -2119,12 +2313,32 @@ def run_wc028_monitoring_acquisition_job(
         network_watcher_resource_id=configuration.network_watcher_resource_id,
         authorized_resource_ids=acquisition_authority.allowed_resource_ids,
         transport=transport,
-        clock=acquisition_clock.source_collection_time,
     )
-    acquisition_adapter = CredentialBoundMonitoringAcquisitionAdapter(
+
+    def build_azure_clients(
+        *,
+        credential: ManagedIdentityCredential,
+        reviewed_contract: MonitoringCollectorContract,
+    ) -> AzureMonitoringClients:
+        clients = tuple(
+            AzureMonitoringCredentialBoundClient(
+                credential=credential,
+                reviewed_contract=reviewed_contract,
+                acquisition_port=port,
+            )
+            for _ in range(5)
+        )
+        return AzureMonitoringClients(
+            log_analytics=clients[0],
+            activity_log=clients[1],
+            resource_graph=clients[2],
+            resource_health=clients[3],
+            ip_flow_verify=clients[4],
+        )
+
+    acquisition_adapter = AzureMonitoringAdapter(
         reviewed_collector_contract=collector_contract,
-        acquisition_port=port,
-        utc_now=acquisition_clock.runtime_now,
+        client_factory=build_azure_clients,
     )
     monitoring_evidence_store = AzureBlobChangeEvidenceReplayStore(
         blob_endpoint=configuration.evidence_blob_endpoint,
@@ -2186,6 +2400,7 @@ def run_wc028_monitoring_acquisition_job(
 __all__ = [
     "AzureManagedIdentityJsonTransport",
     "AzureMonitoringAcquisitionPort",
+    "AzureMonitoringCredentialBoundClient",
     "MonitoringAcquisitionJobError",
     "MonitoringAcquisitionJobOutcome",
     "MonitoringEvidenceCommitPort",
