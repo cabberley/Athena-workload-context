@@ -201,7 +201,8 @@ def _evaluate_feed_producer_job_template(
         ("wc027ProducerJob!.properties.configuration.eventTriggerConfig.scale.maxExecutions == 1"),
         (
             "wc027ProducerJob!.properties.configuration.eventTriggerConfig.scale."
-            "pollingInterval == 30"
+            "pollingInterval == wc027RuntimeDeliveryBudget."
+            "feedKedaPollingIntervalSeconds"
         ),
         ("length(wc027ProducerJob!.properties.configuration.eventTriggerConfig.scale.rules) == 1"),
         (
@@ -375,6 +376,8 @@ def test_wc027_runtime_is_private_keyless_and_session_ordered() -> None:
     assert "connectionString" not in source
     assert "listKeys(" not in source
     assert "runtimeConfigurationJson" in source
+    assert "deliveryBudget: guidancePublicationDeliveryBudget" in source
+    assert "pollingInterval: guidanceFeedKedaPollingIntervalSeconds" in source
     assert "triggerSubmitterIdentityResourceIds" in source
     assert "principalId: triggerSubmitterIdentities[index].properties.principalId" in source
     assert "scope: triggerQueue" in source
@@ -651,9 +654,7 @@ def test_wc027_notification_gate_requires_deployed_job_resource_id() -> None:
     assert "wc027ProducerJobResourceIdShapeValid" in source
     assert "wc027ProducerJobResourceIdSegments[6] == 'Microsoft.App'" in source
     assert "wc027ProducerJobResourceIdSegments[7] == 'jobs'" in source
-    assert (
-        "toLower(wc027ProducerJob!.id) == toLower(wc027EnrichmentFeedProducerJobResourceId)"
-    ) in source
+    assert "wc027ProducerLoadedJobIdMatches" not in source
     assert "exact deployed producer configuration digest" in source
     assert "wc027ProducerImageValid" in source
     assert "wc027ProducerIdentityTypeMatches" in source
@@ -663,6 +664,11 @@ def test_wc027_notification_gate_requires_deployed_job_resource_id() -> None:
     assert "wc027ProducerScalerMatches" in source
     assert "wc027ProducerRegistryMatches" in source
     assert "wc027ProducerTagsMatch" in source
+    assert "wc027RuntimeDeliveryBudgetValid" in source
+    assert (
+        "eventTriggerConfig.scale.pollingInterval == "
+        "wc027RuntimeDeliveryBudget.feedKedaPollingIntervalSeconds"
+    ) in source
     assert "wc027ProducerJob!.tags.runtimeConfigurationDigest" in source
     assert "ATHENA_WC027_ENRICHMENT_FEED_CONFIG_JSON" in source
     assert "notificationV2ProducerReady: validatedWc027FeedV2ProducerReady" in source

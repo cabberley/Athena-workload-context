@@ -5,7 +5,7 @@ import os
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
 from azure.core.exceptions import (
     HttpResponseError,
@@ -440,6 +440,63 @@ def _utc_now_milliseconds() -> datetime:
     return current.replace(microsecond=(current.microsecond // 1000) * 1000)
 
 
+type _RequestProducerSettlementStatus = Literal[
+    "settled",
+    "deferred",
+    "uncertain",
+]
+
+
+def _settle_request_producer_message(
+    receiver: object,
+    message: object,
+    *,
+    action: Literal["complete", "abandon", "dead_letter"],
+    now: datetime,
+    reason: str | None = None,
+    error_description: str | None = None,
+) -> _RequestProducerSettlementStatus:
+    from azure.servicebus.exceptions import MessageAlreadySettled, ServiceBusError
+
+    lock_deadlines = tuple(
+        deadline
+        for deadline in (
+            getattr(message, "locked_until_utc", None),
+            getattr(getattr(receiver, "session", None), "locked_until_utc", None),
+        )
+        if deadline is not None
+    )
+    if any(
+        not isinstance(deadline, datetime)
+        or deadline.tzinfo is None
+        or deadline.utcoffset() != UTC.utcoffset(now)
+        or now >= deadline
+        for deadline in lock_deadlines
+    ):
+        return "deferred" if action == "abandon" else "uncertain"
+    try:
+        if action == "complete":
+            receiver.complete_message(message)  # type: ignore[attr-defined]
+            return "settled"
+        if action == "abandon":
+            receiver.abandon_message(message)  # type: ignore[attr-defined]
+            return "deferred"
+        receiver.dead_letter_message(  # type: ignore[attr-defined]
+            message,
+            reason=reason,
+            error_description=error_description,
+        )
+        return "settled"
+    except (
+        MessageAlreadySettled,
+        ServiceBusError,
+        ServiceRequestError,
+        ServiceResponseError,
+        OSError,
+    ):
+        return "uncertain"
+
+
 def build_wc027_guidance_publication_request_producer(
     configuration: Wc027GuidancePublicationRequestProducerConfiguration,
     *,
@@ -591,11 +648,21 @@ def run_wc027_guidance_publication_request_producer_worker(
                 request,
                 now=_utc_now_milliseconds(),
             )
-            receiver.complete_message(message)
-            return True
+            return (
+                _settle_request_producer_message(
+                    receiver,
+                    message,
+                    action="complete",
+                    now=_utc_now_milliseconds(),
+                )
+                == "settled"
+            )
         except ArtifactAlreadyExistsError:
-            receiver.dead_letter_message(
+            _settle_request_producer_message(
+                receiver,
                 message,
+                action="dead_letter",
+                now=_utc_now_milliseconds(),
                 reason="AthenaWc027GuidanceRequestConflict",
                 error_description=(
                     "the signed occurrence already owns a different immutable "
@@ -614,11 +681,19 @@ def run_wc027_guidance_publication_request_producer_worker(
             ServiceBusError,
             OSError,
         ):
-            receiver.abandon_message(message)
+            _settle_request_producer_message(
+                receiver,
+                message,
+                action="abandon",
+                now=_utc_now_milliseconds(),
+            )
             return False
         except ValidationError, TypeError, ValueError:
-            receiver.dead_letter_message(
+            _settle_request_producer_message(
+                receiver,
                 message,
+                action="dead_letter",
+                now=_utc_now_milliseconds(),
                 reason="AthenaWc027GuidanceRequestRejected",
                 error_description=(
                     "incident-bound request failed canonical, freshness, "

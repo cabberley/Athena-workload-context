@@ -83,12 +83,26 @@ var guidancePublisherKedaPollingIntervalSeconds = 30
 var guidancePublisherColdStartSeconds = 30
 var guidancePublisherConnectionSetupSeconds = 30
 var guidancePublisherProcessingSeconds = 60
-var guidanceMinimumRemainingLifetimeSeconds = guidancePublisherKedaPollingIntervalSeconds + guidancePublisherColdStartSeconds + guidancePublisherConnectionSetupSeconds + guidancePublisherProcessingSeconds
+var guidancePublisherMinimumRemainingLifetimeSeconds = guidancePublisherKedaPollingIntervalSeconds + guidancePublisherColdStartSeconds + guidancePublisherConnectionSetupSeconds + guidancePublisherProcessingSeconds
+var guidanceFeedKedaPollingIntervalSeconds = 30
+var guidanceFeedColdStartSeconds = 30
+var guidanceFeedConnectionSetupSeconds = 30
+var guidanceFeedProcessingSeconds = 60
+var guidanceFeedMinimumRemainingLifetimeSeconds = guidanceFeedKedaPollingIntervalSeconds + guidanceFeedColdStartSeconds + guidanceFeedConnectionSetupSeconds + guidanceFeedProcessingSeconds
+var guidanceFeedTriggerRecoverySeconds = 300
+var guidanceMinimumRemainingLifetimeSeconds = guidancePublisherMinimumRemainingLifetimeSeconds
 var guidancePublicationDeliveryBudget = {
   publisherKedaPollingIntervalSeconds: guidancePublisherKedaPollingIntervalSeconds
   publisherColdStartSeconds: guidancePublisherColdStartSeconds
   publisherConnectionSetupSeconds: guidancePublisherConnectionSetupSeconds
   publisherProcessingSeconds: guidancePublisherProcessingSeconds
+  publisherMinimumRemainingLifetimeSeconds: guidancePublisherMinimumRemainingLifetimeSeconds
+  feedKedaPollingIntervalSeconds: guidanceFeedKedaPollingIntervalSeconds
+  feedColdStartSeconds: guidanceFeedColdStartSeconds
+  feedConnectionSetupSeconds: guidanceFeedConnectionSetupSeconds
+  feedProcessingSeconds: guidanceFeedProcessingSeconds
+  feedMinimumRemainingLifetimeSeconds: guidanceFeedMinimumRemainingLifetimeSeconds
+  feedTriggerRecoverySeconds: guidanceFeedTriggerRecoverySeconds
   minimumRemainingLifetimeSeconds: guidanceMinimumRemainingLifetimeSeconds
 }
 var parsedEnrichmentRuntimeConfiguration = json(enrichmentRuntimeConfigurationJson)
@@ -201,9 +215,36 @@ var validatedRequestOutboxStorageAccountName = requestOutboxBlobService.properti
   : fail('requestOutboxStorageAccountResourceId must have Blob versioning enabled')
 var requestOutboxBlobEndpoint = 'https://${toLower(validatedRequestOutboxStorageAccountName)}.blob.${environment().suffixes.storage}'
 
+var registryResourceIdRawSegments = split(registryResourceId, '/')
+var registryResourceIdSegments = concat(
+  registryResourceIdRawSegments,
+  [
+    ''
+    ''
+    ''
+    ''
+    ''
+    ''
+    ''
+    ''
+    ''
+  ]
+)
+var registryResourceIdValid = length(registryResourceIdRawSegments) == 9 && empty(registryResourceIdSegments[0]) && registryResourceIdSegments[1] == 'subscriptions' && !empty(registryResourceIdSegments[2]) && registryResourceIdSegments[3] == 'resourceGroups' && !empty(registryResourceIdSegments[4]) && registryResourceIdSegments[5] == 'providers' && registryResourceIdSegments[6] == 'Microsoft.ContainerRegistry' && registryResourceIdSegments[7] == 'registries' && !empty(registryResourceIdSegments[8]) && !contains(registryResourceId, '//') && !contains(registryResourceId, '?') && !contains(registryResourceId, '#') && !contains(registryResourceId, '%')
+var validatedRegistryScope = registryResourceIdValid
+  ? {
+      subscriptionId: registryResourceIdSegments[2]
+      resourceGroupName: registryResourceIdSegments[4]
+      registryName: registryResourceIdSegments[8]
+    }
+  : fail('registryResourceId must identify one canonical Microsoft.ContainerRegistry/registries resource')
+
 resource registry 'Microsoft.ContainerRegistry/registries@2025-04-01' existing = {
-  name: last(split(registryResourceId, '/'))
-  scope: resourceGroup(split(registryResourceId, '/')[2], split(registryResourceId, '/')[4])
+  name: validatedRegistryScope.registryName
+  scope: resourceGroup(
+    validatedRegistryScope.subscriptionId,
+    validatedRegistryScope.resourceGroupName
+  )
 }
 
 var expectedRegistryServer = '${toLower(registry.name)}.azurecr.io'
@@ -337,11 +378,11 @@ resource requestQueue 'Microsoft.ServiceBus/namespaces/queues@2026-01-01' = {
     requiresSession: true
     requiresDuplicateDetection: true
     duplicateDetectionHistoryTimeWindow: 'PT15M'
-    defaultMessageTimeToLive: 'PT5M'
+    defaultMessageTimeToLive: 'PT10M'
     maxMessageSizeInKilobytes: 12288
     deadLetteringOnMessageExpiration: true
     lockDuration: 'PT5M'
-    maxDeliveryCount: 5
+    maxDeliveryCount: 10
   }
 }
 
@@ -492,6 +533,10 @@ module bindingSigner 'modules/key-signer-rbac.bicep' = {
 
 module publisherImagePull '../wc027-enrichment-feed-runtime/modules/acr-pull-rbac.bicep' = {
   name: 'wc027-guidance-publisher-acr-pull'
+  scope: resourceGroup(
+    validatedRegistryScope.subscriptionId,
+    validatedRegistryScope.resourceGroupName
+  )
   params: {
     registryName: registry.name
     identityResourceId: brokerIdentity.id

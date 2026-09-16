@@ -26,6 +26,8 @@ from athena_context.azure_adapters import (
     AzureBlobVersionPinnedArtifactReader,
 )
 from athena_context.contracts import (
+    WC027_GUIDANCE_FEED_TRIGGER_RECOVERY_SECONDS,
+    WC027_GUIDANCE_PUBLICATION_REQUEST_MAX_LIFETIME_SECONDS,
     GuidanceAuthorityPublicationRequest,
     VersionPinnedBlobReference,
 )
@@ -188,7 +190,13 @@ class AzureServiceBusGuidancePublicationRequestSender:
             raise TypeError(
                 "delivery_budget must be an exact GuidancePublicationRequestDeliveryBudget"
             )
-        if not delivery_budget.minimum_remaining_lifetime_seconds <= time_to_live_seconds <= 300:
+        if not (
+            delivery_budget.minimum_remaining_lifetime_seconds
+            + delivery_budget.feed_trigger_recovery_seconds
+            <= time_to_live_seconds
+            <= WC027_GUIDANCE_PUBLICATION_REQUEST_MAX_LIFETIME_SECONDS
+            + WC027_GUIDANCE_FEED_TRIGGER_RECOVERY_SECONDS
+        ):
             raise ValueError(
                 "guidance publication request TTL does not retain the reviewed "
                 "downstream delivery budget"

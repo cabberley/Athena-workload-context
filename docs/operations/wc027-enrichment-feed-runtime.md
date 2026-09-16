@@ -147,12 +147,21 @@ versioned Key Vault URI.
 Production publication requests arrive only from the separate request-producer sender identity,
 carry the exact occurrence-keyed outbox reference in their broker metadata, and are rejected unless
 the publisher can exact-read matching immutable outbox bytes. No direct authority-request submit
-command is exposed. Producer and publisher configurations bind the same reviewed 150-second
-downstream budget: 30 seconds for KEDA scale-to-zero polling, 30 seconds for publisher cold start,
-30 seconds for managed-identity Service Bus client/receiver/sender setup, and 60 seconds for
-publisher processing. The broker metadata carries the same values. After startup and transport
-setup have completed, the publisher accepts the exact 60-second processing boundary and rejects
-less.
+command is exposed. Producer, publisher, and feed configurations bind the same reviewed
+delivery contract. It preserves the request producer's 150-second upstream minimum and the
+publisher's 30/30/30/60 phase set. The feed has its own 150-second 30/30/30/60 phase set plus a
+300-second trigger-recovery allowance. The broker metadata, signed activation, publisher request,
+and feed trigger carry the same values. After feed startup and transport setup have completed, the
+runtime accepts the exact 60-second processing boundary and abandons less without writing
+enrichment, feed, or notification state.
+
+The signed activation derives an independent trigger deadline from signed request expiry plus the
+300-second recovery allowance; activation expiry is one complete 150-second feed phase later. The
+activation is the durable trigger outbox and binds the immutable binding reference, trigger
+`MessageId`, both deadlines, and delivery budget. The publisher sends only after CAS. If CAS or
+trigger submission is uncertain, replay exact-reads the activation and binding outbox—even after
+request expiry—and resubmits the same deterministic message without a second activation;
+duplicate detection contains uncertain acceptance.
 
 The publisher verifies the outer request and nested lifecycle, subject, and correlation-binding
 signatures; confirms the exact current signed occurrence and active index; recomputes correlation;
@@ -212,7 +221,9 @@ binding evidence. Canonical publisher Job IDs are evaluated from their parsed se
 safety padding. All three WC-027 Jobs must resolve to the current subscription and
 `foundationResourceGroupName`; malformed prefixes, provider/type aliases, child resources,
 duplicate separators, query/fragment/encoding aliases, empty components, and cross-scope IDs fail
-readiness. Each normalized supplied ID must also equal the loaded Job's canonical `.id`.
+readiness. The existing-resource `.id` expression is not treated as server-returned proof; exact
+syntactic validation plus the referenced Job's complete configuration and identity surfaces form
+the readiness evidence.
 When both jobs are asserted ready, the root gate also requires exact queue plus request-key handoff
 equality. Feed-v2 readiness requires both `wc027RequestProducerReady=true` and
 `wc027PublisherReady=true`.

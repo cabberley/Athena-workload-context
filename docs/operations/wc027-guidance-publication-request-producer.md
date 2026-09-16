@@ -89,15 +89,15 @@ The occurrence-keyed path means:
 - concurrent workers converge on one request identity.
 
 Immediately before persistence and again immediately before enqueue, the worker consults its
-trusted clock and requires at least 150 seconds of remaining request lifetime. The reviewed
-downstream budget is 30 seconds for KEDA scale-to-zero polling, 30 seconds for the publisher cold
-start, 30 seconds for managed-identity Service Bus client/receiver/sender setup, and 60 seconds for
-publisher processing. A request below the first boundary is abandoned without reserving or writing
-its occurrence-keyed outbox path. If revalidation or producer sender setup consumes the budget, the
+trusted clock and preserves the reviewed 150-second upstream minimum: 30 seconds each for
+publisher KEDA polling, cold start, and managed-identity Service Bus setup plus 60 seconds for
+publisher processing. A request below the boundary is abandoned without reserving or writing its
+occurrence-keyed outbox path. If revalidation or producer sender setup consumes the budget, the
 persisted request is not sent and the input is abandoned. A request with exactly 150 seconds
 remaining is eligible to persist and send. After persistence, the worker revalidates lifecycle and
 context authority, establishes the managed-identity Service Bus sender, resamples the trusted
-clock, and only then calculates TTL and constructs/sends the message. Sender creation cannot
+clock, and only then constructs/sends the message. The broker TTL is the remaining signed request
+window plus the separately reviewed 300-second trigger-recovery allowance. Sender creation cannot
 complete the input delivery. The request is sent to the existing
 `wc027-guidance-authority-requests` queue with a distinct sender identity:
 
@@ -105,14 +105,17 @@ complete the input delivery. The request is sent to the existing
 |---|---|
 | Message ID | deterministic `requestId` |
 | Session ID | signed incident ID |
-| TTL | remaining bounded request lifetime, at most five minutes |
+| TTL | remaining signed request lifetime plus the 300-second trigger-recovery allowance, at most ten minutes |
 | Body | exact canonical request bytes |
-| Metadata | request, occurrence, incident-state, context-authority, version-pinned outbox, and exact 30/30/30/60/150-second delivery-budget bindings plus `noAutoRemediation=true` |
+| Metadata | request, occurrence, incident-state, context-authority, version-pinned outbox, exact 30/30/30/60/150-second publisher and feed phase sets, the 300-second trigger-recovery allowance, the preserved 150-second upstream minimum, and `noAutoRemediation=true` |
 
 If send completion is uncertain, the input delivery is abandoned. A retry recovers identical
 outbox bytes and sends the same `MessageId`; Service Bus duplicate detection safely suppresses a
 prior successful send. Budget exhaustion is retryable without output I/O; once the signed input is
-actually stale, the same delivery is rejected rather than completed.
+actually stale, the same delivery is rejected rather than completed. Producer completion,
+abandon, and rejection settlement is lock-aware and bounded to one attempt. Message-lock loss,
+already-settled messages, and Service Bus or transport settlement uncertainty return a deterministic
+deferred/uncertain result instead of crashing the Job.
 
 ## Deployment and identities
 
@@ -136,11 +139,18 @@ reader/writer, upstream trust reader, request signer, or request verifier identi
 that runtime boundary. Resource IDs are normalized before uniqueness and overlap checks so casing
 aliases cannot bypass the separation.
 
-The strict producer and publisher configurations both carry the same reviewed delivery budget.
-The publisher's KEDA polling interval is derived from that configuration, broker metadata binds
-all five budget values, and the publisher checks only the remaining 60-second processing budget
-after cold start and Service Bus connection setup have completed. Exactly 60 seconds is accepted;
-less is rejected.
+The strict producer, publisher, and enrichment/feed configurations carry the same reviewed
+delivery budget. Broker metadata binds every phase. After publisher cold start and Service Bus
+setup, the publisher requires the exact 60-second processing phase before creating authority. The
+signed activation then establishes an independent feed-delivery timeline derived deterministically
+from the signed request: its trigger deadline is request expiry plus 300 seconds, and activation
+expiry is another 150 seconds later. It is the durable trigger outbox and binds the immutable
+binding reference, deterministic trigger `MessageId`, all budget components, and both deadlines.
+After CAS, the publisher submits that exact message to the duplicate-detecting feed queue. A
+definite or uncertain send failure abandons the publisher request; replay may continue after the
+request itself expires, reads the same activation and exact binding version, and resubmits the same
+`MessageId` without another CAS. An uncertain CAS that actually committed is recovered in the same
+way. The publisher completes its input only after trigger submission returns.
 
 Deploy the authority publisher first with the dedicated producer sender identity as the only
 value in `requestSubmitterIdentityResourceIds`; the queue-owning publisher module grants that
@@ -180,8 +190,14 @@ are ready.
 Request-producer, authority-publisher, and feed-producer Job IDs must be canonical absolute ARM
 IDs in the root deployment subscription and `foundationResourceGroupName`. Readiness rejects
 prefix/provider/type aliases, missing components, child or suffix IDs, duplicate separators,
-query/fragment/encoding forms, and any normalized supplied ID that differs from the loaded Job
-`.id`.
+and query/fragment/encoding forms. Existing-resource `.id` values are not represented as
+server-returned evidence; readiness instead uses complete canonical syntactic validation and then
+inspects the referenced Job's exact server-returned configuration surfaces.
+
+The authority publisher validates `registryResourceId` as one canonical
+`Microsoft.ContainerRegistry/registries` ID. Both the existing registry reference and the
+publisher ACR-pull module use the parsed subscription and resource-group scope, including reviewed
+cross-subscription or cross-resource-group registries.
 
 The publisher independently exact-reads every referenced outbox Blob version before invoking its
 existing publication/activation service. Broker metadata without matching durable request bytes is
@@ -200,6 +216,9 @@ request-producer sender identity used in the generated configuration.
 - Current authority temporarily unavailable or changed, Blob uncertainty, Key Vault transport
   failure, insufficient pre-persistence lifetime, expiry during revalidation, or Service Bus
   uncertainty: abandon and retry.
+- Producer completion/abandon settlement lock loss, already-settled state, or transport failure:
+  contain the settlement error and return deferred/uncertain; redelivery recovers the same outbox
+  bytes and deterministic broker identity.
 - Publisher trigger-send or input-completion `ServiceBusError`: abandon only while the delivery or
   session lock remains valid. A retry reuses the same immutable request/activation identity and
   cannot create a second activation.

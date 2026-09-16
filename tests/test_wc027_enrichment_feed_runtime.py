@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -8,6 +9,7 @@ import pytest
 
 import athena_context.enrichment.production as production
 from athena_context.contracts import (
+    GuidancePublicationRequestDeliveryBudget,
     IncidentNotificationEnvelopeV2,
     PublishedGuidanceAuthorityActivation,
     PublishedGuidanceAuthorityActivationAttestation,
@@ -19,6 +21,7 @@ from athena_context.enrichment import (
     Wc027EnrichmentFeedRuntime,
     Wc027EnrichmentSourceNotReadyError,
     parse_wc027_enrichment_trigger,
+    validate_wc027_enrichment_broker_metadata,
 )
 from athena_context.enrichment.feed_pipeline import (
     IncidentEnrichmentFeedPublicationService,
@@ -54,6 +57,8 @@ from test_wc027_incident_enrichment_publication import (
     _publication_service,
     _Store,
 )
+
+_DELIVERY_BUDGET = GuidancePublicationRequestDeliveryBudget.reviewed()
 
 
 class _Signer:
@@ -100,7 +105,19 @@ class _Authority:
 
 
 class _Activation:
-    def __init__(self, binding, occurrence) -> None:
+    def __init__(
+        self,
+        binding,
+        occurrence,
+        *,
+        delivery_budget: GuidancePublicationRequestDeliveryBudget = _DELIVERY_BUDGET,
+    ) -> None:
+        publication_request_expires_at = (
+            binding.incident_bound_request.correlation_request.expires_at
+        )
+        trigger_delivery_deadline = (
+            publication_request_expires_at + delivery_budget.feed_trigger_recovery
+        )
         payload = {
             "schemaVersion": ("athena.wc027PublishedGuidanceAuthorityActivation.v1"),
             "incidentId": (binding.incident_bound_request.incident_subject.incident_id),
@@ -117,8 +134,17 @@ class _Activation:
                 version="synthetic-binding-version",
                 contentDigest=sha256_hex(binding.canonical_bytes()),
             ),
+            "triggerMessageId": binding.binding_id,
+            "deliveryBudget": delivery_budget.model_dump(
+                mode="json",
+                by_alias=True,
+            ),
             "activatedAt": binding.evaluated_at,
-            "expiresAt": (binding.incident_bound_request.correlation_request.expires_at),
+            "publicationRequestExpiresAt": publication_request_expires_at,
+            "triggerDeliveryDeadline": trigger_delivery_deadline,
+            "expiresAt": (
+                trigger_delivery_deadline + delivery_budget.feed_minimum_remaining_lifetime
+            ),
         }
         digest_payload = {
             **payload,
@@ -278,6 +304,7 @@ def _bicep_generated_runtime_configuration() -> dict[str, object]:
     }
     return {
         "schemaVersion": "athena.wc027EnrichmentFeedRuntimeConfiguration.v1",
+        "deliveryBudget": _DELIVERY_BUDGET.model_dump(mode="json", by_alias=True),
         "serviceBus": {
             "namespace": "athena-wc027.servicebus.windows.net",
             "triggerQueueName": "wc027-enrichment-trigger",
@@ -432,13 +459,7 @@ def _bicep_generated_publisher_configuration() -> dict[str, object]:
         },
         "requestKey": request_key,
         "bindingSigningKey": binding_signing_key,
-        "deliveryBudget": {
-            "publisherKedaPollingIntervalSeconds": 30,
-            "publisherColdStartSeconds": 30,
-            "publisherConnectionSetupSeconds": 30,
-            "publisherProcessingSeconds": 60,
-            "minimumRemainingLifetimeSeconds": 150,
-        },
+        "deliveryBudget": _DELIVERY_BUDGET.model_dump(mode="json", by_alias=True),
         "enrichmentRuntimeConfiguration": runtime,
         "deploymentBinding": {
             "bindingEvidenceId": "10000000-0000-0000-0000-000000000099",
@@ -479,6 +500,13 @@ def test_publisher_configuration_preserves_logical_and_physical_binding_keys() -
     assert configuration.delivery_budget.publisher_cold_start_seconds == 30
     assert configuration.delivery_budget.publisher_connection_setup_seconds == 30
     assert configuration.delivery_budget.publisher_processing_seconds == 60
+    assert configuration.delivery_budget.publisher_minimum_remaining_lifetime_seconds == 150
+    assert configuration.delivery_budget.feed_keda_polling_interval_seconds == 30
+    assert configuration.delivery_budget.feed_cold_start_seconds == 30
+    assert configuration.delivery_budget.feed_connection_setup_seconds == 30
+    assert configuration.delivery_budget.feed_processing_seconds == 60
+    assert configuration.delivery_budget.feed_minimum_remaining_lifetime_seconds == 150
+    assert configuration.delivery_budget.feed_trigger_recovery_seconds == 300
     assert configuration.delivery_budget.minimum_remaining_lifetime_seconds == 150
 
 
@@ -489,6 +517,13 @@ def test_publisher_configuration_preserves_logical_and_physical_binding_keys() -
         ("publisherColdStartSeconds", 29),
         ("publisherConnectionSetupSeconds", 29),
         ("publisherProcessingSeconds", 59),
+        ("publisherMinimumRemainingLifetimeSeconds", 149),
+        ("feedKedaPollingIntervalSeconds", 31),
+        ("feedColdStartSeconds", 29),
+        ("feedConnectionSetupSeconds", 29),
+        ("feedProcessingSeconds", 59),
+        ("feedMinimumRemainingLifetimeSeconds", 149),
+        ("feedTriggerRecoverySeconds", 299),
         ("minimumRemainingLifetimeSeconds", 149),
     ),
 )
@@ -689,6 +724,15 @@ def test_complete_bicep_generated_configuration_starts_with_bound_key_authoritie
         configuration.incident_key.anchor.key_vault_key_id
         == configuration.incident_key.key_vault_key_id
     )
+    assert configuration.delivery_budget == _DELIVERY_BUDGET
+
+
+def test_runtime_configuration_rejects_feed_delivery_budget_drift() -> None:
+    payload = _bicep_generated_runtime_configuration()
+    payload["deliveryBudget"]["feedProcessingSeconds"] = 59  # type: ignore[index]
+
+    with pytest.raises(ValueError, match="delivery budget"):
+        Wc027EnrichmentFeedProductionConfiguration.model_validate_json(json.dumps(payload))
 
 
 def test_only_lifecycle_and_guidance_binding_may_use_logical_key_ids() -> None:
@@ -717,7 +761,10 @@ def test_only_lifecycle_and_guidance_binding_may_use_logical_key_ids() -> None:
         Wc027EnrichmentFeedProductionConfiguration.model_validate_json(json.dumps(payload))
 
 
-def _runtime(*, fail_feed_pointer_once: bool = False):
+def _runtime(
+    *,
+    fail_feed_pointer_once: bool = False,
+):
     fixture = _fixture()
     operations: list[str] = []
     enrichment_store = _Store()
@@ -761,6 +808,7 @@ def _runtime(*, fail_feed_pointer_once: bool = False):
         enrichment_publication=_Enrichment(enrichment, operations),
         feed_publication=_Feed(feed, operations),
         notification_publication=notification,
+        delivery_budget=_DELIVERY_BUDGET,
     )
     return (
         fixture,
@@ -800,6 +848,81 @@ def test_runtime_orders_correlation_enrichment_feed_then_notification() -> None:
     assert operations.index("feed.complete") < operations.index("notification")
     assert notification.calls == 1
     assert receipt.binding_id == fixture.guidance_binding.binding_id
+
+
+@pytest.mark.parametrize(
+    ("remaining_seconds", "should_publish"),
+    ((60, True), (59, False)),
+)
+def test_runtime_enforces_exact_feed_processing_boundary(
+    remaining_seconds: int,
+    should_publish: bool,
+) -> None:
+    (
+        fixture,
+        runtime,
+        store,
+        writer,
+        registry,
+        index,
+        notification,
+        operations,
+        _binding_verifier,
+        _incident_authority,
+    ) = _runtime()
+    activation_expires_at = runtime.guidance_activation.snapshot.activation.expires_at
+    published_at = activation_expires_at - timedelta(seconds=remaining_seconds)
+
+    if should_publish:
+        runtime.publish(
+            fixture.guidance_binding,
+            published_at=published_at,
+        )
+        assert notification.calls == 1
+    else:
+        with pytest.raises(
+            Wc027EnrichmentSourceNotReadyError,
+            match="feed processing window",
+        ):
+            runtime.publish(
+                fixture.guidance_binding,
+                published_at=published_at,
+            )
+        assert operations == []
+        assert store.calls == []
+        assert writer.values == {}
+        assert registry.records == {}
+        assert index.calls == 0
+        assert notification.calls == 0
+
+
+def test_feed_trigger_metadata_binds_the_complete_delivery_budget() -> None:
+    binding = _fixture().guidance_binding
+    properties: dict[str, object] = {
+        "schemaVersion": "athena.wc027PublishedGuidanceAuthorityBinding.v2",
+        "bindingDigest": binding.binding_digest,
+    }
+    properties.update(_DELIVERY_BUDGET.broker_properties())
+    message = SimpleNamespace(
+        content_type="application/json",
+        message_id=binding.binding_id,
+        session_id=binding.incident_bound_request.incident_subject.incident_id,
+        application_properties=properties,
+    )
+
+    validate_wc027_enrichment_broker_metadata(
+        message,
+        binding,
+        expected_delivery_budget=_DELIVERY_BUDGET,
+    )
+
+    message.application_properties["feedMinimumRemainingLifetimeSeconds"] = 149
+    with pytest.raises(ValueError, match="broker metadata"):
+        validate_wc027_enrichment_broker_metadata(
+            message,
+            binding,
+            expected_delivery_budget=_DELIVERY_BUDGET,
+        )
 
 
 def test_runtime_rejects_invalid_outer_signature_before_any_authority_or_storage_call() -> None:
@@ -891,6 +1014,7 @@ def test_runtime_rejects_missing_authority_before_correlation_or_writes() -> Non
         enrichment_publication=runtime.enrichment_publication,
         feed_publication=runtime.feed_publication,
         notification_publication=runtime.notification_publication,
+        delivery_budget=runtime.delivery_budget,
     )
 
     with pytest.raises(Wc027EnrichmentSourceNotReadyError):
@@ -937,6 +1061,7 @@ def test_runtime_rejects_stale_signed_binding_before_writes() -> None:
         enrichment_publication=runtime.enrichment_publication,
         feed_publication=runtime.feed_publication,
         notification_publication=runtime.notification_publication,
+        delivery_budget=runtime.delivery_budget,
     )
 
     with pytest.raises(ValueError, match="stale"):
@@ -990,6 +1115,7 @@ def test_runtime_rejects_binding_that_is_not_the_current_activation() -> None:
         enrichment_publication=runtime.enrichment_publication,
         feed_publication=runtime.feed_publication,
         notification_publication=runtime.notification_publication,
+        delivery_budget=runtime.delivery_budget,
     )
 
     with pytest.raises(ValueError, match="activation is invalid or stale"):

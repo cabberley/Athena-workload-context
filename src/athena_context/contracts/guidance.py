@@ -137,6 +137,179 @@ class _StrictGuidanceModel(AthenaBaseModel):
         return (self.canonical_json() + "\n").encode("utf-8")
 
 
+WC027_GUIDANCE_PUBLISHER_KEDA_POLLING_INTERVAL_SECONDS = 30
+WC027_GUIDANCE_PUBLISHER_COLD_START_SECONDS = 30
+WC027_GUIDANCE_PUBLISHER_CONNECTION_SETUP_SECONDS = 30
+WC027_GUIDANCE_PUBLISHER_PROCESSING_SECONDS = 60
+WC027_GUIDANCE_PUBLISHER_MINIMUM_REMAINING_LIFETIME_SECONDS = (
+    WC027_GUIDANCE_PUBLISHER_KEDA_POLLING_INTERVAL_SECONDS
+    + WC027_GUIDANCE_PUBLISHER_COLD_START_SECONDS
+    + WC027_GUIDANCE_PUBLISHER_CONNECTION_SETUP_SECONDS
+    + WC027_GUIDANCE_PUBLISHER_PROCESSING_SECONDS
+)
+WC027_GUIDANCE_FEED_KEDA_POLLING_INTERVAL_SECONDS = 30
+WC027_GUIDANCE_FEED_COLD_START_SECONDS = 30
+WC027_GUIDANCE_FEED_CONNECTION_SETUP_SECONDS = 30
+WC027_GUIDANCE_FEED_PROCESSING_SECONDS = 60
+WC027_GUIDANCE_FEED_MINIMUM_REMAINING_LIFETIME_SECONDS = (
+    WC027_GUIDANCE_FEED_KEDA_POLLING_INTERVAL_SECONDS
+    + WC027_GUIDANCE_FEED_COLD_START_SECONDS
+    + WC027_GUIDANCE_FEED_CONNECTION_SETUP_SECONDS
+    + WC027_GUIDANCE_FEED_PROCESSING_SECONDS
+)
+WC027_GUIDANCE_MINIMUM_REMAINING_LIFETIME_SECONDS = (
+    WC027_GUIDANCE_PUBLISHER_MINIMUM_REMAINING_LIFETIME_SECONDS
+)
+WC027_GUIDANCE_FEED_TRIGGER_RECOVERY_SECONDS = 300
+WC027_GUIDANCE_PUBLICATION_REQUEST_MAX_LIFETIME_SECONDS = 300
+WC027_GUIDANCE_ACTIVATION_MAX_LIFETIME_SECONDS = (
+    WC027_GUIDANCE_PUBLICATION_REQUEST_MAX_LIFETIME_SECONDS
+    + WC027_GUIDANCE_FEED_TRIGGER_RECOVERY_SECONDS
+    + WC027_GUIDANCE_FEED_MINIMUM_REMAINING_LIFETIME_SECONDS
+)
+
+
+class GuidancePublicationRequestDeliveryBudget(_StrictGuidanceModel):
+    publisher_keda_polling_interval_seconds: int = Field(
+        alias="publisherKedaPollingIntervalSeconds"
+    )
+    publisher_cold_start_seconds: int = Field(alias="publisherColdStartSeconds")
+    publisher_connection_setup_seconds: int = Field(
+        alias="publisherConnectionSetupSeconds"
+    )
+    publisher_processing_seconds: int = Field(alias="publisherProcessingSeconds")
+    publisher_minimum_remaining_lifetime_seconds: int = Field(
+        alias="publisherMinimumRemainingLifetimeSeconds"
+    )
+    feed_keda_polling_interval_seconds: int = Field(
+        alias="feedKedaPollingIntervalSeconds"
+    )
+    feed_cold_start_seconds: int = Field(alias="feedColdStartSeconds")
+    feed_connection_setup_seconds: int = Field(
+        alias="feedConnectionSetupSeconds"
+    )
+    feed_processing_seconds: int = Field(alias="feedProcessingSeconds")
+    feed_minimum_remaining_lifetime_seconds: int = Field(
+        alias="feedMinimumRemainingLifetimeSeconds"
+    )
+    feed_trigger_recovery_seconds: int = Field(
+        alias="feedTriggerRecoverySeconds"
+    )
+    minimum_remaining_lifetime_seconds: int = Field(
+        alias="minimumRemainingLifetimeSeconds"
+    )
+
+    @classmethod
+    def reviewed(cls) -> GuidancePublicationRequestDeliveryBudget:
+        return cls(
+            publisherKedaPollingIntervalSeconds=(
+                WC027_GUIDANCE_PUBLISHER_KEDA_POLLING_INTERVAL_SECONDS
+            ),
+            publisherColdStartSeconds=WC027_GUIDANCE_PUBLISHER_COLD_START_SECONDS,
+            publisherConnectionSetupSeconds=(
+                WC027_GUIDANCE_PUBLISHER_CONNECTION_SETUP_SECONDS
+            ),
+            publisherProcessingSeconds=WC027_GUIDANCE_PUBLISHER_PROCESSING_SECONDS,
+            publisherMinimumRemainingLifetimeSeconds=(
+                WC027_GUIDANCE_PUBLISHER_MINIMUM_REMAINING_LIFETIME_SECONDS
+            ),
+            feedKedaPollingIntervalSeconds=(
+                WC027_GUIDANCE_FEED_KEDA_POLLING_INTERVAL_SECONDS
+            ),
+            feedColdStartSeconds=WC027_GUIDANCE_FEED_COLD_START_SECONDS,
+            feedConnectionSetupSeconds=(
+                WC027_GUIDANCE_FEED_CONNECTION_SETUP_SECONDS
+            ),
+            feedProcessingSeconds=WC027_GUIDANCE_FEED_PROCESSING_SECONDS,
+            feedMinimumRemainingLifetimeSeconds=(
+                WC027_GUIDANCE_FEED_MINIMUM_REMAINING_LIFETIME_SECONDS
+            ),
+            feedTriggerRecoverySeconds=(
+                WC027_GUIDANCE_FEED_TRIGGER_RECOVERY_SECONDS
+            ),
+            minimumRemainingLifetimeSeconds=(
+                WC027_GUIDANCE_MINIMUM_REMAINING_LIFETIME_SECONDS
+            ),
+        )
+
+    @model_validator(mode="after")
+    def validate_reviewed_budget(
+        self,
+    ) -> GuidancePublicationRequestDeliveryBudget:
+        if (
+            self.publisher_keda_polling_interval_seconds
+            != WC027_GUIDANCE_PUBLISHER_KEDA_POLLING_INTERVAL_SECONDS
+            or self.publisher_cold_start_seconds
+            != WC027_GUIDANCE_PUBLISHER_COLD_START_SECONDS
+            or self.publisher_connection_setup_seconds
+            != WC027_GUIDANCE_PUBLISHER_CONNECTION_SETUP_SECONDS
+            or self.publisher_processing_seconds
+            != WC027_GUIDANCE_PUBLISHER_PROCESSING_SECONDS
+            or self.publisher_minimum_remaining_lifetime_seconds
+            != WC027_GUIDANCE_PUBLISHER_MINIMUM_REMAINING_LIFETIME_SECONDS
+            or self.publisher_minimum_remaining_lifetime_seconds
+            != self.publisher_keda_polling_interval_seconds
+            + self.publisher_cold_start_seconds
+            + self.publisher_connection_setup_seconds
+            + self.publisher_processing_seconds
+            or self.feed_keda_polling_interval_seconds
+            != WC027_GUIDANCE_FEED_KEDA_POLLING_INTERVAL_SECONDS
+            or self.feed_cold_start_seconds
+            != WC027_GUIDANCE_FEED_COLD_START_SECONDS
+            or self.feed_connection_setup_seconds
+            != WC027_GUIDANCE_FEED_CONNECTION_SETUP_SECONDS
+            or self.feed_processing_seconds
+            != WC027_GUIDANCE_FEED_PROCESSING_SECONDS
+            or self.feed_minimum_remaining_lifetime_seconds
+            != WC027_GUIDANCE_FEED_MINIMUM_REMAINING_LIFETIME_SECONDS
+            or self.feed_minimum_remaining_lifetime_seconds
+            != self.feed_keda_polling_interval_seconds
+            + self.feed_cold_start_seconds
+            + self.feed_connection_setup_seconds
+            + self.feed_processing_seconds
+            or self.feed_trigger_recovery_seconds
+            != WC027_GUIDANCE_FEED_TRIGGER_RECOVERY_SECONDS
+            or self.minimum_remaining_lifetime_seconds
+            != WC027_GUIDANCE_MINIMUM_REMAINING_LIFETIME_SECONDS
+            or self.minimum_remaining_lifetime_seconds
+            != self.publisher_minimum_remaining_lifetime_seconds
+        ):
+            raise ValueError(
+                "guidance publication delivery budget does not match the reviewed "
+                "publisher and feed delivery phases"
+            )
+        return self
+
+    @property
+    def minimum_remaining_lifetime(self) -> timedelta:
+        return timedelta(seconds=self.minimum_remaining_lifetime_seconds)
+
+    @property
+    def publisher_minimum_remaining_lifetime(self) -> timedelta:
+        return timedelta(
+            seconds=self.publisher_minimum_remaining_lifetime_seconds
+        )
+
+    @property
+    def publisher_processing_budget(self) -> timedelta:
+        return timedelta(seconds=self.publisher_processing_seconds)
+
+    @property
+    def feed_minimum_remaining_lifetime(self) -> timedelta:
+        return timedelta(seconds=self.feed_minimum_remaining_lifetime_seconds)
+
+    @property
+    def feed_processing_budget(self) -> timedelta:
+        return timedelta(seconds=self.feed_processing_seconds)
+
+    @property
+    def feed_trigger_recovery(self) -> timedelta:
+        return timedelta(seconds=self.feed_trigger_recovery_seconds)
+
+    def broker_properties(self) -> dict[str, int]:
+        return self.model_dump(mode="python", by_alias=True)
+
+
 def _expected_digest(
     model: AthenaBaseModel,
     *,
@@ -801,7 +974,10 @@ class GuidanceAuthorityPublicationRequest(_StrictGuidanceModel):
             or self.evaluated_at > correlation_request.expires_at
             or self.expires_at <= self.evaluated_at
             or self.expires_at > correlation_request.expires_at
-            or self.expires_at - self.evaluated_at > timedelta(minutes=5)
+            or self.expires_at - self.evaluated_at
+            > timedelta(
+                seconds=WC027_GUIDANCE_PUBLICATION_REQUEST_MAX_LIFETIME_SECONDS
+            )
         ):
             raise ValueError(
                 "guidance publication request is outside its bounded validity window"
@@ -893,7 +1069,20 @@ class PublishedGuidanceAuthorityActivation(_StrictGuidanceModel):
     )
     binding_digest: Sha256Digest = Field(alias="bindingDigest")
     binding_reference: VersionPinnedBlobReference = Field(alias="bindingReference")
+    trigger_message_id: str = Field(
+        alias="triggerMessageId",
+        pattern=r"^guidance-binding-[a-f0-9]{32}$",
+    )
+    delivery_budget: GuidancePublicationRequestDeliveryBudget = Field(
+        alias="deliveryBudget"
+    )
     activated_at: UtcDateTime = Field(alias="activatedAt")
+    publication_request_expires_at: UtcDateTime = Field(
+        alias="publicationRequestExpiresAt"
+    )
+    trigger_delivery_deadline: UtcDateTime = Field(
+        alias="triggerDeliveryDeadline"
+    )
     expires_at: UtcDateTime = Field(alias="expiresAt")
     activation_attestation: PublishedGuidanceAuthorityActivationAttestation = Field(
         alias="activationAttestation"
@@ -905,7 +1094,14 @@ class PublishedGuidanceAuthorityActivation(_StrictGuidanceModel):
         if (
             self.binding_reference.name
             != f"guidance-bindings/{self.binding_id}/binding.json"
-            or self.activated_at >= self.expires_at
+            or self.trigger_message_id != self.binding_id
+            or self.activated_at >= self.publication_request_expires_at
+            or self.trigger_delivery_deadline
+            != self.publication_request_expires_at
+            + self.delivery_budget.feed_trigger_recovery
+            or self.expires_at
+            != self.trigger_delivery_deadline
+            + self.delivery_budget.feed_minimum_remaining_lifetime
         ):
             raise ValueError("guidance activation does not bind an eligible binding")
         preimage = self.model_dump(
@@ -2008,6 +2204,7 @@ __all__ = [
     "GuidanceAuthorityPublicationRequestAttestation",
     "GuidanceControlHealth",
     "GuidanceControlProvenance",
+    "GuidancePublicationRequestDeliveryBudget",
     "GuidanceHypothesisSummary",
     "GuidanceImpactCode",
     "GuidanceImpactSeverity",
@@ -2044,6 +2241,20 @@ __all__ = [
     "PublishedGuidanceAuthorityBindingAttestation",
     "PublishedRunbookGuidanceOption",
     "SelectedRunbookGuidanceSelection",
+    "WC027_GUIDANCE_FEED_COLD_START_SECONDS",
+    "WC027_GUIDANCE_FEED_CONNECTION_SETUP_SECONDS",
+    "WC027_GUIDANCE_FEED_KEDA_POLLING_INTERVAL_SECONDS",
+    "WC027_GUIDANCE_FEED_MINIMUM_REMAINING_LIFETIME_SECONDS",
+    "WC027_GUIDANCE_FEED_PROCESSING_SECONDS",
+    "WC027_GUIDANCE_FEED_TRIGGER_RECOVERY_SECONDS",
+    "WC027_GUIDANCE_ACTIVATION_MAX_LIFETIME_SECONDS",
+    "WC027_GUIDANCE_MINIMUM_REMAINING_LIFETIME_SECONDS",
+    "WC027_GUIDANCE_PUBLICATION_REQUEST_MAX_LIFETIME_SECONDS",
+    "WC027_GUIDANCE_PUBLISHER_COLD_START_SECONDS",
+    "WC027_GUIDANCE_PUBLISHER_CONNECTION_SETUP_SECONDS",
+    "WC027_GUIDANCE_PUBLISHER_KEDA_POLLING_INTERVAL_SECONDS",
+    "WC027_GUIDANCE_PUBLISHER_MINIMUM_REMAINING_LIFETIME_SECONDS",
+    "WC027_GUIDANCE_PUBLISHER_PROCESSING_SECONDS",
     "build_guidance_affected_role_impact",
     "build_incident_guidance_source_binding",
     "guidance_authority_activation_signature_preimage",

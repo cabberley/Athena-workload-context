@@ -9,6 +9,7 @@ from pydantic import ValidationError
 
 from athena_context.contracts import (
     CorrelationRequest,
+    GuidancePublicationRequestDeliveryBudget,
     IncidentNotificationEnvelopeV2,
     PublishedGuidanceAuthorityBinding,
     UtcDateTime,
@@ -116,6 +117,17 @@ class Wc027EnrichmentFeedRuntime:
     enrichment_publication: IncidentEnrichmentPublicationPort
     feed_publication: IncidentEnrichmentFeedPublicationPort
     notification_publication: NotificationV2PublicationPort
+    delivery_budget: GuidancePublicationRequestDeliveryBudget
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.delivery_budget)
+            is not GuidancePublicationRequestDeliveryBudget
+        ):
+            raise TypeError(
+                "delivery_budget must be an exact "
+                "GuidancePublicationRequestDeliveryBudget"
+            )
 
     def publish(
         self,
@@ -158,8 +170,16 @@ class Wc027EnrichmentFeedRuntime:
             binding,
             trusted_key_id=self.guidance_binding_key_id,
             signature_verifier=self.guidance_binding_signature_verifier,
+            expected_delivery_budget=self.delivery_budget,
             verified_at=published_at,
         )
+        if (
+            activation.activation.expires_at - published_at
+            < self.delivery_budget.feed_processing_budget
+        ):
+            raise Wc027EnrichmentSourceNotReadyError(
+                "guidance activation lacks the reviewed feed processing window"
+            )
         subject = request.incident_subject
         if (
             current.state != subject.incident_state
@@ -250,6 +270,8 @@ def verify_wc027_guidance_binding_signature(
 def validate_wc027_enrichment_broker_metadata(
     message: object,
     binding: PublishedGuidanceAuthorityBinding,
+    *,
+    expected_delivery_budget: GuidancePublicationRequestDeliveryBudget,
 ) -> None:
     properties = getattr(message, "application_properties", None)
     if type(properties) is not dict:
@@ -266,16 +288,17 @@ def validate_wc027_enrichment_broker_metadata(
         )
         for key, value in properties.items()
     }
+    expected_properties: dict[str, object] = {
+        "schemaVersion": WC027_ENRICHMENT_TRIGGER_SCHEMA_VERSION,
+        "bindingDigest": binding.binding_digest,
+    }
+    expected_properties.update(expected_delivery_budget.broker_properties())
     if (
         getattr(message, "content_type", None) != "application/json"
         or str(getattr(message, "message_id", "")) != binding.binding_id
         or str(getattr(message, "session_id", ""))
         != binding.incident_bound_request.incident_subject.incident_id
-        or normalized
-        != {
-            "schemaVersion": WC027_ENRICHMENT_TRIGGER_SCHEMA_VERSION,
-            "bindingDigest": binding.binding_digest,
-        }
+        or normalized != expected_properties
     ):
         raise ValueError("WC-027 enrichment trigger broker metadata is invalid")
 

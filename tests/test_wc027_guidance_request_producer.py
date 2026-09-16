@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
@@ -57,13 +58,7 @@ from test_wc027_incident_subject_contract import (
 )
 
 _REQUEST_KEY_ID = "synthetic-key://athena/wc027-guidance-request-rs256-v1"
-_DELIVERY_BUDGET = GuidancePublicationRequestDeliveryBudget(
-    publisher_keda_polling_interval_seconds=30,
-    publisher_cold_start_seconds=30,
-    publisher_connection_setup_seconds=30,
-    publisher_processing_seconds=60,
-    minimum_remaining_lifetime_seconds=150,
-)
+_DELIVERY_BUDGET = GuidancePublicationRequestDeliveryBudget.reviewed()
 
 
 class _Signer:
@@ -318,8 +313,10 @@ def test_producer_builds_signs_persists_revalidates_and_enqueues_only_request() 
     assert sent == publication_request
     assert sent_reference == receipt.outbox_reference
     assert delivery_budget == _DELIVERY_BUDGET
-    assert ttl == int(
-        (publication_request.expires_at - publication_request.evaluated_at).total_seconds()
+    assert (
+        ttl
+        == int((publication_request.expires_at - publication_request.evaluated_at).total_seconds())
+        + _DELIVERY_BUDGET.feed_trigger_recovery_seconds
     )
 
 
@@ -454,7 +451,7 @@ def test_end_to_end_budget_accepts_exact_minimum_before_persistence_and_send() -
     assert len(outbox.calls) == 1
     assert len(sender.calls) == 1
     assert sender.calls[0][0] == receipt.request
-    assert sender.calls[0][2] == 150
+    assert sender.calls[0][2] == 450
     assert sender.calls[0][3] == _DELIVERY_BUDGET
 
 
@@ -470,10 +467,15 @@ def test_reviewed_delivery_budget_timeline_leaves_exact_processing_phase() -> No
     after_connection_setup = after_cold_start + timedelta(
         seconds=_DELIVERY_BUDGET.publisher_connection_setup_seconds
     )
+    trigger_delivery_deadline = expires_at + _DELIVERY_BUDGET.feed_trigger_recovery
+    activation_expires_at = (
+        trigger_delivery_deadline + _DELIVERY_BUDGET.feed_minimum_remaining_lifetime
+    )
 
     assert expires_at - enqueued_at == timedelta(seconds=150)
     assert expires_at - after_connection_setup == (_DELIVERY_BUDGET.publisher_processing_budget)
-    assert _DELIVERY_BUDGET.publisher_processing_budget == timedelta(seconds=60)
+    assert trigger_delivery_deadline - expires_at == timedelta(seconds=300)
+    assert activation_expires_at - trigger_delivery_deadline == timedelta(seconds=150)
 
 
 def test_end_to_end_budget_is_rechecked_immediately_before_enqueue() -> None:
@@ -867,7 +869,7 @@ def test_broker_metadata_binds_request_occurrence_context_and_outbox() -> None:
     adapter.enqueue(
         receipt.request,
         outbox_reference=receipt.outbox_reference,
-        time_to_live_seconds=150,
+        time_to_live_seconds=450,
         delivery_budget=_DELIVERY_BUDGET,
     )
 
@@ -875,7 +877,7 @@ def test_broker_metadata_binds_request_occurrence_context_and_outbox() -> None:
     assert str(message.message_id) == receipt.request.request_id
     assert str(message.session_id) == request.incident_subject.incident_id
     assert message.content_type == "application/json"
-    assert int(message.time_to_live.total_seconds()) == 150
+    assert int(message.time_to_live.total_seconds()) == 450
     assert message.application_properties == (
         guidance_publication_request_broker_properties(
             receipt.request,
@@ -895,7 +897,14 @@ def test_broker_metadata_binds_request_occurrence_context_and_outbox() -> None:
         adapter.enqueue(
             receipt.request,
             outbox_reference=receipt.outbox_reference,
-            time_to_live_seconds=149,
+            time_to_live_seconds=449,
+            delivery_budget=_DELIVERY_BUDGET,
+        )
+    with pytest.raises(ValueError, match="delivery budget"):
+        adapter.enqueue(
+            receipt.request,
+            outbox_reference=receipt.outbox_reference,
+            time_to_live_seconds=601,
             delivery_budget=_DELIVERY_BUDGET,
         )
     assert len(raw_sender.messages) == 1
@@ -1052,13 +1061,7 @@ def _producer_configuration_payload() -> dict[str, object]:
             "verifierIdentityResourceId": identity_resource_id(8),
         },
         "requestedActions": ["investigationCheck"],
-        "deliveryBudget": {
-            "publisherKedaPollingIntervalSeconds": 30,
-            "publisherColdStartSeconds": 30,
-            "publisherConnectionSetupSeconds": 30,
-            "publisherProcessingSeconds": 60,
-            "minimumRemainingLifetimeSeconds": 150,
-        },
+        "deliveryBudget": _DELIVERY_BUDGET.model_dump(mode="json", by_alias=True),
         "deploymentBinding": {
             "bindingEvidenceId": ("20000000-0000-0000-0000-000000000099"),
             "attachedIdentityResourceIds": [identity_resource_id(index) for index in range(9)],
@@ -1192,6 +1195,7 @@ def test_worker_abandons_budget_exhaustion_then_dead_letters_stale_retry(
 ) -> None:
     import azure.identity
     import azure.servicebus
+    from azure.servicebus.exceptions import MessageLockLostError
 
     configuration = Wc027GuidancePublicationRequestProducerConfiguration.model_validate_json(
         json.dumps(_producer_configuration_payload())
@@ -1223,6 +1227,7 @@ def test_worker_abandons_budget_exhaustion_then_dead_letters_stale_retry(
         def __init__(self) -> None:
             self.session = object()
             self.abandoned = []
+            self.abandon_attempts = 0
             self.completed = []
             self.dead_lettered = []
 
@@ -1236,7 +1241,8 @@ def test_worker_abandons_budget_exhaustion_then_dead_letters_stale_retry(
             return [message]
 
         def abandon_message(self, selected) -> None:
-            self.abandoned.append(selected)
+            self.abandon_attempts += 1
+            raise MessageLockLostError()
 
         def complete_message(self, selected) -> None:
             self.completed.append(selected)
@@ -1317,12 +1323,222 @@ def test_worker_abandons_budget_exhaustion_then_dead_letters_stale_retry(
 
     assert first_processed is False
     assert second_processed is False
-    assert receiver.abandoned == [message]
+    assert receiver.abandoned == []
+    assert receiver.abandon_attempts == 1
     assert receiver.completed == []
     assert len(receiver.dead_lettered) == 1
     assert receiver.dead_lettered[0][0] is message
     assert receiver.dead_lettered[0][1]["reason"] == "AthenaWc027GuidanceRequestRejected"
     assert output_sender_opened is False
+
+
+@pytest.mark.parametrize(
+    ("action", "exception_name"),
+    (
+        ("complete", "already-settled"),
+        ("complete", "message-lock-lost"),
+        ("complete", "service-bus"),
+        ("complete", "request-transport"),
+        ("complete", "response-transport"),
+        ("abandon", "already-settled"),
+        ("abandon", "message-lock-lost"),
+        ("abandon", "service-bus"),
+        ("abandon", "request-transport"),
+        ("abandon", "response-transport"),
+    ),
+)
+def test_request_producer_settlement_contains_uncertain_transport_outcomes(
+    action: str,
+    exception_name: str,
+) -> None:
+    from azure.core.exceptions import ServiceRequestError, ServiceResponseError
+    from azure.servicebus.exceptions import (
+        MessageAlreadySettled,
+        MessageLockLostError,
+        ServiceBusError,
+    )
+
+    exceptions = {
+        "already-settled": MessageAlreadySettled(),
+        "message-lock-lost": MessageLockLostError(),
+        "service-bus": ServiceBusError("synthetic settlement failure"),
+        "request-transport": ServiceRequestError("synthetic request failure"),
+        "response-transport": ServiceResponseError("synthetic response failure"),
+    }
+    now = _fixture().guidance_binding.evaluated_at
+    message = SimpleNamespace(locked_until_utc=now + timedelta(minutes=1))
+
+    class _Receiver:
+        session = SimpleNamespace(locked_until_utc=now + timedelta(minutes=1))
+
+        def complete_message(self, _selected) -> None:
+            raise exceptions[exception_name]
+
+        def abandon_message(self, _selected) -> None:
+            raise exceptions[exception_name]
+
+    status = request_production._settle_request_producer_message(
+        _Receiver(),
+        message,
+        action=cast(Any, action),
+        now=now,
+    )
+
+    assert status == "uncertain"
+
+
+@pytest.mark.parametrize(
+    ("action", "expected_status"),
+    (("complete", "uncertain"), ("abandon", "deferred")),
+)
+def test_request_producer_settlement_skips_expired_locks(
+    action: str,
+    expected_status: str,
+) -> None:
+    now = _fixture().guidance_binding.evaluated_at
+    calls: list[str] = []
+    receiver = SimpleNamespace(
+        session=SimpleNamespace(locked_until_utc=now),
+        complete_message=lambda _message: calls.append("complete"),
+        abandon_message=lambda _message: calls.append("abandon"),
+    )
+    message = SimpleNamespace(locked_until_utc=now)
+
+    status = request_production._settle_request_producer_message(
+        receiver,
+        message,
+        action=cast(Any, action),
+        now=now,
+    )
+
+    assert status == expected_status
+    assert calls == []
+
+
+@pytest.mark.parametrize("settlement_error", ("already-settled", "service-bus"))
+def test_request_producer_completion_uncertainty_defers_idempotent_redelivery(
+    monkeypatch: pytest.MonkeyPatch,
+    settlement_error: str,
+) -> None:
+    import azure.identity
+    import azure.servicebus
+    from azure.servicebus.exceptions import MessageAlreadySettled, ServiceBusError
+
+    configuration = Wc027GuidancePublicationRequestProducerConfiguration.model_validate_json(
+        json.dumps(_producer_configuration_payload())
+    )
+    fixture = _fixture()
+    request = fixture.guidance_binding.incident_bound_request
+    context = request.correlation_request.context_binding
+    assert isinstance(context, PublishedRuntimeContextBinding)
+    lock_deadline = request.correlation_request.expires_at
+    message = SimpleNamespace(
+        body=request.canonical_bytes(),
+        content_type="application/json",
+        message_id=request.request_id,
+        session_id=request.incident_subject.incident_id,
+        application_properties={
+            "schemaVersion": "athena.wc027IncidentBoundCorrelationRequest.v1",
+            "bindingDigest": request.binding_digest,
+            "incidentSubjectDigest": request.incident_subject.subject_digest,
+            "correlationRequestDigest": request.correlation_request.request_digest,
+            "contextAuthorityDigest": context.publication_authority.authority_digest,
+            "noAutoRemediation": True,
+        },
+        locked_until_utc=lock_deadline,
+    )
+
+    class _Credential:
+        def __init__(self, *, client_id: str) -> None:
+            self.client_id = client_id
+
+    class _Receiver:
+        def __init__(self) -> None:
+            self.session = SimpleNamespace(locked_until_utc=lock_deadline)
+            self.complete_attempts = 0
+            self.completed = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def receive_messages(self, **_kwargs):
+            return [message]
+
+        def complete_message(self, selected) -> None:
+            self.complete_attempts += 1
+            if self.complete_attempts == 1:
+                if settlement_error == "already-settled":
+                    raise MessageAlreadySettled()
+                raise ServiceBusError("synthetic completion uncertainty")
+            self.completed.append(selected)
+
+    receiver = _Receiver()
+
+    class _Client:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def get_queue_receiver(self, **_kwargs):
+            return receiver
+
+    class _LockRenewer:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def register(self, *_args, **_kwargs) -> None:
+            return None
+
+    class _Producer:
+        def __init__(self) -> None:
+            self.requests = []
+
+        def produce(self, selected, **_kwargs) -> None:
+            self.requests.append(selected)
+
+    producer = _Producer()
+    monkeypatch.setattr(azure.identity, "ManagedIdentityCredential", _Credential)
+    monkeypatch.setattr(azure.servicebus, "ServiceBusClient", _Client)
+    monkeypatch.setattr(azure.servicebus, "AutoLockRenewer", _LockRenewer)
+    monkeypatch.setattr(
+        request_production,
+        "build_wc027_guidance_publication_request_producer",
+        lambda *_args, **_kwargs: producer,
+    )
+    monkeypatch.setattr(
+        request_production,
+        "_utc_now_milliseconds",
+        lambda: request.correlation_request.trusted_as_of,
+    )
+
+    first = run_wc027_guidance_publication_request_producer_worker(
+        configuration=configuration,
+        max_wait_time_seconds=1,
+    )
+    second = run_wc027_guidance_publication_request_producer_worker(
+        configuration=configuration,
+        max_wait_time_seconds=1,
+    )
+
+    assert first is False
+    assert second is True
+    assert producer.requests == [request, request]
+    assert receiver.complete_attempts == 2
+    assert receiver.completed == [message]
 
 
 @pytest.mark.parametrize(
@@ -1337,8 +1553,6 @@ def test_worker_abandons_budget_exhaustion_then_dead_letters_stale_retry(
         ("missing", None, 300, 0, False),
         ("valid", b"{}", 300, 1, False),
         ("valid", None, 300, 1, True),
-        ("valid", None, 60, 1, True),
-        ("valid", None, 59, 0, False),
     ),
 )
 def test_publisher_worker_requires_exact_immutable_outbox_evidence(
@@ -1452,6 +1666,9 @@ def test_publisher_worker_requires_exact_immutable_outbox_evidence(
     class _Publisher:
         def __init__(self) -> None:
             self.calls = []
+
+        def recover_trigger_delivery(self, _selected, *, now) -> bool:
+            return False
 
         def publish(self, selected, *, now) -> None:
             self.calls.append((selected, now))
@@ -1628,11 +1845,21 @@ def test_publisher_worker_retries_service_bus_failure_without_duplicate_activati
     class _ReplayPublisher:
         def __init__(self) -> None:
             self.calls = 0
+            self.recovery_calls = 0
             self.activation_ids: set[str] = set()
+            self.committed = False
+
+        def recover_trigger_delivery(self, selected, *, now) -> bool:
+            if not self.committed:
+                return False
+            self.recovery_calls += 1
+            self.activation_ids.add(selected.request_id)
+            return True
 
         def publish(self, selected, *, now) -> None:
             self.calls += 1
             self.activation_ids.add(selected.request_id)
+            self.committed = True
             if failure_point == "trigger" and self.calls == 1:
                 raise ServiceBusError("synthetic uncertain trigger send")
 
@@ -1650,10 +1877,23 @@ def test_publisher_worker_retries_service_bus_failure_without_duplicate_activati
         "build_wc027_guidance_authority_publisher",
         lambda *_args, **_kwargs: publisher,
     )
+    clock_samples = iter(
+        (
+            request.evaluated_at.astimezone(UTC),
+            request.evaluated_at.astimezone(UTC),
+            request.evaluated_at.astimezone(UTC),
+            request.expires_at.astimezone(UTC) + timedelta(minutes=1),
+            request.expires_at.astimezone(UTC) + timedelta(minutes=1),
+        )
+    )
+
+    def worker_clock():
+        return next(clock_samples)
+
     monkeypatch.setattr(
         guidance_production,
         "_utc_now_milliseconds",
-        lambda: request.evaluated_at.astimezone(UTC),
+        worker_clock,
     )
 
     first_processed = run_wc027_guidance_authority_publisher_worker(
@@ -1670,7 +1910,8 @@ def test_publisher_worker_retries_service_bus_failure_without_duplicate_activati
     assert receiver.abandoned == [message]
     assert receiver.completed == [message]
     assert receiver.dead_lettered == []
-    assert publisher.calls == 2
+    assert publisher.calls == 1
+    assert publisher.recovery_calls == 1
     assert publisher.activation_ids == {request.request_id}
     assert outbox_reader.calls == [
         produced.outbox_reference,

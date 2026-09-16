@@ -1,9 +1,13 @@
+import json
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 PRODUCER = ROOT / "infra" / "wc027-guidance-publication-request-producer" / "main.bicep"
+RUNTIME = ROOT / "infra" / "wc027-enrichment-feed-runtime" / "main.bicep"
 KEY_PUBLIC_READER = (
     ROOT
     / "infra"
@@ -30,7 +34,6 @@ def _evaluate_job_resource_id(
     *,
     prefix: str,
     resource_id: str,
-    loaded_job_id: str,
     expected_subscription_id: str,
     expected_resource_group_name: str,
 ) -> tuple[list[str], bool]:
@@ -61,7 +64,6 @@ def _evaluate_job_resource_id(
         and segments[7] == "jobs"
         and bool(segments[8])
         and not any(alias in resource_id for alias in ("//", "?", "#", "%"))
-        and loaded_job_id.casefold() == resource_id.casefold()
     )
     return segments, valid
 
@@ -211,36 +213,66 @@ def test_request_producer_configuration_and_publisher_handoff_are_derived() -> N
 def test_delivery_budget_is_bound_across_producer_publisher_and_readiness() -> None:
     producer = PRODUCER.read_text(encoding="utf-8")
     publisher = PUBLISHER.read_text(encoding="utf-8")
+    runtime = RUNTIME.read_text(encoding="utf-8")
     root = ROOT_ACCEPTANCE.read_text(encoding="utf-8")
 
-    for source in (producer, publisher):
+    for source in (producer, publisher, runtime):
         for expected in (
             "guidancePublisherKedaPollingIntervalSeconds = 30",
             "guidancePublisherColdStartSeconds = 30",
             "guidancePublisherConnectionSetupSeconds = 30",
             "guidancePublisherProcessingSeconds = 60",
             (
-                "guidanceMinimumRemainingLifetimeSeconds = "
+                "guidancePublisherMinimumRemainingLifetimeSeconds = "
                 "guidancePublisherKedaPollingIntervalSeconds + "
                 "guidancePublisherColdStartSeconds + "
                 "guidancePublisherConnectionSetupSeconds + "
                 "guidancePublisherProcessingSeconds"
+            ),
+            "guidanceFeedKedaPollingIntervalSeconds = 30",
+            "guidanceFeedColdStartSeconds = 30",
+            "guidanceFeedConnectionSetupSeconds = 30",
+            "guidanceFeedProcessingSeconds = 60",
+            (
+                "guidanceFeedMinimumRemainingLifetimeSeconds = "
+                "guidanceFeedKedaPollingIntervalSeconds + "
+                "guidanceFeedColdStartSeconds + "
+                "guidanceFeedConnectionSetupSeconds + "
+                "guidanceFeedProcessingSeconds"
+            ),
+            "guidanceFeedTriggerRecoverySeconds = 300",
+            (
+                "guidanceMinimumRemainingLifetimeSeconds = "
+                "guidancePublisherMinimumRemainingLifetimeSeconds"
             ),
             "deliveryBudget: guidancePublicationDeliveryBudget",
         ):
             assert expected in source
 
     assert "pollingInterval: guidancePublisherKedaPollingIntervalSeconds" in publisher
+    assert "pollingInterval: guidanceFeedKedaPollingIntervalSeconds" in runtime
     for expected in (
         "wc027ReviewedPublisherKedaPollingIntervalSeconds = 30",
         "wc027ReviewedPublisherColdStartSeconds = 30",
         "wc027ReviewedPublisherConnectionSetupSeconds = 30",
         "wc027ReviewedPublisherProcessingSeconds = 60",
+        "wc027ReviewedPublisherMinimumRemainingLifetimeSeconds",
+        "wc027ReviewedFeedKedaPollingIntervalSeconds = 30",
+        "wc027ReviewedFeedColdStartSeconds = 30",
+        "wc027ReviewedFeedConnectionSetupSeconds = 30",
+        "wc027ReviewedFeedProcessingSeconds = 60",
+        "wc027ReviewedFeedMinimumRemainingLifetimeSeconds",
+        "wc027ReviewedFeedTriggerRecoverySeconds = 300",
         "wc027ReviewedMinimumRemainingLifetimeSeconds",
         "wc027RequestProducerDeliveryBudgetValid",
         "wc027PublisherDeliveryBudgetValid",
+        "wc027RuntimeDeliveryBudgetValid",
         "wc027ProducerPublisherDeliveryBudgetsMatch",
+        "wc027RequestProducerRuntimeDeliveryBudgetsMatch",
+        "wc027PublisherRuntimeDeliveryBudgetsMatch",
         "producer and publisher delivery budgets do not match",
+        "publisher and enrichment runtime delivery budgets do not match",
+        "request producer and enrichment runtime delivery budgets do not match",
         (
             "eventTriggerConfig.scale.pollingInterval == "
             "wc027PublisherDeliveryBudget.publisherKedaPollingIntervalSeconds"
@@ -368,48 +400,43 @@ def test_readiness_is_false_by_default_and_closes_the_complete_chain() -> None:
 
 
 @pytest.mark.parametrize(
-    ("prefix", "resource_id_parameter", "job_resource"),
+    ("prefix", "resource_id_parameter"),
     (
         (
             "wc027RequestProducer",
             "wc027RequestProducerJobResourceId",
-            "wc027RequestProducerJob",
         ),
-        ("wc027Publisher", "wc027PublisherJobResourceId", "wc027PublisherJob"),
+        ("wc027Publisher", "wc027PublisherJobResourceId"),
         (
             "wc027Producer",
             "wc027EnrichmentFeedProducerJobResourceId",
-            "wc027ProducerJob",
         ),
     ),
 )
 @pytest.mark.parametrize(
-    ("resource_id_variant", "loaded_id_variant", "expected_valid"),
+    ("resource_id_variant", "expected_valid"),
     (
-        ("canonical", "same", True),
-        ("missing-leading-slash", "same", False),
-        ("not-subscriptions", "same", False),
-        ("not-resource-groups", "same", False),
-        ("not-providers", "same", False),
-        ("provider-case-alias", "same", False),
-        ("type-case-alias", "same", False),
-        ("empty-name", "same", False),
-        ("child-suffix", "same", False),
-        ("duplicate-separator", "same", False),
-        ("query", "same", False),
-        ("fragment", "same", False),
-        ("encoded-separator", "same", False),
-        ("cross-subscription", "same", False),
-        ("cross-resource-group", "same", False),
-        ("loaded-id-mismatch", "different", False),
+        ("canonical", True),
+        ("missing-leading-slash", False),
+        ("not-subscriptions", False),
+        ("not-resource-groups", False),
+        ("not-providers", False),
+        ("provider-case-alias", False),
+        ("type-case-alias", False),
+        ("empty-name", False),
+        ("child-suffix", False),
+        ("duplicate-separator", False),
+        ("query", False),
+        ("fragment", False),
+        ("encoded-separator", False),
+        ("cross-subscription", False),
+        ("cross-resource-group", False),
     ),
 )
-def test_all_wc027_job_resource_ids_are_evaluated_as_canonical_loaded_ids(
+def test_all_wc027_job_resource_ids_are_evaluated_as_canonical_syntax(
     prefix: str,
     resource_id_parameter: str,
-    job_resource: str,
     resource_id_variant: str,
-    loaded_id_variant: str,
     expected_valid: bool,
 ) -> None:
     source = ROOT_ACCEPTANCE.read_text(encoding="utf-8")
@@ -441,20 +468,13 @@ def test_all_wc027_job_resource_ids_are_evaluated_as_canonical_loaded_ids(
             resource_group_name,
             "rg-cross-scope",
         ),
-        "loaded-id-mismatch": canonical,
     }
     selected_resource_id = variants[resource_id_variant]
-    loaded_job_id = (
-        canonical.replace("wc027-job", "other-job")
-        if loaded_id_variant == "different"
-        else selected_resource_id
-    )
 
     segments, valid = _evaluate_job_resource_id(
         source,
         prefix=prefix,
         resource_id=selected_resource_id,
-        loaded_job_id=loaded_job_id,
         expected_subscription_id=subscription_id,
         expected_resource_group_name=resource_group_name,
     )
@@ -480,9 +500,37 @@ def test_all_wc027_job_resource_ids_are_evaluated_as_canonical_loaded_ids(
         f"!contains({resource_id_parameter}, '?')",
         f"!contains({resource_id_parameter}, '#')",
         f"!contains({resource_id_parameter}, '%')",
-        f"toLower({job_resource}!.id) == toLower({resource_id_parameter})",
     ):
         assert expected in source
+    assert f"var {prefix}LoadedJobIdMatches" not in source
+
+
+def test_compiled_job_id_validity_uses_only_canonical_shape_predicates() -> None:
+    az_cli = shutil.which("az")
+    if az_cli is None:
+        pytest.fail("az CLI is required to verify the compiled WC-027 root template")
+    result = subprocess.run(
+        [
+            az_cli,
+            "bicep",
+            "build",
+            "--file",
+            str(ROOT_ACCEPTANCE),
+            "--stdout",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    variables = json.loads(result.stdout)["variables"]
+
+    for prefix in ("wc027RequestProducer", "wc027Publisher", "wc027Producer"):
+        assert variables[f"{prefix}JobResourceIdValid"] == (
+            f"[variables('{prefix}JobResourceIdShapeValid')]"
+        )
+        assert f"{prefix}LoadedJobIdMatches" not in variables
 
 
 def test_root_readiness_rejects_identity_overlap_and_unreviewed_job_surfaces() -> None:

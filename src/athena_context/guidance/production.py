@@ -255,6 +255,8 @@ class Wc027GuidanceAuthorityPublisherConfiguration:
     def _validate_separation(self) -> None:
         runtime = self.enrichment_runtime
         assets = self.authority_assets
+        if self.delivery_budget != runtime.delivery_budget:
+            raise ValueError("publisher delivery budget does not match the enrichment runtime")
         if self.request_outbox.container != "wc027-guidance-request-outbox":
             raise ValueError(
                 "publisher request outbox must be exactly wc027-guidance-request-outbox"
@@ -582,6 +584,7 @@ def build_wc027_guidance_authority_publisher(
             managed_identity_client_id=configuration.activation.identity_client_id,
         ),
         trigger=AzureServiceBusGuidanceAuthorityTrigger(trigger_sender),
+        delivery_budget=configuration.delivery_budget,
         clock=_utc_now_milliseconds,
     )
 
@@ -690,17 +693,6 @@ def run_wc027_guidance_authority_publisher_worker(
                 request,
                 expected_delivery_budget=configuration.delivery_budget,
             )
-            current = processing_started_at
-            if current < request.evaluated_at:
-                raise ValueError("guidance publication request is not yet valid")
-            if (
-                request.expires_at - current
-                < configuration.delivery_budget.publisher_processing_budget
-            ):
-                raise ValueError(
-                    "guidance publication request lacks the reviewed publisher "
-                    "processing budget after cold start and connection setup"
-                )
             verify_guidance_publication_request_outbox(
                 request,
                 outbox_reference=outbox_reference,
@@ -709,14 +701,17 @@ def run_wc027_guidance_authority_publisher_worker(
                     required_prefix="guidance-publication-requests/",
                 ),
             )
-            current = _utc_now_milliseconds()
-            if current < request.evaluated_at or current >= request.expires_at:
-                raise ValueError("guidance publication request is stale")
             publisher = build_wc027_guidance_authority_publisher(
                 configuration,
                 trigger_sender=sender,
             )
-            publisher.publish(request, now=current)
+            current = _utc_now_milliseconds()
+            if publisher.recover_trigger_delivery(request, now=current):
+                receiver.complete_message(message)
+                return True
+            if current < request.evaluated_at or current >= request.expires_at:
+                raise ValueError("guidance publication request is stale")
+            publisher.publish(request, now=processing_started_at)
             receiver.complete_message(message)
             return True
         except (
