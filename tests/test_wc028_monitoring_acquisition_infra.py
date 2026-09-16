@@ -1,4 +1,5 @@
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -252,11 +253,16 @@ def test_upgrade_cleanup_targets_only_exact_legacy_collector_bindings() -> None:
         "'role', 'assignment', 'delete', '--ids'",
         "'role', 'definition', 'delete'",
         "'identity', 'show'",
+        "'resource', 'show'",
+        "'group', 'show'",
+        "'--api-version', '2024-10-01'",
+        "'--name', $workloadResourceGroupName",
         "cleanupEvidenceDigest",
         "verifiedAbsentBindings",
         "Assert-ResourceSubscription",
         "Assert-RoleDefinitionAbsent",
         "Assert-ReviewedRoleDefinition",
+        "Get-ExactResourceGroupName",
         "Get-ResourceGroupScope",
         "Get-HistoricalNetworkWatcherResourceId",
         "$boundedReaderRoleDefinitionGuid",
@@ -277,6 +283,8 @@ def test_upgrade_cleanup_targets_only_exact_legacy_collector_bindings() -> None:
         "Find-RoleDefinitionId",
         "-RoleName",
         "roleName -ne",
+        "'network', 'watcher', 'show'",
+        "'--ids', $WorkloadResourceGroupResourceId",
     ):
         assert forbidden not in cleanup
 
@@ -309,6 +317,11 @@ def test_upgrade_cleanup_targets_only_exact_legacy_collector_bindings() -> None:
     assert "if ($null -ne $boundedReaderRoleDefinitionId)" not in cleanup
     assert "if ($null -ne $changeWriterRoleDefinitionId)" not in cleanup
     assert "if ($null -ne $intentKeyReaderRoleDefinitionId)" not in cleanup
+    assert "[string]$networkWatcher.name -cne 'NetworkWatcher_australiaeast'" in cleanup
+    assert "[string]$networkWatcher.properties.provisioningState -cne 'Succeeded'" in cleanup
+    assert "[string]$workloadResourceGroup.name -cne $workloadResourceGroupName" in cleanup
+    assert "[string]$workloadResourceGroup.properties.provisioningState -cne 'Succeeded'" in cleanup
+    assert cleanup.count(").ToLowerInvariant() -ne 'australiaeast'") == 2
 
 
 def test_upgrade_cleanup_exact_role_helpers_are_script_scoped() -> None:
@@ -361,6 +374,181 @@ if ($errors.Count -ne 0) {{
     assert parents["Get-ExactRoleDefinition"] == "<script>"
     assert parents["Assert-ReviewedRoleDefinition"] == "<script>"
     assert parents["Assert-RoleDefinitionAbsent"] == "<script>"
+    assert parents["Get-ExactResourceGroupName"] == "<script>"
+
+
+def test_cleanup_lookup_commands_match_installed_azure_cli_parser() -> None:
+    azure_cli = shutil.which("az")
+    if azure_cli is None:
+        pytest.skip("Azure CLI is required for argument-contract validation")
+    subscription_id = "00000000-0000-0000-0000-000000000000"
+    network_watcher_id = (
+        f"/subscriptions/{subscription_id}/resourceGroups/NetworkWatcherRG/providers/"
+        "Microsoft.Network/networkWatchers/NetworkWatcher_australiaeast"
+    )
+
+    resource_help = subprocess.run(
+        [azure_cli, "resource", "show", "--help"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    group_help = subprocess.run(
+        [azure_cli, "group", "show", "--help"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert "--ids" in resource_help
+    assert "--name --resource-group -g -n [Required]" in group_help
+
+    for arguments in (
+        (
+            "resource",
+            "show",
+            "--ids",
+            network_watcher_id,
+            "--api-version",
+            "2024-10-01",
+            "--subscription",
+            subscription_id,
+        ),
+        (
+            "group",
+            "show",
+            "--name",
+            "rg-athena-demo-workload",
+            "--subscription",
+            subscription_id,
+        ),
+    ):
+        parsed = subprocess.run(
+            [azure_cli, *arguments, "--help"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert parsed.returncode == 0
+
+        read_only_probe = subprocess.run(
+            [
+                azure_cli,
+                *arguments,
+                "--only-show-errors",
+                "--output",
+                "none",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        parser_output = (read_only_probe.stdout + read_only_probe.stderr).casefold()
+        assert read_only_probe.returncode == 1
+        assert "unrecognized arguments" not in parser_output
+        assert "the following arguments are required" not in parser_output
+        assert "misspelled or not recognized" not in parser_output
+
+    invalid_group = subprocess.run(
+        [azure_cli, "group", "show", "--ids", network_watcher_id],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert invalid_group.returncode == 2
+    assert "the following arguments are required" in invalid_group.stderr.casefold()
+
+    invalid_watcher = subprocess.run(
+        [azure_cli, "network", "watcher", "show", "--ids", network_watcher_id],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert invalid_watcher.returncode == 2
+    assert "misspelled or not recognized" in invalid_watcher.stderr.casefold()
+
+
+@pytest.mark.parametrize(
+    ("workload_resource_group_id", "expected_error"),
+    (
+        ("not-an-arm-resource-id", "does not match the"),
+        (
+            (
+                "/subscriptions/11111111-1111-1111-1111-111111111111/"
+                "resourceGroups/rg-athena-demo-workload"
+            ),
+            "outside SubscriptionId",
+        ),
+    ),
+)
+def test_cleanup_rejects_malformed_or_cross_subscription_before_azure_cli(
+    workload_resource_group_id: str,
+    expected_error: str,
+) -> None:
+    shell = shutil.which("pwsh") or shutil.which("powershell")
+    if shell is None:
+        pytest.skip("PowerShell is required for cleanup argument validation")
+    subscription_id = "00000000-0000-0000-0000-000000000000"
+    cleanup = str(INFRA / "remove-obsolete-collector-rbac.ps1")
+    arguments = [
+        shell,
+        "-NoProfile",
+        "-NonInteractive",
+        "-File",
+        cleanup,
+        "-SubscriptionId",
+        subscription_id,
+        "-CollectorPrincipalId",
+        "22222222-2222-2222-2222-222222222222",
+        "-CollectorIdentityResourceId",
+        (
+            f"/subscriptions/{subscription_id}/resourceGroups/rg-athena-demo-monitoring/"
+            "providers/Microsoft.ManagedIdentity/userAssignedIdentities/collector"
+        ),
+        "-RegistryResourceId",
+        (
+            f"/subscriptions/{subscription_id}/resourceGroups/rg-athena-demo-shared/"
+            "providers/Microsoft.ContainerRegistry/registries/athenademoacr"
+        ),
+        "-WorkloadResourceGroupResourceId",
+        workload_resource_group_id,
+        "-NetworkWatcherResourceId",
+        (
+            f"/subscriptions/{subscription_id}/resourceGroups/NetworkWatcherRG/providers/"
+            "Microsoft.Network/networkWatchers/NetworkWatcher_australiaeast"
+        ),
+        "-ChangeEvidenceContainerResourceId",
+        (
+            f"/subscriptions/{subscription_id}/resourceGroups/rg-athena-demo-context/"
+            "providers/Microsoft.Storage/storageAccounts/athenachange/"
+            "blobServices/default/containers/change-evidence"
+        ),
+        "-MonitoringEvidenceContainerResourceId",
+        (
+            f"/subscriptions/{subscription_id}/resourceGroups/rg-athena-demo-monitoring/"
+            "providers/Microsoft.Storage/storageAccounts/athenamonitoring/"
+            "blobServices/default/containers/monitoring-evidence"
+        ),
+        "-MonitoringIntentSigningKeyResourceId",
+        (
+            f"/subscriptions/{subscription_id}/resourceGroups/rg-athena-demo-context/"
+            "providers/Microsoft.KeyVault/vaults/synthetic-context-kv/"
+            "keys/monitoring-intent-signing"
+        ),
+    ]
+    environment = dict(os.environ)
+    environment["PATH"] = ""
+
+    completed = subprocess.run(
+        arguments,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert completed.returncode != 0
+    assert expected_error.casefold() in (completed.stdout + completed.stderr).casefold()
+    assert "az should not run" not in (completed.stdout + completed.stderr).casefold()
 
 
 def test_upgrade_cleanup_role_helpers_execute_for_absent_deleted_and_renamed_roles() -> None:

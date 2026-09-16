@@ -154,6 +154,25 @@ function Get-ResourceGroupScope {
     return $resourceGroupScope
 }
 
+function Get-ExactResourceGroupName {
+    param([Parameter(Mandatory)][string]$ResourceGroupResourceId)
+
+    $segments = $ResourceGroupResourceId.Trim('/').Split('/')
+    if (
+        $segments.Count -ne 4 -or
+        $segments[0].ToLowerInvariant() -ne 'subscriptions' -or
+        $segments[1].ToLowerInvariant() -ne $SubscriptionId.ToLowerInvariant() -or
+        $segments[2].ToLowerInvariant() -ne 'resourcegroups' -or
+        [string]::IsNullOrEmpty($segments[3])
+    ) {
+        throw (
+            "Resource ID '$ResourceGroupResourceId' is not one exact resource group " +
+            'in SubscriptionId.'
+        )
+    }
+    return $segments[3]
+}
+
 function Get-HistoricalNetworkWatcherResourceId {
     param([Parameter(Mandatory)][string]$ResourceId)
 
@@ -317,29 +336,44 @@ if (
 }
 
 $networkWatcher = Invoke-AzJson -AzArguments @(
-    'network', 'watcher', 'show',
+    'resource', 'show',
     '--ids', $NetworkWatcherResourceId,
+    '--api-version', '2024-10-01',
     '--subscription', $SubscriptionId
 )
 if (
     (Normalize-ResourceId -ResourceId ([string]$networkWatcher.id)) -ne (
         Normalize-ResourceId -ResourceId $NetworkWatcherResourceId
-    )
+    ) -or
+    [string]$networkWatcher.name -cne 'NetworkWatcher_australiaeast' -or
+    ([string]$networkWatcher.location).ToLowerInvariant() -ne 'australiaeast' -or
+    [string]$networkWatcher.properties.provisioningState -cne 'Succeeded'
 ) {
-    throw 'NetworkWatcherResourceId does not resolve to the exact reviewed Network Watcher.'
+    throw (
+        'NetworkWatcherResourceId does not resolve to the exact reviewed ' +
+        'name, location, state, and resource ID.'
+    )
 }
 $networkWatcherId = [string]$networkWatcher.id
+$workloadResourceGroupName = Get-ExactResourceGroupName `
+    -ResourceGroupResourceId $WorkloadResourceGroupResourceId
 $workloadResourceGroup = Invoke-AzJson -AzArguments @(
     'group', 'show',
-    '--ids', $WorkloadResourceGroupResourceId,
+    '--name', $workloadResourceGroupName,
     '--subscription', $SubscriptionId
 )
 if (
     (Normalize-ResourceId -ResourceId ([string]$workloadResourceGroup.id)) -ne (
         Normalize-ResourceId -ResourceId $WorkloadResourceGroupResourceId
-    )
+    ) -or
+    [string]$workloadResourceGroup.name -cne $workloadResourceGroupName -or
+    ([string]$workloadResourceGroup.location).ToLowerInvariant() -ne 'australiaeast' -or
+    [string]$workloadResourceGroup.properties.provisioningState -cne 'Succeeded'
 ) {
-    throw 'WorkloadResourceGroupResourceId does not resolve to the exact reviewed resource group.'
+    throw (
+        'WorkloadResourceGroupResourceId does not resolve to the exact reviewed ' +
+        'name, location, state, and resource ID.'
+    )
 }
 $workloadResourceGroupId = [string]$workloadResourceGroup.id
 $workloadResourceGroupSegments = (

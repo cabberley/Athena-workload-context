@@ -120,6 +120,14 @@ exact permissions and assignable scope without trusting its mutable display name
 exact ID, verifies every reviewed assignment and definition is absent, and emits
 `cleanupEvidenceDigest`.
 
+The cleanup uses only supported exact lookups: `az resource show --ids` for the reviewed
+`NetworkWatcherRG/NetworkWatcher_australiaeast` resource and `az group show --name` for the
+resource-group name parsed from the canonical workload resource-group ID. Both calls remain bound to
+the supplied subscription, and their returned ID, name, `australiaeast` location, and `Succeeded`
+provisioning state must match before any cleanup command runs. Executable tests exercise the
+installed Azure CLI command parser plus malformed and cross-subscription script preflight paths
+without permitting a live mutation.
+
 Pass that digest as both `legacyCollectorRbacCleanupDigest` and the matching field in runtime
 configuration v4. All-zero cleanup evidence is rejected. Measure and embed fresh collector and
 runtime-support effective-RBAC inventories only after cleanup. The Job is

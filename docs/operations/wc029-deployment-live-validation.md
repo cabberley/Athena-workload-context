@@ -183,7 +183,10 @@ template. Perform these steps in order:
    and all four deterministic obsolete custom role definitions, including the Network Watcher IP
    Flow assignment and role, are absent. Discover each historical role only by its exact
    original-ARM-`guid()` ID; a renamed role must still be validated and removed, while any changed
-   permission body or assignable scope blocks cleanup.
+   permission body or assignable scope blocks cleanup. The script must resolve the exact historical
+   Network Watcher with `az resource show --ids` and the canonical workload resource-group name with
+   `az group show --name`; returned ID, name, location, provisioning state, and subscription binding
+   must all match before mutation.
 4. Produce a fresh collector contract and authority from the PR #99 revision that recognizes the
    conditioned known-name-read/add-only writer, binds the reviewed storage-protection contract and
    signed persistence replay preimage, and proves all management-group or tenant-root ancestor
