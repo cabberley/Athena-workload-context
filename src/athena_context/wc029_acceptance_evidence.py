@@ -7967,7 +7967,7 @@ def write_acceptance_record(
                     output_root=output_root,
                     output_pin=output_pin,
                 )
-            except Wc029AcceptanceEvidenceError:
+            except Wc029AcceptanceEvidenceError as exc:
                 if staging_pin is not None:
                     staging_pin.close()
                 if os.name == "nt":
@@ -7976,7 +7976,9 @@ def write_acceptance_record(
                 else:
                     with suppress(OSError):
                         os.unlink(staging_name, dir_fd=output_pin.descriptor)
-                raise
+                raise Wc029AcceptanceEvidenceError(
+                    f"acceptance record could not be created exclusively: {exc}"
+                ) from exc
             except FileExistsError as exc:
                 if staging_pin is not None:
                     staging_pin.close()
