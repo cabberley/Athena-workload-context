@@ -28,13 +28,14 @@ _ENRICHMENT_ASSET_PATH = re.compile(
     r"(?:"
     r"correlation-reports/report-[a-f0-9]{32}/(?:report|attestation)\.json"
     r"|guidance/incident-guidance-[a-f0-9]{32}/(?:guidance|attestation)\.json"
-    r"|enrichments/incident-enrichment-[a-f0-9]{32}/(?:manifest|attestation)\.json"
+    r"|enrichments/incident-enrichment-[a-f0-9]{32}/"
+    r"(?:manifest|attestation|feed-pointer|feed-pointer-attestation)\.json"
     r")$"
 )
 
 
 class AzureBlobIncidentEnrichmentArtifactWriter:
-    """Create or recover only immutable WC-027 incident-enrichment assets."""
+    """Create or recover immutable assets only in the isolated WC-027 v2 container."""
 
     def __init__(
         self,
@@ -43,8 +44,10 @@ class AzureBlobIncidentEnrichmentArtifactWriter:
         container_name: str,
         managed_identity_client_id: str,
     ) -> None:
-        if container_name != "incident-assets":
-            raise ValueError("container_name must be exactly incident-assets")
+        if container_name != "wc027-enrichment-feed-v2":
+            raise ValueError(
+                "container_name must be exactly wc027-enrichment-feed-v2"
+            )
         self._writer = AzureBlobCreateOnlyArtifactWriter(
             blob_endpoint=blob_endpoint,
             container_name=container_name,

@@ -131,9 +131,44 @@ Context MCP, presentation, and correlation identities remain absent from monitor
 assignments.
 
 A separate RBAC attestor UAMI receives only role-assignment, role-definition, deny-assignment, and
-active PIM schedule-instance reads at the subscription. Its short-lived v2 inventory binds exact
-target queries, full roles, conditions, applicable denies, transitive groups, raw page hashes, and
-stable repeated reads before acquisition can start.
+active PIM schedule-instance reads at the subscription, plus Microsoft Graph
+`Application.Read.All`, the least-privileged application permission for reading a service
+principal's transitive `memberOf` relationship. It receives no workload or monitoring data-plane
+role. Contract publication is deliberately two-phase so this identity and the collector
+assignments exist before they are measured. The foundation deployment outputs an immutable
+`athena.wc024MonitoringRbacBootstrapHandoff.v1`, including the exact Graph app-role assignment and
+membership request paths, and keeps acquisition-contract readiness false. The attestor then
+performs stable repeated `atScope() and assignedTo(principalId)` reads at the exact subscription
+and descendant scopes in that handoff and separately captures the two service principals'
+transitive group IDs from Microsoft Graph using the exact casted requests with
+`$count=true`, `$select=id`, and `ConsistencyLevel: eventual`. It does not claim direct enumeration of
+management-group ancestors; any inherited management-group deny returned by the scoped Azure
+query is evaluated conservatively. The short-lived v3 inventory binds exact target queries, full
+roles, conditions, applicable denies, transitive groups, independently timed first/second raw page
+sets for role assignments, Graph memberships, role definitions, deny assignments, and PIM
+instances, and stable repeated reads. V2 remains parseable only for historical inspection.
+
+`publish-monitoring-contract.bicep` is the only phase-two publication entry point. It accepts the
+name of the successful phase-one subscription deployment and retrieves the authoritative handoff
+directly from that deployment's outputs; callers cannot substitute a handoff object. It also
+requires the independently reviewed canonical inventory digest. It recomputes the handoff
+identity, rejects duplicate, missing, extra, or out-of-subscription target scopes, verifies the
+Graph membership contract, physical identity separation, principal evidence, exact collector
+grants, role-definition set, stable snapshots, source reference, and the inventory lifetime
+against the phase-two deployment's own timestamp before it emits the generic and WC-028 v8
+collector contracts. Current publication deliberately rejects any active PIM instance, Athena
+context grant, conditioned deny, or deny that effectively applies to the collector. An
+`All Principals` deny is allowed only when its direct or transitive-group exclusion is present in
+the attested principal set, matching the Python contract's fail-closed semantics.
+
+The same phase-one deployment creates the Athena-owned identity-proof authority required before
+any collector source I/O. It uses a secure tenant-scoped
+`api://<tenant-id>/athena-monitoring-identity-proof` identifier URI, v1 access tokens, one
+application-only `Athena.MonitoringAcquisition.ProveIdentity` role, and one direct assignment to
+the collector UAMI. No secret or credential is created. The phase-one handoff and v8 contract bind
+the application, enterprise application, role, assignment, assigned principal, and audience IDs,
+and the application explicitly requests the `idtyp` access-token claim, so an unprovisioned or
+substituted proof authority cannot be published.
 
 The collector uses a dedicated non-exportable Key Vault RSA signing key and a versioned,
 retention-controlled `monitoring-evidence` Blob container. The checked-in contract binds the
@@ -174,6 +209,27 @@ reviewed endpoint paths in a separate change.
    stated ingestion baseline, run `set-private-access.ps1` with all three explicit confirmations.
    The steady-state template has no public-access mutation path and cannot reopen an adopted
    PrivateOnly AMPLS.
+4. Deploy `main.bicep` without a pre-existing effective-RBAC inventory. Capture the exact
+   `monitoringRbacBootstrapHandoff` output and confirm
+   `monitoringAcquisitionContractPublicationReady=false`.
+5. Use only the handoff attestor identity to collect both principals at every exact
+   `effectiveRbacTargetScopeIds` entry. Preserve every page, role definition, deny assignment,
+   active PIM instance, Graph transitive-group response, and both independently timed raw reads in
+   one short-lived v3 inventory. Do not add management-group target scopes or claim direct ancestor
+   enumeration. The target deployment currently requires empty PIM, deny, and Athena context
+   grant sets.
+6. Independently validate and record the inventory's canonical `inventoryDigest`.
+7. Deploy `publish-monitoring-contract.bicep` with the exact successful phase-one deployment name,
+   the fresh inventory, and that independently reviewed digest. Capture its v8 acquisition
+   contract and publication handoff. Any identity, Graph permission, scope, duplicate target,
+   grant, stable-read, source, freshness, or digest mismatch keeps publication fail-closed.
+
+The exact target list includes the subscription, all three relevant resource groups, the workload
+VNet, the Network Watcher, the Log Analytics workspace and every reviewed table resource, every
+collector Reader/signal/resource-log/resource-health scope, the evidence storage account and Blob
+service/container, and the signing vault/key. This is intentionally broader than the collector's
+grants: it lets the attestor detect a direct or group-derived Athena Context grant on a protected
+child resource that an `atScope()` query at only the parent resource group would not return.
 
 ## Consequences
 
@@ -217,6 +273,7 @@ the DCR-association adoption and DCE-only `configurationAccessEndpoint` associat
 private networking, collector runtime topology validation, and DNS links, populated-zone-before-VNet-link
 ordering, persistent private-access ordering and mutable-state preservation, versioned signing
 key binding, lifecycle/retention, collector-only RBAC, canonical VNet Traffic Analytics, explicit
-allowlisted legacy-flow-log migration with existing-target verification, and the absence of
-Connection Monitor definitions or unpublished-intent configuration. Local Bicep build validates
-the root template and example parameters without contacting Azure.
+allowlisted legacy-flow-log migration with existing-target verification, the two-phase
+RBAC-attestor handoff and freshness gate, and the absence of Connection Monitor definitions or
+unpublished-intent configuration. Local Bicep build validates the root, publication, and example
+parameter templates without contacting Azure.

@@ -70,7 +70,11 @@ from athena_context.monitoring_collection import (
     ResourceChangeRecord,
     VmConnectionHealthRecord,
 )
-from athena_context.monitoring_incident import build_selected_incident
+from athena_context.monitoring_incident import (
+    MonitoringIncidentSample,
+    build_selected_incident,
+    select_monitoring_incident,
+)
 from test_wc024_monitoring_contract import (
     COLLECTOR_TENANT_ID,
     _acquisition_collector_contract,
@@ -200,6 +204,7 @@ def _trust_synthetic_managed_identity_key(monkeypatch: pytest.MonkeyPatch) -> No
     _SyntheticJwks.advance_clock_seconds = 0
     _SyntheticJwt.advance_clock_seconds = 0
     _SyntheticClaims.advance_clock_seconds = 0
+    _ReceiptSigner.advance_clock_seconds = 0
 
     class _SigningKey:
         key = _TOKEN_PRIVATE_KEY.public_key()
@@ -249,8 +254,11 @@ def _trust_synthetic_managed_identity_key(monkeypatch: pytest.MonkeyPatch) -> No
 
 
 class _ReceiptSigner:
+    advance_clock_seconds = 0
+
     def sign_preimage(self, canonical_preimage: bytes) -> str:
         assert canonical_preimage
+        _SyntheticClock.now += timedelta(seconds=self.advance_clock_seconds)
         return base64.b64encode(b"synthetic-acquisition-receipt").decode("ascii")
 
 
@@ -567,6 +575,7 @@ class _AcquisitionPort:
         mismatched_aggregate_proof: bool = False,
         future_aggregate_proof: bool = False,
         truncated_heartbeat: bool = False,
+        advance_clock_seconds_per_request: int = 0,
     ) -> None:
         self.reverse_rows = reverse_rows
         self.ambiguous_vm_mapping = ambiguous_vm_mapping
@@ -602,6 +611,7 @@ class _AcquisitionPort:
         self.mismatched_aggregate_proof = mismatched_aggregate_proof
         self.future_aggregate_proof = future_aggregate_proof
         self.truncated_heartbeat = truncated_heartbeat
+        self.advance_clock_seconds_per_request = advance_clock_seconds_per_request
         self.ip_flow_calls = 0
         self.requests: list[object] = []
         self.azure_client_credentials: list[object] = []
@@ -612,6 +622,7 @@ class _AcquisitionPort:
 
     def _record_request(self, request: object) -> None:
         self.requests.append(request)
+        _SyntheticClock.now += timedelta(seconds=self.advance_clock_seconds_per_request)
 
     def query_log_analytics(
         self,
@@ -1065,9 +1076,10 @@ def _execute(
     collected_at: datetime = NOW,
     acquisition_authority: MonitoringAcquisitionAuthority | None = None,
     collector_contract=None,
+    commit_port: _CommitPort | None = None,
 ):
     context, intent, controls = _authority() if authority is None else authority
-    commit = _CommitPort()
+    commit = _CommitPort() if commit_port is None else commit_port
     acquisition_authority = (
         _acquisition_authority(
             required_control_ids=_required_control_ids(context, controls),
@@ -1286,6 +1298,152 @@ def test_acquisition_derives_strict_requests_and_commits_one_batch() -> None:
     )
     with pytest.raises(ValidationError, match="does not bind the monitoring bundle"):
         type(outcome.prepared.monitoring_bundle).model_validate_json(json.dumps(tampered_evidence))
+
+
+def test_heartbeat_and_vmconnection_corroboration_reaches_correlation_service() -> None:
+    authority = _authority(required_control_names={"heartbeat", "endpoint"})
+    outcome, commit, _ = _execute(_AcquisitionPort(), authority=authority)
+
+    assert commit.calls == 1
+    receipt = outcome.prepared.monitoring_bundle.acquisition_receipt
+    assert receipt is not None
+    assert receipt.selected_incident is not None
+    current_records = tuple(
+        item
+        for item in outcome.batch.records
+        if item.source_record_id in receipt.selected_incident.current_record_ids
+    )
+    assert {type(item) for item in current_records} == {
+        AmaHeartbeatRecord,
+        VmConnectionHealthRecord,
+    }
+    assert (
+        receipt.selected_incident.current_record_ids
+        == outcome.batch.current_health_source_record_ids
+    )
+    assert {
+        item.evidence_id
+        for item in outcome.correlation_request.incident_anchor.current_state_evidence
+    } == set(outcome.prepared.current_health_observation_ids)
+
+    verified = _test_service(outcome.correlation_request).correlate(outcome.correlation_request)
+    assert verified.report.request_digest == outcome.correlation_request.request_digest
+
+
+def test_signed_selection_cannot_omit_valid_corroborating_health_evidence() -> None:
+    authority = _authority(required_control_names={"heartbeat", "endpoint"})
+    outcome, _, _ = _execute(_AcquisitionPort(), authority=authority)
+    request = outcome.correlation_request
+    receipt = outcome.prepared.monitoring_bundle.acquisition_receipt
+    assert request.selected_incident is not None
+    assert receipt is not None
+    assert len(request.selected_incident.current_record_ids) == 2
+    narrowed = build_selected_incident(
+        incident_resource_id=request.selected_incident.incident_resource_id,
+        previous_record_id=request.selected_incident.previous_record_id,
+        current_record_ids=(request.selected_incident.current_record_ids[0],),
+        current_state=request.selected_incident.current_state,
+    )
+    narrowed_selection = request.selected_incident.model_copy(
+        update={
+            "current_record_ids": narrowed.current_record_ids,
+            "transition_digest": narrowed.transition_digest,
+        }
+    )
+
+    with pytest.raises(ValueError, match="reconstructed incident"):
+        _verify_collector_incident_selection(
+            request.model_copy(update={"selected_incident": narrowed_selection}),
+            receipt.model_copy(update={"selected_incident": narrowed_selection}),
+        )
+
+
+def test_incident_expansion_reselects_predecessor_before_earliest_corroboration() -> None:
+    resource_id = WEB_ID.casefold()
+    samples = (
+        MonitoringIncidentSample(
+            resource_id=resource_id,
+            control_id="control-a",
+            payload_id="a-healthy",
+            selection_key="a-healthy",
+            observed_start=NOW - timedelta(minutes=12),
+            observed_end=NOW - timedelta(minutes=10),
+            state="healthy",
+        ),
+        MonitoringIncidentSample(
+            resource_id=resource_id,
+            control_id="control-a",
+            payload_id="a-unhealthy",
+            selection_key="a-unhealthy",
+            observed_start=NOW - timedelta(minutes=9),
+            observed_end=NOW,
+            state="unhealthy",
+        ),
+        MonitoringIncidentSample(
+            resource_id=resource_id,
+            control_id="control-z",
+            payload_id="z-healthy",
+            selection_key="z-healthy",
+            observed_start=NOW - timedelta(minutes=8),
+            observed_end=NOW - timedelta(minutes=6),
+            state="healthy",
+        ),
+        MonitoringIncidentSample(
+            resource_id=resource_id,
+            control_id="control-z",
+            payload_id="z-unhealthy",
+            selection_key="z-unhealthy",
+            observed_start=NOW - timedelta(minutes=5),
+            observed_end=NOW,
+            state="unhealthy",
+        ),
+    )
+
+    selected = select_monitoring_incident(samples)
+
+    assert selected.previous.payload_id == "a-healthy"
+    assert tuple(item.payload_id for item in selected.current) == (
+        "a-unhealthy",
+        "z-unhealthy",
+    )
+    assert selected.previous.observed_end <= min(item.observed_start for item in selected.current)
+
+
+def test_incident_predecessor_prefers_a_selected_health_stream_on_tied_chronology() -> None:
+    resource_id = WEB_ID.casefold()
+    samples = (
+        MonitoringIncidentSample(
+            resource_id=resource_id,
+            control_id="resource-health-control",
+            payload_id="resource-health-healthy",
+            selection_key="a-resource-health-healthy",
+            observed_start=NOW - timedelta(minutes=10),
+            observed_end=NOW - timedelta(minutes=5),
+            state="healthy",
+        ),
+        MonitoringIncidentSample(
+            resource_id=resource_id,
+            control_id="resource-health-control",
+            payload_id="resource-health-unavailable",
+            selection_key="resource-health-unavailable",
+            observed_start=NOW - timedelta(minutes=5),
+            observed_end=NOW,
+            state="unavailable",
+        ),
+        MonitoringIncidentSample(
+            resource_id=resource_id,
+            control_id="unrelated-endpoint-control",
+            payload_id="unrelated-endpoint-healthy",
+            selection_key="z-unrelated-endpoint-healthy",
+            observed_start=NOW - timedelta(minutes=9),
+            observed_end=NOW - timedelta(minutes=5),
+            state="healthy",
+        ),
+    )
+
+    selected = select_monitoring_incident(samples)
+
+    assert selected.previous.payload_id == "resource-health-healthy"
 
 
 def test_signed_receipt_blocks_recomputed_alternate_incident_anchor() -> None:
@@ -1591,6 +1749,7 @@ def test_each_source_call_rechecks_live_effective_rbac_start_time() -> None:
     execution = monitoring_acquisition_module._AcquisitionExecution(
         adapter=_ClockAdapter(),
         identity_proof=_IdentityProof(),
+        authorization_expires_at=NOW + timedelta(seconds=1),
         max_calls=2,
         max_freshness_seconds=600,
         effective_rbac_collected_at=NOW - timedelta(minutes=1),
@@ -2297,6 +2456,8 @@ def test_effective_rbac_inventory_expiry_blocks_credential_and_source_io() -> No
         {
             "collectedAt": NOW - timedelta(minutes=20),
             "expiresAt": NOW - timedelta(minutes=10),
+            "firstReadCompletedAt": NOW - timedelta(minutes=21),
+            "secondReadCompletedAt": NOW - timedelta(minutes=20),
         }
     )
     inventory.pop("inventoryDigest")
@@ -2314,6 +2475,34 @@ def test_effective_rbac_inventory_expiry_blocks_credential_and_source_io() -> No
 
     assert _SyntheticManagedIdentityCredential.instances[0].calls == 0
     assert port.requests == []
+
+
+def test_effective_rbac_inventory_expiry_during_source_io_aborts_without_commit() -> None:
+    port = _AcquisitionPort(advance_clock_seconds_per_request=601)
+
+    with pytest.raises(
+        MonitoringAcquisitionError,
+        match="expired or stale at Azure source request completion",
+    ):
+        _execute(port)
+
+    assert port.requests
+
+
+@pytest.mark.parametrize("signing_delay_seconds", (301, 601))
+def test_effective_rbac_inventory_freshness_during_receipt_signing_aborts_commit(
+    signing_delay_seconds: int,
+) -> None:
+    _ReceiptSigner.advance_clock_seconds = signing_delay_seconds
+    commit = _CommitPort()
+
+    with pytest.raises(
+        MonitoringAcquisitionError,
+        match="expired or stale at acquisition receipt signing completion",
+    ):
+        _execute(_AcquisitionPort(), commit_port=commit)
+
+    assert commit.calls == 0
 
 
 def test_authority_effective_rbac_digest_mismatch_fails_before_identity() -> None:

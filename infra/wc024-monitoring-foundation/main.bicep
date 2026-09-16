@@ -86,9 +86,6 @@ param monitoringCollectorKeyVaultName string
 @description('Exact existing Athena context UAMI resource ID. Its resource and principal identities must differ from the monitoring collector UAMI.')
 param athenaContextIdentityResourceId string
 
-@description('Externally collected hierarchy-complete effective RBAC inventory for the collector and Athena context identities.')
-param monitoringEffectiveRbacInventory object
-
 var athenaContextIdentitySegments = split(toLower(athenaContextIdentityResourceId), '/')
 resource athenaContextIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2024-11-30' existing = {
   scope: resourceGroup(athenaContextIdentitySegments[2], athenaContextIdentitySegments[4])
@@ -458,6 +455,14 @@ module monitoringRbacAttestor 'modules/monitoring-rbac-attestor.bicep' = {
   }
 }
 
+module monitoringIdentityProofAuthority 'modules/monitoring-identity-proof-authority.bicep' = {
+  name: 'monitoring-identity-proof-authority'
+  params: {
+    tenantId: monitoringEvidenceSeams.outputs.collectorIdentityTenantId
+    collectorPrincipalId: monitoringEvidenceSeams.outputs.collectorIdentityPrincipalId
+  }
+}
+
 module legacyFlowLogMigration 'modules/legacy-flow-log-migration.bicep' = {
   name: 'disable-redundant-legacy-flow-logs'
   scope: resourceGroup(networkWatcherResourceGroupName)
@@ -484,80 +489,170 @@ module connectionMonitorCapability 'modules/connection-monitor-capability.bicep'
   }
 }
 
-module collectorContract 'modules/monitoring-collector-contract.bicep' = {
-  name: 'monitoring-collector-contract'
-  scope: monitoringResourceGroup
-  params: {
-    collectorIdentityResourceId: monitoringEvidenceSeams.outputs.collectorIdentityResourceId
-    collectorIdentityClientId: monitoringEvidenceSeams.outputs.collectorIdentityClientId
-    collectorTenantId: monitoringEvidenceSeams.outputs.collectorIdentityTenantId
-    monitoringResourceGroupId: monitoringResourceGroup.id
-    workloadResourceGroupId: workloadResourceGroupId
-    workloadVirtualNetworkResourceId: validatedWorkloadVirtualNetworkResourceId
-    approvedVmNames: validatedApprovedVmNames
-    workspaceResourceId: monitoringDataPlatform.outputs.workspaceResourceId
-    dataCollectionRuleResourceId: monitoringDataPlatform.outputs.dataCollectionRuleResourceId
-    dataCollectionEndpointResourceId: monitoringDataPlatform.outputs.dataCollectionEndpointResourceId
-    authorizationMode: 'conditionedWorkspacePlusExactResourceContext'
-    workspaceAccessControlMode: monitoringDataPlatform.outputs.workspaceResourceContextAccessEnabled
-      ? 'workspaceAndResourceContext'
-      : 'workspaceOnly'
-    workspaceResourceContextAccessEnabled: monitoringDataPlatform.outputs.workspaceResourceContextAccessEnabled
-    workspaceSkuName: monitoringDataPlatform.outputs.workspaceSkuName == 'PerGB2018'
-      ? 'PerGB2018'
-      : fail('WC-028 resource-context acquisition requires the Analytics workspace SKU.')
-    resourceContextTablePlans: monitoringDataPlatform.outputs.resourceContextTablePlans
-    readerRoleDefinitionId: monitoringEvidenceReaderAssignments.outputs.readerRoleDefinitionId
-    signalReaderRoleDefinitionId: workloadEvidenceReaderAssignments.outputs.signalReaderRoleDefinitionId
-    signalReaderRoleName: workloadEvidenceReaderAssignments.outputs.signalReaderRoleName
-    resourceLogReaderRoleDefinitionId: workloadEvidenceReaderAssignments.outputs.resourceLogReaderRoleDefinitionId
-    resourceLogReaderRoleName: workloadEvidenceReaderAssignments.outputs.resourceLogReaderRoleName
-    resourceLogAllowedOperations: workloadEvidenceReaderAssignments.outputs.resourceLogAllowedOperations
-    resourceLogReadScopeIds: workloadEvidenceReaderAssignments.outputs.resourceLogReadScopeIds
-    logAnalyticsDataReaderRoleDefinitionId: monitoringEvidenceReaderAssignments.outputs.logAnalyticsDataReaderRoleDefinitionId
-    rbacAttestorIdentityResourceId: monitoringEvidenceSeams.outputs.rbacAttestorIdentityResourceId
-    rbacAttestorIdentityClientId: monitoringEvidenceSeams.outputs.rbacAttestorIdentityClientId
-    rbacAttestorPrincipalId: monitoringEvidenceSeams.outputs.rbacAttestorIdentityPrincipalId
-    rbacAttestorTenantId: monitoringEvidenceSeams.outputs.rbacAttestorIdentityTenantId
-    rbacAttestorRoleDefinitionId: monitoringRbacAttestor.outputs.attestorRoleDefinitionId
-    rbacAttestorRoleName: monitoringRbacAttestor.outputs.attestorRoleName
-    rbacAttestorScopeId: monitoringRbacAttestor.outputs.attestorScopeId
-    rbacAttestorAllowedOperations: monitoringRbacAttestor.outputs.attestorAllowedOperations
-    resourceHealthRoleDefinitionId: workloadEvidenceReaderAssignments.outputs.resourceHealthRoleDefinitionId
-    resourceHealthRoleName: workloadEvidenceReaderAssignments.outputs.resourceHealthRoleName
-    resourceHealthScopeIds: workloadEvidenceReaderAssignments.outputs.resourceHealthScopeIds
-    resourceHealthAllowedOperations: workloadEvidenceReaderAssignments.outputs.resourceHealthAllowedOperations
-    logAnalyticsAllowedTables: monitoringEvidenceReaderAssignments.outputs.allowedLogTableNames
-    logAnalyticsAccessCondition: monitoringEvidenceReaderAssignments.outputs.logAnalyticsAccessCondition
-    resourceReadScopeIds: concat(
-      monitoringEvidenceReaderAssignments.outputs.resourceReadScopeIds,
-      workloadEvidenceReaderAssignments.outputs.resourceReadScopeIds,
-      networkWatcherEvidenceReaderAssignment.outputs.resourceReadScopeIds
-    )
-    signalReadScopeIds: workloadEvidenceReaderAssignments.outputs.signalReadScopeIds
-    signingKeyResourceId: monitoringEvidenceSeams.outputs.signingKeyResourceId
-    signingKeyArmResourceId: monitoringEvidenceSeams.outputs.signingKeyArmResourceId
-    signingKeyCryptoUserRoleDefinitionId: monitoringEvidenceSeams.outputs.signingKeyCryptoUserRoleDefinitionId
-    evidenceStorageAccountResourceId: monitoringStorage.outputs.storageAccountResourceId
-    evidenceContainerResourceId: monitoringEvidenceSeams.outputs.evidenceContainerResourceId
-    evidenceWriterRoleDefinitionId: monitoringEvidenceSeams.outputs.evidenceWriterRoleDefinitionId
-    effectiveRbacInventory: validatedMonitoringEffectiveRbacInventory
-    maximumEvidenceAgeSeconds: maximumEvidenceAgeSeconds
-    connectionMonitorDeploymentMode: connectionMonitorCapability.outputs.deploymentMode
-  }
-}
-
-@description('Exact generic monitoring collector contract that must be captured, reviewed, and signed before a collector runs.')
-output monitoringCollectorContract object = collectorContract.outputs.collectorContract
 var acquisitionIdentitySeparation = toLower(monitoringEvidenceSeams.outputs.collectorIdentityResourceId) != toLower(athenaContextIdentity.id) && toLower(monitoringEvidenceSeams.outputs.collectorIdentityResourceId) != toLower(monitoringEvidenceSeams.outputs.rbacAttestorIdentityResourceId) && toLower(athenaContextIdentity.id) != toLower(monitoringEvidenceSeams.outputs.rbacAttestorIdentityResourceId) && toLower(monitoringEvidenceSeams.outputs.collectorIdentityPrincipalId) != toLower(athenaContextIdentity.properties.principalId) && toLower(monitoringEvidenceSeams.outputs.collectorIdentityPrincipalId) != toLower(monitoringEvidenceSeams.outputs.rbacAttestorIdentityPrincipalId) && toLower(athenaContextIdentity.properties.principalId) != toLower(monitoringEvidenceSeams.outputs.rbacAttestorIdentityPrincipalId) ? true : fail('monitoring collector, Athena context, and RBAC attestor must be physically separate UAMIs with distinct principal IDs')
-var validatedMonitoringEffectiveRbacInventory = monitoringEffectiveRbacInventory.schemaVersion == 'athena.wc028MonitoringEffectiveRbacInventory.v2' && toLower(monitoringEffectiveRbacInventory.collectorPrincipalId) == toLower(monitoringEvidenceSeams.outputs.collectorIdentityPrincipalId) && toLower(monitoringEffectiveRbacInventory.athenaContextPrincipalId) == toLower(athenaContextIdentity.properties.principalId) && toLower(monitoringEffectiveRbacInventory.attestorIdentityResourceId) == toLower(monitoringEvidenceSeams.outputs.rbacAttestorIdentityResourceId) && toLower(monitoringEffectiveRbacInventory.attestorClientId) == toLower(monitoringEvidenceSeams.outputs.rbacAttestorIdentityClientId) && toLower(monitoringEffectiveRbacInventory.attestorPrincipalId) == toLower(monitoringEvidenceSeams.outputs.rbacAttestorIdentityPrincipalId) && toLower(monitoringEffectiveRbacInventory.attestorTenantId) == toLower(monitoringEvidenceSeams.outputs.rbacAttestorIdentityTenantId) && toLower(monitoringEffectiveRbacInventory.tenantId) == toLower(monitoringEvidenceSeams.outputs.collectorIdentityTenantId) ? monitoringEffectiveRbacInventory : fail('monitoring acquisition requires stable effective RBAC inventory v2 bound to all three isolated identities and tenant')
-
-output monitoringAcquisitionCollectorContract object = union(collectorContract.outputs.acquisitionCollectorContract, {
+var resourceReadScopeIds = concat(
+  monitoringEvidenceReaderAssignments.outputs.resourceReadScopeIds,
+  workloadEvidenceReaderAssignments.outputs.resourceReadScopeIds,
+  networkWatcherEvidenceReaderAssignment.outputs.resourceReadScopeIds
+)
+var workspaceTableResourceIds = map(
+  monitoringEvidenceReaderAssignments.outputs.allowedLogTableNames,
+  tableName => '${monitoringDataPlatform.outputs.workspaceResourceId}/tables/${tableName}'
+)
+var evidenceBlobServiceResourceId = '${monitoringStorage.outputs.storageAccountResourceId}/blobServices/default'
+var networkWatcherResourceGroupId = subscriptionResourceId(
+  'Microsoft.Resources/resourceGroups',
+  networkWatcherResourceGroupName
+)
+var networkWatcherResourceId = resourceId(
+  networkWatcherResourceGroupName,
+  'Microsoft.Network/networkWatchers',
+  networkWatcherName
+)
+var effectiveRbacTargetScopeIds = union(
+  concat(
+    [
+      subscription().id
+      workloadResourceGroupId
+      monitoringResourceGroup.id
+      networkWatcherResourceGroupId
+      validatedWorkloadVirtualNetworkResourceId
+      monitoringDataPlatform.outputs.workspaceResourceId
+      monitoringStorage.outputs.storageAccountResourceId
+      evidenceBlobServiceResourceId
+      monitoringEvidenceSeams.outputs.evidenceContainerResourceId
+      monitoringEvidenceSeams.outputs.keyVaultResourceId
+      monitoringEvidenceSeams.outputs.signingKeyArmResourceId
+      networkWatcherResourceId
+    ],
+    workspaceTableResourceIds,
+    resourceReadScopeIds,
+    workloadEvidenceReaderAssignments.outputs.signalReadScopeIds,
+    workloadEvidenceReaderAssignments.outputs.resourceLogReadScopeIds,
+    workloadEvidenceReaderAssignments.outputs.resourceHealthScopeIds
+  ),
+  []
+)
+var collectorContractInputs = {
+  collectorIdentityResourceId: monitoringEvidenceSeams.outputs.collectorIdentityResourceId
+  collectorIdentityClientId: monitoringEvidenceSeams.outputs.collectorIdentityClientId
+  collectorTenantId: monitoringEvidenceSeams.outputs.collectorIdentityTenantId
+  monitoringResourceGroupId: monitoringResourceGroup.id
+  workloadResourceGroupId: workloadResourceGroupId
+  workloadVirtualNetworkResourceId: validatedWorkloadVirtualNetworkResourceId
+  approvedVmNames: validatedApprovedVmNames
+  workspaceResourceId: monitoringDataPlatform.outputs.workspaceResourceId
+  dataCollectionRuleResourceId: monitoringDataPlatform.outputs.dataCollectionRuleResourceId
+  dataCollectionEndpointResourceId: monitoringDataPlatform.outputs.dataCollectionEndpointResourceId
+  authorizationMode: 'conditionedWorkspacePlusExactResourceContext'
+  workspaceAccessControlMode: monitoringDataPlatform.outputs.workspaceResourceContextAccessEnabled
+    ? 'workspaceAndResourceContext'
+    : 'workspaceOnly'
+  workspaceResourceContextAccessEnabled: monitoringDataPlatform.outputs.workspaceResourceContextAccessEnabled
+  workspaceSkuName: monitoringDataPlatform.outputs.workspaceSkuName == 'PerGB2018'
+    ? 'PerGB2018'
+    : fail('WC-028 resource-context acquisition requires the Analytics workspace SKU.')
+  resourceContextTablePlans: monitoringDataPlatform.outputs.resourceContextTablePlans
+  readerRoleDefinitionId: monitoringEvidenceReaderAssignments.outputs.readerRoleDefinitionId
+  signalReaderRoleDefinitionId: workloadEvidenceReaderAssignments.outputs.signalReaderRoleDefinitionId
+  signalReaderRoleName: workloadEvidenceReaderAssignments.outputs.signalReaderRoleName
+  resourceLogReaderRoleDefinitionId: workloadEvidenceReaderAssignments.outputs.resourceLogReaderRoleDefinitionId
+  resourceLogReaderRoleName: workloadEvidenceReaderAssignments.outputs.resourceLogReaderRoleName
+  resourceLogAllowedOperations: workloadEvidenceReaderAssignments.outputs.resourceLogAllowedOperations
+  resourceLogReadScopeIds: workloadEvidenceReaderAssignments.outputs.resourceLogReadScopeIds
+  logAnalyticsDataReaderRoleDefinitionId: monitoringEvidenceReaderAssignments.outputs.logAnalyticsDataReaderRoleDefinitionId
+  rbacAttestorIdentityResourceId: monitoringEvidenceSeams.outputs.rbacAttestorIdentityResourceId
+  rbacAttestorIdentityClientId: monitoringEvidenceSeams.outputs.rbacAttestorIdentityClientId
+  rbacAttestorPrincipalId: monitoringEvidenceSeams.outputs.rbacAttestorIdentityPrincipalId
+  rbacAttestorTenantId: monitoringEvidenceSeams.outputs.rbacAttestorIdentityTenantId
+  rbacAttestorRoleDefinitionId: monitoringRbacAttestor.outputs.attestorRoleDefinitionId
+  rbacAttestorRoleName: monitoringRbacAttestor.outputs.attestorRoleName
+  rbacAttestorScopeId: monitoringRbacAttestor.outputs.attestorScopeId
+  rbacAttestorAllowedOperations: monitoringRbacAttestor.outputs.attestorAllowedOperations
+  rbacAttestorGraphApplicationId: monitoringRbacAttestor.outputs.microsoftGraphApplicationId
+  rbacAttestorGraphApplicationReadAllAppRoleId: monitoringRbacAttestor.outputs.applicationReadAllAppRoleId
+  rbacAttestorGraphApplicationReadAllAssignmentId: monitoringRbacAttestor.outputs.applicationReadAllAssignmentId
+  rbacAttestorGraphServicePrincipalId: monitoringRbacAttestor.outputs.microsoftGraphServicePrincipalId
+  identityProofAudience: monitoringIdentityProofAuthority.outputs.identityProofAudience
+  identityProofApplicationId: monitoringIdentityProofAuthority.outputs.identityProofApplicationId
+  identityProofApplicationObjectId: monitoringIdentityProofAuthority.outputs.identityProofApplicationObjectId
+  identityProofServicePrincipalId: monitoringIdentityProofAuthority.outputs.identityProofServicePrincipalId
+  identityProofAppRoleId: monitoringIdentityProofAuthority.outputs.identityProofAppRoleId
+  identityProofAppRoleValue: monitoringIdentityProofAuthority.outputs.identityProofAppRoleValue
+  identityProofAppRoleAssignmentId: monitoringIdentityProofAuthority.outputs.identityProofAppRoleAssignmentId
+  identityProofAssignedPrincipalId: monitoringIdentityProofAuthority.outputs.identityProofAssignedPrincipalId
+  resourceHealthRoleDefinitionId: workloadEvidenceReaderAssignments.outputs.resourceHealthRoleDefinitionId
+  resourceHealthRoleName: workloadEvidenceReaderAssignments.outputs.resourceHealthRoleName
+  resourceHealthScopeIds: workloadEvidenceReaderAssignments.outputs.resourceHealthScopeIds
+  resourceHealthAllowedOperations: workloadEvidenceReaderAssignments.outputs.resourceHealthAllowedOperations
+  logAnalyticsAllowedTables: monitoringEvidenceReaderAssignments.outputs.allowedLogTableNames
+  logAnalyticsAccessCondition: monitoringEvidenceReaderAssignments.outputs.logAnalyticsAccessCondition
+  resourceReadScopeIds: resourceReadScopeIds
+  signalReadScopeIds: workloadEvidenceReaderAssignments.outputs.signalReadScopeIds
+  signingKeyResourceId: monitoringEvidenceSeams.outputs.signingKeyResourceId
+  signingKeyArmResourceId: monitoringEvidenceSeams.outputs.signingKeyArmResourceId
+  signingKeyCryptoUserRoleDefinitionId: monitoringEvidenceSeams.outputs.signingKeyCryptoUserRoleDefinitionId
+  evidenceStorageAccountResourceId: monitoringStorage.outputs.storageAccountResourceId
+  evidenceBlobServiceResourceId: evidenceBlobServiceResourceId
+  evidenceContainerResourceId: monitoringEvidenceSeams.outputs.evidenceContainerResourceId
+  evidenceWriterRoleDefinitionId: monitoringEvidenceSeams.outputs.evidenceWriterRoleDefinitionId
+  signingKeyVaultResourceId: monitoringEvidenceSeams.outputs.keyVaultResourceId
+  networkWatcherResourceGroupId: networkWatcherResourceGroupId
+  networkWatcherResourceId: networkWatcherResourceId
+  workspaceTableResourceIds: workspaceTableResourceIds
+  maximumEvidenceAgeSeconds: maximumEvidenceAgeSeconds
+  connectionMonitorDeploymentMode: connectionMonitorCapability.outputs.deploymentMode
+}
+var monitoringRbacBootstrapHandoff = {
+  schemaVersion: 'athena.wc024MonitoringRbacBootstrapHandoff.v1'
+  sourceDeploymentName: deployment().name
+  handoffId: guid(
+    subscription().id,
+    monitoringEvidenceSeams.outputs.collectorIdentityResourceId,
+    athenaContextIdentity.id,
+    monitoringEvidenceSeams.outputs.rbacAttestorIdentityResourceId,
+    join(effectiveRbacTargetScopeIds, '|')
+  )
+  publicationState: 'blockedPendingEffectiveRbacInventory'
+  scopeCollectionMode: 'subscriptionAndDescendantAtScope'
+  managementGroupAncestorDisposition: 'notDirectlyEnumerated'
+  subscriptionId: subscription().subscriptionId
+  tenantId: tenant().tenantId
   monitoringReaderPrincipalId: monitoringEvidenceSeams.outputs.collectorIdentityPrincipalId
   athenaContextIdentityId: athenaContextIdentity.id
   athenaContextPrincipalId: athenaContextIdentity.properties.principalId
   physicalIdentitySeparationEnforced: acquisitionIdentitySeparation
-})
+  effectiveRbacTargetScopeIds: effectiveRbacTargetScopeIds
+  directoryMembershipCollection: {
+    graphApplicationId: monitoringRbacAttestor.outputs.microsoftGraphApplicationId
+    graphApplicationReadAllAppRoleId: monitoringRbacAttestor.outputs.applicationReadAllAppRoleId
+    graphApplicationReadAllAssignmentId: monitoringRbacAttestor.outputs.applicationReadAllAssignmentId
+    graphServicePrincipalId: monitoringRbacAttestor.outputs.microsoftGraphServicePrincipalId
+    requestHeaders: {
+      ConsistencyLevel: 'eventual'
+    }
+    collectorRequestPath: '/v1.0/servicePrincipals/${monitoringEvidenceSeams.outputs.collectorIdentityPrincipalId}/transitiveMemberOf/microsoft.graph.group?$count=true&$select=id'
+    athenaContextRequestPath: '/v1.0/servicePrincipals/${athenaContextIdentity.properties.principalId}/transitiveMemberOf/microsoft.graph.group?$count=true&$select=id'
+  }
+  identityProofAuthority: {
+    audience: monitoringIdentityProofAuthority.outputs.identityProofAudience
+    applicationId: monitoringIdentityProofAuthority.outputs.identityProofApplicationId
+    applicationObjectId: monitoringIdentityProofAuthority.outputs.identityProofApplicationObjectId
+    servicePrincipalId: monitoringIdentityProofAuthority.outputs.identityProofServicePrincipalId
+    appRoleId: monitoringIdentityProofAuthority.outputs.identityProofAppRoleId
+    appRoleValue: monitoringIdentityProofAuthority.outputs.identityProofAppRoleValue
+    appRoleAssignmentId: monitoringIdentityProofAuthority.outputs.identityProofAppRoleAssignmentId
+    assignedPrincipalId: monitoringIdentityProofAuthority.outputs.identityProofAssignedPrincipalId
+    requestedAccessTokenVersion: '1.0'
+  }
+  collectorContractInputs: collectorContractInputs
+}
+
+@description('Phase-one handoff. Collect effective RBAC only after these identities, roles, and exact target scopes exist, then pass the immutable reviewed handoff to publish-monitoring-contract.bicep.')
+output monitoringRbacBootstrapHandoff object = monitoringRbacBootstrapHandoff
+
+@description('Contract publication remains fail-closed until the phase-two template validates a fresh effective RBAC inventory against monitoringRbacBootstrapHandoff.')
+output monitoringAcquisitionContractPublicationReady bool = false
 
 @description('Monitoring-owned replacement storage. It is separate from the retained legacy flow-log destination.')
 output replacementMonitoringStorageAccountResourceId string = monitoringStorage.outputs.storageAccountResourceId

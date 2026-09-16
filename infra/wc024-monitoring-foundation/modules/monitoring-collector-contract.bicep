@@ -126,6 +126,30 @@ param rbacAttestorScopeId string
 @maxLength(4)
 param rbacAttestorAllowedOperations array
 
+@description('Secure single-tenant Application ID URI of the deployed identity-proof API.')
+param identityProofAudience string
+
+@description('Application client ID of the deployed identity-proof API.')
+param identityProofApplicationId string
+
+@description('Application object ID of the deployed identity-proof API.')
+param identityProofApplicationObjectId string
+
+@description('Enterprise application service-principal object ID of the identity-proof API.')
+param identityProofServicePrincipalId string
+
+@description('Application role ID that emits the monitoring proof role claim.')
+param identityProofAppRoleId string
+
+@description('Application role value that the collector token must carry.')
+param identityProofAppRoleValue string
+
+@description('Direct app-role assignment ID binding the collector managed identity.')
+param identityProofAppRoleAssignmentId string
+
+@description('Principal ID receiving the direct identity-proof app-role assignment.')
+param identityProofAssignedPrincipalId string
+
 @description('Exact Log Analytics table names permitted by the role-assignment condition.')
 @minLength(13)
 @maxLength(13)
@@ -162,7 +186,7 @@ param evidenceContainerResourceId string
 @description('Exact Storage Blob Data Contributor role definition resource ID.')
 param evidenceWriterRoleDefinitionId string
 
-@description('Externally collected, hierarchy-complete effective RBAC inventory for both identities.')
+@description('Externally collected effective RBAC inventory for both identities at the exact subscription and descendant scopes published by the phase-one handoff.')
 param effectiveRbacInventory object
 
 @description('Maximum accepted age for a signed evidence handoff.')
@@ -261,9 +285,15 @@ output acquisitionCollectorContract object = union(collectorContract, {
   rbacAttestorScopeId: rbacAttestorScopeId
   rbacAttestorAllowedOperations: rbacAttestorAllowedOperations
   rbacAttestorIdentitySeparationEnforced: true
-  identityProofAudience: 'api://athena-monitoring-identity-proof'
+  identityProofAudience: identityProofAudience
+  identityProofApplicationId: identityProofApplicationId
+  identityProofApplicationObjectId: identityProofApplicationObjectId
+  identityProofServicePrincipalId: identityProofServicePrincipalId
+  identityProofAppRoleId: identityProofAppRoleId
+  identityProofAppRoleAssignmentId: identityProofAppRoleAssignmentId
+  identityProofAssignedPrincipalId: identityProofAssignedPrincipalId
   identityProofTokenVersion: '1.0'
-  identityProofRequiredRole: 'Athena.MonitoringAcquisition.ProveIdentity'
+  identityProofRequiredRole: identityProofAppRoleValue
   identityProofMaximumLifetimeSeconds: 7200
   resourceHealthRoleDefinitionId: resourceHealthRoleDefinitionId
   resourceHealthRoleName: resourceHealthRoleName

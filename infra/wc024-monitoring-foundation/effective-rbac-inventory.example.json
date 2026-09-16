@@ -1,5 +1,5 @@
 {
-  "schemaVersion": "athena.wc028MonitoringEffectiveRbacInventory.v2",
+  "schemaVersion": "athena.wc028MonitoringEffectiveRbacInventory.v3",
   "collectionRunId": "monitoring-rbac-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "tenantId": "00000000-0000-0000-0000-000000000003",
   "subscriptionId": "00000000-0000-0000-0000-000000000000",
@@ -11,10 +11,11 @@
   "attestorTenantId": "00000000-0000-0000-0000-000000000003",
   "collectedAt": "2026-09-10T01:55:00Z",
   "expiresAt": "2026-09-10T02:10:00Z",
-  "managementGroupAncestry": [
-    "/providers/microsoft.management/managementgroups/synthetic-root"
-  ],
-  "ancestorScopeCollectionComplete": true,
+  "firstReadCompletedAt": "2026-09-10T01:54:00Z",
+  "secondReadCompletedAt": "2026-09-10T01:55:00Z",
+  "scopeCollectionMode": "subscriptionAndDescendantAtScope",
+  "managementGroupAncestry": [],
+  "ancestorScopeCollectionComplete": false,
   "subscriptionDescendantCollectionComplete": true,
   "groupMembershipCollectionComplete": true,
   "roleDefinitionCollectionComplete": true,
@@ -32,7 +33,7 @@
     "microsoft.insights/logs/vmconnection/read"
   ],
   "resourceHealthRoleActions": [
-    "microsoft.resourcehealth/availabilitystatuses/current/read"
+    "microsoft.resourcegraph/resources/read"
   ],
   "collectorSecurityGroupIds": [],
   "athenaContextSecurityGroupIds": [],
@@ -177,15 +178,33 @@
     "principalId": "11111111-1111-1111-1111-111111111111",
     "queryFilter": "atScope() and assignedTo(principalId)",
     "targetScopeIds": [
-      "/providers/microsoft.management/managementgroups/synthetic-root",
       "/subscriptions/00000000-0000-0000-0000-000000000000",
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/networkwatcherrg",
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/networkwatcherrg/providers/microsoft.network/networkwatchers/networkwatcher_australiaeast",
       "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/networkwatcherrg/providers/microsoft.network/networkwatchers/networkwatcher_australiaeast/flowlogs/athena-hackathon-vnet-rg-athena-demo-workload-flowlog",
       "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring",
       "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.insights/datacollectionendpoints/athena-hackathon-linux-dce",
       "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.insights/datacollectionrules/athena-hackathon-linux-dcr",
       "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.insights/privatelinkscopes/athena-demo-monitoring-collector-ampls",
       "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.insights/privatelinkscopes/athena-demo-monitoring-workload-ampls",
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.keyvault/vaults/athenademomonkv",
       "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.keyvault/vaults/athenademomonkv/keys/monitoring-evidence-signing",
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.operationalinsights/workspaces/athena-hackathon-law",
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.operationalinsights/workspaces/athena-hackathon-law/tables/heartbeat",
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.operationalinsights/workspaces/athena-hackathon-law/tables/insightsmetrics",
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.operationalinsights/workspaces/athena-hackathon-law/tables/ntanetanalytics",
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.operationalinsights/workspaces/athena-hackathon-law/tables/nwconnectionmonitordestinationlistenerresult",
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.operationalinsights/workspaces/athena-hackathon-law/tables/nwconnectionmonitordnsresult",
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.operationalinsights/workspaces/athena-hackathon-law/tables/nwconnectionmonitorpathresult",
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.operationalinsights/workspaces/athena-hackathon-law/tables/nwconnectionmonitortestresult",
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.operationalinsights/workspaces/athena-hackathon-law/tables/perf",
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.operationalinsights/workspaces/athena-hackathon-law/tables/syslog",
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.operationalinsights/workspaces/athena-hackathon-law/tables/vmboundport",
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.operationalinsights/workspaces/athena-hackathon-law/tables/vmcomputer",
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.operationalinsights/workspaces/athena-hackathon-law/tables/vmconnection",
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.operationalinsights/workspaces/athena-hackathon-law/tables/vmprocess",
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.storage/storageaccounts/athenademomonstore",
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.storage/storageaccounts/athenademomonstore/blobservices/default",
       "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.storage/storageaccounts/athenademomonstore/blobservices/default/containers/monitoring-evidence",
       "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload",
       "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-client-01",
@@ -220,18 +239,37 @@
       "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-web-02/providers/microsoft.insights/datacollectionruleassociations/configurationaccessendpoint",
       "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-web-03",
       "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-web-03/providers/microsoft.insights/datacollectionruleassociations/athena-linux-dcr",
-      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-web-03/providers/microsoft.insights/datacollectionruleassociations/configurationaccessendpoint"
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-web-03/providers/microsoft.insights/datacollectionruleassociations/configurationaccessendpoint",
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.network/virtualnetworks/athena-hackathon-vnet"
     ],
     "firstReadTargetDigests": [
-      "sha256:1178eb3a1f5c10241a5521f93328c73acec89fc574d457d09c7afe124962c7e5",
       "sha256:c9a76c135f7a494d40c6180fbca30bc6a138d0bdf9ae1f72ab6cba0181dd58cc",
+      "sha256:1d6114bd821e9c4d29721bc83d810d57d1aa85d3a57ccd9d7bc2bd8a6369f14b",
+      "sha256:3ce13ff586faaa1db87b2b517fd4acd11ccb3943ae3a7c8fb133fa7f363ddea3",
       "sha256:04eaa82915e5e074470bcb693d6f45b85a6b7a736395fc64f261ac77c71de327",
       "sha256:9a3f209bf05828e8e3db59557eed248a7f5e19fd2c0296ed6068db4d11ff29bf",
       "sha256:0cac2b221e16509cca6c78278008b8d5aeb1e4043207b07b4e4b8decff873ccf",
       "sha256:52d846efbfc0ade352d0cccdae0a104a31c3fb0a74cd4cdb569e18412094c84b",
       "sha256:7ad84e643dfcede4da4aa3bc3c7bd60ea506ab83b48250d8eba6647df38fdd27",
       "sha256:89c6f0fc6f2f6add2c42a51fb387311207b3f651119b3ab1d60e8196dcc50455",
+      "sha256:aa95c044c78b89dbd01e74599fc4bf859893ab31ace79274931540e89ed1c71b",
       "sha256:3d307975c97c417f53f97062026ffb848c77de396d3911b37e1db14d1c2301f7",
+      "sha256:6f81904a7ce47b245d0866614963401c94c1dce6371dccadda95f140cc09ecad",
+      "sha256:68d122453b442379de4d0ede16bd67cb826a614397f29557124f1ede61806f2b",
+      "sha256:2acb752eb8aabe699bbcc339f14b4a8add8bbc8e1e7ab812a0a82b48305c09bb",
+      "sha256:b7fac70d5fc5a6f7f22ac69e3e356e6d8d7804edd40d4282eaad52a2d90b3e39",
+      "sha256:4f815b2a3686cfb4266fbd3d1722938b9d676daee084c6a3ac543951cc04ce35",
+      "sha256:ebd9d55432f080fbb7addb4be274234abe40bb3232401dfa96a46557b37657c9",
+      "sha256:1ab1fa045430ed7953a80f3942c3261b686c172bdd03451eac7e56bb96ffc848",
+      "sha256:74daaed4c9fbddc712efebef4502bdf557a9dcaef487dea41d6c307f27774a63",
+      "sha256:f1f943e200c29a65530cb532b4f720a2e3a88b185e120a60e7c3c5f651c3e2b8",
+      "sha256:3d991b66eb809313fb17007d1e6a22ff26106926a263169890f4698106bf3db4",
+      "sha256:3970aa7f473c20247500adf4eb1a69cb41211f48237c8e19486f0e01f5eea1da",
+      "sha256:6b703def260235ced106e904f5d46c071b404467adaf33e51a30bd3c068376a9",
+      "sha256:bac55dc9e74e7d07a2f8ffc050d0bff6d5917f0ee19cd9bf2b8c6be4a58baa14",
+      "sha256:8cb0da46f85685eb08838c13919d74fc266c7113d77ebf59e2e708ab89c16afe",
+      "sha256:cf491baaba63a77f9dd4409fd2cfd92eeff0334639c5f162b5a67211088da651",
+      "sha256:b2915fb406677976d39f4afadea107453248a39f5c571db640ee002c970d3015",
       "sha256:0bf1cd658f30e48537eba8fac5aa3f90a5a109c863238a20549b1062e17b321d",
       "sha256:e46970d16e09b3bb514101b2543458c7d2eeee631611055ae6f74c12c2c329a7",
       "sha256:1dac39330c0ff91d886c0489d359912ce767aa091b84e2210b41891f217656a0",
@@ -266,18 +304,37 @@
       "sha256:6f963bd7b2cdb235fb259fce739c51f4be692db933fdff8ca5badd1a3de55546",
       "sha256:380129ac38d874ab7c28f35b04a32db256a97b1620e9b13ba89e9a0dd1061c80",
       "sha256:3ecb892d93efbf208659378f7fd908d61aacbc02d2752009875ab25cb8962212",
-      "sha256:282e752c6b6513de4e7108b0c97504e60e8162bb44bd3fe159b6626e7e147b5c"
+      "sha256:282e752c6b6513de4e7108b0c97504e60e8162bb44bd3fe159b6626e7e147b5c",
+      "sha256:1c6de474c939c3aa4bc869825dd60cf6eb572d7390bc2746da64a5c9a3c692a1"
     ],
     "secondReadTargetDigests": [
-      "sha256:1178eb3a1f5c10241a5521f93328c73acec89fc574d457d09c7afe124962c7e5",
       "sha256:c9a76c135f7a494d40c6180fbca30bc6a138d0bdf9ae1f72ab6cba0181dd58cc",
+      "sha256:1d6114bd821e9c4d29721bc83d810d57d1aa85d3a57ccd9d7bc2bd8a6369f14b",
+      "sha256:3ce13ff586faaa1db87b2b517fd4acd11ccb3943ae3a7c8fb133fa7f363ddea3",
       "sha256:04eaa82915e5e074470bcb693d6f45b85a6b7a736395fc64f261ac77c71de327",
       "sha256:9a3f209bf05828e8e3db59557eed248a7f5e19fd2c0296ed6068db4d11ff29bf",
       "sha256:0cac2b221e16509cca6c78278008b8d5aeb1e4043207b07b4e4b8decff873ccf",
       "sha256:52d846efbfc0ade352d0cccdae0a104a31c3fb0a74cd4cdb569e18412094c84b",
       "sha256:7ad84e643dfcede4da4aa3bc3c7bd60ea506ab83b48250d8eba6647df38fdd27",
       "sha256:89c6f0fc6f2f6add2c42a51fb387311207b3f651119b3ab1d60e8196dcc50455",
+      "sha256:aa95c044c78b89dbd01e74599fc4bf859893ab31ace79274931540e89ed1c71b",
       "sha256:3d307975c97c417f53f97062026ffb848c77de396d3911b37e1db14d1c2301f7",
+      "sha256:6f81904a7ce47b245d0866614963401c94c1dce6371dccadda95f140cc09ecad",
+      "sha256:68d122453b442379de4d0ede16bd67cb826a614397f29557124f1ede61806f2b",
+      "sha256:2acb752eb8aabe699bbcc339f14b4a8add8bbc8e1e7ab812a0a82b48305c09bb",
+      "sha256:b7fac70d5fc5a6f7f22ac69e3e356e6d8d7804edd40d4282eaad52a2d90b3e39",
+      "sha256:4f815b2a3686cfb4266fbd3d1722938b9d676daee084c6a3ac543951cc04ce35",
+      "sha256:ebd9d55432f080fbb7addb4be274234abe40bb3232401dfa96a46557b37657c9",
+      "sha256:1ab1fa045430ed7953a80f3942c3261b686c172bdd03451eac7e56bb96ffc848",
+      "sha256:74daaed4c9fbddc712efebef4502bdf557a9dcaef487dea41d6c307f27774a63",
+      "sha256:f1f943e200c29a65530cb532b4f720a2e3a88b185e120a60e7c3c5f651c3e2b8",
+      "sha256:3d991b66eb809313fb17007d1e6a22ff26106926a263169890f4698106bf3db4",
+      "sha256:3970aa7f473c20247500adf4eb1a69cb41211f48237c8e19486f0e01f5eea1da",
+      "sha256:6b703def260235ced106e904f5d46c071b404467adaf33e51a30bd3c068376a9",
+      "sha256:bac55dc9e74e7d07a2f8ffc050d0bff6d5917f0ee19cd9bf2b8c6be4a58baa14",
+      "sha256:8cb0da46f85685eb08838c13919d74fc266c7113d77ebf59e2e708ab89c16afe",
+      "sha256:cf491baaba63a77f9dd4409fd2cfd92eeff0334639c5f162b5a67211088da651",
+      "sha256:b2915fb406677976d39f4afadea107453248a39f5c571db640ee002c970d3015",
       "sha256:0bf1cd658f30e48537eba8fac5aa3f90a5a109c863238a20549b1062e17b321d",
       "sha256:e46970d16e09b3bb514101b2543458c7d2eeee631611055ae6f74c12c2c329a7",
       "sha256:1dac39330c0ff91d886c0489d359912ce767aa091b84e2210b41891f217656a0",
@@ -312,31 +369,56 @@
       "sha256:6f963bd7b2cdb235fb259fce739c51f4be692db933fdff8ca5badd1a3de55546",
       "sha256:380129ac38d874ab7c28f35b04a32db256a97b1620e9b13ba89e9a0dd1061c80",
       "sha256:3ecb892d93efbf208659378f7fd908d61aacbc02d2752009875ab25cb8962212",
-      "sha256:282e752c6b6513de4e7108b0c97504e60e8162bb44bd3fe159b6626e7e147b5c"
-    ],
-    "roleAssignmentRawPageDigests": [
-      "sha256:4f383eacac3efd7630af7681f04f6e3137d1c733a7b4d3b321eff10e27c264c8"
+      "sha256:282e752c6b6513de4e7108b0c97504e60e8162bb44bd3fe159b6626e7e147b5c",
+      "sha256:1c6de474c939c3aa4bc869825dd60cf6eb572d7390bc2746da64a5c9a3c692a1"
     ],
     "transitiveGroupIds": [],
-    "transitiveGroupRawPageDigests": [
+    "firstRoleAssignmentRawPageDigests": [
+      "sha256:4f383eacac3efd7630af7681f04f6e3137d1c733a7b4d3b321eff10e27c264c8"
+    ],
+    "secondRoleAssignmentRawPageDigests": [
+      "sha256:4f383eacac3efd7630af7681f04f6e3137d1c733a7b4d3b321eff10e27c264c8"
+    ],
+    "firstTransitiveGroupRawPageDigests": [
+      "sha256:8c41d5a42ef7a9e00541080bee87b59536d562bdbbd77935deaa1036adf35a01"
+    ],
+    "secondTransitiveGroupRawPageDigests": [
       "sha256:8c41d5a42ef7a9e00541080bee87b59536d562bdbbd77935deaa1036adf35a01"
     ],
     "allPagesRetrieved": true,
-    "evidenceDigest": "sha256:42a47f41d39f904414900a5acc78401186143a729bb558ebb5e91bebb62bf46f"
+    "evidenceDigest": "sha256:eb4f94a75241cc596a8d5dc025916a8a1784e0bb4b8b818fcce7722f9914230b"
   },
   "athenaContextPrincipalEvidence": {
     "principalId": "22222222-2222-2222-2222-222222222222",
     "queryFilter": "atScope() and assignedTo(principalId)",
     "targetScopeIds": [
-      "/providers/microsoft.management/managementgroups/synthetic-root",
       "/subscriptions/00000000-0000-0000-0000-000000000000",
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/networkwatcherrg",
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/networkwatcherrg/providers/microsoft.network/networkwatchers/networkwatcher_australiaeast",
       "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/networkwatcherrg/providers/microsoft.network/networkwatchers/networkwatcher_australiaeast/flowlogs/athena-hackathon-vnet-rg-athena-demo-workload-flowlog",
       "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring",
       "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.insights/datacollectionendpoints/athena-hackathon-linux-dce",
       "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.insights/datacollectionrules/athena-hackathon-linux-dcr",
       "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.insights/privatelinkscopes/athena-demo-monitoring-collector-ampls",
       "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.insights/privatelinkscopes/athena-demo-monitoring-workload-ampls",
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.keyvault/vaults/athenademomonkv",
       "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.keyvault/vaults/athenademomonkv/keys/monitoring-evidence-signing",
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.operationalinsights/workspaces/athena-hackathon-law",
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.operationalinsights/workspaces/athena-hackathon-law/tables/heartbeat",
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.operationalinsights/workspaces/athena-hackathon-law/tables/insightsmetrics",
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.operationalinsights/workspaces/athena-hackathon-law/tables/ntanetanalytics",
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.operationalinsights/workspaces/athena-hackathon-law/tables/nwconnectionmonitordestinationlistenerresult",
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.operationalinsights/workspaces/athena-hackathon-law/tables/nwconnectionmonitordnsresult",
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.operationalinsights/workspaces/athena-hackathon-law/tables/nwconnectionmonitorpathresult",
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.operationalinsights/workspaces/athena-hackathon-law/tables/nwconnectionmonitortestresult",
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.operationalinsights/workspaces/athena-hackathon-law/tables/perf",
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.operationalinsights/workspaces/athena-hackathon-law/tables/syslog",
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.operationalinsights/workspaces/athena-hackathon-law/tables/vmboundport",
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.operationalinsights/workspaces/athena-hackathon-law/tables/vmcomputer",
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.operationalinsights/workspaces/athena-hackathon-law/tables/vmconnection",
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.operationalinsights/workspaces/athena-hackathon-law/tables/vmprocess",
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.storage/storageaccounts/athenademomonstore",
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.storage/storageaccounts/athenademomonstore/blobservices/default",
       "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.storage/storageaccounts/athenademomonstore/blobservices/default/containers/monitoring-evidence",
       "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload",
       "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-client-01",
@@ -371,18 +453,37 @@
       "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-web-02/providers/microsoft.insights/datacollectionruleassociations/configurationaccessendpoint",
       "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-web-03",
       "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-web-03/providers/microsoft.insights/datacollectionruleassociations/athena-linux-dcr",
-      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-web-03/providers/microsoft.insights/datacollectionruleassociations/configurationaccessendpoint"
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-web-03/providers/microsoft.insights/datacollectionruleassociations/configurationaccessendpoint",
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.network/virtualnetworks/athena-hackathon-vnet"
     ],
     "firstReadTargetDigests": [
-      "sha256:de37f46d636348418b9533e9c7616f25d7376ba823465bd6dccf8980dfcfe9a1",
       "sha256:43d15360c4a5298485d224653afd7233a15d03ae10473cda36d84426b73cf3c2",
+      "sha256:3d58fe28985b1f8f7c77a32ab64527793f4dbc96bc2441492582b8fd06522f99",
+      "sha256:2886a6cad8c3cb96124f49d70d9f90c4b448903e4a9eaee0db1f2df0756c977b",
       "sha256:7fae5d97807072b7763575fd6f030a9169b4f423c1da1455a817cabfe1c63899",
       "sha256:4a85eb185311005551217ccc4ebc1df417472ef32ce600450e908957dc56418c",
       "sha256:de902983b8cb21f38e0a84b0097c2943d655e13457ce0b0471e340da92064104",
       "sha256:fa8be001f78627fe3e85e265cc8287d65f9472a479c97b4071f82969880c5e03",
       "sha256:388bcae084d48dad89ff45f1d24f861076afbb0eb1f57b49331a7baf91791aa1",
       "sha256:f07cd99b115c510d820ac9272c57198075e24faa319c7d9607bb4580bd301e4b",
+      "sha256:2aac45e82fc98f5d3dcb9c4c3825e0862529f6ae310ba5c08e7099dd836782f7",
       "sha256:4107ef07e09d40b38417be1944b4e72d7ddbaa4b400891204e6d6737da646671",
+      "sha256:d9bb8ba9dd6314b89125803995ed48a75850c76241ed7b9ee5a467a799f3298c",
+      "sha256:53a3225b3c7c182f18712923549904547dae5ecd41c5d142f2da5c43f2455818",
+      "sha256:b1aa155b24075db6d4dde6f38c2d11c85bd08cefaf6ef73065fa414c9f286168",
+      "sha256:d05fdd30dfd4cc647c1026f8cbe2668dddeee0db9967324ac9eb843a2a5f568d",
+      "sha256:2d9eeb00e84d7709fdb369a2cad126b36a8bb232c1a304cde7a4e0c27b880701",
+      "sha256:8edfdf9b34a6afec61d02119a327096665949935c98dab0f5b25b5408a9f50f0",
+      "sha256:74966a9e267dd4a54ee6e1d8e9709e9b0ffdcef7ea69bcac7fdb1eaac44e7d5f",
+      "sha256:a91d3a71d089f9b99dbeb027197740993202d52f31f2bdbe6dfc7e733ba7d615",
+      "sha256:05d6c87d54df130b3d1b509646e6121ca386958bd3083a0d81a57a8f9a19ac67",
+      "sha256:8bc4d35cd39199ba9ef980ba7598c1f4a3000e5e661e21f6432bb8c9030a64f4",
+      "sha256:541a29f6c76495dbf3df4fb605a597e52825d33354def8b59697c2bcd187d69c",
+      "sha256:a871848c590411f324032305883eeaf71ccea8e9eebc09d229f77546a63ba256",
+      "sha256:51301bb7b6b5a84db061368337111963afc63814c933d0f17cb6093ab0ab3269",
+      "sha256:324c6818c3fc081958c5e8267529d2c6c613c95c821fffad233c67f5af5232bf",
+      "sha256:77a92e563d054537a62cb760ea69bc445cd40ee8ce59d718a817cbd0c1dd069e",
+      "sha256:7b14ac324bc9539402a8d80a452efd3c946c238db76cbf5c30cda2cf94ed2c3a",
       "sha256:e3d6e15bfbcb4f008d8174ab66ee29685ff95c8ea8e2fdd8bd6bd5809b3fb74d",
       "sha256:7644e49efe1cf7ef7e2483d06fd4de0ee8e48acf9de043243819d436b41860e2",
       "sha256:9971829ef81fd8af96180568f10d68d5c0e01359bc6aba0a62c5d6daa12059ff",
@@ -417,18 +518,37 @@
       "sha256:e4f07f10ec14a1b784abab4935f7ee4c1344ad0d5cd2654ae7d1a493fa0cd59c",
       "sha256:a03300c85a5d68777e3e7842a60c3f267a2d2c6067d1f8115007e57e602ce5d3",
       "sha256:837a687130420779c06b9953676d08d2c719b8950b10863987651533e7523bb4",
-      "sha256:30bb8c7f885d02045b59b4f6e92b0cb20a1779d6dd091ccf5449fff8d64b742b"
+      "sha256:30bb8c7f885d02045b59b4f6e92b0cb20a1779d6dd091ccf5449fff8d64b742b",
+      "sha256:034ca250a4ad04aa4a27fd3135d6849b2061d56411fde8f6900f97a6cdc92a55"
     ],
     "secondReadTargetDigests": [
-      "sha256:de37f46d636348418b9533e9c7616f25d7376ba823465bd6dccf8980dfcfe9a1",
       "sha256:43d15360c4a5298485d224653afd7233a15d03ae10473cda36d84426b73cf3c2",
+      "sha256:3d58fe28985b1f8f7c77a32ab64527793f4dbc96bc2441492582b8fd06522f99",
+      "sha256:2886a6cad8c3cb96124f49d70d9f90c4b448903e4a9eaee0db1f2df0756c977b",
       "sha256:7fae5d97807072b7763575fd6f030a9169b4f423c1da1455a817cabfe1c63899",
       "sha256:4a85eb185311005551217ccc4ebc1df417472ef32ce600450e908957dc56418c",
       "sha256:de902983b8cb21f38e0a84b0097c2943d655e13457ce0b0471e340da92064104",
       "sha256:fa8be001f78627fe3e85e265cc8287d65f9472a479c97b4071f82969880c5e03",
       "sha256:388bcae084d48dad89ff45f1d24f861076afbb0eb1f57b49331a7baf91791aa1",
       "sha256:f07cd99b115c510d820ac9272c57198075e24faa319c7d9607bb4580bd301e4b",
+      "sha256:2aac45e82fc98f5d3dcb9c4c3825e0862529f6ae310ba5c08e7099dd836782f7",
       "sha256:4107ef07e09d40b38417be1944b4e72d7ddbaa4b400891204e6d6737da646671",
+      "sha256:d9bb8ba9dd6314b89125803995ed48a75850c76241ed7b9ee5a467a799f3298c",
+      "sha256:53a3225b3c7c182f18712923549904547dae5ecd41c5d142f2da5c43f2455818",
+      "sha256:b1aa155b24075db6d4dde6f38c2d11c85bd08cefaf6ef73065fa414c9f286168",
+      "sha256:d05fdd30dfd4cc647c1026f8cbe2668dddeee0db9967324ac9eb843a2a5f568d",
+      "sha256:2d9eeb00e84d7709fdb369a2cad126b36a8bb232c1a304cde7a4e0c27b880701",
+      "sha256:8edfdf9b34a6afec61d02119a327096665949935c98dab0f5b25b5408a9f50f0",
+      "sha256:74966a9e267dd4a54ee6e1d8e9709e9b0ffdcef7ea69bcac7fdb1eaac44e7d5f",
+      "sha256:a91d3a71d089f9b99dbeb027197740993202d52f31f2bdbe6dfc7e733ba7d615",
+      "sha256:05d6c87d54df130b3d1b509646e6121ca386958bd3083a0d81a57a8f9a19ac67",
+      "sha256:8bc4d35cd39199ba9ef980ba7598c1f4a3000e5e661e21f6432bb8c9030a64f4",
+      "sha256:541a29f6c76495dbf3df4fb605a597e52825d33354def8b59697c2bcd187d69c",
+      "sha256:a871848c590411f324032305883eeaf71ccea8e9eebc09d229f77546a63ba256",
+      "sha256:51301bb7b6b5a84db061368337111963afc63814c933d0f17cb6093ab0ab3269",
+      "sha256:324c6818c3fc081958c5e8267529d2c6c613c95c821fffad233c67f5af5232bf",
+      "sha256:77a92e563d054537a62cb760ea69bc445cd40ee8ce59d718a817cbd0c1dd069e",
+      "sha256:7b14ac324bc9539402a8d80a452efd3c946c238db76cbf5c30cda2cf94ed2c3a",
       "sha256:e3d6e15bfbcb4f008d8174ab66ee29685ff95c8ea8e2fdd8bd6bd5809b3fb74d",
       "sha256:7644e49efe1cf7ef7e2483d06fd4de0ee8e48acf9de043243819d436b41860e2",
       "sha256:9971829ef81fd8af96180568f10d68d5c0e01359bc6aba0a62c5d6daa12059ff",
@@ -463,17 +583,24 @@
       "sha256:e4f07f10ec14a1b784abab4935f7ee4c1344ad0d5cd2654ae7d1a493fa0cd59c",
       "sha256:a03300c85a5d68777e3e7842a60c3f267a2d2c6067d1f8115007e57e602ce5d3",
       "sha256:837a687130420779c06b9953676d08d2c719b8950b10863987651533e7523bb4",
-      "sha256:30bb8c7f885d02045b59b4f6e92b0cb20a1779d6dd091ccf5449fff8d64b742b"
-    ],
-    "roleAssignmentRawPageDigests": [
-      "sha256:69b6e27a8929fe94e802ab8f77ecf3552396365262b9b806ee6d7d458a112064"
+      "sha256:30bb8c7f885d02045b59b4f6e92b0cb20a1779d6dd091ccf5449fff8d64b742b",
+      "sha256:034ca250a4ad04aa4a27fd3135d6849b2061d56411fde8f6900f97a6cdc92a55"
     ],
     "transitiveGroupIds": [],
-    "transitiveGroupRawPageDigests": [
+    "firstRoleAssignmentRawPageDigests": [
+      "sha256:69b6e27a8929fe94e802ab8f77ecf3552396365262b9b806ee6d7d458a112064"
+    ],
+    "secondRoleAssignmentRawPageDigests": [
+      "sha256:69b6e27a8929fe94e802ab8f77ecf3552396365262b9b806ee6d7d458a112064"
+    ],
+    "firstTransitiveGroupRawPageDigests": [
+      "sha256:43c5c2b431ea59aef001805586dfedbddae1e20178b748d94897ba1cf9dca9ff"
+    ],
+    "secondTransitiveGroupRawPageDigests": [
       "sha256:43c5c2b431ea59aef001805586dfedbddae1e20178b748d94897ba1cf9dca9ff"
     ],
     "allPagesRetrieved": true,
-    "evidenceDigest": "sha256:8b23e89c4aaad2bc4e13dedc14f7c952634b8154ec5e09b93c69eba43bbf3231"
+    "evidenceDigest": "sha256:2f952e5f505c5f76cb4ca3a2b3c3a231040127c54f59fdba91e3fb2e0bf9e20a"
   },
   "roleDefinitions": [
     {
@@ -545,13 +672,13 @@
       "roleDefinitionId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.authorization/roledefinitions/0790d6f2-9553-5b63-84ac-56596b7e4072",
       "roleDefinitionName": "Athena WC-028 VM Resource Health Reader",
       "actions": [
-        "microsoft.resourcehealth/availabilitystatuses/current/read"
+        "microsoft.resourcegraph/resources/read"
       ],
       "notActions": [],
       "dataActions": [],
       "notDataActions": [],
-      "rawDefinitionDigest": "sha256:bf23385a01d36b7001daccaf9e6bbe497fc57e13aef396bc30cf07ec05b6290f",
-      "definitionDigest": "sha256:e04001a4468090f6e9af13222c5c24d69a83bdf4c6c1996801d96f3a846d33c6"
+      "rawDefinitionDigest": "sha256:40dd176fa85cb0ae0643f959a825d2a3ccbdfb8cd564ace494ccbdf53132eda9",
+      "definitionDigest": "sha256:42ad1f83832281859fc1cb60373da391d2eb60d15240425483cc9558476607c7"
     },
     {
       "roleDefinitionId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.authorization/roledefinitions/f33a4363-5d9a-5d50-9871-c08582234978",
@@ -572,17 +699,26 @@
   ],
   "denyAssignments": [],
   "activePimScheduleInstances": [],
-  "roleDefinitionRawPageDigests": [
-    "sha256:025ad387028001ba38399b836f2392b59047491c46df67b942361b74d56acb45"
+  "firstRoleDefinitionRawPageDigests": [
+    "sha256:ce7065bf598f146d67c27c7be1cb8ff0d7e51e4ff2c274ad008f506a1eaee570"
   ],
-  "denyAssignmentRawPageDigests": [
+  "secondRoleDefinitionRawPageDigests": [
+    "sha256:ce7065bf598f146d67c27c7be1cb8ff0d7e51e4ff2c274ad008f506a1eaee570"
+  ],
+  "firstDenyAssignmentRawPageDigests": [
     "sha256:0594ae3648fdbbec62d39aba86a3ba20a849f088b70e92f13c367da9ee9bc95c"
   ],
-  "pimScheduleInstanceRawPageDigests": [
+  "secondDenyAssignmentRawPageDigests": [
+    "sha256:0594ae3648fdbbec62d39aba86a3ba20a849f088b70e92f13c367da9ee9bc95c"
+  ],
+  "firstPimScheduleInstanceRawPageDigests": [
     "sha256:8959f9366f36fe82895ee188994b77fe18ec6cf00b06532747ed2462fb817320"
   ],
-  "firstRawSnapshotDigest": "sha256:02fa3793a08ae8a28bdf29d2a19b7ccb93673c96e1a537963d71e17740694dd7",
-  "secondRawSnapshotDigest": "sha256:02fa3793a08ae8a28bdf29d2a19b7ccb93673c96e1a537963d71e17740694dd7",
+  "secondPimScheduleInstanceRawPageDigests": [
+    "sha256:8959f9366f36fe82895ee188994b77fe18ec6cf00b06532747ed2462fb817320"
+  ],
+  "firstRawSnapshotDigest": "sha256:0dfadb83663d0910b74c12b4050d72720da1e8c607142893abadb1d5e4c8f8d5",
+  "secondRawSnapshotDigest": "sha256:0dfadb83663d0910b74c12b4050d72720da1e8c607142893abadb1d5e4c8f8d5",
   "repeatedReadStable": true,
   "assignmentCount": 62,
   "sourceReference": {
@@ -591,5 +727,5 @@
     "contentDigest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
   },
   "sourceManifestDigest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-  "inventoryDigest": "sha256:460032818e434fcd8de7d9f066a767f1c8e36e0810044ccc85a7b7122fe3ec25"
+  "inventoryDigest": "sha256:b36423449627e57f32d7dd0b023cb5bdbbdca6baabb750583963a55bbeaee7f6"
 }

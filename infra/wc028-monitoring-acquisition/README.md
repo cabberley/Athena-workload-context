@@ -80,9 +80,10 @@ collector effective-RBAC inventory window into every acquisition execution, and 
 time immediately before and after every Azure source call. Receipt verification proves every
 logical exchange, every nested wire-attempt request/completion, and the collector execution
 completion remained inside the signed inventory lifetime and effective minimum freshness bound.
-Each actual HTTP request—including per-resource Activity Log/Resource Health calls and ARM polling—
-consumes the reviewed call budget and contributes exact request/response digests to the signed
-receipt. The adapter creates every Azure source client from the same verified
+Each actual HTTP request—including per-resource Activity Log calls, the bounded Resource Graph
+HealthResources query, and ARM polling—consumes the reviewed call budget and contributes exact
+request/response digests to the signed receipt. The adapter creates every Azure source client from
+the same verified
 `ManagedIdentityCredential`, binds resource-context Log Analytics request v3 and permission evidence
 to the authority-selected VM scope, and persists the selected incident in acquisition receipt v5
 and correlation request v4.
@@ -94,9 +95,15 @@ IP Flow calls and no IP Flow RBAC.
 > **Provisional stack boundary:** the published collector contract v8 currently required by this
 > draft still encodes `Storage Blob Data Contributor` and `blobs/write`. It cannot truthfully
 > describe the narrow role below after cleanup. Do not deploy this draft until PR #99 publishes the
-> corresponding conditioned read-plus-add collector contract, bootstrap, and effective-RBAC
-> revision and this branch is restacked on that head. Runtime startup also fails closed explicitly
-> on the currently published contract schema.
+> corresponding conditioned read-plus-add collector contract/bootstrap and effective-RBAC
+> revision, a reviewed storage-protection contract, and the collector-signed persistence replay
+> binding. PR #99 must also replace its current subscription-descendant-only inventory with
+> ancestor-complete evidence that can detect inherited management-group or tenant-root grants.
+> This branch must then be restacked on that exact head. Runtime startup also fails closed explicitly
+> on the currently published contract schema. The Bicep
+> `pr99RuntimeDependenciesReady` parameter is constrained to `false`; its deployment-time failure
+> is referenced by every RBAC module and the Container Apps Job, so this draft cannot grant roles or
+> create a runnable Job.
 
 ## Upgrade cleanup gate
 
@@ -116,9 +123,10 @@ runtime-support effective-RBAC inventories only after cleanup. The Job is
 manual with no replica retry, so every execution requires a newly reviewed configuration, cleanup
 evidence binding, execution ID, and replay key.
 
-## Least privilege
+## Planned least privilege
 
-The deployment adds only:
+After the PR #99 dependency gate is replaced during the final restack, the deployment is designed to
+add only:
 
 - `AcrPull` for the runtime-support identity on the existing registry;
 - public-key read access for the runtime-support identity on the exact monitoring-intent signing
@@ -133,13 +141,15 @@ module name and the Job environment. The module computes an ARM `guid()` binding
 resource IDs and protection values and requires it to equal the binding embedded in the same parsed
 runtime configuration. A mismatched versioning, public-access, policy-state, retention,
 protected-append, binding-ID, or readiness-digest claim prevents role assignment and Job deployment.
-Runtime recomputes the SHA-256 readiness digest and revalidates the same protection contract before
-any durable writer call.
+Runtime recomputes the SHA-256 readiness digest and requires a fresh storage-readiness verifier to
+return the exact same validated contract immediately before any durable writer call. This draft
+deliberately wires a verifier that fails closed because current PR #99 has not yet published the
+required storage contract or narrow runtime read authorization.
 
 It adds no built-in Reader, Contributor, Owner, Blob overwrite/delete/list, diagnostic-setting,
 alert-rule, or Connection Monitor mutation permission. Existing WC-024 grants continue to
-authorize the collector's exact VM resource-context Logs and Resource Health reads, measured RBAC
-attestation, and signing-key use.
+authorize the collector's exact VM resource-context Logs and Resource Graph HealthResources reads,
+measured RBAC attestation, and signing-key use.
 
 ## Local validation
 

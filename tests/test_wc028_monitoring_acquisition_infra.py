@@ -224,6 +224,12 @@ def test_storage_readiness_gates_writer_rbac_and_job_on_exact_wc024_readback() -
     assert (
         "expectedReadbackBindingId: string(validatedConfiguredStorageReadiness.readbackBindingId)"
     ) in main
+    assert "param pr99RuntimeDependenciesReady bool = false" in main
+    assert (
+        "WC-028 deployment remains blocked pending the complete reviewed PR #99 "
+        "storage, replay, and ancestor-RBAC contract"
+    ) in main
+    assert main.count("validatedPr99RuntimeDependencyGate == 'ready'") == 3
 
 
 def test_upgrade_cleanup_targets_only_exact_legacy_collector_bindings() -> None:

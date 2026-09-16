@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import timedelta
 
 import pytest
-from azure.core.exceptions import ResourceNotFoundError
+from azure.core.exceptions import ResourceNotFoundError, ServiceResponseError
 from pydantic import ValidationError
 
 from athena_context.contracts import (
@@ -31,6 +31,7 @@ from athena_context.enrichment import (
     AzureTableIncidentFeedRegistry,
     IncidentFeedRegistryCapacityError,
     IncidentFeedRegistryConflictError,
+    IncidentFeedRegistryError,
     IncidentFeedRegistryIncompleteError,
     IncidentFeedRegistryRecord,
     build_incident_feed_registry_record,
@@ -236,6 +237,66 @@ def _record(
         entry,
         pointer,
         attestation,
+    )
+
+
+def _record_with_distinct_pointer_for_same_authority(
+    index: int,
+    *,
+    lifecycle: str,
+    updated_at,
+) -> tuple[IncidentFeedRegistryRecord, CurrentIncidentStateSnapshot]:
+    entry, pointer, _attestation, authority = _pointer_bundle(
+        index,
+        lifecycle=lifecycle,
+        updated_at=updated_at,
+    )
+    occurrence = authority.occurrence
+    assert occurrence is not None
+    replacement_pointer = build_incident_enrichment_feed_pointer(
+        occurrence,
+        pointer.enrichment_asset,
+        authority.state,
+        published_at=pointer.published_at + timedelta(milliseconds=1),
+    )
+    replacement_attestation = IncidentEnrichmentFeedPointerAttestation(
+        schemaVersion=("athena.wc027IncidentEnrichmentFeedPointerAttestation.v2"),
+        pointerId=replacement_pointer.pointer_id,
+        pointerDigest=replacement_pointer.pointer_digest,
+        signatureAlgorithm="RS256",
+        keyVaultKeyId=_KEY_ID,
+        signedPreimageDigest=sha256_hex(replacement_pointer.canonical_bytes()),
+        detachedSignature=_SIGNATURE,
+    )
+    replacement_entry = IncidentFeedEntryV2(
+        incidentId=entry.incident_id,
+        lifecycle=entry.lifecycle,
+        stateResultDigest=entry.state_result_digest,
+        updatedAt=entry.updated_at,
+        feedPointerReference=entry.feed_pointer_reference.model_copy(
+            update={
+                "content_digest": sha256_hex(
+                    replacement_pointer.canonical_bytes()
+                )
+            }
+        ),
+        feedPointerAttestationReference=(
+            entry.feed_pointer_attestation_reference.model_copy(
+                update={
+                    "content_digest": sha256_hex(
+                        replacement_attestation.canonical_bytes()
+                    )
+                }
+            )
+        ),
+    )
+    return (
+        build_incident_feed_registry_record(
+            replacement_entry,
+            replacement_pointer,
+            replacement_attestation,
+        ),
+        authority,
     )
 
 
@@ -616,6 +677,7 @@ class _Table:
         self.delete_count = 0
         self.transaction_count = 0
         self.before_submit = None
+        self.before_update = None
         self._next_etag = 1
 
     def _etag(self) -> str:
@@ -655,7 +717,14 @@ class _Table:
         assert mode is not None
         assert match_condition is not None
         row_key = str(entity["RowKey"])
-        assert self.entities[row_key].metadata["etag"] == etag
+        if self.before_update is not None:
+            callback = self.before_update
+            self.before_update = None
+            callback()
+        if self.entities[row_key].metadata["etag"] != etag:
+            from azure.core.exceptions import ResourceModifiedError
+
+            raise ResourceModifiedError("synthetic stale update")
         self.update_count += 1
         self.entities[row_key] = _Entity(
             entity,
@@ -726,11 +795,33 @@ class _Table:
         return tuple(self.entities.values())
 
 
-def _azure_registry(table: _Table) -> AzureTableIncidentFeedRegistry:
+@dataclass
+class _AuthorityReader:
+    current: dict[str, CurrentIncidentStateSnapshot]
+
+    def read_current_incident_state(self, *, incident_id: str):
+        return self.current.get(incident_id)
+
+
+def _azure_registry(
+    table: _Table,
+    authority_reader: _AuthorityReader | None = None,
+) -> AzureTableIncidentFeedRegistry:
     registry = object.__new__(AzureTableIncidentFeedRegistry)
     registry._table = table
     registry._partition_key = "feed-v2"
+    registry._current_incident_reader = authority_reader or _AuthorityReader({})
     return registry
+
+
+def _put(
+    registry: AzureTableIncidentFeedRegistry,
+    record: IncidentFeedRegistryRecord,
+    *,
+    authority: CurrentIncidentStateSnapshot,
+) -> None:
+    registry._current_incident_reader.current[record.entry.incident_id] = authority
+    registry.put(record, authority=authority)
 
 
 def test_azure_registry_is_idempotent_and_rejects_stale_updates() -> None:
@@ -743,18 +834,188 @@ def test_azure_registry_is_idempotent_and_rejects_stale_updates() -> None:
         updated_at=NOW + timedelta(minutes=1),
     )
 
-    registry.put(active)
-    registry.put(active)
-    registry.put(resolved)
+    active_authority = _authority(1, lifecycle="active")
+    resolved_authority = _authority(
+        1,
+        lifecycle="resolved",
+        updated_at=resolved.entry.updated_at,
+    )
+    _put(registry, active, authority=active_authority)
+    _put(registry, active, authority=active_authority)
+    _put(registry, resolved, authority=resolved_authority)
 
     assert registry.list_records(as_of=NOW) == (resolved,)
     assert table.update_count == 1
     assert table.transaction_count == 1
     with pytest.raises(
         IncidentFeedRegistryConflictError,
-        match="stale",
+        match="authoritative current occurrence",
     ):
-        registry.put(active)
+        _put(registry, active, authority=resolved_authority)
+
+
+@pytest.mark.parametrize(
+    "resolved_updated_at",
+    [
+        NOW,
+        NOW - timedelta(minutes=1),
+    ],
+)
+def test_azure_registry_replaces_by_current_authority_when_updated_at_does_not_advance(
+    resolved_updated_at,
+) -> None:
+    table = _Table()
+    registry = _azure_registry(table)
+    active = _record(1, lifecycle="active", updated_at=NOW)
+    resolved = _record(
+        1,
+        lifecycle="resolved",
+        updated_at=resolved_updated_at,
+    )
+
+    _put(
+        registry,
+        active,
+        authority=_authority(1, lifecycle="active", updated_at=NOW),
+    )
+    _put(
+        registry,
+        resolved,
+        authority=_authority(
+            1,
+            lifecycle="resolved",
+            updated_at=resolved_updated_at,
+        ),
+    )
+
+    assert registry.list_records(as_of=NOW) == (resolved,)
+    assert table.update_count == 1
+    projection = project_incident_feed_registry(
+        registry.list_records(as_of=NOW),
+        source_active_index=_active_index(()),
+        source_current_incidents={
+            resolved.entry.incident_id: _authority(
+                1,
+                lifecycle="resolved",
+                updated_at=resolved_updated_at,
+            )
+        },
+        as_of=NOW,
+        trusted_feed_key_id=_KEY_ID,
+        feed_signature_verifier=_verify,
+    )
+    assert projection.active == ()
+    assert projection.recently_resolved == (resolved.entry,)
+
+
+def test_azure_registry_rejects_conflicting_record_for_same_current_authority() -> None:
+    table = _Table()
+    registry = _azure_registry(table)
+    record = _record(1, lifecycle="active", updated_at=NOW)
+    conflicting, authority = _record_with_distinct_pointer_for_same_authority(
+        1,
+        lifecycle="active",
+        updated_at=NOW,
+    )
+
+    _put(registry, record, authority=authority)
+
+    with pytest.raises(
+        IncidentFeedRegistryConflictError,
+        match="same current authority",
+    ):
+        _put(registry, conflicting, authority=authority)
+
+    assert registry.list_records(as_of=NOW) == (record,)
+    assert table.update_count == 0
+
+
+def test_azure_registry_rejects_stale_caller_authority_after_successor() -> None:
+    table = _Table()
+    authority_reader = _AuthorityReader({})
+    registry = _azure_registry(table, authority_reader)
+    active = _record(1, lifecycle="active", updated_at=NOW)
+    resolved = _record(
+        1,
+        lifecycle="resolved",
+        updated_at=NOW - timedelta(minutes=1),
+    )
+    active_authority = _authority(1, lifecycle="active", updated_at=NOW)
+    resolved_authority = _authority(
+        1,
+        lifecycle="resolved",
+        updated_at=NOW - timedelta(minutes=1),
+    )
+    _put(registry, active, authority=active_authority)
+    _put(registry, resolved, authority=resolved_authority)
+
+    with pytest.raises(
+        IncidentFeedRegistryConflictError,
+        match="authoritative current occurrence",
+    ):
+        registry.put(active, authority=active_authority)
+
+    assert registry.list_records(as_of=NOW) == (resolved,)
+
+
+def test_azure_registry_rejects_concurrent_successor_cas() -> None:
+    table = _Table()
+    authority_reader = _AuthorityReader({})
+    first = _azure_registry(table, authority_reader)
+    second = _azure_registry(table, authority_reader)
+    active = _record(1, lifecycle="active", updated_at=NOW)
+    resolved = _record(1, lifecycle="resolved", updated_at=NOW)
+    active_authority = _authority(1, lifecycle="active", updated_at=NOW)
+    resolved_authority = _authority(
+        1,
+        lifecycle="resolved",
+        updated_at=NOW,
+    )
+    _put(first, active, authority=active_authority)
+
+    table.before_update = lambda: _put(
+        second,
+        resolved,
+        authority=resolved_authority,
+    )
+    with pytest.raises(
+        IncidentFeedRegistryConflictError,
+        match="conditional write",
+    ):
+        _put(
+            first,
+            resolved,
+            authority=resolved_authority,
+        )
+
+    assert first.list_records(as_of=NOW) == (resolved,)
+
+
+def test_azure_registry_surfaces_uncertain_response_as_domain_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    table = _Table()
+    registry = _azure_registry(table)
+    active = _record(1, lifecycle="active")
+    submit = table.submit_transaction
+
+    def submit_then_lose_response(operations) -> None:
+        submit(operations)
+        raise ServiceResponseError("synthetic response loss")
+
+    monkeypatch.setattr(table, "submit_transaction", submit_then_lose_response)
+
+    with pytest.raises(
+        IncidentFeedRegistryError,
+        match="outcome is uncertain",
+    ):
+        _put(
+            registry,
+            active,
+            authority=_authority(1, lifecycle="active"),
+        )
+
+    assert registry.list_records(as_of=NOW) == (active,)
 
 
 def test_azure_registry_prunes_expired_rows() -> None:
@@ -802,7 +1063,11 @@ def test_azure_registry_rejects_corrupt_entity_metadata() -> None:
     table = _Table()
     registry = _azure_registry(table)
     record = _record(1, lifecycle="active")
-    registry.put(record)
+    _put(
+        registry,
+        record,
+        authority=_authority(1, lifecycle="active"),
+    )
     table.entities[record.entry.incident_id]["recordDigest"] = "sha256:" + "f" * 64
 
     with pytest.raises(RuntimeError, match="metadata"):
@@ -818,16 +1083,32 @@ def test_azure_registry_reserves_capacity_atomically(
         2,
     )
     table = _Table()
-    first = _azure_registry(table)
-    second = _azure_registry(table)
-    first.put(_record(1, lifecycle="active"))
+    authority_reader = _AuthorityReader({})
+    first = _azure_registry(table, authority_reader)
+    second = _azure_registry(table, authority_reader)
+    first_record = _record(1, lifecycle="active")
+    _put(
+        first,
+        first_record,
+        authority=_authority(1, lifecycle="active"),
+    )
 
-    table.before_submit = lambda: second.put(_record(2, lifecycle="active"))
+    second_record = _record(2, lifecycle="active")
+    table.before_submit = lambda: _put(
+        second,
+        second_record,
+        authority=_authority(2, lifecycle="active"),
+    )
+    third_record = _record(3, lifecycle="active")
     with pytest.raises(
         IncidentFeedRegistryConflictError,
         match="conditional write",
     ):
-        first.put(_record(3, lifecycle="active"))
+        _put(
+            first,
+            third_record,
+            authority=_authority(3, lifecycle="active"),
+        )
 
     assert first.list_records(as_of=NOW) == (
         _record(1, lifecycle="active"),
@@ -838,4 +1119,8 @@ def test_azure_registry_reserves_capacity_atomically(
         IncidentFeedRegistryCapacityError,
         match="cannot accept",
     ):
-        first.put(_record(3, lifecycle="active"))
+        _put(
+            first,
+            third_record,
+            authority=_authority(3, lifecycle="active"),
+        )

@@ -17,9 +17,7 @@ AMPLS_BOOTSTRAP_SCRIPT = (WC024_ROOT / "bootstrap-ampls.ps1").read_text(encoding
 DATA_PLATFORM = (WC024_ROOT / "modules" / "monitoring-data-platform.bicep").read_text(
     encoding="utf-8"
 )
-STORAGE = (WC024_ROOT / "modules" / "monitoring-flow-log-storage.bicep").read_text(
-    encoding="utf-8"
-)
+STORAGE = (WC024_ROOT / "modules" / "monitoring-flow-log-storage.bicep").read_text(encoding="utf-8")
 EVIDENCE_SEAMS = (WC024_ROOT / "modules" / "monitoring-evidence-seams.bicep").read_text(
     encoding="utf-8"
 )
@@ -35,12 +33,13 @@ WORKLOAD_READER_RBAC = (
 NETWORK_WATCHER_READER_RBAC = (
     WC024_ROOT / "modules" / "network-watcher-monitoring-evidence-reader-rbac.bicep"
 ).read_text(encoding="utf-8")
-RBAC_ATTESTOR = (
-    WC024_ROOT / "modules" / "monitoring-rbac-attestor.bicep"
-).read_text(encoding="utf-8")
-DCR_ASSOCIATIONS = (WC024_ROOT / "modules" / "dcr-associations.bicep").read_text(
+RBAC_ATTESTOR = (WC024_ROOT / "modules" / "monitoring-rbac-attestor.bicep").read_text(
     encoding="utf-8"
 )
+IDENTITY_PROOF_AUTHORITY = (
+    WC024_ROOT / "modules" / "monitoring-identity-proof-authority.bicep"
+).read_text(encoding="utf-8")
+DCR_ASSOCIATIONS = (WC024_ROOT / "modules" / "dcr-associations.bicep").read_text(encoding="utf-8")
 DCR_ASSOCIATION_VALIDATION = (
     WC024_ROOT / "modules" / "dcr-association-validation.bicep"
 ).read_text(encoding="utf-8")
@@ -48,40 +47,33 @@ PRIVATE_RUNTIME_TOPOLOGY_VALIDATION = (
     WC024_ROOT / "modules" / "private-runtime-topology-validation.bicep"
 ).read_text(encoding="utf-8")
 FLOW_LOG = (WC024_ROOT / "modules" / "vnet-flow-log.bicep").read_text(encoding="utf-8")
-FLOW_LOG_VALIDATION = (
-    WC024_ROOT / "modules" / "canonical-flow-log-validation.bicep"
-).read_text(encoding="utf-8")
-PRIVATE_ACCESS_SCRIPT = (WC024_ROOT / "set-private-access.ps1").read_text(
+FLOW_LOG_VALIDATION = (WC024_ROOT / "modules" / "canonical-flow-log-validation.bicep").read_text(
     encoding="utf-8"
 )
-PRIVATE_DNS_VNET_LINKS = (
-    WC024_ROOT / "modules" / "private-dns-vnet-links.bicep"
-).read_text(encoding="utf-8")
-PRIVATE_DNS_ZONES = (WC024_ROOT / "modules" / "private-dns-zones.bicep").read_text(
+PRIVATE_ACCESS_SCRIPT = (WC024_ROOT / "set-private-access.ps1").read_text(encoding="utf-8")
+PRIVATE_DNS_VNET_LINKS = (WC024_ROOT / "modules" / "private-dns-vnet-links.bicep").read_text(
     encoding="utf-8"
 )
+PRIVATE_DNS_ZONES = (WC024_ROOT / "modules" / "private-dns-zones.bicep").read_text(encoding="utf-8")
 COLLECTOR_KEY_VAULT_DNS = (
     WC024_ROOT / "modules" / "collector-key-vault-private-dns.bicep"
 ).read_text(encoding="utf-8")
-LEGACY_FLOW_LOG_MIGRATION = (
-    WC024_ROOT / "modules" / "legacy-flow-log-migration.bicep"
-).read_text(encoding="utf-8")
-CONNECTION_MONITOR = (
-    WC024_ROOT / "modules" / "connection-monitor-capability.bicep"
-).read_text(encoding="utf-8")
-COLLECTOR_CONTRACT = (
-    WC024_ROOT / "modules" / "monitoring-collector-contract.bicep"
-).read_text(encoding="utf-8")
+LEGACY_FLOW_LOG_MIGRATION = (WC024_ROOT / "modules" / "legacy-flow-log-migration.bicep").read_text(
+    encoding="utf-8"
+)
+CONNECTION_MONITOR = (WC024_ROOT / "modules" / "connection-monitor-capability.bicep").read_text(
+    encoding="utf-8"
+)
+COLLECTOR_CONTRACT = (WC024_ROOT / "modules" / "monitoring-collector-contract.bicep").read_text(
+    encoding="utf-8"
+)
+PUBLISH_CONTRACT = (WC024_ROOT / "publish-monitoring-contract.bicep").read_text(encoding="utf-8")
 ADR = (ROOT / "docs" / "adr" / "0020-wc024-generic-monitoring-foundation.md").read_text(
     encoding="utf-8"
 )
-CONNECTIVITY_MAIN = (WC024_CONNECTIVITY_ROOT / "main.bicep").read_text(
-    encoding="utf-8"
-)
+CONNECTIVITY_MAIN = (WC024_CONNECTIVITY_ROOT / "main.bicep").read_text(encoding="utf-8")
 CONNECTIVITY_HUB = (
-    WC024_CONNECTIVITY_ROOT
-    / "modules"
-    / "monitoring-collector-network.bicep"
+    WC024_CONNECTIVITY_ROOT / "modules" / "monitoring-collector-network.bicep"
 ).read_text(encoding="utf-8")
 
 
@@ -89,8 +81,7 @@ def test_wc024_adr_uses_unique_sequential_number_after_wc021_wc022_merges() -> N
     assert (ROOT / "docs" / "adr" / "0020-wc024-generic-monitoring-foundation.md").is_file()
     assert not (ROOT / "docs" / "adr" / "0018-wc024-generic-monitoring-foundation.md").exists()
     assert ADR.startswith(
-        "# ADR 0020: Isolate generic monitoring evidence from context and "
-        "presentation runtimes"
+        "# ADR 0020: Isolate generic monitoring evidence from context and presentation runtimes"
     )
 
 
@@ -123,8 +114,7 @@ def test_wc024_adopts_existing_law_dce_dcr_and_associations_without_duplicates()
     assert "param dataCollectionRuleName string = 'athena-hackathon-linux-dcr'" in MAIN
     assert "param dataCollectionRuleAssociationName string = 'athena-linux-dcr'" in MAIN
     assert (
-        "param dataCollectionEndpointAssociationName string = "
-        "'configurationAccessEndpoint'" in MAIN
+        "param dataCollectionEndpointAssociationName string = 'configurationAccessEndpoint'" in MAIN
     )
     assert (
         "resource workspace 'Microsoft.OperationalInsights/workspaces@2025-02-01' existing"
@@ -144,12 +134,10 @@ def test_wc024_adopts_existing_law_dce_dcr_and_associations_without_duplicates()
     assert "Custom-AthenaJson" in DATA_PLATFORM
     assert "Custom-AthenaApp_CL" in DATA_PLATFORM
     assert "@minLength(11)\n@maxLength(11)\nparam approvedVmNames array" in MAIN
-    assert "@minLength(11)\n@maxLength(11)\nparam approvedVmNames array" in (
-        DCR_ASSOCIATIONS
-    )
-    dcr_declaration = DATA_PLATFORM.split(
-        "resource dataCollectionRule ", maxsplit=1
-    )[1].split("\n}", maxsplit=1)[0]
+    assert "@minLength(11)\n@maxLength(11)\nparam approvedVmNames array" in (DCR_ASSOCIATIONS)
+    dcr_declaration = DATA_PLATFORM.split("resource dataCollectionRule ", maxsplit=1)[1].split(
+        "\n}", maxsplit=1
+    )[0]
     assert "existing = {" in dcr_declaration
     assert "tags:" not in dcr_declaration
     assert "Microsoft.Compute/virtualMachines/extensions" not in DCR_ASSOCIATIONS
@@ -176,8 +164,7 @@ def test_wc024_adopts_existing_law_dce_dcr_and_associations_without_duplicates()
     )
     assert (
         "resource configurationAccessEndpointAssociation "
-        "'Microsoft.Insights/dataCollectionRuleAssociations@2024-03-11'"
-        in DCR_ASSOCIATIONS
+        "'Microsoft.Insights/dataCollectionRuleAssociations@2024-03-11'" in DCR_ASSOCIATIONS
     )
     assert "output dataCollectionEndpointAssociationResourceIds array" in DCR_ASSOCIATIONS
     assert "validate-adopted-dcr-associations" in MAIN
@@ -189,13 +176,10 @@ def test_wc024_adopts_existing_law_dce_dcr_and_associations_without_duplicates()
     )
     assert (
         "output dataCollectionEndpointAssociationResourceIds array = "
-        "dcrAssociations.outputs.dataCollectionEndpointAssociationResourceIds"
-        in MAIN
+        "dcrAssociations.outputs.dataCollectionEndpointAssociationResourceIds" in MAIN
     )
     assert "map(approvedVmNames, vmName => toLower(string(vmName)))" in DCR_ASSOCIATIONS
-    assert "var uniqueApprovedVmNames = union(normalizedApprovedVmNames, [])" in (
-        DCR_ASSOCIATIONS
-    )
+    assert "var uniqueApprovedVmNames = union(normalizedApprovedVmNames, [])" in (DCR_ASSOCIATIONS)
     assert "fail('WC-024 requires exactly 11 distinct approved VM names" in DCR_ASSOCIATIONS
     assert "for vmName in validatedApprovedVmNames" in DCR_ASSOCIATIONS
     assert "for (vmName, index) in validatedApprovedVmNames" in DCR_ASSOCIATIONS
@@ -223,16 +207,15 @@ def test_wc024_validates_preserved_dcr_associations_before_dce_association_puts(
     assert "validatedDcrAssociationIds[index]" in DCR_ASSOCIATIONS
     assert "prerequisite adopted DCR association validation" in DCR_ASSOCIATIONS
     assert "module dcrAssociationValidation 'modules/dcr-association-validation.bicep'" in MAIN
-    dcr_associations_declaration = MAIN.split(
-        "module dcrAssociations", maxsplit=1
-    )[1].split("module workloadPrivateDnsZones", maxsplit=1)[0]
+    dcr_associations_declaration = MAIN.split("module dcrAssociations", maxsplit=1)[1].split(
+        "module workloadPrivateDnsZones", maxsplit=1
+    )[0]
     assert "dependsOn: [" in dcr_associations_declaration
     assert "dcrAssociationValidation" in dcr_associations_declaration
     assert (
         "validatedDataCollectionRuleAssociationResourceIds: "
         "dcrAssociationValidation.outputs."
-        "validatedAdoptedDataCollectionRuleAssociationResourceIds"
-        in dcr_associations_declaration
+        "validatedAdoptedDataCollectionRuleAssociationResourceIds" in dcr_associations_declaration
     )
     assert (
         "dataCollectionRuleResourceId: "
@@ -250,9 +233,12 @@ def test_wc024_private_networking_and_storage_lifecycle_are_enforced() -> None:
     assert "collectorKeyVaultPrivateDnsZoneResourceId" in PRIVATE_ENDPOINTS
     assert "@minLength(4)" in PRIVATE_ENDPOINTS
     assert PRIVATE_DNS_ZONES.count("Microsoft.Network/privateDnsZones@2024-06-01") == 5
-    assert PRIVATE_DNS_VNET_LINKS.count(
-        "Microsoft.Network/privateDnsZones/virtualNetworkLinks@2024-06-01"
-    ) == 5
+    assert (
+        PRIVATE_DNS_VNET_LINKS.count(
+            "Microsoft.Network/privateDnsZones/virtualNetworkLinks@2024-06-01"
+        )
+        == 5
+    )
     assert "privatelink.vaultcore.azure.net" not in PRIVATE_DNS_ZONES
     assert "privatelink.vaultcore.azure.net" in COLLECTOR_KEY_VAULT_DNS
     assert "accessBoundary: 'collector-only'" in COLLECTOR_KEY_VAULT_DNS
@@ -295,9 +281,9 @@ def test_wc024_private_networking_and_storage_lifecycle_are_enforced() -> None:
     assert "param monitoringEvidenceContainerResourceId string" in EVIDENCE_SEAMS
     assert "validatedMonitoringEvidenceContainerResourceId" in EVIDENCE_SEAMS
     assert "guid(validatedMonitoringEvidenceContainerResourceId" in EVIDENCE_SEAMS
-    evidence_seams_declaration = MAIN.split("module monitoringEvidenceSeams", maxsplit=1)[
-        1
-    ].split("module monitoringPrivateEndpoints", maxsplit=1)[0]
+    evidence_seams_declaration = MAIN.split("module monitoringEvidenceSeams", maxsplit=1)[1].split(
+        "module monitoringPrivateEndpoints", maxsplit=1
+    )[0]
     assert "dependsOn: [" in evidence_seams_declaration
     assert "monitoringStorage" in evidence_seams_declaration
     assert (
@@ -316,16 +302,12 @@ def test_wc024_standardizes_vnet_flow_log_and_traffic_analytics() -> None:
     assert "trafficAnalyticsInterval: 10" in FLOW_LOG
     assert "workspaceResourceId: workspaceResourceId" in FLOW_LOG
     assert (
-        "param flowLogName string = "
-        "'athena-hackathon-vnet-rg-athena-demo-workload-flowlog'" in MAIN
+        "param flowLogName string = 'athena-hackathon-vnet-rg-athena-demo-workload-flowlog'" in MAIN
     )
     assert "name: flowLogName" in FLOW_LOG
     assert "athenahackathonflowwhtco" in MAIN
     assert "retainedLegacyFlowLogStorageAccountName" in MAIN
-    assert (
-        "@allowed([\n  'athena-hackathon-vnet-rg-athena-demo-workload-flowlog'\n])"
-        in MAIN
-    )
+    assert "@allowed([\n  'athena-hackathon-vnet-rg-athena-demo-workload-flowlog'\n])" in MAIN
     assert "resource existingFlowLog" in FLOW_LOG_VALIDATION
     assert "existingFlowLog.properties.targetResourceId" in FLOW_LOG_VALIDATION
     assert "refuses to update the canonical flow log" in FLOW_LOG_VALIDATION
@@ -352,9 +334,7 @@ def test_wc024_disables_redundant_legacy_flow_logs_only_after_canonical_cutover(
     assert "existing target and storage account match the reviewed allowlist" in (
         LEGACY_FLOW_LOG_MIGRATION
     )
-    assert "toLower(canonicalVnetFlowLogName)" in (
-        LEGACY_FLOW_LOG_MIGRATION
-    )
+    assert "toLower(canonicalVnetFlowLogName)" in (LEGACY_FLOW_LOG_MIGRATION)
     assert "canonicalVnetFlowLogCutoverConfirmed" in LEGACY_FLOW_LOG_MIGRATION
     assert "a6add389-9978-47ac-ab1e-a09212e321d4" in LEGACY_FLOW_LOG_MIGRATION
     assert "validatedMigrationSubscriptionId" in LEGACY_FLOW_LOG_MIGRATION
@@ -399,13 +379,11 @@ def test_wc024_disables_adopted_public_access_only_after_private_readiness() -> 
     assert "privateLinkScopeDeploymentPhase" not in DATA_PLATFORM
     assert (
         "resource workloadPrivateLinkScope "
-        "'Microsoft.Insights/privateLinkScopes@2021-09-01' existing"
-        in DATA_PLATFORM
+        "'Microsoft.Insights/privateLinkScopes@2021-09-01' existing" in DATA_PLATFORM
     )
     assert (
         "resource collectorPrivateLinkScope "
-        "'Microsoft.Insights/privateLinkScopes@2021-09-01' existing"
-        in DATA_PLATFORM
+        "'Microsoft.Insights/privateLinkScopes@2021-09-01' existing" in DATA_PLATFORM
     )
     assert "resource privateLinkScope" in AMPLS_BOOTSTRAP
     assert "queryAccessMode: 'Open'" in AMPLS_BOOTSTRAP
@@ -452,17 +430,10 @@ def test_wc024_disables_adopted_public_access_only_after_private_readiness() -> 
     assert "$updatedTags -ne $expectedTags" in PRIVATE_ACCESS_SCRIPT
     assert "$updatedExclusions -ne $expectedExclusions" in PRIVATE_ACCESS_SCRIPT
     assert "scopedResources?api-version=2021-09-01" in PRIVATE_ACCESS_SCRIPT
-    assert "privateEndpointConnections?api-version=2021-09-01" in (
-        PRIVATE_ACCESS_SCRIPT
-    )
+    assert "privateEndpointConnections?api-version=2021-09-01" in (PRIVATE_ACCESS_SCRIPT)
     assert "does not contain the exact reviewed LAW and DCE" in PRIVATE_ACCESS_SCRIPT
-    assert "does not contain the exact approved private endpoint" in (
-        PRIVATE_ACCESS_SCRIPT
-    )
-    assert (
-        "[ValidateSet('a6add389-9978-47ac-ab1e-a09212e321d4')]"
-        in PRIVATE_ACCESS_SCRIPT
-    )
+    assert "does not contain the exact approved private endpoint" in (PRIVATE_ACCESS_SCRIPT)
+    assert "[ValidateSet('a6add389-9978-47ac-ab1e-a09212e321d4')]" in PRIVATE_ACCESS_SCRIPT
     assert "athena-demo-monitoring-workload-ampls" in PRIVATE_ACCESS_SCRIPT
     assert "athena-demo-monitoring-collector-ampls" in PRIVATE_ACCESS_SCRIPT
     assert "Private access verification failed" in PRIVATE_ACCESS_SCRIPT
@@ -471,8 +442,7 @@ def test_wc024_disables_adopted_public_access_only_after_private_readiness() -> 
 def test_wc024_serializes_ampls_links_to_shared_law_and_dce() -> None:
     assert (
         "resource workloadDcePrivateLinkScope "
-        "'Microsoft.Insights/privateLinkScopes/scopedResources@2021-09-01' = {"
-        in DATA_PLATFORM
+        "'Microsoft.Insights/privateLinkScopes/scopedResources@2021-09-01' = {" in DATA_PLATFORM
     )
     assert "dependsOn: [\n    workloadWorkspacePrivateLinkScope\n  ]" in DATA_PLATFORM
     assert "dependsOn: [\n    workloadDcePrivateLinkScope\n  ]" in DATA_PLATFORM
@@ -523,27 +493,23 @@ def test_wc024_populates_private_dns_before_workload_vnet_links() -> None:
         < MAIN.index("module workloadPrivateDnsVnetLinks")
         < MAIN.index("module collectorKeyVaultPrivateDnsLink")
     )
-    private_endpoints_declaration = MAIN.split(
-        "module monitoringPrivateEndpoints", maxsplit=1
-    )[1].split("module workloadPrivateDnsVnetLinks", maxsplit=1)[0]
-    private_dns_zones_declaration = MAIN.split(
-        "module workloadPrivateDnsZones", maxsplit=1
-    )[1].split("module monitoringStorage", maxsplit=1)[0]
-    vnet_links_declaration = MAIN.split(
-        "module workloadPrivateDnsVnetLinks", maxsplit=1
-    )[1].split("module monitoringEvidenceReaderAssignments", maxsplit=1)[0]
+    private_endpoints_declaration = MAIN.split("module monitoringPrivateEndpoints", maxsplit=1)[
+        1
+    ].split("module workloadPrivateDnsVnetLinks", maxsplit=1)[0]
+    private_dns_zones_declaration = MAIN.split("module workloadPrivateDnsZones", maxsplit=1)[
+        1
+    ].split("module monitoringStorage", maxsplit=1)[0]
+    vnet_links_declaration = MAIN.split("module workloadPrivateDnsVnetLinks", maxsplit=1)[1].split(
+        "module monitoringEvidenceReaderAssignments", maxsplit=1
+    )[0]
     assert "dependsOn: [\n    dcrAssociations\n  ]" in private_endpoints_declaration
     assert "dependsOn: [\n    dcrAssociations\n  ]" in private_dns_zones_declaration
-    assert "dependsOn: [\n    monitoringPrivateEndpoints\n  ]" in (
-        vnet_links_declaration
-    )
+    assert "dependsOn: [\n    monitoringPrivateEndpoints\n  ]" in (vnet_links_declaration)
     key_vault_link_declaration = MAIN.split(
         "module collectorKeyVaultPrivateDnsLink",
         maxsplit=1,
     )[1].split("module monitoringEvidenceReaderAssignments", maxsplit=1)[0]
-    assert "dependsOn: [\n    monitoringPrivateEndpoints\n  ]" in (
-        key_vault_link_declaration
-    )
+    assert "dependsOn: [\n    monitoringPrivateEndpoints\n  ]" in (key_vault_link_declaration)
 
 
 def test_wc024_requires_private_collector_runtime_topology_and_dns_links() -> None:
@@ -560,9 +526,7 @@ def test_wc024_requires_private_collector_runtime_topology_and_dns_links() -> No
     assert "workloadPrivateEndpointSubnetBelongsToWorkloadVnet" in (
         PRIVATE_RUNTIME_TOPOLOGY_VALIDATION
     )
-    assert "collectorRuntimeSubnetBelongsToCollectorVnet" in (
-        PRIVATE_RUNTIME_TOPOLOGY_VALIDATION
-    )
+    assert "collectorRuntimeSubnetBelongsToCollectorVnet" in (PRIVATE_RUNTIME_TOPOLOGY_VALIDATION)
     assert "collectorPrivateEndpointSubnetBelongsToCollectorVnet" in (
         PRIVATE_RUNTIME_TOPOLOGY_VALIDATION
     )
@@ -571,13 +535,11 @@ def test_wc024_requires_private_collector_runtime_topology_and_dns_links() -> No
     assert "module privateRuntimeTopologyValidation" in MAIN
     assert (
         "workloadPrivateEndpointSubnetResourceId: "
-        "privateRuntimeTopologyValidation.outputs.workloadPrivateEndpointSubnetResourceId"
-        in MAIN
+        "privateRuntimeTopologyValidation.outputs.workloadPrivateEndpointSubnetResourceId" in MAIN
     )
     assert "collectorRuntimeVirtualNetworkResourceId:" in MAIN
     assert (
-        "privateRuntimeTopologyValidation.outputs.collectorRuntimeVirtualNetworkResourceId"
-        in MAIN
+        "privateRuntimeTopologyValidation.outputs.collectorRuntimeVirtualNetworkResourceId" in MAIN
     )
     assert "module workloadPrivateDnsVnetLinks" in MAIN
     assert "module collectorPrivateDnsVnetLinks" in MAIN
@@ -628,15 +590,9 @@ def test_wc024_rbac_is_collector_only_and_narrow() -> None:
         assert f"  '{table}'" in READER_RBAC
     assert "StringEquals \\'${tableName}\\'" in READER_RBAC
     assert "AzureNetworkAnalytics_CL" not in READER_RBAC
-    assert "Microsoft.OperationalInsights/workspaces/tables/data/read" in (
-        COLLECTOR_CONTRACT
-    )
-    assert "Microsoft.Compute/virtualMachines/instanceView/read" in (
-        COLLECTOR_CONTRACT
-    )
-    assert "Microsoft.Network/networkWatchers/connectionMonitors/read" not in (
-        COLLECTOR_CONTRACT
-    )
+    assert "Microsoft.OperationalInsights/workspaces/tables/data/read" in (COLLECTOR_CONTRACT)
+    assert "Microsoft.Compute/virtualMachines/instanceView/read" in (COLLECTOR_CONTRACT)
+    assert "Microsoft.Network/networkWatchers/connectionMonitors/read" not in (COLLECTOR_CONTRACT)
     assert "AzureNetworkAnalytics_CL" not in COLLECTOR_CONTRACT
     assert "scope: workspace" not in READER_RBAC
     assert "resource collectorWorkspaceDataReader" not in READER_RBAC
@@ -659,21 +615,18 @@ def test_wc024_rbac_is_collector_only_and_narrow() -> None:
         "resource collectorVmSignalReaders",
         maxsplit=1,
     )[1].split("resource collectorDcrAssociationReaders", maxsplit=1)[0]
-    assert "roleDefinitionId: validatedSignalReaderRoleDefinitionId" in (
-        vm_signal_assignment
-    )
+    assert "roleDefinitionId: validatedSignalReaderRoleDefinitionId" in (vm_signal_assignment)
     assert "roleDefinitionId: readerRoleDefinitionId" not in vm_signal_assignment
     resource_health_assignment = WORKLOAD_READER_RBAC.split(
         "resource collectorVmResourceHealthReaders",
         maxsplit=1,
     )[1].split("resource collectorDcrAssociationReaders", maxsplit=1)[0]
     assert "scope: approvedVms[index]" in resource_health_assignment
-    assert "roleDefinitionId: resourceHealthRoleDefinition.id" in (
-        resource_health_assignment
-    )
+    assert "roleDefinitionId: resourceHealthRoleDefinition.id" in (resource_health_assignment)
     assert "roleDefinitionId: readerRoleDefinitionId" not in resource_health_assignment
     assert "0790d6f2-9553-5b63-84ac-56596b7e4072" in WORKLOAD_READER_RBAC
-    assert "Microsoft.ResourceHealth/AvailabilityStatuses/current/read" in (
+    assert "Microsoft.ResourceGraph/resources/read" in WORKLOAD_READER_RBAC
+    assert "Microsoft.ResourceHealth/AvailabilityStatuses/current/read" not in (
         WORKLOAD_READER_RBAC
     )
     assert "resourceHealthAllowedOperations" in WORKLOAD_READER_RBAC
@@ -689,10 +642,7 @@ def test_wc024_rbac_is_collector_only_and_narrow() -> None:
     ):
         assert operation in WORKLOAD_READER_RBAC
     assert "Microsoft.Insights/logs/NTANetAnalytics/read" not in WORKLOAD_READER_RBAC
-    assert (
-        "Microsoft.Insights/logs/NWConnectionMonitorTestResult/read"
-        not in WORKLOAD_READER_RBAC
-    )
+    assert "Microsoft.Insights/logs/NWConnectionMonitorTestResult/read" not in WORKLOAD_READER_RBAC
     assert "Microsoft.Insights/logs/*/read" not in WORKLOAD_READER_RBAC
     assert "f33a4363-5d9a-5d50-9871-c08582234978" in WORKLOAD_READER_RBAC
     resource_log_assignment = WORKLOAD_READER_RBAC.split(
@@ -700,9 +650,7 @@ def test_wc024_rbac_is_collector_only_and_narrow() -> None:
         maxsplit=1,
     )[1].split("resource collectorVmResourceHealthReaders", maxsplit=1)[0]
     assert "scope: approvedVms[index]" in resource_log_assignment
-    assert "roleDefinitionId: resourceLogReaderRoleDefinition.id" in (
-        resource_log_assignment
-    )
+    assert "roleDefinitionId: resourceLogReaderRoleDefinition.id" in (resource_log_assignment)
     assert "scope: resourceGroup()" not in resource_log_assignment
     assert "signalReaderAssignableScopes" in WORKLOAD_READER_RBAC
     assert "length(signalReaderRoleDefinition.properties.permissions) == 1" in (
@@ -729,12 +677,21 @@ def test_wc024_rbac_is_collector_only_and_narrow() -> None:
     assert "dataActions: []" in RBAC_ATTESTOR
     assert "notActions: []" in RBAC_ATTESTOR
     assert "scope: subscription()" in RBAC_ATTESTOR
-    combined_rbac = (
-        READER_RBAC
-        + WORKLOAD_READER_RBAC
-        + NETWORK_WATCHER_READER_RBAC
-        + RBAC_ATTESTOR
+    assert "extension microsoftGraphV1" in RBAC_ATTESTOR
+    assert "Microsoft.Graph/appRoleAssignedTo@v1.0" in RBAC_ATTESTOR
+    assert "00000003-0000-0000-c000-000000000000" in RBAC_ATTESTOR
+    assert "9a5d68dd-52b0-4cc2-bd40-abcf44ac3a30" in RBAC_ATTESTOR
+    assert "Microsoft.Graph/applications@v1.0" in IDENTITY_PROOF_AUTHORITY
+    assert "Microsoft.Graph/servicePrincipals@v1.0" in IDENTITY_PROOF_AUTHORITY
+    assert "Microsoft.Graph/appRoleAssignedTo@v1.0" in IDENTITY_PROOF_AUTHORITY
+    assert "requestedAccessTokenVersion: 1" in IDENTITY_PROOF_AUTHORITY
+    assert "name: 'idtyp'" in IDENTITY_PROOF_AUTHORITY
+    assert "essential: true" in IDENTITY_PROOF_AUTHORITY
+    assert "api://${toLower(tenantId)}/athena-monitoring-identity-proof" in (
+        IDENTITY_PROOF_AUTHORITY
     )
+    assert "principalId: collectorPrincipalId" in IDENTITY_PROOF_AUTHORITY
+    combined_rbac = READER_RBAC + WORKLOAD_READER_RBAC + NETWORK_WATCHER_READER_RBAC + RBAC_ATTESTOR
     assert "Owner" not in combined_rbac
     assert "Contributor" not in combined_rbac
     assert "collectorPrincipalId" in combined_rbac
@@ -787,21 +744,14 @@ def test_wc024_collector_contract_is_signed_handoff_ready_and_generic_only() -> 
     assert "isolatedSignedCollector" in COLLECTOR_CONTRACT
     assert "capabilityOnly" in COLLECTOR_CONTRACT
     assert "authorizationMode: authorizationMode" in COLLECTOR_CONTRACT
-    assert "workspaceAccessControlMode: workspaceAccessControlMode" in (
-        COLLECTOR_CONTRACT
-    )
+    assert "workspaceAccessControlMode: workspaceAccessControlMode" in (COLLECTOR_CONTRACT)
     assert "readerRoleDefinitionId: readerRoleDefinitionId" in COLLECTOR_CONTRACT
-    assert "signalReaderRoleDefinitionId: signalReaderRoleDefinitionId" in (
-        COLLECTOR_CONTRACT
-    )
+    assert "signalReaderRoleDefinitionId: signalReaderRoleDefinitionId" in (COLLECTOR_CONTRACT)
     assert (
-        "logAnalyticsDataReaderRoleDefinitionId: "
-        "logAnalyticsDataReaderRoleDefinitionId"
+        "logAnalyticsDataReaderRoleDefinitionId: logAnalyticsDataReaderRoleDefinitionId"
     ) in COLLECTOR_CONTRACT
     assert "logAnalyticsAllowedTables: logAnalyticsAllowedTables" in COLLECTOR_CONTRACT
-    assert "logAnalyticsAccessCondition: logAnalyticsAccessCondition" in (
-        COLLECTOR_CONTRACT
-    )
+    assert "logAnalyticsAccessCondition: logAnalyticsAccessCondition" in (COLLECTOR_CONTRACT)
     assert "resourceReadScopeIds: resourceReadScopeIds" in COLLECTOR_CONTRACT
     assert "signalReadScopeIds: signalReadScopeIds" in COLLECTOR_CONTRACT
     assert "athena.wc028MonitoringCollectorContract.v8" in COLLECTOR_CONTRACT
@@ -809,11 +759,59 @@ def test_wc024_collector_contract_is_signed_handoff_ready_and_generic_only() -> 
     assert "validatedAcquisitionWorkspaceAccessControlMode" in COLLECTOR_CONTRACT
     assert "resource-context Log Analytics mode" in COLLECTOR_CONTRACT
     assert "effectiveRbacInventory: effectiveRbacInventory" in COLLECTOR_CONTRACT
-    assert "monitoringEffectiveRbacInventory" in MAIN
-    assert "validatedMonitoringEffectiveRbacInventory" in MAIN
-    assert "loadJsonContent('effective-rbac-inventory.example.json')" in (
-        (WC024_ROOT / "main.example.bicepparam").read_text(encoding="utf-8")
+    assert "param monitoringEffectiveRbacInventory" not in MAIN
+    assert "athena.wc024MonitoringRbacBootstrapHandoff.v1" in MAIN
+    assert "blockedPendingEffectiveRbacInventory" in MAIN
+    assert "subscriptionAndDescendantAtScope" in MAIN
+    assert "managementGroupAncestorDisposition: 'notDirectlyEnumerated'" in MAIN
+    assert "output monitoringRbacBootstrapHandoff object" in MAIN
+    assert "sourceDeploymentName: deployment().name" in MAIN
+    assert "directoryMembershipCollection:" in MAIN
+    assert (
+        "module monitoringIdentityProofAuthority "
+        "'modules/monitoring-identity-proof-authority.bicep'" in MAIN
     )
+    assert "identityProofAuthority:" in MAIN
+    assert "graphApplicationReadAllAssignmentId" in MAIN
+    assert "ConsistencyLevel: 'eventual'" in MAIN
+    assert "$count=true&$select=id" in MAIN
+    assert "workspaceTableResourceIds" in MAIN
+    assert "evidenceBlobServiceResourceId" in MAIN
+    assert "networkWatcherResourceGroupId" in MAIN
+    assert "networkWatcherResourceId" in MAIN
+    assert "signingKeyVaultResourceId" in MAIN
+    assert "param monitoringEffectiveRbacInventory object" in PUBLISH_CONTRACT
+    assert "param monitoringRbacBootstrapDeploymentName string" in PUBLISH_CONTRACT
+    assert "param reviewedMonitoringEffectiveRbacInventoryDigest string" in PUBLISH_CONTRACT
+    assert "validatedReviewedInventoryDigest" in PUBLISH_CONTRACT
+    assert "Microsoft.Resources/deployments@2025-04-01" in PUBLISH_CONTRACT
+    assert "monitoringRbacBootstrapDeployment.properties.outputs" in PUBLISH_CONTRACT
+    assert "athena.wc024MonitoringContractPublicationHandoff.v1" in PUBLISH_CONTRACT
+    assert "athena.wc028MonitoringEffectiveRbacInventory.v3" in PUBLISH_CONTRACT
+    assert "expectedHandoffId = guid(" in PUBLISH_CONTRACT
+    assert "handoff.handoffId == expectedHandoffId" in PUBLISH_CONTRACT
+    assert "handoffTargetsAreUnique" in PUBLISH_CONTRACT
+    assert "collectorTargetsAreUnique" in PUBLISH_CONTRACT
+    assert "contextTargetsAreUnique" in PUBLISH_CONTRACT
+    assert "module publicationClock 'modules/deployment-timestamp.bicep'" in PUBLISH_CONTRACT
+    assert "publicationClock.outputs.deploymentTimestamp" in PUBLISH_CONTRACT
+    assert "inventoryIsFresh" in PUBLISH_CONTRACT
+    assert "independentReadTimesAreValid" in PUBLISH_CONTRACT
+    assert "globalRepeatedReadPagesAreStable" in PUBLISH_CONTRACT
+    assert "principalEvidenceIsComplete" in PUBLISH_CONTRACT
+    assert "collectorGrantsMatch" in PUBLISH_CONTRACT
+    assert "missingOrDuplicateExpectedCollectorGrants" in PUBLISH_CONTRACT
+    assert "roleDefinitionSetMatches" in PUBLISH_CONTRACT
+    assert "collectorEffectivePrincipalIds" in PUBLISH_CONTRACT
+    assert "effectiveDenyAssignments" in PUBLISH_CONTRACT
+    assert "denyAssignmentsAreSafe" in PUBLISH_CONTRACT
+    assert "empty(inventory.denyAssignments)" not in PUBLISH_CONTRACT
+    assert "inventory.inventoryDigest == validatedReviewedInventoryDigest" in (PUBLISH_CONTRACT)
+    assert "identityProofAuthorityMatches" in PUBLISH_CONTRACT
+    assert "expectedIdentityProofAudience" in PUBLISH_CONTRACT
+    assert "management-group enumeration claims are forbidden" in PUBLISH_CONTRACT
+    assert "module collectorContract" in PUBLISH_CONTRACT
+    assert "monitoringEffectiveRbacInventory" not in PARAMETERS
     assert "ipFlowVerifyRoleDefinitionId" not in COLLECTOR_CONTRACT
     assert "ipFlowVerifyScopeId" not in COLLECTOR_CONTRACT
     assert "ipFlowVerifyAllowedOperations" not in COLLECTOR_CONTRACT
@@ -827,40 +825,42 @@ def test_wc024_collector_contract_is_signed_handoff_ready_and_generic_only() -> 
     assert "rbacAttestorRoleDefinitionId" in COLLECTOR_CONTRACT
     assert "rbacAttestorAllowedOperations" in COLLECTOR_CONTRACT
     assert "collectorTenantId: collectorTenantId" in COLLECTOR_CONTRACT
-    assert "identityProofAudience: 'api://athena-monitoring-identity-proof'" in (
+    assert "identityProofAudience: identityProofAudience" in COLLECTOR_CONTRACT
+    assert "identityProofApplicationId: identityProofApplicationId" in COLLECTOR_CONTRACT
+    assert "identityProofApplicationObjectId: identityProofApplicationObjectId" in (
+        COLLECTOR_CONTRACT
+    )
+    assert "identityProofServicePrincipalId: identityProofServicePrincipalId" in (
+        COLLECTOR_CONTRACT
+    )
+    assert "identityProofAppRoleId: identityProofAppRoleId" in COLLECTOR_CONTRACT
+    assert "identityProofAppRoleAssignmentId: identityProofAppRoleAssignmentId" in (
+        COLLECTOR_CONTRACT
+    )
+    assert "identityProofAssignedPrincipalId: identityProofAssignedPrincipalId" in (
         COLLECTOR_CONTRACT
     )
     assert "identityProofTokenVersion: '1.0'" in COLLECTOR_CONTRACT
-    assert (
-        "identityProofRequiredRole: 'Athena.MonitoringAcquisition.ProveIdentity'"
-        in COLLECTOR_CONTRACT
-    )
+    assert "identityProofRequiredRole: identityProofAppRoleValue" in COLLECTOR_CONTRACT
     assert "identityProofMaximumLifetimeSeconds: 7200" in COLLECTOR_CONTRACT
-    assert "resourceHealthRoleDefinitionId: resourceHealthRoleDefinitionId" in (
-        COLLECTOR_CONTRACT
-    )
+    assert "resourceHealthRoleDefinitionId: resourceHealthRoleDefinitionId" in (COLLECTOR_CONTRACT)
     assert "resourceHealthScopeIds: resourceHealthScopeIds" in COLLECTOR_CONTRACT
     assert "resourceHealthAllowedOperations: resourceHealthAllowedOperations" in (
         COLLECTOR_CONTRACT
     )
     assert "workspaceResourceContextAccessEnabled" in DATA_PLATFORM
     assert "resourceContextTablePlans" in DATA_PLATFORM
-    assert "plan: resourceContextTables[index].properties.plan == 'Analytics'" in (
-        DATA_PLATFORM
-    )
+    assert "plan: resourceContextTables[index].properties.plan == 'Analytics'" in (DATA_PLATFORM)
     assert "'workspaceAndResourceContext'" in MAIN
     assert "'workspaceOnly'" in MAIN
-    assert "Microsoft.Network/networkWatchers/connectionMonitors/read" not in (
-        COLLECTOR_CONTRACT
-    )
+    assert "Microsoft.Network/networkWatchers/connectionMonitors/read" not in (COLLECTOR_CONTRACT)
     assert "workloadVirtualNetworkResourceId: workloadVirtualNetworkResourceId" in (
         COLLECTOR_CONTRACT
     )
     assert "approvedVmNames: approvedVmNames" in COLLECTOR_CONTRACT
     assert "signingKeyResourceId: signingKeyResourceId" in COLLECTOR_CONTRACT
     assert (
-        "evidenceStorageAccountResourceId: evidenceStorageAccountResourceId"
-        in COLLECTOR_CONTRACT
+        "evidenceStorageAccountResourceId: evidenceStorageAccountResourceId" in COLLECTOR_CONTRACT
     )
     assert "evidenceContainerName: 'monitoring-evidence'" in COLLECTOR_CONTRACT
     assert "connectionMonitorDeploymentMode: validatedConnectionMonitorDeploymentMode" in (
@@ -882,9 +882,7 @@ def test_wc024_collector_contract_is_signed_handoff_ready_and_generic_only() -> 
 
 
 def test_wc024_connection_monitor_is_capability_only() -> None:
-    all_bicep = "\n".join(
-        path.read_text(encoding="utf-8") for path in WC024_ROOT.rglob("*.bicep")
-    )
+    all_bicep = "\n".join(path.read_text(encoding="utf-8") for path in WC024_ROOT.rglob("*.bicep"))
 
     assert "connectionMonitorDeploymentEnabled" in CONNECTION_MONITOR
     assert "capability-only" in CONNECTION_MONITOR
@@ -931,11 +929,7 @@ def test_wc024_records_and_preserves_the_live_telemetry_cutover_baseline() -> No
         "NTANetAnalytics",
     ):
         assert signal in ADR
-        assert (
-            signal in COLLECTOR_CONTRACT
-            or signal in DATA_PLATFORM
-            or signal in READER_RBAC
-        )
+        assert signal in COLLECTOR_CONTRACT or signal in DATA_PLATFORM or signal in READER_RBAC
     assert "All 11 workload VMs had successful" in ADR
     assert "configurationAccessEndpoint" in ADR
     assert "DCR association is read without being rewritten" in ADR
@@ -990,9 +984,7 @@ def _without_bicep_generator_metadata(value: object) -> object:
 
 
 def _template_without_bicep_generator(path: Path) -> object:
-    return _without_bicep_generator_metadata(
-        json.loads(path.read_text(encoding="utf-8"))
-    )
+    return _without_bicep_generator_metadata(json.loads(path.read_text(encoding="utf-8")))
 
 
 def test_wc024_generator_metadata_normalization_is_recursive_and_only_metadata() -> None:
@@ -1013,9 +1005,7 @@ def test_wc024_generator_metadata_normalization_is_recursive_and_only_metadata()
 
     assert _without_bicep_generator_metadata(payload) == {
         "metadata": {"owner": "athena"},
-        "resources": [
-            {"properties": {"template": {"metadata": {}, "semantic": "retained"}}}
-        ],
+        "resources": [{"properties": {"template": {"metadata": {}, "semantic": "retained"}}}],
         "_generator": "not metadata and therefore semantic",
     }
 
@@ -1028,6 +1018,14 @@ def test_wc024_checked_in_generated_artifacts_match_current_bicep(tmp_path: Path
     _run_az_bicep(
         ["build-params", "--file", str(WC024_ROOT / "main.example.bicepparam")],
         generated_parameters,
+    )
+    _run_az_bicep(
+        [
+            "build",
+            "--file",
+            str(WC024_ROOT / "publish-monitoring-contract.bicep"),
+        ],
+        tmp_path / "publish-monitoring-contract.json",
     )
 
     assert _template_without_bicep_generator(WC024_ROOT / "main.json") == (

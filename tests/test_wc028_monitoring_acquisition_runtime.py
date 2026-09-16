@@ -5,6 +5,7 @@ import copy
 import hashlib
 import io
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -28,7 +29,6 @@ from athena_context.artifacts import (
 from athena_context.contracts import (
     MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
     MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION,
-    MONITORING_IDENTITY_PROOF_AUDIENCE,
     MONITORING_IDENTITY_PROOF_MAXIMUM_LIFETIME_SECONDS,
     MONITORING_IDENTITY_PROOF_REQUIRED_ROLE,
     MONITORING_IDENTITY_PROOF_TOKEN_VERSION,
@@ -63,6 +63,7 @@ NOW = datetime(2026, 9, 14, 5, 30, tzinfo=UTC)
 SUBSCRIPTION_ID = "11111111-1111-1111-1111-111111111111"
 CLIENT_ID = "22222222-2222-2222-2222-222222222222"
 TENANT_ID = "33333333-3333-3333-3333-333333333333"
+IDENTITY_PROOF_AUDIENCE = f"api://{TENANT_ID}/athena-monitoring-identity-proof"
 COLLECTOR_PRINCIPAL_ID = "44444444-4444-4444-4444-444444444444"
 CONTEXT_PRINCIPAL_ID = "55555555-5555-5555-5555-555555555555"
 SUPPORT_CLIENT_ID = "66666666-6666-6666-6666-666666666666"
@@ -597,7 +598,7 @@ def _configuration_payload() -> dict[str, object]:
             "requiredCoverageScopeDigests": [DIGEST_B],
             "allowedSources": ["logAnalytics"],
             "allowedResourceIds": [VM_ID],
-            "identityProofAudience": MONITORING_IDENTITY_PROOF_AUDIENCE,
+            "identityProofAudience": IDENTITY_PROOF_AUDIENCE,
             "identityProofTokenVersion": MONITORING_IDENTITY_PROOF_TOKEN_VERSION,
             "identityProofRequiredRole": MONITORING_IDENTITY_PROOF_REQUIRED_ROLE,
             "identityProofMaximumLifetimeSeconds": (
@@ -639,10 +640,8 @@ def _configuration_payload() -> dict[str, object]:
             "signingKeyResourceId": COLLECTOR_KEY_ID,
             "resourceHealthRoleDefinitionId": RESOURCE_HEALTH_ROLE_ID,
             "resourceHealthScopeIds": [VM_ID],
-            "resourceHealthAllowedOperations": [
-                "Microsoft.ResourceHealth/AvailabilityStatuses/current/read"
-            ],
-            "identityProofAudience": MONITORING_IDENTITY_PROOF_AUDIENCE,
+            "resourceHealthAllowedOperations": ["Microsoft.ResourceGraph/resources/read"],
+            "identityProofAudience": IDENTITY_PROOF_AUDIENCE,
             "identityProofTokenVersion": MONITORING_IDENTITY_PROOF_TOKEN_VERSION,
             "identityProofRequiredRole": MONITORING_IDENTITY_PROOF_REQUIRED_ROLE,
             "identityProofMaximumLifetimeSeconds": (
@@ -650,7 +649,7 @@ def _configuration_payload() -> dict[str, object]:
             ),
             "allowedReadOperations": [
                 "Microsoft.Insights/Logs/Heartbeat/Read",
-                "Microsoft.ResourceHealth/AvailabilityStatuses/current/read",
+                "Microsoft.ResourceGraph/resources/read",
             ],
             "effectiveRbacInventory": {
                 "inventoryDigest": DIGEST_B,
@@ -712,6 +711,33 @@ def test_configuration_preserves_identity_and_storage_separation(
     shared_support_principal["runtimeSupportIdentityPrincipalId"] = COLLECTOR_PRINCIPAL_ID
     with pytest.raises(ValidationError, match="client/principal identities"):
         Wc028MonitoringAcquisitionJobConfiguration.model_validate(shared_support_principal)
+
+
+def test_configuration_accepts_tenant_bound_identity_proof_audience() -> None:
+    payload = _configuration_payload()
+    tenant_id = "99999999-9999-4999-8999-999999999999"
+    audience = f"api://{tenant_id}/athena-monitoring-identity-proof"
+    authority = cast(dict[str, object], payload["acquisitionAuthority"])
+    authority["monitoringReaderTenantId"] = tenant_id
+    authority["identityProofAudience"] = audience
+    contract = cast(dict[str, object], payload["monitoringCollectorContract"])
+    contract["collectorTenantId"] = tenant_id
+    contract["rbacAttestorTenantId"] = tenant_id
+    contract["identityProofAudience"] = audience
+    support_inventory = cast(
+        dict[str, object],
+        payload["runtimeSupportEffectiveRbacInventory"],
+    )
+    support_inventory["tenantId"] = tenant_id
+    support_inventory["attestorTenantId"] = tenant_id
+    payload["runtimeSupportEffectiveRbacInventory"] = _refresh_support_rbac_inventory(
+        support_inventory
+    )
+
+    configuration = Wc028MonitoringAcquisitionJobConfiguration.model_validate(payload)
+
+    assert configuration.monitoring_collector_contract["identityProofAudience"] == audience
+    assert configuration.acquisition_authority["identityProofAudience"] == audience
 
 
 def test_configuration_rejects_source_identity_and_scope_substitution() -> None:
@@ -1401,7 +1427,7 @@ def test_authority_scope_digest_and_freshness_fail_before_external_reads(
         allowed_resource_ids=(),
         max_freshness_seconds=600,
         receipt_signing_key_id=COLLECTOR_KEY_ID,
-        identity_proof_audience=MONITORING_IDENTITY_PROOF_AUDIENCE,
+        identity_proof_audience=IDENTITY_PROOF_AUDIENCE,
         identity_proof_token_version=MONITORING_IDENTITY_PROOF_TOKEN_VERSION,
         identity_proof_required_role=MONITORING_IDENTITY_PROOF_REQUIRED_ROLE,
         identity_proof_maximum_lifetime_seconds=(
@@ -1439,10 +1465,8 @@ def test_authority_scope_digest_and_freshness_fail_before_external_reads(
             "Microsoft.Insights/Logs/Syslog/Read",
             "Microsoft.Insights/Logs/VMConnection/Read",
         ),
-        resource_health_allowed_operations=(
-            "Microsoft.ResourceHealth/AvailabilityStatuses/current/read",
-        ),
-        identity_proof_audience=MONITORING_IDENTITY_PROOF_AUDIENCE,
+        resource_health_allowed_operations=("Microsoft.ResourceGraph/resources/read",),
+        identity_proof_audience=IDENTITY_PROOF_AUDIENCE,
         identity_proof_token_version=MONITORING_IDENTITY_PROOF_TOKEN_VERSION,
         identity_proof_required_role=MONITORING_IDENTITY_PROOF_REQUIRED_ROLE,
         identity_proof_maximum_lifetime_seconds=(
@@ -1668,10 +1692,8 @@ def test_job_composes_hardened_coordinator_transaction_and_commit_port(
             "Microsoft.Insights/Logs/Syslog/Read",
             "Microsoft.Insights/Logs/VMConnection/Read",
         ),
-        resource_health_allowed_operations=(
-            "Microsoft.ResourceHealth/AvailabilityStatuses/current/read",
-        ),
-        identity_proof_audience=MONITORING_IDENTITY_PROOF_AUDIENCE,
+        resource_health_allowed_operations=("Microsoft.ResourceGraph/resources/read",),
+        identity_proof_audience=IDENTITY_PROOF_AUDIENCE,
         identity_proof_token_version=MONITORING_IDENTITY_PROOF_TOKEN_VERSION,
         identity_proof_required_role=MONITORING_IDENTITY_PROOF_REQUIRED_ROLE,
         identity_proof_maximum_lifetime_seconds=(
@@ -1702,7 +1724,7 @@ def test_job_composes_hardened_coordinator_transaction_and_commit_port(
         max_freshness_seconds=600,
         receipt_signing_key_id=COLLECTOR_KEY_ID,
         deployment_identity_contract_digest=DIGEST_A,
-        identity_proof_audience=MONITORING_IDENTITY_PROOF_AUDIENCE,
+        identity_proof_audience=IDENTITY_PROOF_AUDIENCE,
         identity_proof_token_version=MONITORING_IDENTITY_PROOF_TOKEN_VERSION,
         identity_proof_required_role=MONITORING_IDENTITY_PROOF_REQUIRED_ROLE,
         identity_proof_maximum_lifetime_seconds=(
@@ -2320,6 +2342,13 @@ def _commit_port(
     *,
     private_key: rsa.RSAPrivateKey | None = None,
     signer: object | None = None,
+    storage_readiness_verifier: (
+        Callable[
+            [runtime_module.MonitoringEvidenceStorageReadiness],
+            runtime_module.MonitoringEvidenceStorageReadiness,
+        ]
+        | None
+    ) = None,
 ) -> MonitoringEvidenceCommitPort:
     private_key = private_key or rsa.generate_private_key(
         public_exponent=65537,
@@ -2354,6 +2383,16 @@ def _commit_port(
         context_binding=case.context_binding,
         monitoring_intent_reference=case.prepared.monitoring_intent_reference,
         acquisition_receipt_verifier=lambda _receipt, _as_of: None,
+        storage_readiness_verifier=(
+            storage_readiness_verifier
+            or (
+                lambda expected: (
+                    runtime_module.MonitoringEvidenceStorageReadiness.model_validate_json(
+                        expected.model_dump_json(by_alias=True)
+                    )
+                )
+            )
+        ),
         key_record=key_record,
     )
 
@@ -2478,6 +2517,33 @@ def test_first_durable_write_revalidates_storage_protection(
             match="storage readiness failed runtime revalidation",
         ),
         _commit_port(store, unsafe_case).transaction(unsafe_case.prepared),
+    ):
+        pass
+
+    assert store.create_requests == []
+    assert store.blobs == {}
+
+
+def test_first_durable_write_requires_matching_live_storage_readback(
+    persistence_case: _PersistenceCase,
+) -> None:
+    changed_payload = _storage_readiness_payload()
+    changed_payload["immutabilityRetentionDays"] = 31
+    changed_readiness = runtime_module.MonitoringEvidenceStorageReadiness.model_validate(
+        _refresh_storage_readiness(changed_payload)
+    )
+    store = _MemoryStore(container_name="monitoring-evidence")
+
+    with (
+        pytest.raises(
+            MonitoringAcquisitionJobError,
+            match="live monitoring evidence storage protection changed",
+        ),
+        _commit_port(
+            store,
+            persistence_case,
+            storage_readiness_verifier=lambda _expected: changed_readiness,
+        ).transaction(persistence_case.prepared),
     ):
         pass
 
@@ -2911,6 +2977,46 @@ def test_probe_reconciles_concurrent_state_and_manifest_publication(
         private_key=private_key,
     ).recover(probe)
     assert recovered is not None
+
+
+def test_transaction_rejects_evidence_collision_not_seen_with_signed_state(
+    persistence_case: _PersistenceCase,
+) -> None:
+    manifest_name, recovery_name, evidence_name = runtime_module._monitoring_persistence_blob_names(
+        PERSISTENCE_REPLAY_KEY
+    )
+
+    class _LateOrphanStore(_MemoryStore):
+        injected = False
+
+        def create(self, request: Any) -> ArtifactWriteReceipt:
+            if request.blob_name == evidence_name and not self.injected:
+                self.injected = True
+                self.blobs[evidence_name] = ArtifactReadResult(
+                    container_name=self.container_name,
+                    blob_name=evidence_name,
+                    version_id="preexisting-orphan-version",
+                    payload=request.payload,
+                    size_bytes=len(request.payload),
+                    content_type="application/json",
+                    payload_sha256=sha256_hex(request.payload),
+                )
+            return super().create(request)
+
+    store = _LateOrphanStore(container_name="monitoring-evidence")
+
+    with (
+        pytest.raises(
+            MonitoringAcquisitionJobError,
+            match="pre-existed its signed recovery state",
+        ),
+        _commit_port(store, persistence_case).transaction(persistence_case.prepared),
+    ):
+        pass
+
+    assert recovery_name in store.blobs
+    assert store.blobs[evidence_name].version_id == "preexisting-orphan-version"
+    assert manifest_name not in store.blobs
 
 
 def test_restart_rejects_evidence_without_collector_signed_recovery_binding(

@@ -183,8 +183,10 @@ template. Perform these steps in order:
    and all three obsolete custom role definitions, including the deterministic Network Watcher IP
    Flow assignment and role, are absent.
 4. Produce a fresh collector contract and authority from the PR #99 revision that recognizes the
-   conditioned known-name-read/add-only writer. Stop if the contract still requires
-   `Storage Blob Data Contributor` or `blobs/write`.
+   conditioned known-name-read/add-only writer, binds the reviewed storage-protection contract and
+   signed persistence replay preimage, and proves all management-group or tenant-root ancestor
+   assignments. Stop if the contract still requires `Storage Blob Data Contributor` or
+   `blobs/write`, or if any ancestor scope cannot be enumerated.
 5. Produce a one-execution runtime configuration v4 whose non-zero
    `legacyCollectorRbacCleanupDigest` and stable `persistenceReplayKey` bind the execution ID,
    authority, intent reference, context, incident revision, and request-window policy. Current
@@ -196,17 +198,20 @@ template. Perform these steps in order:
    public access is `None`, policy state and retention exactly match review, and both protected
    append-write flags are false. Embed the resulting non-zero readiness digest and ARM `guid()`
    readback binding in runtime configuration v4. The deployment must parse that same configuration
-   and compare the live binding before releasing any role assignment or Job resource.
+   and compare the live binding before releasing any role assignment or Job resource. The runtime
+   must also perform the PR #99-authorized fresh readback immediately before its first durable
+   create and reject any drift.
 7. Run resource-group `validate` and `what-if` for
    `infra/wc028-monitoring-acquisition/main.bicep`. The only new assignments may be ACR pull and
    monitoring-intent key read for the distinct runtime-support identity plus the conditioned
    known-name-read/add-only monitoring-evidence role for the measured collector. The collector must
    retain no built-in Blob contributor assignment.
 8. Do not deploy while the runtime's explicit PR #99 conditioned-Blob contract gate remains closed.
-   After the required PR #99 restack, deploy the manual Job, remeasure both identities, and verify
-   the collector inventory matches the new contract and the runtime-support identity has only
-   direct `AcrPull` on the reviewed registry plus the exact monitoring-intent key-read role before
-   any new acquisition.
+   In this draft, `pr99RuntimeDependenciesReady` is constrained to `false` and blocks every RBAC
+   module and the Job. After the required PR #99 restack, replace that hard gate, deploy the manual
+   Job, remeasure both identities, and verify the collector inventory matches the new contract and
+   the runtime-support identity has only direct `AcrPull` on the reviewed registry plus the exact
+   monitoring-intent key-read role before any new acquisition.
 
 The Job uses `triggerType: Manual` and `replicaRetryLimit: 0`. Never start it on a timer. Create a
 new execution ID, cleanup binding, collector inventory, and replay key for each governed execution.

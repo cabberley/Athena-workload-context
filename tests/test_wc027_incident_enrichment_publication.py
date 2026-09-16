@@ -42,6 +42,9 @@ from test_wc027_guidance_authority_contract import (
 )
 
 _SIGNATURE = "c3ludGhldGlj"
+_INCIDENT_LOGICAL_KEY_ID = (
+    "synthetic-key://athena-argus-demo/wc016-incidents-rs256-v1"
+)
 _INCIDENT_KEY_FINGERPRINT = "sha256:" + "2" * 64
 _REPORT_KEY_ID = (
     "https://synthetic-wc027.vault.azure.net/keys/"
@@ -200,9 +203,10 @@ def _fixture(*, selected_runbook: bool = False) -> _Fixture:
         state,
         state_attestation,
         published_at=guidance_binding.evaluated_at,
-        key_id=state_attestation.key_vault_key_id,
+        key_id=_INCIDENT_LOGICAL_KEY_ID,
         key_fingerprint=_INCIDENT_KEY_FINGERPRINT,
         signer=_Signer(),
+        key_vault_key_id=state_attestation.key_vault_key_id,
     )
     pointer_reference = VersionPinnedBlobReference(
         name=publication.pointer_asset.blob_name,
@@ -297,12 +301,15 @@ def _publication_service(
         incident_publication_reader=fixture.publication_reader,
         guidance_authority_reader=fixture.authority_reader,
         artifact_writer=store,
-        incident_key_id=(request.incident_subject.incident_state_attestation.key_vault_key_id),
+        incident_key_id=_INCIDENT_LOGICAL_KEY_ID,
+        incident_key_vault_key_id=(
+            request.incident_subject.incident_state_attestation.key_vault_key_id
+        ),
         incident_key_fingerprint=_INCIDENT_KEY_FINGERPRINT,
         incident_signature_verifier=incident_verifier,
         correlation_binding_key_id=(request.binding_attestation.key_vault_key_id),
         correlation_binding_signature_verifier=_verify_signature,
-        guidance_binding_key_id=(binding.binding_attestation.key_vault_key_id),
+        guidance_binding_key_id=(binding.binding_attestation.key_id),
         guidance_binding_signature_verifier=_verify_signature,
         report_key_id=_REPORT_KEY_ID,
         report_signer=_Signer(),
@@ -351,6 +358,16 @@ def test_publication_writes_six_assets_and_commits_with_final_attestation() -> N
     assert names[5] == names[4].removesuffix("/manifest.json") + "/attestation.json"
     assert receipt.enrichment_asset.attestation_reference.name == names[-1]
     assert receipt.occurrence == fixture.incident_publication.occurrence
+    occurrence = fixture.incident_publication.occurrence
+    assert occurrence is not None
+    assert fixture.publication_reader.current.pointer.key_id == _INCIDENT_LOGICAL_KEY_ID
+    state_attestation = (
+        fixture.guidance_binding.incident_bound_request.incident_subject
+        .incident_state_attestation
+    )
+    assert (
+        state_attestation.key_vault_key_id != _INCIDENT_LOGICAL_KEY_ID
+    )
 
 
 def test_publication_retry_recovers_same_versions_and_receipt() -> None:
@@ -461,8 +478,21 @@ def test_writer_reference_mismatch_fails_closed() -> None:
     assert len(store.calls) == 1
 
 
+@pytest.mark.parametrize(
+    "asset_suffix",
+    [
+        "correlation-reports/report-" + "2" * 32 + "/report.json",
+        "enrichments/incident-enrichment-" + "3" * 32 + "/feed-pointer.json",
+        (
+            "enrichments/incident-enrichment-"
+            + "3" * 32
+            + "/feed-pointer-attestation.json"
+        ),
+    ],
+)
 def test_azure_store_recovers_exact_current_version(
     monkeypatch: pytest.MonkeyPatch,
+    asset_suffix: str,
 ) -> None:
     writer = object.__new__(AzureBlobCreateOnlyArtifactWriter)
     reader = object.__new__(AzureBlobVersionPinnedArtifactReader)
@@ -475,9 +505,8 @@ def test_azure_store_recovers_exact_current_version(
         blob_name=(
             "incidents/inc-0123456789ab/versions/"
             + "1" * 64
-            + "/correlation-reports/report-"
-            + "2" * 32
-            + "/report.json"
+            + "/"
+            + asset_suffix
         ),
         payload=payload,
         content_type="application/json",

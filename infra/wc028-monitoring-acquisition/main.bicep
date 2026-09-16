@@ -88,11 +88,20 @@ param monitoringEvidenceImmutabilityRetentionDays int
 @description('Reviewed WC-028 runtime configuration. It contains no credentials and is secret-backed to avoid command-line or plain environment disclosure.')
 param acquisitionRuntimeConfigurationJson string
 
+@description('Hard deployment gate. This draft must remain false until PR #99 publishes the conditioned add-only Blob bootstrap, reviewed storage contract, signed replay binding, and ancestor-complete collector RBAC evidence.')
+@allowed([
+  false
+])
+param pr99RuntimeDependenciesReady bool = false
+
 @description('Tags applied to the WC-028 job.')
 param tags object = {}
 
 var parsedRuntimeConfiguration = json(acquisitionRuntimeConfigurationJson)
 var configuredStorageReadiness = parsedRuntimeConfiguration.monitoringEvidenceStorageReadiness
+var validatedPr99RuntimeDependencyGate = pr99RuntimeDependenciesReady
+  ? 'ready'
+  : fail('WC-028 deployment remains blocked pending the complete reviewed PR #99 storage, replay, and ancestor-RBAC contract')
 var registrySegments = split(registryResourceId, '/')
 var registryResourceGroupName = length(registrySegments) == 9 && toLower(
   registrySegments[1]
@@ -379,7 +388,9 @@ module storageReadiness 'modules/storage-readiness.bicep' = {
 }
 
 module acquisitionRbac 'modules/acquisition-rbac.bicep' = {
-  name: 'wc028-monitoring-acquisition-rbac'
+  name: validatedPr99RuntimeDependencyGate == 'ready'
+    ? 'wc028-monitoring-acquisition-rbac'
+    : 'wc028-monitoring-acquisition-rbac-blocked'
   scope: subscription()
   params: {
     collectorPrincipalId: collectorIdentity.properties.principalId
@@ -392,7 +403,9 @@ module acquisitionRbac 'modules/acquisition-rbac.bicep' = {
 }
 
 module runtimeSupportImagePull 'modules/acr-pull-assignment.bicep' = {
-  name: 'wc028-runtime-support-acr-pull'
+  name: validatedPr99RuntimeDependencyGate == 'ready'
+    ? 'wc028-runtime-support-acr-pull'
+    : 'wc028-runtime-support-acr-pull-blocked'
   scope: registryResourceGroup
   params: {
     registryName: validatedRegistryName
@@ -407,7 +420,9 @@ module runtimeSupportImagePull 'modules/acr-pull-assignment.bicep' = {
 }
 
 resource acquisitionJob 'Microsoft.App/jobs@2025-01-01' = {
-  name: 'athena-wc028-monitoring-acquisition'
+  name: validatedPr99RuntimeDependencyGate == 'ready'
+    ? 'athena-wc028-monitoring-acquisition'
+    : 'athena-wc028-monitoring-acquisition-blocked'
   location: location
   tags: resourceTags
   identity: {

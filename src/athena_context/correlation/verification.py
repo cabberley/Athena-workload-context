@@ -48,6 +48,8 @@ from athena_context.contracts.models import (
     UtcDateTime,
 )
 from athena_context.contracts.monitoring import (
+    MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+    MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION,
     MonitoringAcquisitionReceipt,
     MonitoringCollectorContract,
     MonitoringEvidenceHandoff,
@@ -174,7 +176,8 @@ class TrustedMonitoringHandoffVerifier:
     reviewed_contract: MonitoringCollectorContract
     trusted_key_anchor: TrustedKeyAnchor
     key_resolver: KeyVaultTrustedKeyResolver
-    expected_acquisition_authority_digest: str | None = None
+    expected_collector_contract_digest: str
+    expected_acquisition_authority_digest: str
     acquisition_receipt_maximum_age_seconds: int = 900
     receipt_trusted_key_anchor: TrustedKeyAnchor | None = None
     receipt_key_resolver: KeyVaultTrustedKeyResolver | None = None
@@ -191,6 +194,42 @@ class TrustedMonitoringHandoffVerifier:
             and type(self.receipt_key_resolver) is not KeyVaultTrustedKeyResolver
         ):
             raise TypeError("production receipt verification requires KeyVaultTrustedKeyResolver")
+        if (
+            self.reviewed_contract.schema_version
+            != MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION
+            or self.reviewed_contract.acquisition_receipt_schema_version
+            != MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION
+        ):
+            raise ValueError(
+                "legacy monitoring collector contracts, including v3, are parse-only; "
+                "production correlation requires recollection and republication under v8"
+            )
+        if (
+            self.expected_collector_contract_digest
+            != self.reviewed_contract.compute_artifact_digest_value()
+        ):
+            raise ValueError(
+                "production monitoring verification requires the exact reviewed "
+                "collector contract digest"
+            )
+        for label, value in (
+            (
+                "collector contract",
+                self.expected_collector_contract_digest,
+            ),
+            (
+                "acquisition authority",
+                self.expected_acquisition_authority_digest,
+            ),
+        ):
+            if (
+                type(value) is not str
+                or len(value) != 71
+                or not value.startswith("sha256:")
+                or value == "sha256:" + "0" * 64
+                or any(character not in "0123456789abcdef" for character in value[7:])
+            ):
+                raise ValueError(f"production monitoring {label} digest is invalid")
 
     def verify(
         self,
@@ -202,6 +241,7 @@ class TrustedMonitoringHandoffVerifier:
             handoff,
             as_of=as_of,
             reviewed_collector_contract=self.reviewed_contract,
+            expected_collector_contract_digest=(self.expected_collector_contract_digest),
             trusted_key_anchor=self.trusted_key_anchor,
             key_resolver=self.key_resolver,
         )
@@ -213,8 +253,6 @@ class TrustedMonitoringHandoffVerifier:
         *,
         as_of: UtcDateTime,
     ) -> str:
-        if self.expected_acquisition_authority_digest is None:
-            raise ValueError("production acquisition verification requires deployed authority")
         receipt_anchor = self.receipt_trusted_key_anchor
         receipt_resolver = self.receipt_key_resolver
         if receipt_anchor is None or receipt_resolver is None:

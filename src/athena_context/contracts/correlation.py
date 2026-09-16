@@ -14,7 +14,11 @@ from athena_context.contracts.change_ingestion import (
     ChangeEvidenceArtifact,
     ChangeEvidencePersistenceHandoff,
 )
-from athena_context.contracts.common import compute_artifact_digest, sha256_hex
+from athena_context.contracts.common import (
+    canonicalize_json,
+    compute_artifact_digest,
+    sha256_hex,
+)
 from athena_context.contracts.eventing import IncidentState, IncidentStateAttestation
 from athena_context.contracts.models import AthenaBaseModel, Sha256Digest, UtcDateTime
 from athena_context.contracts.monitoring import (
@@ -2625,6 +2629,46 @@ class IncidentBoundCorrelationRequest(_StrictCorrelationModel):
         return self
 
 
+def incident_correlation_subject_signature_preimage(
+    subject: IncidentCorrelationSubject,
+) -> bytes:
+    subject = IncidentCorrelationSubject.model_validate_json(
+        subject.model_dump_json(by_alias=True)
+    )
+    return canonicalize_json(
+        subject.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=True,
+            exclude={
+                "subject_id",
+                "subject_digest",
+                "subject_attestation",
+            },
+        )
+    ).encode("utf-8")
+
+
+def incident_bound_correlation_request_signature_preimage(
+    request: IncidentBoundCorrelationRequest,
+) -> bytes:
+    request = IncidentBoundCorrelationRequest.model_validate_json(
+        request.model_dump_json(by_alias=True)
+    )
+    return canonicalize_json(
+        request.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=True,
+            exclude={
+                "request_id",
+                "binding_digest",
+                "binding_attestation",
+            },
+        )
+    ).encode("utf-8")
+
+
 def _flow_coverage_matches(
     coverage: EvidenceCoverage,
     flow: NetworkFlowObservation,
@@ -4143,6 +4187,8 @@ __all__ = [
     "HealthState",
     "IncidentBoundCorrelationRequest",
     "IncidentBoundCorrelationRequestAttestation",
+    "incident_bound_correlation_request_signature_preimage",
+    "incident_correlation_subject_signature_preimage",
     "IncidentCorrelationSubject",
     "IncidentCorrelationSubjectAttestation",
     "IncidentHealthTransition",

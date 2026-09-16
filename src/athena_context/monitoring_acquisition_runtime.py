@@ -41,7 +41,6 @@ from athena_context.azure_adapters import (
 from athena_context.contracts import (
     MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
     MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION,
-    MONITORING_IDENTITY_PROOF_AUDIENCE,
     MONITORING_IDENTITY_PROOF_MAXIMUM_LIFETIME_SECONDS,
     MONITORING_IDENTITY_PROOF_REQUIRED_ROLE,
     MONITORING_IDENTITY_PROOF_TOKEN_VERSION,
@@ -124,9 +123,7 @@ _RESOURCE_LOG_ALLOWED_OPERATIONS = (
     "Microsoft.Insights/Logs/Syslog/Read",
     "Microsoft.Insights/Logs/VMConnection/Read",
 )
-_RESOURCE_HEALTH_ALLOWED_OPERATIONS = (
-    "Microsoft.ResourceHealth/AvailabilityStatuses/current/read",
-)
+_RESOURCE_HEALTH_ALLOWED_OPERATIONS = ("Microsoft.ResourceGraph/resources/read",)
 _BLOCKED_PR99_CONTRACT_SCHEMA_VERSION = "athena.wc028MonitoringCollectorContract.v8"
 _ACR_PULL_ROLE_DEFINITION_GUID = "7f951dda-4ed3-4680-a7ca-43fe172d538d"
 _ACR_PULL_ROLE_NAME = "AcrPull"
@@ -698,8 +695,12 @@ class MonitoringRuntimeSupportEffectiveRbacInventory(_StrictRuntimeModel):
             principal_evidence.evidence_digest,
             *principal_evidence.first_read_target_digests,
             *principal_evidence.second_read_target_digests,
-            *principal_evidence.role_assignment_raw_page_digests,
-            *principal_evidence.transitive_group_raw_page_digests,
+            *(principal_evidence.role_assignment_raw_page_digests or ()),
+            *(principal_evidence.transitive_group_raw_page_digests or ()),
+            *(principal_evidence.first_role_assignment_raw_page_digests or ()),
+            *(principal_evidence.second_role_assignment_raw_page_digests or ()),
+            *(principal_evidence.first_transitive_group_raw_page_digests or ()),
+            *(principal_evidence.second_transitive_group_raw_page_digests or ()),
             *self.role_definition_raw_page_digests,
             *self.deny_assignment_raw_page_digests,
             *self.pim_schedule_instance_raw_page_digests,
@@ -1098,6 +1099,9 @@ class Wc028MonitoringAcquisitionJobConfiguration(_StrictRuntimeModel):
             collector_tenant_id,
             label="collector tenant",
         )
+        expected_identity_proof_audience = (
+            f"api://{collector_tenant_id}/athena-monitoring-identity-proof"
+        )
         context_principal_id = _require_nonzero_guid(
             context_principal_id,
             label="Athena context principal",
@@ -1212,7 +1216,7 @@ class Wc028MonitoringAcquisitionJobConfiguration(_StrictRuntimeModel):
             ),
             (
                 contract.get("identityProofAudience"),
-                MONITORING_IDENTITY_PROOF_AUDIENCE,
+                expected_identity_proof_audience,
                 "collector contract identity proof audience",
             ),
             (
@@ -1272,7 +1276,7 @@ class Wc028MonitoringAcquisitionJobConfiguration(_StrictRuntimeModel):
             ),
             (
                 authority.get("identityProofAudience"),
-                MONITORING_IDENTITY_PROOF_AUDIENCE,
+                expected_identity_proof_audience,
                 "acquisition identity proof audience",
             ),
             (
@@ -1676,6 +1680,13 @@ def _revalidate_monitoring_evidence_storage_readiness(
     *,
     configuration: Wc028MonitoringAcquisitionJobConfiguration,
     expected_signed_digest: str | None = None,
+    verifier: (
+        Callable[
+            [MonitoringEvidenceStorageReadiness],
+            MonitoringEvidenceStorageReadiness,
+        ]
+        | None
+    ) = None,
 ) -> MonitoringEvidenceStorageReadiness:
     try:
         readiness = MonitoringEvidenceStorageReadiness.model_validate_json(
@@ -1700,7 +1711,24 @@ def _revalidate_monitoring_evidence_storage_readiness(
         raise MonitoringAcquisitionJobError(
             "monitoring evidence storage readiness changed before writer access"
         )
-    return readiness
+    if verifier is None:
+        return readiness
+    try:
+        current = verifier(readiness)
+        current = MonitoringEvidenceStorageReadiness.model_validate_json(
+            current.model_dump_json(by_alias=True)
+        )
+    except MonitoringAcquisitionJobError:
+        raise
+    except (AttributeError, TypeError, ValueError, *_EXTERNAL_AZURE_FAILURES) as exc:
+        raise MonitoringAcquisitionJobError(
+            "live monitoring evidence storage readiness verification failed closed"
+        ) from exc
+    if current != readiness:
+        raise MonitoringAcquisitionJobError(
+            "live monitoring evidence storage protection changed before writer access"
+        )
+    return current
 
 
 def load_wc028_monitoring_acquisition_job_configuration(
@@ -2605,8 +2633,19 @@ def _require_pr99_conditioned_blob_contract(
     if collector_contract.schema_version == _BLOCKED_PR99_CONTRACT_SCHEMA_VERSION:
         raise MonitoringAcquisitionJobError(
             "WC-028 deployment remains blocked until PR #99 publishes the conditioned "
-            "known-name Blob read and add/action collector contract and bootstrap"
+            "known-name Blob read and add/action collector contract and bootstrap, "
+            "reviewed storage-protection contract, signed persistence replay binding, "
+            "and ancestor-complete collector RBAC evidence"
         )
+
+
+def _blocked_pr99_storage_readiness_verifier(
+    _expected: MonitoringEvidenceStorageReadiness,
+) -> MonitoringEvidenceStorageReadiness:
+    raise MonitoringAcquisitionJobError(
+        "live monitoring evidence storage verification remains blocked until PR #99 "
+        "publishes the reviewed storage contract and runtime read authorization"
+    )
 
 
 def _build_acquisition_receipt_verifier(
@@ -2649,6 +2688,10 @@ class MonitoringEvidenceCommitPort:
         context_binding: PublishedRuntimeContextBinding,
         monitoring_intent_reference: PublishedMonitoringIntentAssetReference,
         acquisition_receipt_verifier: Callable[[MonitoringAcquisitionReceipt, datetime], None],
+        storage_readiness_verifier: Callable[
+            [MonitoringEvidenceStorageReadiness],
+            MonitoringEvidenceStorageReadiness,
+        ],
         key_resolver: TrustedKeyResolver | None = None,
         key_record: TrustedKeyRecord | None = None,
     ) -> None:
@@ -2666,6 +2709,7 @@ class MonitoringEvidenceCommitPort:
         self._context_binding = context_binding
         self._monitoring_intent_reference = monitoring_intent_reference
         self._acquisition_receipt_verifier = acquisition_receipt_verifier
+        self._storage_readiness_verifier = storage_readiness_verifier
         self._key_resolver: TrustedKeyResolver
         if key_resolver is None:
             record = key_record or TrustedKeyRecord(
@@ -3329,6 +3373,7 @@ class MonitoringEvidenceCommitPort:
         _revalidate_monitoring_evidence_storage_readiness(
             configuration=self._configuration,
             expected_signed_digest=(state.monitoring_evidence_storage_readiness_digest),
+            verifier=self._storage_readiness_verifier,
         )
         if probe.recovery_state_result is None:
             state_reference = self._write(
@@ -3345,6 +3390,7 @@ class MonitoringEvidenceCommitPort:
                 current_reader=self._monitoring_current_reader,
                 blob_name=evidence_blob_name,
                 payload=state.monitoring_bundle.canonical_bytes(),
+                allow_existing_exact_collision=probe.recovery_state_result is not None,
             )
         if evidence_reference is None:
             raise MonitoringAcquisitionJobError(
@@ -3442,6 +3488,7 @@ class MonitoringEvidenceCommitPort:
         _revalidate_monitoring_evidence_storage_readiness(
             configuration=self._configuration,
             expected_signed_digest=(state.monitoring_evidence_storage_readiness_digest),
+            verifier=self._storage_readiness_verifier,
         )
         state_reference = self._write(
             writer=self._monitoring_writer,
@@ -3454,6 +3501,7 @@ class MonitoringEvidenceCommitPort:
             current_reader=self._monitoring_current_reader,
             blob_name=evidence_blob_name,
             payload=state.monitoring_bundle.canonical_bytes(),
+            allow_existing_exact_collision=False,
         )
         committed = self._build_committed(
             state=state,
@@ -3496,7 +3544,10 @@ class MonitoringEvidenceCommitPort:
         current_reader: CurrentArtifactReaderPort,
         blob_name: str,
         payload: bytes,
+        allow_existing_exact_collision: bool = True,
     ) -> VersionPinnedBlobReference:
+        if type(allow_existing_exact_collision) is not bool:
+            raise TypeError("allow_existing_exact_collision must be an exact bool")
         try:
             receipt = writer.create(
                 ArtifactWriteRequest(
@@ -3521,6 +3572,10 @@ class MonitoringEvidenceCommitPort:
                 and recovered.payload == payload
                 and recovered.payload_sha256 == sha256_hex(payload)
             ):
+                if not allow_existing_exact_collision:
+                    raise MonitoringAcquisitionJobError(
+                        "immutable monitoring evidence pre-existed its signed recovery state"
+                    ) from exc
                 return VersionPinnedBlobReference(
                     name=recovered.blob_name,
                     version=recovered.version_id,
@@ -3675,6 +3730,7 @@ def run_wc028_monitoring_acquisition_job(
                     context_binding=context_binding,
                     monitoring_intent_reference=intent_reference,
                     acquisition_receipt_verifier=acquisition_receipt_verifier,
+                    storage_readiness_verifier=(_blocked_pr99_storage_readiness_verifier),
                     key_resolver=collector_key_resolver,
                 ),
             )

@@ -130,6 +130,7 @@ class PresentationAssetGatewayApplication:
         *,
         incident_reader: PresentationAssetReaderPort | None = None,
         incident_key_id: str | None = None,
+        incident_key_vault_key_id: str | None = None,
         incident_key_fingerprint: str | None = None,
         incident_public_key: rsa.RSAPublicKey | None = None,
         incident_feed_v2_trust: GatewaySignatureTrustAnchor | None = None,
@@ -140,6 +141,7 @@ class PresentationAssetGatewayApplication:
         incident_values = (
             incident_reader,
             incident_key_id,
+            incident_key_vault_key_id,
             incident_key_fingerprint,
             incident_public_key,
         )
@@ -150,6 +152,7 @@ class PresentationAssetGatewayApplication:
         self._reader = reader
         self._incident_reader = incident_reader
         self._incident_key_id = incident_key_id
+        self._incident_key_vault_key_id = incident_key_vault_key_id
         self._incident_key_fingerprint = incident_key_fingerprint
         self._incident_public_key = incident_public_key
         v2_trust = (
@@ -229,7 +232,8 @@ class PresentationAssetGatewayApplication:
                     )
                     if (
                         index_attestation.index_digest != sha256_hex(index_bytes)
-                        or index_attestation.key_vault_key_id != self._incident_key_id
+                        or index_attestation.key_vault_key_id
+                        != self._incident_key_vault_key_id
                         or result.payload != index_attestation.canonical_bytes()
                         or not self._verify_incident_signature(
                             payload=index_bytes,
@@ -255,7 +259,8 @@ class PresentationAssetGatewayApplication:
                         )
                         if (
                             pointer_attestation.pointer_digest != sha256_hex(pointer_bytes)
-                            or pointer_attestation.key_vault_key_id != self._incident_key_id
+                            or pointer_attestation.key_vault_key_id
+                            != self._incident_key_vault_key_id
                             or result.payload != pointer_attestation.canonical_bytes()
                             or not self._verify_incident_signature(
                                 payload=pointer_bytes,
@@ -436,7 +441,8 @@ class PresentationAssetGatewayApplication:
         if (
             attestation_result.payload != attestation.canonical_bytes()
             or attestation.index_digest != sha256_hex(result.payload)
-            or attestation.key_vault_key_id != self._incident_key_id
+            or attestation.key_vault_key_id
+            != self._incident_key_vault_key_id
             or not self._verify_incident_signature(
                 payload=result.payload,
                 detached_signature=attestation.detached_signature,
@@ -474,7 +480,8 @@ class PresentationAssetGatewayApplication:
         if (
             attestation_result.payload != attestation.canonical_bytes()
             or attestation.pointer_digest != sha256_hex(result.payload)
-            or attestation.key_vault_key_id != self._incident_key_id
+            or attestation.key_vault_key_id
+            != self._incident_key_vault_key_id
             or not self._verify_incident_signature(
                 payload=result.payload,
                 detached_signature=attestation.detached_signature,
@@ -831,9 +838,10 @@ class PresentationAssetGatewayApplication:
             source_pointer.key_id != self._incident_key_id
             or source_pointer.key_fingerprint
             != self._incident_key_fingerprint
-            or state_attestation.key_vault_key_id != self._incident_key_id
+            or state_attestation.key_vault_key_id
+            != self._incident_key_vault_key_id
             or source_pointer_attestation.key_vault_key_id
-            != self._incident_key_id
+            != self._incident_key_vault_key_id
             or state.result_digest
             != sha256_hex(incident_state_signature_preimage(state))
             or not self._verify_incident_signature(
@@ -1100,6 +1108,7 @@ def run_presentation_asset_gateway(
     container_name: str,
     incident_container_name: str,
     incident_key_id: str,
+    incident_key_vault_key_id: str,
     incident_key_fingerprint: str,
     incident_public_key_path: Path,
     managed_identity_client_id: str,
@@ -1191,6 +1200,7 @@ def run_presentation_asset_gateway(
             active_reader,
             incident_reader=incident_reader,
             incident_key_id=incident_key_id,
+            incident_key_vault_key_id=incident_key_vault_key_id,
             incident_key_fingerprint=incident_key_fingerprint,
             incident_public_key=public_key_value,
             incident_feed_v2_trust=load_v2_trust(

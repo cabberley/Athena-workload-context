@@ -799,8 +799,8 @@ def _batch(
         schemaVersion="athena.wc028MonitoringCollectionBatch.v2",
         collectedAt=NOW,
         incidentResourceId=WEB_ID,
-        previousHealthSourceRecordId="endpoint-healthy",
-        currentHealthSourceRecordIds=("endpoint-unhealthy",),
+        previousHealthSourceRecordId="resource-health-resolved",
+        currentHealthSourceRecordIds=("resource-health-active",),
         records=records,
         coverage=coverage,
     )

@@ -155,7 +155,12 @@ def build_incident_feed_registry_record(
 
 
 class IncidentFeedRegistryPort(Protocol):
-    def put(self, record: IncidentFeedRegistryRecord) -> None: ...
+    def put(
+        self,
+        record: IncidentFeedRegistryRecord,
+        *,
+        authority: CurrentIncidentStateSnapshot,
+    ) -> None: ...
 
     def list_records(
         self,
@@ -167,6 +172,14 @@ class IncidentFeedRegistryPort(Protocol):
         self,
         plan: IncidentFeedRegistryPrunePlan,
     ) -> None: ...
+
+
+class IncidentFeedRegistryAuthorityReaderPort(Protocol):
+    def read_current_incident_state(
+        self,
+        *,
+        incident_id: str,
+    ) -> CurrentIncidentStateSnapshot | None: ...
 
 
 class IncidentFeedRegistryPrunePlan:
@@ -449,6 +462,7 @@ __all__ = [
     "IncidentFeedRegistryConflictError",
     "IncidentFeedRegistryError",
     "IncidentFeedRegistryIncompleteError",
+    "IncidentFeedRegistryAuthorityReaderPort",
     "IncidentFeedRegistryPort",
     "IncidentFeedRegistryProjection",
     "IncidentFeedRegistryRecord",

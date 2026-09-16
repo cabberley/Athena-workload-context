@@ -39,17 +39,23 @@ The coordinator:
   acquire its own service-audience token without exposing or parsing ARM or Log Analytics tokens;
 - implements credential-bound clients over Azure Core authenticated transports with fixed public
   Azure endpoints and audiences: resource-centric Azure Monitor Logs, exact-resource Activity Log
-  filters, generated bounded Resource Graph change queries, and the per-VM Resource Health current
-  endpoint. The historical IP Flow client remains parseable but current contract v8 rejects it
-  before transport;
+  filters, generated bounded Resource Graph change queries, and a bounded `HealthResources`
+  availability-status query that returns documented current and previous VM states. The historical
+  IP Flow client remains parseable but current contract v8 rejects it before transport;
 - normalizes Azure service values, resource IDs, UTC timestamps, enums, dynamic resource-candidate
   arrays, row ordering, truncation markers, and response byte counts into the existing strict
   acquisition result contracts while retaining duplicate source rows for downstream ambiguity
   detection;
 - obtains identity proof before the first source read by requesting only the Athena-owned
-  single-tenant `api://athena-monitoring-identity-proof` audience, then validates RS256 signature
-  through tenant-pinned JWKS, token version `1.0`, exact issuer and audience, tenant, `oid`,
-  `appid`/`azp`, app-only `idtyp`, exact application role, and `iat`/`nbf`/`exp`;
+  single-tenant `api://<tenant-id>/athena-monitoring-identity-proof` audience, then validates RS256
+  signature through tenant-pinned JWKS, token version `1.0`, exact issuer and audience, tenant,
+  `oid`, `appid`/`azp`, app-only `idtyp`, exact application role, and `iat`/`nbf`/`exp`;
+- provisions that proof authority through the Microsoft Graph Bicep extension as a single-tenant
+  application, enterprise application, one application-only role, and one direct assignment to
+  the collector managed identity. The v8 collector contract binds the application/client ID,
+  application object ID, service-principal ID, app-role ID, app-role-assignment ID, assigned
+  principal, secure audience, token version, role value, and required `idtyp` access-token
+  optional claim; phase two rejects any mismatch;
 - captures `verifiedAt` only after token acquisition, JWKS retrieval, cryptographic verification,
   and claim validation, then uses that same trusted time for lifetime checks, normalized proof,
   collection time, and receipt execution start;
@@ -74,12 +80,13 @@ The coordinator:
   assignments, workload network/change resources stay under the reviewed workload resource group,
   and monitoring evidence resources stay under the reviewed monitoring resource group;
 - replaces self-asserted read-only RBAC booleans with a digest-bound, externally collected
-  effective RBAC inventory covering management-group ancestry, subscription descendants, direct
-  and inherited assignments, assignment conditions, transitive group-derived grants, and measured
-  custom-role actions; the inventory cites one immutable version-pinned source artifact and external
-  manifest digest, the contract derives its expected collector grants from reviewed role IDs,
-  conditions, and exact scopes, and acquisition rejects stale, incomplete, missing, or unexpected
-  inventory before identity proof or source I/O;
+  effective RBAC inventory covering the exact subscription and descendant target scopes, direct
+  and inherited assignments returned by those scoped reads, assignment conditions, transitive
+  group-derived grants, and measured custom-role actions; the inventory makes no unsupported
+  claim that the subscription-scoped attestor directly enumerated management-group ancestors,
+  cites one immutable version-pinned source artifact and external manifest digest, and causes
+  acquisition to reject stale, incomplete, missing, or unexpected inventory before identity
+  proof or source I/O;
 - emits an immutable signed acquisition receipt containing collector-owned execution, call, result
   receipt, and issuance times plus every exact request/result digest; IP Flow entries also bind the
   collector-owned `checkedAt`; receipt v5 additionally signs the collector-selected incident
@@ -93,6 +100,11 @@ The coordinator:
   production correlation verification to revalidate the receipt signature, manifest, signed
   intent, context binding, deployed identities, acquisition authority, collector contract, and
   freshness;
+- requires WC-027 enrichment and guidance production configurations to carry the exact v8
+  collector contract, its canonical digest, and the exact acquisition-authority digest. Both
+  production verifiers compare those deployed values before accepting a handoff or receipt;
+  legacy v3 collector contracts remain parseable only and require recollection and republication
+  before production correlation;
 - binds every request to the exact signed intent, control digest, scope digest, query text and
   query digest, then binds every normalized log record and coverage statement to an exact
   query-execution digest;
@@ -134,19 +146,34 @@ The coordinator:
   observations, coverage, and incident selection therefore remain one governed unit. Supporting
   Activity Log controls without their own required coverage are not executed.
 - provisions a separate Resource Health custom role containing only
-  `Microsoft.ResourceHealth/AvailabilityStatuses/current/read`, makes it assignable only in
-  `rg-athena-demo-workload`, and assigns it independently at each exact approved VM; built-in
-  Reader remains limited to the already reviewed DCR/DCE-association and flow-log child resources.
+  `Microsoft.ResourceGraph/resources/read`, makes it assignable only in
+  `rg-athena-demo-workload`, and assigns it independently at each exact approved VM. The
+  production client queries only `HealthResources` availability-status rows for those VM IDs and
+  binds documented `previousAvailabilityState`, `availabilityState`, `occurredTime`, and
+  `reasonType`. A missing or empty `reasonType` is normalized to `Unknown` rather than aborting the
+  source, and remains usable only when the signed monitoring control explicitly allows `Unknown`;
+  built-in Reader remains limited to the already reviewed DCR/DCE-association and flow-log child
+  resources.
 - provisions a separate WC-028 resource-log role with only
   `Microsoft.Insights/Logs/Heartbeat/Read`, `Perf/Read`, `InsightsMetrics/Read`, `Syslog/Read`, and
   `VMConnection/Read`, assigns it only at the 11 exact approved VMs, and includes no invented NTA
   or Connection Monitor table action.
 - provisions a physically separate RBAC attestor UAMI with only
   `roleAssignments/read`, `roleDefinitions/read`, `denyAssignments/read`, and
-  `roleAssignmentScheduleInstances/read` at the subscription. Effective RBAC inventory v2 binds
-  exact-target `atScope() and assignedTo(principalId)` results for collector and context
-  principals, complete role definitions, applicable denies, active PIM instances, transitive
-  groups, raw page hashes, freshness, and repeated-read stability.
+  `roleAssignmentScheduleInstances/read` at the subscription, plus the Microsoft Graph
+  `Application.Read.All` app role required to enumerate service-principal transitive group
+  membership. The foundation first publishes a blocked phase-one handoff containing the deployed
+  identities, exact Graph app-role assignment, casted request paths with `$count=true`, and the
+  required `ConsistencyLevel: eventual` header, exact collector-contract inputs,
+  and all collectable target scopes. Effective RBAC inventory v3 then binds exact-target
+  `atScope() and assignedTo(principalId)` results for collector and context principals, complete
+  role definitions, applicable denies, active PIM instances, Graph transitive groups, separate raw
+  page hashes for two independently timed reads, freshness, and repeated-read stability. V2 inventory is
+  historical and parse-only. A separate phase-two template retrieves the
+  handoff from the exact successful phase-one deployment and rejects a changed deployment,
+  duplicate or out-of-scope targets, unreviewed inventory digest, incomplete principal evidence,
+  unexpected grants or roles, expired evidence, and management-group enumeration claims before
+  publishing the v8 contract.
 
 Source exceptions, stale results, schema mismatches, scope escapes, duplicate change pairings, or
 ambiguous incident transitions fail before the persistence transaction is entered.
@@ -157,9 +184,11 @@ ambiguous incident transitions fail before the persistence transaction is entere
   monitoring Reader access.
 - Query authority remains human-owned through the immutable published intent.
 - Acquisition contract publication is a guarded second phase after infrastructure and role
-  assignments exist: an external hierarchy-complete RBAC collection supplies the short-lived
-  inventory and source-manifest digest, and acquisition remains blocked until that measured
-  inventory is refreshed and matches the deployed identities and exact expected grants.
+  assignments exist: the first deployment publishes only a blocked bootstrap handoff; an external
+  exact-target RBAC and Graph membership collection supplies the short-lived inventory and
+  source-manifest digest; and the phase-two publication template keeps acquisition blocked until
+  the authoritative deployment handoff, independently reviewed inventory digest, identities,
+  target set, stable evidence, freshness, and exact expected grants all match.
 - Reordered source rows produce identical batch bytes.
 - Source `sourceIdentityId` values remain untrusted compatibility fields and cannot replace adapter
   proof; a fake source client cannot alter the identity stamped into exchanges or receipts.
@@ -182,7 +211,7 @@ ambiguous incident transitions fail before the persistence transaction is entere
 - The deployment publishes `athena.wc028MonitoringCollectorContract.v8` while retaining parse
   support for WC-024 v2 and legacy WC-028 v3-v7 contracts. Production verification requires the
   full reviewed v8 contract, permission-attested resource-context logs, effective RBAC inventory
-  v2, separate attestor identity, identity proof, and current Resource Health policy.
+  v3, separate attestor identity, identity proof, and current Resource Health policy.
 - Legacy acquisition-authority v1-v4 documents remain readable, but only v5 authorities can execute
   production acquisition. Production receipt verification requires receipt v5 and derives deployed
   tenant/client/object/resource identity and proof policy from the full reviewed
@@ -190,7 +219,7 @@ ambiguous incident transitions fail before the persistence transaction is entere
 - Production collection transactions require cryptographic receipt verification before persistence;
   receiptless compatibility is isolated in an explicitly named legacy/test transaction type.
 - This slice removes the IP Flow role and Network Watcher assignment, adds one separate narrow
-  Resource Health current-status role, one separate five-table resource-log role with exact per-VM
+  Resource Graph HealthResources role, one separate five-table resource-log role with exact per-VM
   assignments, and one separate read-only RBAC attestor role. It leaves the shared WC-016
   resource-group role unchanged and adds no Reader
   broadening, diagnostic setting, alert, query deployment, Connection Monitor mutation, or write
@@ -228,8 +257,13 @@ ambiguous incident transitions fail before the persistence transaction is entere
   times, unauthorized sources, or unauthorized resource scopes fail before any read.
 - Invalid proof signature, token version, issuer, audience, tenant, object ID, client ID, app-only
   identity type, role, or lifetime fails before client construction and the first source I/O.
+- Missing or substituted proof application, enterprise application, app role, direct assignment,
+  assigned principal, or secure tenant-scoped audience prevents phase-two contract publication.
 - Clock-advance tests prove `verifiedAt` is captured after token and JWKS work and is reused as the
   exact collection and execution-start timestamp.
+- Every call start/result, execution completion, receipt issuance start, and receipt-signing
+  completion must occur before the effective-RBAC inventory expires; crossing that boundary
+  aborts before persistence.
 - Tests prove the exact same `ManagedIdentityCredential` object reaches all five Azure clients,
   fake source identity values cannot change receipt identity, and `DefaultAzureCredential` cannot
   enter the production receipt path.
@@ -252,17 +286,26 @@ ambiguous incident transitions fail before the persistence transaction is entere
 - Log request v3 tests bind current and prior windows, collector execution time, `_ResourceId`,
   exact authority coverage, the permissions response, and the `Prefer` header without module
   globals.
-- IaC and contract tests require the exact Resource Health role ID, one allowed operation, and all
-  11 approved VM scopes while proving Reader was not broadened.
+- IaC and contract tests require the exact Resource Health role ID,
+  `Microsoft.ResourceGraph/resources/read`, and all 11 approved VM scopes while proving Reader was
+  not broadened. Production client tests use the documented `HealthResources` transition shape and
+  no longer inject an unsupported `previousAvailabilityState` into the current-status endpoint.
 - Receipt signatures and deployed identity/authority bindings are reverified in the production
   correlation boundary.
 - Replacing the incident anchor and recomputing unsigned correlation request and inventory digests
   fails because correlation reconstructs the canonical collector selection from signed persisted
-  observations and requires the receipt's exact source-record, observation, resource, state, and
-  interval bindings.
+  observations, including every connected same-state corroborating control, and requires the
+  receipt's exact source-record, observation, resource, state, and interval bindings.
 - Extra authority resources, stale effective RBAC evidence, inherited or group-derived unexpected
-  roles, changed assignment conditions, incomplete hierarchy evidence, workspace-context query
-  targets, and persisted out-of-contract resources all fail before trusted use.
+  roles, changed assignment conditions, incomplete exact-target evidence, workspace-context query
+  targets, and persisted out-of-contract resources all fail before trusted use. Every acquisition
+  read scope remains protected even though v8 disables IP Flow Verify. Exact attestation targets
+  include the workspace and each reviewed table, workload VNet, Network Watcher hierarchy,
+  evidence Storage hierarchy, signing Key Vault hierarchy, and every collector grant scope, so a
+  direct or transitive-group Athena Context assignment on a protected child cannot hide behind
+  parent-only `atScope()` reads. Azure's system-defined all-zero `All Principals` deny is evaluated
+  as a wildcard unless the collector principal or one of its attested transitive groups is
+  explicitly excluded.
 - Identical unsupported flow input produces identical unavailable signed evidence regardless of
   hypothetical IP Flow results, with zero transport calls.
 - Forged source identity claims, caller-backdated collection time, unproved aggregate zero,

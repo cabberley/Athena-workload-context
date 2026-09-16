@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.47.16.16243",
-      "templateHash": "18226004731080621115"
+      "templateHash": "17080182944959189541"
     },
     "name": "Athena WC-024 generic monitoring foundation",
     "description": "Deploys private generic Azure Monitor, VNet flow-log, and isolated evidence-collector foundations without workload-intent-derived thresholds or paths."
@@ -145,12 +145,6 @@
       "type": "string",
       "metadata": {
         "description": "Exact existing Athena context UAMI resource ID. Its resource and principal identities must differ from the monitoring collector UAMI."
-      }
-    },
-    "monitoringEffectiveRbacInventory": {
-      "type": "object",
-      "metadata": {
-        "description": "Externally collected hierarchy-complete effective RBAC inventory for the collector and Athena context identities."
       }
     },
     "retentionDays": {
@@ -300,7 +294,9 @@
     "validatedWorkloadPrivateEndpointSubnetResourceId": "[if(equals(toLower(parameters('workloadPrivateEndpointSubnetResourceId')), toLower(variables('reviewedWorkloadPrivateEndpointSubnetResourceId'))), variables('reviewedWorkloadPrivateEndpointSubnetResourceId'), fail('WC-024 workloadPrivateEndpointSubnetResourceId must match the reviewed workload private-endpoint subnet.'))]",
     "validatedCollectorRuntimeVirtualNetworkResourceId": "[if(equals(toLower(parameters('collectorRuntimeVirtualNetworkResourceId')), toLower(variables('reviewedCollectorRuntimeVirtualNetworkResourceId'))), variables('reviewedCollectorRuntimeVirtualNetworkResourceId'), fail('WC-024 collectorRuntimeVirtualNetworkResourceId must match the dedicated WC-024 collector VNet.'))]",
     "validatedCollectorRuntimeSubnetResourceId": "[if(equals(toLower(parameters('collectorRuntimeSubnetResourceId')), toLower(variables('reviewedCollectorRuntimeSubnetResourceId'))), variables('reviewedCollectorRuntimeSubnetResourceId'), fail('WC-024 collectorRuntimeSubnetResourceId must match the dedicated WC-024 collector runtime subnet.'))]",
-    "validatedCollectorPrivateEndpointSubnetResourceId": "[if(equals(toLower(parameters('collectorPrivateEndpointSubnetResourceId')), toLower(variables('reviewedCollectorPrivateEndpointSubnetResourceId'))), variables('reviewedCollectorPrivateEndpointSubnetResourceId'), fail('WC-024 collectorPrivateEndpointSubnetResourceId must match the dedicated WC-024 collector private-endpoint subnet.'))]"
+    "validatedCollectorPrivateEndpointSubnetResourceId": "[if(equals(toLower(parameters('collectorPrivateEndpointSubnetResourceId')), toLower(variables('reviewedCollectorPrivateEndpointSubnetResourceId'))), variables('reviewedCollectorPrivateEndpointSubnetResourceId'), fail('WC-024 collectorPrivateEndpointSubnetResourceId must match the dedicated WC-024 collector private-endpoint subnet.'))]",
+    "networkWatcherResourceGroupId": "[subscriptionResourceId('Microsoft.Resources/resourceGroups', parameters('networkWatcherResourceGroupName'))]",
+    "networkWatcherResourceId": "[resourceId(parameters('networkWatcherResourceGroupName'), 'Microsoft.Network/networkWatchers', parameters('networkWatcherName'))]"
   },
   "resources": [
     {
@@ -2403,7 +2399,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.47.16.16243",
-              "templateHash": "5019771191150949796"
+              "templateHash": "1752966289820779357"
             }
           },
           "parameters": {
@@ -2457,7 +2453,7 @@
             ],
             "resourceHealthRoleDefinitionGuid": "0790d6f2-9553-5b63-84ac-56596b7e4072",
             "resourceHealthAllowedOperations": [
-              "Microsoft.ResourceHealth/AvailabilityStatuses/current/read"
+              "Microsoft.ResourceGraph/resources/read"
             ]
           },
           "resources": [
@@ -2488,7 +2484,7 @@
               "name": "[variables('resourceHealthRoleDefinitionGuid')]",
               "properties": {
                 "roleName": "Athena WC-028 VM Resource Health Reader",
-                "description": "Read Resource Health availability status only at exact approved workload VMs.",
+                "description": "Read only HealthResources availability-status rows through Azure Resource Graph for exact approved workload VMs.",
                 "type": "CustomRole",
                 "permissions": [
                   {
@@ -2967,12 +2963,13 @@
         },
         "template": {
           "$schema": "https://schema.management.azure.com/schemas/2018-05-01/subscriptionDeploymentTemplate.json#",
+          "languageVersion": "2.0",
           "contentVersion": "1.0.0.0",
           "metadata": {
             "_generator": {
               "name": "bicep",
               "version": "0.47.16.16243",
-              "templateHash": "10424721827790073301"
+              "templateHash": "11596277367881675743"
             }
           },
           "parameters": {
@@ -2985,6 +2982,8 @@
           },
           "variables": {
             "attestorRoleDefinitionGuid": "2a8d9aea-2688-5841-a7e4-82f23d0f1bac",
+            "microsoftGraphApplicationId": "00000003-0000-0000-c000-000000000000",
+            "applicationReadAllAppRoleId": "9a5d68dd-52b0-4cc2-bd40-abcf44ac3a30",
             "attestorAllowedOperations": [
               "Microsoft.Authorization/roleAssignments/read",
               "Microsoft.Authorization/roleDefinitions/read",
@@ -2992,14 +2991,20 @@
               "Microsoft.Authorization/roleAssignmentScheduleInstances/read"
             ]
           },
-          "resources": [
-            {
+          "imports": {
+            "microsoftGraphV1": {
+              "provider": "MicrosoftGraph",
+              "version": "1.0.0"
+            }
+          },
+          "resources": {
+            "attestorRoleDefinition": {
               "type": "Microsoft.Authorization/roleDefinitions",
               "apiVersion": "2022-04-01",
               "name": "[variables('attestorRoleDefinitionGuid')]",
               "properties": {
                 "roleName": "Athena WC-028 Effective RBAC Attestor",
-                "description": "Read exact Azure RBAC assignments, full role definitions, deny assignments, and active PIM schedule instances without workload data access.",
+                "description": "Read exact Azure RBAC assignments, full role definitions, deny assignments, and active PIM schedule instances without workload data access. Microsoft Graph transitive membership is granted separately.",
                 "type": "CustomRole",
                 "permissions": [
                   {
@@ -3014,7 +3019,7 @@
                 ]
               }
             },
-            {
+            "attestorRoleAssignment": {
               "type": "Microsoft.Authorization/roleAssignments",
               "apiVersion": "2022-04-01",
               "name": "[guid(subscription().id, parameters('attestorPrincipalId'), subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('attestorRoleDefinitionGuid')))]",
@@ -3024,10 +3029,31 @@
                 "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('attestorRoleDefinitionGuid'))]"
               },
               "dependsOn": [
-                "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('attestorRoleDefinitionGuid'))]"
+                "attestorRoleDefinition"
+              ]
+            },
+            "microsoftGraphServicePrincipal": {
+              "existing": true,
+              "import": "microsoftGraphV1",
+              "type": "Microsoft.Graph/servicePrincipals@v1.0",
+              "properties": {
+                "appId": "[variables('microsoftGraphApplicationId')]"
+              }
+            },
+            "attestorDirectoryMembershipRead": {
+              "import": "microsoftGraphV1",
+              "type": "Microsoft.Graph/appRoleAssignedTo@v1.0",
+              "properties": {
+                "appRoleId": "[variables('applicationReadAllAppRoleId')]",
+                "principalId": "[parameters('attestorPrincipalId')]",
+                "resourceDisplayName": "Microsoft Graph",
+                "resourceId": "[reference('microsoftGraphServicePrincipal').id]"
+              },
+              "dependsOn": [
+                "microsoftGraphServicePrincipal"
               ]
             }
-          ],
+          },
           "outputs": {
             "attestorRoleDefinitionId": {
               "type": "string",
@@ -3035,7 +3061,7 @@
             },
             "attestorRoleName": {
               "type": "string",
-              "value": "[reference(subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('attestorRoleDefinitionGuid')), '2022-04-01').roleName]"
+              "value": "[reference('attestorRoleDefinition').roleName]"
             },
             "attestorScopeId": {
               "type": "string",
@@ -3044,6 +3070,186 @@
             "attestorAllowedOperations": {
               "type": "array",
               "value": "[variables('attestorAllowedOperations')]"
+            },
+            "microsoftGraphApplicationId": {
+              "type": "string",
+              "value": "[variables('microsoftGraphApplicationId')]"
+            },
+            "applicationReadAllAppRoleId": {
+              "type": "string",
+              "value": "[variables('applicationReadAllAppRoleId')]"
+            },
+            "applicationReadAllAssignmentId": {
+              "type": "string",
+              "value": "[reference('attestorDirectoryMembershipRead').id]"
+            },
+            "microsoftGraphServicePrincipalId": {
+              "type": "string",
+              "value": "[reference('microsoftGraphServicePrincipal').id]"
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams')]"
+      ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "monitoring-identity-proof-authority",
+      "location": "[deployment().location]",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "tenantId": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.collectorIdentityTenantId.value]"
+          },
+          "collectorPrincipalId": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.collectorIdentityPrincipalId.value]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2018-05-01/subscriptionDeploymentTemplate.json#",
+          "languageVersion": "2.0",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.47.16.16243",
+              "templateHash": "14120324858556383413"
+            }
+          },
+          "parameters": {
+            "tenantId": {
+              "type": "string",
+              "metadata": {
+                "description": "Tenant that owns the single-tenant monitoring identity-proof API."
+              }
+            },
+            "collectorPrincipalId": {
+              "type": "string",
+              "metadata": {
+                "description": "Collector managed-identity principal receiving the one proof app role."
+              }
+            }
+          },
+          "variables": {
+            "applicationUniqueName": "athena-wc028-monitoring-identity-proof",
+            "applicationDisplayName": "Athena WC-028 monitoring identity proof",
+            "identityProofAudience": "[format('api://{0}/athena-monitoring-identity-proof', toLower(parameters('tenantId')))]",
+            "identityProofAppRoleId": "[guid(parameters('tenantId'), 'athena-wc028-monitoring-identity-proof', 'Athena.MonitoringAcquisition.ProveIdentity')]",
+            "identityProofRoleValue": "Athena.MonitoringAcquisition.ProveIdentity"
+          },
+          "imports": {
+            "microsoftGraphV1": {
+              "provider": "MicrosoftGraph",
+              "version": "1.0.0"
+            }
+          },
+          "resources": {
+            "identityProofApplication": {
+              "import": "microsoftGraphV1",
+              "type": "Microsoft.Graph/applications@v1.0",
+              "properties": {
+                "displayName": "[variables('applicationDisplayName')]",
+                "uniqueName": "[variables('applicationUniqueName')]",
+                "signInAudience": "AzureADMyOrg",
+                "identifierUris": [
+                  "[variables('identityProofAudience')]"
+                ],
+                "api": {
+                  "requestedAccessTokenVersion": 1,
+                  "oauth2PermissionScopes": []
+                },
+                "optionalClaims": {
+                  "accessToken": [
+                    {
+                      "name": "idtyp",
+                      "essential": true,
+                      "additionalProperties": []
+                    }
+                  ]
+                },
+                "appRoles": [
+                  {
+                    "id": "[variables('identityProofAppRoleId')]",
+                    "displayName": "Prove monitoring acquisition identity",
+                    "description": "Emit one app-only role claim proving the exact WC-028 monitoring collector managed identity before Azure evidence reads.",
+                    "value": "[variables('identityProofRoleValue')]",
+                    "allowedMemberTypes": [
+                      "Application"
+                    ],
+                    "isEnabled": true
+                  }
+                ]
+              }
+            },
+            "identityProofServicePrincipal": {
+              "import": "microsoftGraphV1",
+              "type": "Microsoft.Graph/servicePrincipals@v1.0",
+              "properties": {
+                "appId": "[reference('identityProofApplication').appId]",
+                "displayName": "[variables('applicationDisplayName')]",
+                "accountEnabled": true,
+                "appRoleAssignmentRequired": true,
+                "tags": [
+                  "WindowsAzureActiveDirectoryIntegratedApp"
+                ]
+              },
+              "dependsOn": [
+                "identityProofApplication"
+              ]
+            },
+            "collectorIdentityProofRoleAssignment": {
+              "import": "microsoftGraphV1",
+              "type": "Microsoft.Graph/appRoleAssignedTo@v1.0",
+              "properties": {
+                "appRoleId": "[variables('identityProofAppRoleId')]",
+                "principalId": "[parameters('collectorPrincipalId')]",
+                "resourceDisplayName": "[variables('applicationDisplayName')]",
+                "resourceId": "[reference('identityProofServicePrincipal').id]"
+              },
+              "dependsOn": [
+                "identityProofServicePrincipal"
+              ]
+            }
+          },
+          "outputs": {
+            "identityProofAudience": {
+              "type": "string",
+              "value": "[variables('identityProofAudience')]"
+            },
+            "identityProofApplicationId": {
+              "type": "string",
+              "value": "[reference('identityProofApplication').appId]"
+            },
+            "identityProofApplicationObjectId": {
+              "type": "string",
+              "value": "[reference('identityProofApplication').id]"
+            },
+            "identityProofServicePrincipalId": {
+              "type": "string",
+              "value": "[reference('identityProofServicePrincipal').id]"
+            },
+            "identityProofAppRoleId": {
+              "type": "string",
+              "value": "[variables('identityProofAppRoleId')]"
+            },
+            "identityProofAppRoleValue": {
+              "type": "string",
+              "value": "[variables('identityProofRoleValue')]"
+            },
+            "identityProofAppRoleAssignmentId": {
+              "type": "string",
+              "value": "[reference('collectorIdentityProofRoleAssignment').id]"
+            },
+            "identityProofAssignedPrincipalId": {
+              "type": "string",
+              "value": "[parameters('collectorPrincipalId')]"
             }
           }
         }
@@ -3366,577 +3572,124 @@
           }
         }
       }
-    },
-    {
-      "type": "Microsoft.Resources/deployments",
-      "apiVersion": "2025-04-01",
-      "name": "monitoring-collector-contract",
-      "resourceGroup": "[parameters('monitoringResourceGroupName')]",
-      "properties": {
-        "expressionEvaluationOptions": {
-          "scope": "inner"
-        },
-        "mode": "Incremental",
-        "parameters": {
-          "collectorIdentityResourceId": {
-            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.collectorIdentityResourceId.value]"
-          },
-          "collectorIdentityClientId": {
-            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.collectorIdentityClientId.value]"
-          },
-          "collectorTenantId": {
-            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.collectorIdentityTenantId.value]"
-          },
-          "monitoringResourceGroupId": {
-            "value": "[subscriptionResourceId('Microsoft.Resources/resourceGroups', parameters('monitoringResourceGroupName'))]"
-          },
-          "workloadResourceGroupId": {
-            "value": "[variables('workloadResourceGroupId')]"
-          },
-          "workloadVirtualNetworkResourceId": {
-            "value": "[variables('validatedWorkloadVirtualNetworkResourceId')]"
-          },
-          "approvedVmNames": {
-            "value": "[variables('validatedApprovedVmNames')]"
-          },
-          "workspaceResourceId": {
-            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'adopt-monitoring-data-platform'), '2025-04-01').outputs.workspaceResourceId.value]"
-          },
-          "dataCollectionRuleResourceId": {
-            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'adopt-monitoring-data-platform'), '2025-04-01').outputs.dataCollectionRuleResourceId.value]"
-          },
-          "dataCollectionEndpointResourceId": {
-            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'adopt-monitoring-data-platform'), '2025-04-01').outputs.dataCollectionEndpointResourceId.value]"
-          },
-          "authorizationMode": {
-            "value": "conditionedWorkspacePlusExactResourceContext"
-          },
-          "workspaceAccessControlMode": "[if(reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'adopt-monitoring-data-platform'), '2025-04-01').outputs.workspaceResourceContextAccessEnabled.value, createObject('value', 'workspaceAndResourceContext'), createObject('value', 'workspaceOnly'))]",
-          "workspaceResourceContextAccessEnabled": {
-            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'adopt-monitoring-data-platform'), '2025-04-01').outputs.workspaceResourceContextAccessEnabled.value]"
-          },
-          "workspaceSkuName": "[if(equals(reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'adopt-monitoring-data-platform'), '2025-04-01').outputs.workspaceSkuName.value, 'PerGB2018'), createObject('value', 'PerGB2018'), createObject('value', fail('WC-028 resource-context acquisition requires the Analytics workspace SKU.')))]",
-          "resourceContextTablePlans": {
-            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'adopt-monitoring-data-platform'), '2025-04-01').outputs.resourceContextTablePlans.value]"
-          },
-          "readerRoleDefinitionId": {
-            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-reader-assignments'), '2025-04-01').outputs.readerRoleDefinitionId.value]"
-          },
-          "signalReaderRoleDefinitionId": {
-            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments'), '2025-04-01').outputs.signalReaderRoleDefinitionId.value]"
-          },
-          "signalReaderRoleName": {
-            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments'), '2025-04-01').outputs.signalReaderRoleName.value]"
-          },
-          "resourceLogReaderRoleDefinitionId": {
-            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments'), '2025-04-01').outputs.resourceLogReaderRoleDefinitionId.value]"
-          },
-          "resourceLogReaderRoleName": {
-            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments'), '2025-04-01').outputs.resourceLogReaderRoleName.value]"
-          },
-          "resourceLogAllowedOperations": {
-            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments'), '2025-04-01').outputs.resourceLogAllowedOperations.value]"
-          },
-          "resourceLogReadScopeIds": {
-            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments'), '2025-04-01').outputs.resourceLogReadScopeIds.value]"
-          },
-          "logAnalyticsDataReaderRoleDefinitionId": {
-            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-reader-assignments'), '2025-04-01').outputs.logAnalyticsDataReaderRoleDefinitionId.value]"
-          },
-          "rbacAttestorIdentityResourceId": {
-            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.rbacAttestorIdentityResourceId.value]"
-          },
-          "rbacAttestorIdentityClientId": {
-            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.rbacAttestorIdentityClientId.value]"
-          },
-          "rbacAttestorPrincipalId": {
-            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.rbacAttestorIdentityPrincipalId.value]"
-          },
-          "rbacAttestorTenantId": {
-            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.rbacAttestorIdentityTenantId.value]"
-          },
-          "rbacAttestorRoleDefinitionId": {
-            "value": "[reference(subscriptionResourceId('Microsoft.Resources/deployments', 'monitoring-effective-rbac-attestor'), '2025-04-01').outputs.attestorRoleDefinitionId.value]"
-          },
-          "rbacAttestorRoleName": {
-            "value": "[reference(subscriptionResourceId('Microsoft.Resources/deployments', 'monitoring-effective-rbac-attestor'), '2025-04-01').outputs.attestorRoleName.value]"
-          },
-          "rbacAttestorScopeId": {
-            "value": "[reference(subscriptionResourceId('Microsoft.Resources/deployments', 'monitoring-effective-rbac-attestor'), '2025-04-01').outputs.attestorScopeId.value]"
-          },
-          "rbacAttestorAllowedOperations": {
-            "value": "[reference(subscriptionResourceId('Microsoft.Resources/deployments', 'monitoring-effective-rbac-attestor'), '2025-04-01').outputs.attestorAllowedOperations.value]"
-          },
-          "resourceHealthRoleDefinitionId": {
-            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments'), '2025-04-01').outputs.resourceHealthRoleDefinitionId.value]"
-          },
-          "resourceHealthRoleName": {
-            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments'), '2025-04-01').outputs.resourceHealthRoleName.value]"
-          },
-          "resourceHealthScopeIds": {
-            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments'), '2025-04-01').outputs.resourceHealthScopeIds.value]"
-          },
-          "resourceHealthAllowedOperations": {
-            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments'), '2025-04-01').outputs.resourceHealthAllowedOperations.value]"
-          },
-          "logAnalyticsAllowedTables": {
-            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-reader-assignments'), '2025-04-01').outputs.allowedLogTableNames.value]"
-          },
-          "logAnalyticsAccessCondition": {
-            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-reader-assignments'), '2025-04-01').outputs.logAnalyticsAccessCondition.value]"
-          },
-          "resourceReadScopeIds": {
-            "value": "[concat(reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-reader-assignments'), '2025-04-01').outputs.resourceReadScopeIds.value, reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments'), '2025-04-01').outputs.resourceReadScopeIds.value, reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('networkWatcherResourceGroupName')), 'Microsoft.Resources/deployments', 'network-watcher-monitoring-evidence-reader-assignment'), '2025-04-01').outputs.resourceReadScopeIds.value)]"
-          },
-          "signalReadScopeIds": {
-            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments'), '2025-04-01').outputs.signalReadScopeIds.value]"
-          },
-          "signingKeyResourceId": {
-            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.signingKeyResourceId.value]"
-          },
-          "signingKeyArmResourceId": {
-            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.signingKeyArmResourceId.value]"
-          },
-          "signingKeyCryptoUserRoleDefinitionId": {
-            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.signingKeyCryptoUserRoleDefinitionId.value]"
-          },
-          "evidenceStorageAccountResourceId": {
-            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-flow-log-storage'), '2025-04-01').outputs.storageAccountResourceId.value]"
-          },
-          "evidenceContainerResourceId": {
-            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.evidenceContainerResourceId.value]"
-          },
-          "evidenceWriterRoleDefinitionId": {
-            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.evidenceWriterRoleDefinitionId.value]"
-          },
-          "effectiveRbacInventory": "[if(and(and(and(and(and(and(and(equals(parameters('monitoringEffectiveRbacInventory').schemaVersion, 'athena.wc028MonitoringEffectiveRbacInventory.v2'), equals(toLower(parameters('monitoringEffectiveRbacInventory').collectorPrincipalId), toLower(reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.collectorIdentityPrincipalId.value))), equals(toLower(parameters('monitoringEffectiveRbacInventory').athenaContextPrincipalId), toLower(reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', variables('athenaContextIdentitySegments')[2], variables('athenaContextIdentitySegments')[4]), 'Microsoft.ManagedIdentity/userAssignedIdentities', variables('athenaContextIdentitySegments')[8]), '2024-11-30').principalId))), equals(toLower(parameters('monitoringEffectiveRbacInventory').attestorIdentityResourceId), toLower(reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.rbacAttestorIdentityResourceId.value))), equals(toLower(parameters('monitoringEffectiveRbacInventory').attestorClientId), toLower(reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.rbacAttestorIdentityClientId.value))), equals(toLower(parameters('monitoringEffectiveRbacInventory').attestorPrincipalId), toLower(reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.rbacAttestorIdentityPrincipalId.value))), equals(toLower(parameters('monitoringEffectiveRbacInventory').attestorTenantId), toLower(reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.rbacAttestorIdentityTenantId.value))), equals(toLower(parameters('monitoringEffectiveRbacInventory').tenantId), toLower(reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.collectorIdentityTenantId.value))), createObject('value', parameters('monitoringEffectiveRbacInventory')), createObject('value', fail('monitoring acquisition requires stable effective RBAC inventory v2 bound to all three isolated identities and tenant')))]",
-          "maximumEvidenceAgeSeconds": {
-            "value": "[parameters('maximumEvidenceAgeSeconds')]"
-          },
-          "connectionMonitorDeploymentMode": {
-            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'connection-monitor-capability'), '2025-04-01').outputs.deploymentMode.value]"
-          }
-        },
-        "template": {
-          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
-          "contentVersion": "1.0.0.0",
-          "metadata": {
-            "_generator": {
-              "name": "bicep",
-              "version": "0.47.16.16243",
-              "templateHash": "7470773017094291366"
-            }
-          },
-          "parameters": {
-            "collectorIdentityResourceId": {
-              "type": "string",
-              "metadata": {
-                "description": "Resource ID of the isolated monitoring evidence collector identity."
-              }
-            },
-            "collectorIdentityClientId": {
-              "type": "string",
-              "metadata": {
-                "description": "Client ID of the isolated monitoring evidence collector identity."
-              }
-            },
-            "collectorTenantId": {
-              "type": "string",
-              "metadata": {
-                "description": "Tenant ID that owns the isolated monitoring evidence collector identity."
-              }
-            },
-            "monitoringResourceGroupId": {
-              "type": "string",
-              "metadata": {
-                "description": "Resource ID of the monitoring-owned resource group."
-              }
-            },
-            "workloadResourceGroupId": {
-              "type": "string",
-              "metadata": {
-                "description": "Resource ID of the approved workload resource group."
-              }
-            },
-            "workloadVirtualNetworkResourceId": {
-              "type": "string",
-              "metadata": {
-                "description": "Exact reviewed workload VNet resource ID."
-              }
-            },
-            "approvedVmNames": {
-              "type": "array",
-              "minLength": 11,
-              "maxLength": 11,
-              "metadata": {
-                "description": "Exact reviewed 11 VM names that are inside the WC-024 workload boundary."
-              }
-            },
-            "workspaceResourceId": {
-              "type": "string",
-              "metadata": {
-                "description": "Resource ID of the private Log Analytics workspace."
-              }
-            },
-            "dataCollectionRuleResourceId": {
-              "type": "string",
-              "metadata": {
-                "description": "Resource ID of the generic AMA and VM Insights DCR."
-              }
-            },
-            "dataCollectionEndpointResourceId": {
-              "type": "string",
-              "metadata": {
-                "description": "Resource ID of the private data collection endpoint."
-              }
-            },
-            "authorizationMode": {
-              "type": "string",
-              "allowedValues": [
-                "conditionedWorkspacePlusExactResourceContext"
-              ],
-              "metadata": {
-                "description": "Reviewed authorization model used by the isolated collector."
-              }
-            },
-            "workspaceAccessControlMode": {
-              "type": "string",
-              "allowedValues": [
-                "workspaceAndResourceContext",
-                "workspaceOnly"
-              ],
-              "metadata": {
-                "description": "Observed Log Analytics workspace access-control mode."
-              }
-            },
-            "workspaceResourceContextAccessEnabled": {
-              "type": "bool",
-              "metadata": {
-                "description": "Observed workspace resource-context access flag."
-              }
-            },
-            "workspaceSkuName": {
-              "type": "string",
-              "metadata": {
-                "description": "Observed adopted workspace SKU."
-              }
-            },
-            "resourceContextTablePlans": {
-              "type": "array",
-              "minLength": 5,
-              "maxLength": 5,
-              "metadata": {
-                "description": "Observed exact Analytics plans for supported resource-context tables."
-              }
-            },
-            "readerRoleDefinitionId": {
-              "type": "string",
-              "metadata": {
-                "description": "Built-in Reader role definition resource ID."
-              }
-            },
-            "signalReaderRoleDefinitionId": {
-              "type": "string",
-              "metadata": {
-                "description": "Existing narrow VM signal-reader role definition resource ID."
-              }
-            },
-            "signalReaderRoleName": {
-              "type": "string",
-              "metadata": {
-                "description": "Exact deployed narrow VM signal-reader role name."
-              }
-            },
-            "resourceLogReaderRoleDefinitionId": {
-              "type": "string",
-              "metadata": {
-                "description": "Exact custom role definition for resource-context Log Analytics reads."
-              }
-            },
-            "resourceLogReaderRoleName": {
-              "type": "string",
-              "metadata": {
-                "description": "Exact custom role name for resource-context Log Analytics reads."
-              }
-            },
-            "resourceLogAllowedOperations": {
-              "type": "array",
-              "minLength": 5,
-              "maxLength": 5,
-              "metadata": {
-                "description": "Exact registered resource-context log-table actions granted only at approved VMs."
-              }
-            },
-            "resourceLogReadScopeIds": {
-              "type": "array",
-              "minLength": 11,
-              "maxLength": 11,
-              "metadata": {
-                "description": "Exact approved VM scopes receiving the resource-context log role."
-              }
-            },
-            "logAnalyticsDataReaderRoleDefinitionId": {
-              "type": "string",
-              "metadata": {
-                "description": "Built-in Log Analytics Data Reader role definition resource ID."
-              }
-            },
-            "resourceHealthRoleDefinitionId": {
-              "type": "string",
-              "metadata": {
-                "description": "Exact custom role definition resource ID for Resource Health availability reads."
-              }
-            },
-            "resourceHealthRoleName": {
-              "type": "string",
-              "metadata": {
-                "description": "Exact custom role name for Resource Health availability reads."
-              }
-            },
-            "resourceHealthScopeIds": {
-              "type": "array",
-              "minLength": 11,
-              "maxLength": 11,
-              "metadata": {
-                "description": "Exact approved VM resource IDs receiving Resource Health availability-read assignments."
-              }
-            },
-            "resourceHealthAllowedOperations": {
-              "type": "array",
-              "minLength": 1,
-              "maxLength": 1,
-              "metadata": {
-                "description": "Exact Resource Health management-plane operation allowlist."
-              }
-            },
-            "rbacAttestorIdentityResourceId": {
-              "type": "string",
-              "metadata": {
-                "description": "Resource ID of the isolated effective RBAC attestor identity."
-              }
-            },
-            "rbacAttestorIdentityClientId": {
-              "type": "string",
-              "metadata": {
-                "description": "Client ID of the isolated effective RBAC attestor identity."
-              }
-            },
-            "rbacAttestorPrincipalId": {
-              "type": "string",
-              "metadata": {
-                "description": "Principal ID of the isolated effective RBAC attestor identity."
-              }
-            },
-            "rbacAttestorTenantId": {
-              "type": "string",
-              "metadata": {
-                "description": "Tenant ID of the isolated effective RBAC attestor identity."
-              }
-            },
-            "rbacAttestorRoleDefinitionId": {
-              "type": "string",
-              "metadata": {
-                "description": "Exact custom role definition used only by the RBAC attestor."
-              }
-            },
-            "rbacAttestorRoleName": {
-              "type": "string",
-              "metadata": {
-                "description": "Exact custom role name used only by the RBAC attestor."
-              }
-            },
-            "rbacAttestorScopeId": {
-              "type": "string",
-              "metadata": {
-                "description": "Exact subscription scope receiving the RBAC attestor assignment."
-              }
-            },
-            "rbacAttestorAllowedOperations": {
-              "type": "array",
-              "minLength": 4,
-              "maxLength": 4,
-              "metadata": {
-                "description": "Exact read-only Azure RBAC operations granted to the attestor."
-              }
-            },
-            "logAnalyticsAllowedTables": {
-              "type": "array",
-              "minLength": 13,
-              "maxLength": 13,
-              "metadata": {
-                "description": "Exact Log Analytics table names permitted by the role-assignment condition."
-              }
-            },
-            "logAnalyticsAccessCondition": {
-              "type": "string",
-              "metadata": {
-                "description": "Exact restrictive Azure RBAC condition applied to Log Analytics data reads."
-              }
-            },
-            "resourceReadScopeIds": {
-              "type": "array",
-              "minLength": 27,
-              "maxLength": 27,
-              "metadata": {
-                "description": "Exact management-plane resource IDs readable through built-in Reader."
-              }
-            },
-            "signalReadScopeIds": {
-              "type": "array",
-              "minLength": 11,
-              "maxLength": 11,
-              "metadata": {
-                "description": "Exact VM resource IDs readable through the narrow signal-reader role."
-              }
-            },
-            "signingKeyResourceId": {
-              "type": "string",
-              "metadata": {
-                "description": "Resource ID of the non-exportable collector signing key."
-              }
-            },
-            "signingKeyArmResourceId": {
-              "type": "string",
-              "metadata": {
-                "description": "ARM resource ID of the non-exportable collector signing key."
-              }
-            },
-            "signingKeyCryptoUserRoleDefinitionId": {
-              "type": "string",
-              "metadata": {
-                "description": "Exact Key Vault Crypto User role definition resource ID."
-              }
-            },
-            "evidenceStorageAccountResourceId": {
-              "type": "string",
-              "metadata": {
-                "description": "Resource ID of the monitoring-owned immutable evidence storage account."
-              }
-            },
-            "evidenceContainerResourceId": {
-              "type": "string",
-              "metadata": {
-                "description": "Exact monitoring evidence container receiving immutable evidence writes."
-              }
-            },
-            "evidenceWriterRoleDefinitionId": {
-              "type": "string",
-              "metadata": {
-                "description": "Exact Storage Blob Data Contributor role definition resource ID."
-              }
-            },
-            "effectiveRbacInventory": {
-              "type": "object",
-              "metadata": {
-                "description": "Externally collected, hierarchy-complete effective RBAC inventory for both identities."
-              }
-            },
-            "maximumEvidenceAgeSeconds": {
-              "type": "int",
-              "minValue": 60,
-              "maxValue": 900,
-              "metadata": {
-                "description": "Maximum accepted age for a signed evidence handoff."
-              }
-            },
-            "connectionMonitorDeploymentMode": {
-              "type": "string",
-              "metadata": {
-                "description": "The generic Connection Monitor capability state."
-              }
-            }
-          },
-          "variables": {
-            "validatedConnectionMonitorDeploymentMode": "[if(equals(parameters('connectionMonitorDeploymentMode'), 'capability-only'), parameters('connectionMonitorDeploymentMode'), fail('collector contracts require the generic Connection Monitor capability-only mode'))]",
-            "collectorContract": {
-              "schemaVersion": "athena.wc024MonitoringCollectorContract.v2",
-              "collectorIdentityResourceId": "[parameters('collectorIdentityResourceId')]",
-              "collectorIdentityClientId": "[parameters('collectorIdentityClientId')]",
-              "monitoringResourceGroupId": "[parameters('monitoringResourceGroupId')]",
-              "workloadResourceGroupId": "[parameters('workloadResourceGroupId')]",
-              "workloadVirtualNetworkResourceId": "[parameters('workloadVirtualNetworkResourceId')]",
-              "approvedVmNames": "[parameters('approvedVmNames')]",
-              "workspaceResourceId": "[parameters('workspaceResourceId')]",
-              "dataCollectionRuleResourceId": "[parameters('dataCollectionRuleResourceId')]",
-              "dataCollectionEndpointResourceId": "[parameters('dataCollectionEndpointResourceId')]",
-              "authorizationMode": "[parameters('authorizationMode')]",
-              "workspaceAccessControlMode": "[parameters('workspaceAccessControlMode')]",
-              "readerRoleDefinitionId": "[parameters('readerRoleDefinitionId')]",
-              "signalReaderRoleDefinitionId": "[parameters('signalReaderRoleDefinitionId')]",
-              "logAnalyticsDataReaderRoleDefinitionId": "[parameters('logAnalyticsDataReaderRoleDefinitionId')]",
-              "logAnalyticsAllowedTables": "[parameters('logAnalyticsAllowedTables')]",
-              "logAnalyticsAccessCondition": "[parameters('logAnalyticsAccessCondition')]",
-              "resourceReadScopeIds": "[parameters('resourceReadScopeIds')]",
-              "signalReadScopeIds": "[parameters('signalReadScopeIds')]",
-              "signalKinds": [
-                "heartbeat",
-                "perf",
-                "insightsMetrics",
-                "syslog",
-                "disk",
-                "guest",
-                "vnetFlow",
-                "trafficAnalytics"
-              ],
-              "allowedReadOperations": [
-                "Microsoft.OperationalInsights/workspaces/read",
-                "Microsoft.OperationalInsights/workspaces/query/read",
-                "Microsoft.OperationalInsights/workspaces/tables/data/read",
-                "Microsoft.Compute/virtualMachines/instanceView/read",
-                "Microsoft.Insights/Metrics/Read",
-                "Microsoft.Insights/dataCollectionRules/read",
-                "Microsoft.Insights/dataCollectionEndpoints/read",
-                "Microsoft.Insights/dataCollectionRuleAssociations/read",
-                "Microsoft.Insights/privateLinkScopes/read",
-                "Microsoft.Network/networkWatchers/flowLogs/read"
-              ],
-              "collectionMode": "isolatedSignedCollector",
-              "handoffSchemaVersion": "athena.wc024MonitoringEvidenceHandoff.v1",
-              "maximumEvidenceAgeSeconds": "[parameters('maximumEvidenceAgeSeconds')]",
-              "connectionMonitorMode": "capabilityOnly",
-              "signingKeyResourceId": "[parameters('signingKeyResourceId')]",
-              "evidenceStorageAccountResourceId": "[parameters('evidenceStorageAccountResourceId')]",
-              "evidenceContainerName": "monitoring-evidence",
-              "connectionMonitorDeploymentMode": "[variables('validatedConnectionMonitorDeploymentMode')]"
-            },
-            "validatedAcquisitionWorkspaceAccessControlMode": "[if(equals(parameters('workspaceAccessControlMode'), 'workspaceAndResourceContext'), parameters('workspaceAccessControlMode'), fail('production monitoring acquisition requires resource-context Log Analytics mode'))]"
-          },
-          "resources": [],
-          "outputs": {
-            "collectorContract": {
-              "type": "object",
-              "value": "[variables('collectorContract')]"
-            },
-            "acquisitionCollectorContract": {
-              "type": "object",
-              "value": "[union(variables('collectorContract'), createObject('schemaVersion', 'athena.wc028MonitoringCollectorContract.v8', 'handoffSchemaVersion', 'athena.wc028MonitoringEvidenceHandoff.v2', 'acquisitionReceiptSchemaVersion', 'athena.wc028MonitoringAcquisitionReceipt.v5', 'workspaceAccessControlMode', variables('validatedAcquisitionWorkspaceAccessControlMode'), 'workspaceResourceContextAccessEnabled', parameters('workspaceResourceContextAccessEnabled'), 'workspaceSkuName', parameters('workspaceSkuName'), 'resourceContextTablePlans', parameters('resourceContextTablePlans'), 'resourceIdColumn', '_ResourceId', 'logQueryPreferHeader', 'include-permissions=true', 'flowTableAcquisitionMode', 'unsupportedUnavailable', 'collectorTenantId', parameters('collectorTenantId'), 'signalReaderRoleName', parameters('signalReaderRoleName'), 'resourceLogReaderRoleDefinitionId', parameters('resourceLogReaderRoleDefinitionId'), 'resourceLogReaderRoleName', parameters('resourceLogReaderRoleName'), 'resourceLogAllowedOperations', parameters('resourceLogAllowedOperations'), 'resourceLogReadScopeIds', parameters('resourceLogReadScopeIds'), 'rbacAttestorIdentityResourceId', parameters('rbacAttestorIdentityResourceId'), 'rbacAttestorIdentityClientId', parameters('rbacAttestorIdentityClientId'), 'rbacAttestorPrincipalId', parameters('rbacAttestorPrincipalId'), 'rbacAttestorTenantId', parameters('rbacAttestorTenantId'), 'rbacAttestorRoleDefinitionId', parameters('rbacAttestorRoleDefinitionId'), 'rbacAttestorRoleName', parameters('rbacAttestorRoleName'), 'rbacAttestorScopeId', parameters('rbacAttestorScopeId'), 'rbacAttestorAllowedOperations', parameters('rbacAttestorAllowedOperations'), 'rbacAttestorIdentitySeparationEnforced', true(), 'identityProofAudience', 'api://athena-monitoring-identity-proof', 'identityProofTokenVersion', '1.0', 'identityProofRequiredRole', 'Athena.MonitoringAcquisition.ProveIdentity', 'identityProofMaximumLifetimeSeconds', 7200, 'resourceHealthRoleDefinitionId', parameters('resourceHealthRoleDefinitionId'), 'resourceHealthRoleName', parameters('resourceHealthRoleName'), 'resourceHealthScopeIds', parameters('resourceHealthScopeIds'), 'resourceHealthAllowedOperations', parameters('resourceHealthAllowedOperations'), 'signingKeyArmResourceId', parameters('signingKeyArmResourceId'), 'signingKeyCryptoUserRoleDefinitionId', parameters('signingKeyCryptoUserRoleDefinitionId'), 'evidenceContainerResourceId', parameters('evidenceContainerResourceId'), 'evidenceWriterRoleDefinitionId', parameters('evidenceWriterRoleDefinitionId'), 'effectiveRbacInventory', parameters('effectiveRbacInventory'), 'allowedReadOperations', concat(filter(variables('collectorContract').allowedReadOperations, lambda('operation', not(startsWith(toLower(lambdaVariables('operation')), 'microsoft.operationalinsights/workspaces')))), parameters('resourceHealthAllowedOperations'), parameters('resourceLogAllowedOperations'))))]"
-            }
-          }
-        }
-      },
-      "dependsOn": [
-        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'connection-monitor-capability')]",
-        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'adopt-monitoring-data-platform')]",
-        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-reader-assignments')]",
-        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams')]",
-        "[subscriptionResourceId('Microsoft.Resources/deployments', 'monitoring-effective-rbac-attestor')]",
-        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-flow-log-storage')]",
-        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('networkWatcherResourceGroupName')), 'Microsoft.Resources/deployments', 'network-watcher-monitoring-evidence-reader-assignment')]",
-        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments')]"
-      ]
     }
   ],
   "outputs": {
-    "monitoringCollectorContract": {
+    "monitoringRbacBootstrapHandoff": {
       "type": "object",
       "metadata": {
-        "description": "Exact generic monitoring collector contract that must be captured, reviewed, and signed before a collector runs."
+        "description": "Phase-one handoff. Collect effective RBAC only after these identities, roles, and exact target scopes exist, then pass the immutable reviewed handoff to publish-monitoring-contract.bicep."
       },
-      "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-collector-contract'), '2025-04-01').outputs.collectorContract.value]"
+      "value": {
+        "schemaVersion": "athena.wc024MonitoringRbacBootstrapHandoff.v1",
+        "sourceDeploymentName": "[deployment().name]",
+        "handoffId": "[guid(subscription().id, reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.collectorIdentityResourceId.value, extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', variables('athenaContextIdentitySegments')[2], variables('athenaContextIdentitySegments')[4]), 'Microsoft.ManagedIdentity/userAssignedIdentities', variables('athenaContextIdentitySegments')[8]), reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.rbacAttestorIdentityResourceId.value, join(union(concat(createArray(subscription().id, variables('workloadResourceGroupId'), subscriptionResourceId('Microsoft.Resources/resourceGroups', parameters('monitoringResourceGroupName')), variables('networkWatcherResourceGroupId'), variables('validatedWorkloadVirtualNetworkResourceId'), reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'adopt-monitoring-data-platform'), '2025-04-01').outputs.workspaceResourceId.value, reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-flow-log-storage'), '2025-04-01').outputs.storageAccountResourceId.value, format('{0}/blobServices/default', reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-flow-log-storage'), '2025-04-01').outputs.storageAccountResourceId.value), reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.evidenceContainerResourceId.value, reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.keyVaultResourceId.value, reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.signingKeyArmResourceId.value, variables('networkWatcherResourceId')), map(reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-reader-assignments'), '2025-04-01').outputs.allowedLogTableNames.value, lambda('tableName', format('{0}/tables/{1}', reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'adopt-monitoring-data-platform'), '2025-04-01').outputs.workspaceResourceId.value, lambdaVariables('tableName')))), concat(reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-reader-assignments'), '2025-04-01').outputs.resourceReadScopeIds.value, reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments'), '2025-04-01').outputs.resourceReadScopeIds.value, reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('networkWatcherResourceGroupName')), 'Microsoft.Resources/deployments', 'network-watcher-monitoring-evidence-reader-assignment'), '2025-04-01').outputs.resourceReadScopeIds.value), reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments'), '2025-04-01').outputs.signalReadScopeIds.value, reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments'), '2025-04-01').outputs.resourceLogReadScopeIds.value, reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments'), '2025-04-01').outputs.resourceHealthScopeIds.value), createArray()), '|'))]",
+        "publicationState": "blockedPendingEffectiveRbacInventory",
+        "scopeCollectionMode": "subscriptionAndDescendantAtScope",
+        "managementGroupAncestorDisposition": "notDirectlyEnumerated",
+        "subscriptionId": "[subscription().subscriptionId]",
+        "tenantId": "[tenant().tenantId]",
+        "monitoringReaderPrincipalId": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.collectorIdentityPrincipalId.value]",
+        "athenaContextIdentityId": "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', variables('athenaContextIdentitySegments')[2], variables('athenaContextIdentitySegments')[4]), 'Microsoft.ManagedIdentity/userAssignedIdentities', variables('athenaContextIdentitySegments')[8])]",
+        "athenaContextPrincipalId": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', variables('athenaContextIdentitySegments')[2], variables('athenaContextIdentitySegments')[4]), 'Microsoft.ManagedIdentity/userAssignedIdentities', variables('athenaContextIdentitySegments')[8]), '2024-11-30').principalId]",
+        "physicalIdentitySeparationEnforced": "[if(and(and(and(and(and(not(equals(toLower(reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.collectorIdentityResourceId.value), toLower(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', variables('athenaContextIdentitySegments')[2], variables('athenaContextIdentitySegments')[4]), 'Microsoft.ManagedIdentity/userAssignedIdentities', variables('athenaContextIdentitySegments')[8])))), not(equals(toLower(reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.collectorIdentityResourceId.value), toLower(reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.rbacAttestorIdentityResourceId.value)))), not(equals(toLower(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', variables('athenaContextIdentitySegments')[2], variables('athenaContextIdentitySegments')[4]), 'Microsoft.ManagedIdentity/userAssignedIdentities', variables('athenaContextIdentitySegments')[8])), toLower(reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.rbacAttestorIdentityResourceId.value)))), not(equals(toLower(reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.collectorIdentityPrincipalId.value), toLower(reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', variables('athenaContextIdentitySegments')[2], variables('athenaContextIdentitySegments')[4]), 'Microsoft.ManagedIdentity/userAssignedIdentities', variables('athenaContextIdentitySegments')[8]), '2024-11-30').principalId)))), not(equals(toLower(reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.collectorIdentityPrincipalId.value), toLower(reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.rbacAttestorIdentityPrincipalId.value)))), not(equals(toLower(reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', variables('athenaContextIdentitySegments')[2], variables('athenaContextIdentitySegments')[4]), 'Microsoft.ManagedIdentity/userAssignedIdentities', variables('athenaContextIdentitySegments')[8]), '2024-11-30').principalId), toLower(reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.rbacAttestorIdentityPrincipalId.value)))), true(), fail('monitoring collector, Athena context, and RBAC attestor must be physically separate UAMIs with distinct principal IDs'))]",
+        "effectiveRbacTargetScopeIds": "[union(concat(createArray(subscription().id, variables('workloadResourceGroupId'), subscriptionResourceId('Microsoft.Resources/resourceGroups', parameters('monitoringResourceGroupName')), variables('networkWatcherResourceGroupId'), variables('validatedWorkloadVirtualNetworkResourceId'), reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'adopt-monitoring-data-platform'), '2025-04-01').outputs.workspaceResourceId.value, reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-flow-log-storage'), '2025-04-01').outputs.storageAccountResourceId.value, format('{0}/blobServices/default', reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-flow-log-storage'), '2025-04-01').outputs.storageAccountResourceId.value), reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.evidenceContainerResourceId.value, reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.keyVaultResourceId.value, reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.signingKeyArmResourceId.value, variables('networkWatcherResourceId')), map(reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-reader-assignments'), '2025-04-01').outputs.allowedLogTableNames.value, lambda('tableName', format('{0}/tables/{1}', reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'adopt-monitoring-data-platform'), '2025-04-01').outputs.workspaceResourceId.value, lambdaVariables('tableName')))), concat(reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-reader-assignments'), '2025-04-01').outputs.resourceReadScopeIds.value, reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments'), '2025-04-01').outputs.resourceReadScopeIds.value, reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('networkWatcherResourceGroupName')), 'Microsoft.Resources/deployments', 'network-watcher-monitoring-evidence-reader-assignment'), '2025-04-01').outputs.resourceReadScopeIds.value), reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments'), '2025-04-01').outputs.signalReadScopeIds.value, reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments'), '2025-04-01').outputs.resourceLogReadScopeIds.value, reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments'), '2025-04-01').outputs.resourceHealthScopeIds.value), createArray())]",
+        "directoryMembershipCollection": {
+          "graphApplicationId": "[reference(subscriptionResourceId('Microsoft.Resources/deployments', 'monitoring-effective-rbac-attestor'), '2025-04-01').outputs.microsoftGraphApplicationId.value]",
+          "graphApplicationReadAllAppRoleId": "[reference(subscriptionResourceId('Microsoft.Resources/deployments', 'monitoring-effective-rbac-attestor'), '2025-04-01').outputs.applicationReadAllAppRoleId.value]",
+          "graphApplicationReadAllAssignmentId": "[reference(subscriptionResourceId('Microsoft.Resources/deployments', 'monitoring-effective-rbac-attestor'), '2025-04-01').outputs.applicationReadAllAssignmentId.value]",
+          "graphServicePrincipalId": "[reference(subscriptionResourceId('Microsoft.Resources/deployments', 'monitoring-effective-rbac-attestor'), '2025-04-01').outputs.microsoftGraphServicePrincipalId.value]",
+          "requestHeaders": {
+            "ConsistencyLevel": "eventual"
+          },
+          "collectorRequestPath": "[format('/v1.0/servicePrincipals/{0}/transitiveMemberOf/microsoft.graph.group?$count=true&$select=id', reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.collectorIdentityPrincipalId.value)]",
+          "athenaContextRequestPath": "[format('/v1.0/servicePrincipals/{0}/transitiveMemberOf/microsoft.graph.group?$count=true&$select=id', reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', variables('athenaContextIdentitySegments')[2], variables('athenaContextIdentitySegments')[4]), 'Microsoft.ManagedIdentity/userAssignedIdentities', variables('athenaContextIdentitySegments')[8]), '2024-11-30').principalId)]"
+        },
+        "identityProofAuthority": {
+          "audience": "[reference(subscriptionResourceId('Microsoft.Resources/deployments', 'monitoring-identity-proof-authority'), '2025-04-01').outputs.identityProofAudience.value]",
+          "applicationId": "[reference(subscriptionResourceId('Microsoft.Resources/deployments', 'monitoring-identity-proof-authority'), '2025-04-01').outputs.identityProofApplicationId.value]",
+          "applicationObjectId": "[reference(subscriptionResourceId('Microsoft.Resources/deployments', 'monitoring-identity-proof-authority'), '2025-04-01').outputs.identityProofApplicationObjectId.value]",
+          "servicePrincipalId": "[reference(subscriptionResourceId('Microsoft.Resources/deployments', 'monitoring-identity-proof-authority'), '2025-04-01').outputs.identityProofServicePrincipalId.value]",
+          "appRoleId": "[reference(subscriptionResourceId('Microsoft.Resources/deployments', 'monitoring-identity-proof-authority'), '2025-04-01').outputs.identityProofAppRoleId.value]",
+          "appRoleValue": "[reference(subscriptionResourceId('Microsoft.Resources/deployments', 'monitoring-identity-proof-authority'), '2025-04-01').outputs.identityProofAppRoleValue.value]",
+          "appRoleAssignmentId": "[reference(subscriptionResourceId('Microsoft.Resources/deployments', 'monitoring-identity-proof-authority'), '2025-04-01').outputs.identityProofAppRoleAssignmentId.value]",
+          "assignedPrincipalId": "[reference(subscriptionResourceId('Microsoft.Resources/deployments', 'monitoring-identity-proof-authority'), '2025-04-01').outputs.identityProofAssignedPrincipalId.value]",
+          "requestedAccessTokenVersion": "1.0"
+        },
+        "collectorContractInputs": {
+          "collectorIdentityResourceId": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.collectorIdentityResourceId.value]",
+          "collectorIdentityClientId": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.collectorIdentityClientId.value]",
+          "collectorTenantId": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.collectorIdentityTenantId.value]",
+          "monitoringResourceGroupId": "[subscriptionResourceId('Microsoft.Resources/resourceGroups', parameters('monitoringResourceGroupName'))]",
+          "workloadResourceGroupId": "[variables('workloadResourceGroupId')]",
+          "workloadVirtualNetworkResourceId": "[variables('validatedWorkloadVirtualNetworkResourceId')]",
+          "approvedVmNames": "[variables('validatedApprovedVmNames')]",
+          "workspaceResourceId": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'adopt-monitoring-data-platform'), '2025-04-01').outputs.workspaceResourceId.value]",
+          "dataCollectionRuleResourceId": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'adopt-monitoring-data-platform'), '2025-04-01').outputs.dataCollectionRuleResourceId.value]",
+          "dataCollectionEndpointResourceId": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'adopt-monitoring-data-platform'), '2025-04-01').outputs.dataCollectionEndpointResourceId.value]",
+          "authorizationMode": "conditionedWorkspacePlusExactResourceContext",
+          "workspaceAccessControlMode": "[if(reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'adopt-monitoring-data-platform'), '2025-04-01').outputs.workspaceResourceContextAccessEnabled.value, 'workspaceAndResourceContext', 'workspaceOnly')]",
+          "workspaceResourceContextAccessEnabled": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'adopt-monitoring-data-platform'), '2025-04-01').outputs.workspaceResourceContextAccessEnabled.value]",
+          "workspaceSkuName": "[if(equals(reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'adopt-monitoring-data-platform'), '2025-04-01').outputs.workspaceSkuName.value, 'PerGB2018'), 'PerGB2018', fail('WC-028 resource-context acquisition requires the Analytics workspace SKU.'))]",
+          "resourceContextTablePlans": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'adopt-monitoring-data-platform'), '2025-04-01').outputs.resourceContextTablePlans.value]",
+          "readerRoleDefinitionId": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-reader-assignments'), '2025-04-01').outputs.readerRoleDefinitionId.value]",
+          "signalReaderRoleDefinitionId": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments'), '2025-04-01').outputs.signalReaderRoleDefinitionId.value]",
+          "signalReaderRoleName": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments'), '2025-04-01').outputs.signalReaderRoleName.value]",
+          "resourceLogReaderRoleDefinitionId": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments'), '2025-04-01').outputs.resourceLogReaderRoleDefinitionId.value]",
+          "resourceLogReaderRoleName": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments'), '2025-04-01').outputs.resourceLogReaderRoleName.value]",
+          "resourceLogAllowedOperations": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments'), '2025-04-01').outputs.resourceLogAllowedOperations.value]",
+          "resourceLogReadScopeIds": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments'), '2025-04-01').outputs.resourceLogReadScopeIds.value]",
+          "logAnalyticsDataReaderRoleDefinitionId": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-reader-assignments'), '2025-04-01').outputs.logAnalyticsDataReaderRoleDefinitionId.value]",
+          "rbacAttestorIdentityResourceId": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.rbacAttestorIdentityResourceId.value]",
+          "rbacAttestorIdentityClientId": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.rbacAttestorIdentityClientId.value]",
+          "rbacAttestorPrincipalId": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.rbacAttestorIdentityPrincipalId.value]",
+          "rbacAttestorTenantId": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.rbacAttestorIdentityTenantId.value]",
+          "rbacAttestorRoleDefinitionId": "[reference(subscriptionResourceId('Microsoft.Resources/deployments', 'monitoring-effective-rbac-attestor'), '2025-04-01').outputs.attestorRoleDefinitionId.value]",
+          "rbacAttestorRoleName": "[reference(subscriptionResourceId('Microsoft.Resources/deployments', 'monitoring-effective-rbac-attestor'), '2025-04-01').outputs.attestorRoleName.value]",
+          "rbacAttestorScopeId": "[reference(subscriptionResourceId('Microsoft.Resources/deployments', 'monitoring-effective-rbac-attestor'), '2025-04-01').outputs.attestorScopeId.value]",
+          "rbacAttestorAllowedOperations": "[reference(subscriptionResourceId('Microsoft.Resources/deployments', 'monitoring-effective-rbac-attestor'), '2025-04-01').outputs.attestorAllowedOperations.value]",
+          "rbacAttestorGraphApplicationId": "[reference(subscriptionResourceId('Microsoft.Resources/deployments', 'monitoring-effective-rbac-attestor'), '2025-04-01').outputs.microsoftGraphApplicationId.value]",
+          "rbacAttestorGraphApplicationReadAllAppRoleId": "[reference(subscriptionResourceId('Microsoft.Resources/deployments', 'monitoring-effective-rbac-attestor'), '2025-04-01').outputs.applicationReadAllAppRoleId.value]",
+          "rbacAttestorGraphApplicationReadAllAssignmentId": "[reference(subscriptionResourceId('Microsoft.Resources/deployments', 'monitoring-effective-rbac-attestor'), '2025-04-01').outputs.applicationReadAllAssignmentId.value]",
+          "rbacAttestorGraphServicePrincipalId": "[reference(subscriptionResourceId('Microsoft.Resources/deployments', 'monitoring-effective-rbac-attestor'), '2025-04-01').outputs.microsoftGraphServicePrincipalId.value]",
+          "identityProofAudience": "[reference(subscriptionResourceId('Microsoft.Resources/deployments', 'monitoring-identity-proof-authority'), '2025-04-01').outputs.identityProofAudience.value]",
+          "identityProofApplicationId": "[reference(subscriptionResourceId('Microsoft.Resources/deployments', 'monitoring-identity-proof-authority'), '2025-04-01').outputs.identityProofApplicationId.value]",
+          "identityProofApplicationObjectId": "[reference(subscriptionResourceId('Microsoft.Resources/deployments', 'monitoring-identity-proof-authority'), '2025-04-01').outputs.identityProofApplicationObjectId.value]",
+          "identityProofServicePrincipalId": "[reference(subscriptionResourceId('Microsoft.Resources/deployments', 'monitoring-identity-proof-authority'), '2025-04-01').outputs.identityProofServicePrincipalId.value]",
+          "identityProofAppRoleId": "[reference(subscriptionResourceId('Microsoft.Resources/deployments', 'monitoring-identity-proof-authority'), '2025-04-01').outputs.identityProofAppRoleId.value]",
+          "identityProofAppRoleValue": "[reference(subscriptionResourceId('Microsoft.Resources/deployments', 'monitoring-identity-proof-authority'), '2025-04-01').outputs.identityProofAppRoleValue.value]",
+          "identityProofAppRoleAssignmentId": "[reference(subscriptionResourceId('Microsoft.Resources/deployments', 'monitoring-identity-proof-authority'), '2025-04-01').outputs.identityProofAppRoleAssignmentId.value]",
+          "identityProofAssignedPrincipalId": "[reference(subscriptionResourceId('Microsoft.Resources/deployments', 'monitoring-identity-proof-authority'), '2025-04-01').outputs.identityProofAssignedPrincipalId.value]",
+          "resourceHealthRoleDefinitionId": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments'), '2025-04-01').outputs.resourceHealthRoleDefinitionId.value]",
+          "resourceHealthRoleName": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments'), '2025-04-01').outputs.resourceHealthRoleName.value]",
+          "resourceHealthScopeIds": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments'), '2025-04-01').outputs.resourceHealthScopeIds.value]",
+          "resourceHealthAllowedOperations": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments'), '2025-04-01').outputs.resourceHealthAllowedOperations.value]",
+          "logAnalyticsAllowedTables": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-reader-assignments'), '2025-04-01').outputs.allowedLogTableNames.value]",
+          "logAnalyticsAccessCondition": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-reader-assignments'), '2025-04-01').outputs.logAnalyticsAccessCondition.value]",
+          "resourceReadScopeIds": "[concat(reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-reader-assignments'), '2025-04-01').outputs.resourceReadScopeIds.value, reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments'), '2025-04-01').outputs.resourceReadScopeIds.value, reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('networkWatcherResourceGroupName')), 'Microsoft.Resources/deployments', 'network-watcher-monitoring-evidence-reader-assignment'), '2025-04-01').outputs.resourceReadScopeIds.value)]",
+          "signalReadScopeIds": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments'), '2025-04-01').outputs.signalReadScopeIds.value]",
+          "signingKeyResourceId": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.signingKeyResourceId.value]",
+          "signingKeyArmResourceId": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.signingKeyArmResourceId.value]",
+          "signingKeyCryptoUserRoleDefinitionId": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.signingKeyCryptoUserRoleDefinitionId.value]",
+          "evidenceStorageAccountResourceId": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-flow-log-storage'), '2025-04-01').outputs.storageAccountResourceId.value]",
+          "evidenceBlobServiceResourceId": "[format('{0}/blobServices/default', reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-flow-log-storage'), '2025-04-01').outputs.storageAccountResourceId.value)]",
+          "evidenceContainerResourceId": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.evidenceContainerResourceId.value]",
+          "evidenceWriterRoleDefinitionId": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.evidenceWriterRoleDefinitionId.value]",
+          "signingKeyVaultResourceId": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.keyVaultResourceId.value]",
+          "networkWatcherResourceGroupId": "[variables('networkWatcherResourceGroupId')]",
+          "networkWatcherResourceId": "[variables('networkWatcherResourceId')]",
+          "workspaceTableResourceIds": "[map(reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-reader-assignments'), '2025-04-01').outputs.allowedLogTableNames.value, lambda('tableName', format('{0}/tables/{1}', reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'adopt-monitoring-data-platform'), '2025-04-01').outputs.workspaceResourceId.value, lambdaVariables('tableName'))))]",
+          "maximumEvidenceAgeSeconds": "[parameters('maximumEvidenceAgeSeconds')]",
+          "connectionMonitorDeploymentMode": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'connection-monitor-capability'), '2025-04-01').outputs.deploymentMode.value]"
+        }
+      }
     },
-    "monitoringAcquisitionCollectorContract": {
-      "type": "object",
-      "value": "[union(reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-collector-contract'), '2025-04-01').outputs.acquisitionCollectorContract.value, createObject('monitoringReaderPrincipalId', reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.collectorIdentityPrincipalId.value, 'athenaContextIdentityId', extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', variables('athenaContextIdentitySegments')[2], variables('athenaContextIdentitySegments')[4]), 'Microsoft.ManagedIdentity/userAssignedIdentities', variables('athenaContextIdentitySegments')[8]), 'athenaContextPrincipalId', reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', variables('athenaContextIdentitySegments')[2], variables('athenaContextIdentitySegments')[4]), 'Microsoft.ManagedIdentity/userAssignedIdentities', variables('athenaContextIdentitySegments')[8]), '2024-11-30').principalId, 'physicalIdentitySeparationEnforced', if(and(and(and(and(and(not(equals(toLower(reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.collectorIdentityResourceId.value), toLower(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', variables('athenaContextIdentitySegments')[2], variables('athenaContextIdentitySegments')[4]), 'Microsoft.ManagedIdentity/userAssignedIdentities', variables('athenaContextIdentitySegments')[8])))), not(equals(toLower(reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.collectorIdentityResourceId.value), toLower(reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.rbacAttestorIdentityResourceId.value)))), not(equals(toLower(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', variables('athenaContextIdentitySegments')[2], variables('athenaContextIdentitySegments')[4]), 'Microsoft.ManagedIdentity/userAssignedIdentities', variables('athenaContextIdentitySegments')[8])), toLower(reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.rbacAttestorIdentityResourceId.value)))), not(equals(toLower(reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.collectorIdentityPrincipalId.value), toLower(reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', variables('athenaContextIdentitySegments')[2], variables('athenaContextIdentitySegments')[4]), 'Microsoft.ManagedIdentity/userAssignedIdentities', variables('athenaContextIdentitySegments')[8]), '2024-11-30').principalId)))), not(equals(toLower(reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.collectorIdentityPrincipalId.value), toLower(reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.rbacAttestorIdentityPrincipalId.value)))), not(equals(toLower(reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', variables('athenaContextIdentitySegments')[2], variables('athenaContextIdentitySegments')[4]), 'Microsoft.ManagedIdentity/userAssignedIdentities', variables('athenaContextIdentitySegments')[8]), '2024-11-30').principalId), toLower(reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.rbacAttestorIdentityPrincipalId.value)))), true(), fail('monitoring collector, Athena context, and RBAC attestor must be physically separate UAMIs with distinct principal IDs'))))]"
+    "monitoringAcquisitionContractPublicationReady": {
+      "type": "bool",
+      "metadata": {
+        "description": "Contract publication remains fail-closed until the phase-two template validates a fresh effective RBAC inventory against monitoringRbacBootstrapHandoff."
+      },
+      "value": false
     },
     "replacementMonitoringStorageAccountResourceId": {
       "type": "string",
