@@ -13,7 +13,7 @@ import stat
 import sys
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import suppress
+from contextlib import ExitStack, suppress
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -85,6 +85,8 @@ CORRELATION_ONLY_REPORT_ATTESTATION_SCHEMA_VERSION = (
 DEPLOYMENT_READBACK_SCHEMA_VERSION = "athena.wc029DeploymentReadback.v1"
 JOB_EXECUTION_SCHEMA_VERSION = "athena.wc029JobExecution.v1"
 JOB_READBACK_SCHEMA_VERSION = "athena.wc029JobReadback.v1"
+JOB_PLATFORM_CAPTURE_STATEMENT_SCHEMA_VERSION = "athena.wc029JobPlatformCaptureStatement.v1"
+JOB_PLATFORM_CAPTURE_ATTESTATION_SCHEMA_VERSION = "athena.wc029JobPlatformCaptureAttestation.v1"
 PREFLIGHT_RESULT_SCHEMA_VERSION = "athena.wc029PreflightResult.v1"
 SCENARIO_PLAN_SCHEMA_VERSION = "athena.wc029ScenarioPlan.v1"
 SCENARIO_EXECUTION_MANIFEST_SCHEMA_VERSION = "athena.wc029ScenarioExecutionManifest.v1"
@@ -123,6 +125,7 @@ type PreflightKind = Literal["what-if", "rbac"]
 type QueueScope = Literal["baseline", "scenario-verify", "final"]
 type DeploymentStage = Literal["foundation", "producer", "publisher", "live-acceptance"]
 type JobScope = Literal["global", "scenario"]
+type JobPurpose = Literal["global-acceptance", "scenario-recovery-verification"]
 type EvidenceClass = Literal[
     "version-inventory",
     "signing-public-key",
@@ -135,6 +138,7 @@ type EvidenceClass = Literal[
     "deployment-readback",
     "job-execution",
     "job-readback",
+    "job-platform-attestation",
     "url-probe",
     "effective-rbac",
     "rbac-policy",
@@ -235,8 +239,14 @@ _RESOURCE_ID_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _JOB_RESOURCE_ID_PATTERN = re.compile(
+    r"^/subscriptions/(?P<subscription>[0-9a-fA-F-]{36})/"
+    r"resourceGroups/(?P<resource_group>[^/]{1,90})/providers/"
+    r"Microsoft\.App/jobs/(?P<job_name>[A-Za-z0-9-]{1,64})$",
+    re.IGNORECASE,
+)
+_MANAGED_IDENTITY_RESOURCE_ID_PATTERN = re.compile(
     r"^/subscriptions/[0-9a-fA-F-]{36}/resourceGroups/[^/]{1,90}/providers/"
-    r"Microsoft\.App/jobs/[A-Za-z0-9-]{1,64}$",
+    r"Microsoft\.ManagedIdentity/userAssignedIdentities/[A-Za-z0-9._()-]{1,128}$",
     re.IGNORECASE,
 )
 _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
@@ -256,6 +266,7 @@ _GLOBAL_REQUIRED_CLASSES: frozenset[EvidenceClass] = frozenset(
         "deployment-readback",
         "job-execution",
         "job-readback",
+        "job-platform-attestation",
         "url-probe",
         "effective-rbac",
         "rbac-policy",
@@ -306,6 +317,7 @@ _ATTESTATION_SUBJECT_CLASSES: dict[EvidenceClass, EvidenceClass] = {
     "source-index-active-attestation": "source-index-active",
     "source-index-resolved-attestation": "source-index-resolved",
     "publication-authority-attestation": "publication-authority",
+    "job-platform-attestation": "job-readback",
     "scenario-execution-attestation": "scenario-execution-manifest",
 }
 _SIGNED_KEY_PURPOSE_BY_CLASS: dict[EvidenceClass, str] = {
@@ -324,6 +336,7 @@ _SIGNED_KEY_PURPOSE_BY_CLASS: dict[EvidenceClass, str] = {
     "source-index-active-attestation": "incident",
     "source-index-resolved-attestation": "incident",
     "publication-authority-attestation": "context-authority",
+    "job-platform-attestation": "job-capture",
     "scenario-execution-attestation": "scenario-authority",
     "notification-active": "notification",
     "notification-resolved": "notification",
@@ -340,6 +353,7 @@ _EXPECTED_SCHEMA_BY_CLASS: dict[EvidenceClass, str | None] = {
     "deployment-readback": DEPLOYMENT_READBACK_SCHEMA_VERSION,
     "job-execution": JOB_EXECUTION_SCHEMA_VERSION,
     "job-readback": JOB_READBACK_SCHEMA_VERSION,
+    "job-platform-attestation": JOB_PLATFORM_CAPTURE_ATTESTATION_SCHEMA_VERSION,
     "url-probe": URL_PROBE_SCHEMA_VERSION,
     "effective-rbac": None,
     "rbac-policy": None,
@@ -499,6 +513,47 @@ def _validate_versioned_key_id(value: str) -> str:
     return value
 
 
+def _validate_job_resource_scope(
+    job_resource_id: str,
+    *,
+    subscription_id: str,
+    resource_group: str,
+    label: str,
+) -> None:
+    match = _JOB_RESOURCE_ID_PATTERN.fullmatch(job_resource_id)
+    if (
+        match is None
+        or match.group("subscription").casefold() != subscription_id.casefold()
+        or match.group("resource_group").casefold() != resource_group.casefold()
+    ):
+        raise ValueError(
+            f"{label} must identify the exact declared subscription and resource group"
+        )
+
+
+def _validate_resource_id_set(
+    values: tuple[str, ...],
+    *,
+    subscription_id: str,
+    label: str,
+) -> None:
+    normalized = tuple(item.casefold().rstrip("/") for item in values)
+    subscription_prefix = f"/subscriptions/{subscription_id}/".casefold()
+    if (
+        not values
+        or normalized != tuple(sorted(normalized))
+        or len(normalized) != len(set(normalized))
+        or any(
+            _MANAGED_IDENTITY_RESOURCE_ID_PATTERN.fullmatch(item) is None
+            or not item.casefold().startswith(subscription_prefix)
+            for item in values
+        )
+    ):
+        raise ValueError(
+            f"{label} must be unique, sorted, complete resource IDs in the Job subscription"
+        )
+
+
 class Wc029TrustedUpstreamHandoff(_StrictAcceptanceModel):
     stage: Literal["foundation", "producer", "publisher"]
     deployment_id: str = Field(
@@ -639,6 +694,91 @@ class Wc029ImageVersion(_StrictAcceptanceModel):
         if match is None or match.group("digest") == "0" * 64:
             raise ValueError("image must be one real lowercase digest-pinned reference")
         return value
+
+
+class Wc029JobVersion(_StrictAcceptanceModel):
+    job_id: str = Field(
+        alias="jobId",
+        pattern=r"^[a-z0-9][a-z0-9._-]{0,63}$",
+    )
+    purpose: JobPurpose
+    job_resource_id: str = Field(
+        alias="jobResourceId",
+        min_length=1,
+        max_length=2048,
+    )
+    subscription_id: str = Field(
+        alias="subscriptionId",
+        pattern=(
+            r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+            r"[0-9a-f]{4}-[0-9a-f]{12}$"
+        ),
+    )
+    resource_group: str = Field(
+        alias="resourceGroup",
+        min_length=1,
+        max_length=90,
+    )
+    component: str = Field(pattern=r"^[a-z0-9][a-z0-9._-]{0,63}$")
+    image_repo_digest: str = Field(
+        alias="imageRepoDigest",
+        min_length=1,
+        max_length=512,
+    )
+    execution_template_configuration_sha256: str = Field(
+        alias="executionTemplateConfigurationSha256",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    expected_attached_identity_resource_ids: tuple[str, ...] = Field(
+        alias="expectedAttachedIdentityResourceIds",
+        min_length=1,
+        max_length=32,
+    )
+    capture_anchor_resource_id: str = Field(
+        alias="captureAnchorResourceId",
+        min_length=1,
+        max_length=2048,
+    )
+
+    @property
+    def job_scope(self) -> JobScope:
+        return "global" if self.purpose == "global-acceptance" else "scenario"
+
+    @model_validator(mode="after")
+    def validate_job(self) -> Wc029JobVersion:
+        _validate_fixed_text(
+            self.resource_group,
+            label="Job resourceGroup",
+            maximum_length=90,
+        )
+        _validate_job_resource_scope(
+            self.job_resource_id,
+            subscription_id=self.subscription_id,
+            resource_group=self.resource_group,
+            label="trusted Job resource ID",
+        )
+        Wc029ImageVersion(
+            component=self.component,
+            image=self.image_repo_digest,
+        )
+        _validate_digest(
+            self.execution_template_configuration_sha256,
+            label="executionTemplateConfigurationSha256",
+        )
+        _validate_resource_id_set(
+            self.expected_attached_identity_resource_ids,
+            subscription_id=self.subscription_id,
+            label="expected attached Job identities",
+        )
+        if _RESOURCE_ID_PATTERN.fullmatch(
+            self.capture_anchor_resource_id
+        ) is None or not self.capture_anchor_resource_id.casefold().startswith(
+            f"/subscriptions/{self.subscription_id}/".casefold()
+        ):
+            raise ValueError(
+                "captureAnchorResourceId must be one complete resource ID in the Job subscription"
+            )
+        return self
 
 
 class Wc029EndpointVersion(_StrictAcceptanceModel):
@@ -1244,6 +1384,7 @@ class Wc029VersionInventory(_StrictAcceptanceModel):
         max_length=32,
     )
     images: tuple[Wc029ImageVersion, ...] = Field(min_length=1, max_length=64)
+    jobs: tuple[Wc029JobVersion, ...] = Field(min_length=2, max_length=32)
     endpoints: tuple[Wc029EndpointVersion, ...] = Field(min_length=1, max_length=32)
     rbac_boundaries: tuple[Wc029RbacBoundary, ...] = Field(
         alias="rbacBoundaries",
@@ -1282,6 +1423,10 @@ class Wc029VersionInventory(_StrictAcceptanceModel):
             (
                 "image references",
                 tuple(item.image for item in self.images),
+            ),
+            (
+                "Job IDs",
+                tuple(item.job_id for item in self.jobs),
             ),
             (
                 "endpoint IDs",
@@ -1331,6 +1476,44 @@ class Wc029VersionInventory(_StrictAcceptanceModel):
             sorted(item.component for item in self.images)
         ):
             raise ValueError("images must be sorted by component")
+        if tuple(item.job_id for item in self.jobs) != tuple(
+            sorted(item.job_id for item in self.jobs)
+        ):
+            raise ValueError("jobs must be sorted by jobId")
+        if {item.purpose for item in self.jobs} != {
+            "global-acceptance",
+            "scenario-recovery-verification",
+        }:
+            raise ValueError(
+                "trusted Job inventory must include global acceptance and "
+                "scenario recovery verification purposes"
+            )
+        jobs_by_resource: dict[str, list[Wc029JobVersion]] = {}
+        for job in self.jobs:
+            jobs_by_resource.setdefault(job.job_resource_id.casefold(), []).append(job)
+        for matching_jobs in jobs_by_resource.values():
+            configurations = {
+                (
+                    item.subscription_id,
+                    item.resource_group.casefold(),
+                    item.component,
+                    item.image_repo_digest,
+                    item.execution_template_configuration_sha256,
+                    item.expected_attached_identity_resource_ids,
+                    item.capture_anchor_resource_id.casefold(),
+                )
+                for item in matching_jobs
+            }
+            purposes = {item.purpose for item in matching_jobs}
+            if len(configurations) != 1 or len(purposes) != len(matching_jobs):
+                raise ValueError(
+                    "duplicate Job resource records must differ only by approved purpose"
+                )
+        inventory_images = {item.component: item.image for item in self.images}
+        if any(
+            inventory_images.get(item.component) != item.image_repo_digest for item in self.jobs
+        ):
+            raise ValueError("trusted Jobs must use exact inventoried image RepoDigests")
         if tuple(item.endpoint_id for item in self.endpoints) != tuple(
             sorted(item.endpoint_id for item in self.endpoints)
         ):
@@ -1383,6 +1566,9 @@ class Wc029VersionInventory(_StrictAcceptanceModel):
                 raise ValueError("trusted deployment upstream roots are missing or out of order")
         if self.capability_deployment_id not in deployment_ids:
             raise ValueError("capabilityDeploymentId must identify one trusted deployment root")
+        deployment_subscriptions = {item.subscription_id for item in self.deployments}
+        if any(item.subscription_id not in deployment_subscriptions for item in self.jobs):
+            raise ValueError("trusted Jobs must belong to an inventoried deployment subscription")
         capability_root = deployment_by_id[self.capability_deployment_id]
         if (
             capability_root.stage,
@@ -1407,6 +1593,7 @@ class Wc029VersionInventory(_StrictAcceptanceModel):
             "feed",
             "guidance",
             "incident",
+            "job-capture",
             "monitoring",
             "notification",
             "report",
@@ -1729,6 +1916,11 @@ class Wc029ArtifactDigestReference(_StrictAcceptanceModel):
 class Wc029JobExecutionEvidence(_StrictAcceptanceModel):
     schema_version: Literal["athena.wc029JobExecution.v1"] = Field(alias="schemaVersion")
     scope: JobScope
+    job_inventory_id: str = Field(
+        alias="jobInventoryId",
+        pattern=r"^[a-z0-9][a-z0-9._-]{0,63}$",
+    )
+    purpose: JobPurpose
     scenario_id: str | None = Field(
         default=None,
         alias="scenarioId",
@@ -1758,9 +1950,30 @@ class Wc029JobExecutionEvidence(_StrictAcceptanceModel):
         min_length=1,
         max_length=2048,
     )
+    subscription_id: str = Field(
+        alias="subscriptionId",
+        pattern=(
+            r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+            r"[0-9a-f]{4}-[0-9a-f]{12}$"
+        ),
+    )
+    resource_group: str = Field(
+        alias="resourceGroup",
+        min_length=1,
+        max_length=90,
+    )
     source_commit: str = Field(alias="sourceCommit", pattern=r"^[a-f0-9]{40}$")
     component: str = Field(pattern=r"^[a-z0-9][a-z0-9._-]{0,63}$")
     image: str = Field(min_length=1, max_length=512)
+    execution_template_configuration_sha256: str = Field(
+        alias="executionTemplateConfigurationSha256",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    attached_identity_resource_ids: tuple[str, ...] = Field(
+        alias="attachedIdentityResourceIds",
+        min_length=1,
+        max_length=32,
+    )
     started_at: UtcDateTime = Field(alias="startedAt")
     completed_at: UtcDateTime = Field(alias="completedAt")
     status: Literal["Succeeded"]
@@ -1789,9 +2002,24 @@ class Wc029JobExecutionEvidence(_StrictAcceptanceModel):
             raise ValueError("global job execution cannot claim a scenario phase")
         if self.completed_at < self.started_at:
             raise ValueError("job completion precedes start")
-        if _JOB_RESOURCE_ID_PATTERN.fullmatch(self.job_resource_id) is None:
-            raise ValueError("jobResourceId must identify one Microsoft.App Job")
+        if (self.scope == "global") != (self.purpose == "global-acceptance"):
+            raise ValueError("Job execution scope does not match its approved purpose")
+        _validate_job_resource_scope(
+            self.job_resource_id,
+            subscription_id=self.subscription_id,
+            resource_group=self.resource_group,
+            label="Job execution resource ID",
+        )
         Wc029ImageVersion(component=self.component, image=self.image)
+        _validate_digest(
+            self.execution_template_configuration_sha256,
+            label="executionTemplateConfigurationSha256",
+        )
+        _validate_resource_id_set(
+            self.attached_identity_resource_ids,
+            subscription_id=self.subscription_id,
+            label="attached Job identities",
+        )
         if self.execution_digest != compute_artifact_digest(self._digest_payload()):
             raise ValueError("executionDigest does not bind the Job execution")
         return self
@@ -1800,6 +2028,11 @@ class Wc029JobExecutionEvidence(_StrictAcceptanceModel):
 class Wc029JobReadbackEvidence(_StrictAcceptanceModel):
     schema_version: Literal["athena.wc029JobReadback.v1"] = Field(alias="schemaVersion")
     scope: JobScope
+    job_inventory_id: str = Field(
+        alias="jobInventoryId",
+        pattern=r"^[a-z0-9][a-z0-9._-]{0,63}$",
+    )
+    purpose: JobPurpose
     scenario_id: str | None = Field(
         default=None,
         alias="scenarioId",
@@ -1829,9 +2062,30 @@ class Wc029JobReadbackEvidence(_StrictAcceptanceModel):
         min_length=1,
         max_length=2048,
     )
+    subscription_id: str = Field(
+        alias="subscriptionId",
+        pattern=(
+            r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+            r"[0-9a-f]{4}-[0-9a-f]{12}$"
+        ),
+    )
+    resource_group: str = Field(
+        alias="resourceGroup",
+        min_length=1,
+        max_length=90,
+    )
     source_commit: str = Field(alias="sourceCommit", pattern=r"^[a-f0-9]{40}$")
     component: str = Field(pattern=r"^[a-z0-9][a-z0-9._-]{0,63}$")
     image: str = Field(min_length=1, max_length=512)
+    execution_template_configuration_sha256: str = Field(
+        alias="executionTemplateConfigurationSha256",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    attached_identity_resource_ids: tuple[str, ...] = Field(
+        alias="attachedIdentityResourceIds",
+        min_length=1,
+        max_length=32,
+    )
     observed_at: UtcDateTime = Field(alias="observedAt")
     provisioning_state: Literal["Succeeded"] = Field(alias="provisioningState")
     status: Literal["Succeeded"]
@@ -1862,13 +2116,196 @@ class Wc029JobReadbackEvidence(_StrictAcceptanceModel):
             raise ValueError("scenario Job read-back requires scenario, execution, plan, and phase")
         if self.scope == "global" and any(item is not None for item in scenario_values):
             raise ValueError("global Job read-back cannot claim a scenario phase")
+        if (self.scope == "global") != (self.purpose == "global-acceptance"):
+            raise ValueError("Job read-back scope does not match its approved purpose")
+        _validate_job_resource_scope(
+            self.job_resource_id,
+            subscription_id=self.subscription_id,
+            resource_group=self.resource_group,
+            label="Job read-back resource ID",
+        )
         Wc029ImageVersion(component=self.component, image=self.image)
+        _validate_digest(
+            self.execution_template_configuration_sha256,
+            label="executionTemplateConfigurationSha256",
+        )
+        _validate_resource_id_set(
+            self.attached_identity_resource_ids,
+            subscription_id=self.subscription_id,
+            label="attached Job identities",
+        )
         ids = tuple(item.artifact_id for item in self.result_artifacts)
         if ids != tuple(sorted(ids)) or len(ids) != len(set(ids)):
             raise ValueError("resultArtifacts must be unique and sorted")
         if self.readback_digest != compute_artifact_digest(self._digest_payload()):
             raise ValueError("readbackDigest does not bind the Job read-back")
         return self
+
+
+class Wc029JobPlatformCaptureStatement(_StrictAcceptanceModel):
+    schema_version: Literal["athena.wc029JobPlatformCaptureStatement.v1"] = Field(
+        alias="schemaVersion"
+    )
+    statement_id: str = Field(
+        alias="statementId",
+        pattern=r"^job-platform-capture-statement-[a-f0-9]{32}$",
+    )
+    scope: Literal["global"]
+    job_inventory_id: str = Field(
+        alias="jobInventoryId",
+        pattern=r"^[a-z0-9][a-z0-9._-]{0,63}$",
+    )
+    purpose: Literal["global-acceptance"]
+    execution_id: str = Field(
+        alias="executionId",
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+    )
+    job_resource_id: str = Field(
+        alias="jobResourceId",
+        min_length=1,
+        max_length=2048,
+    )
+    subscription_id: str = Field(
+        alias="subscriptionId",
+        pattern=(
+            r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+            r"[0-9a-f]{4}-[0-9a-f]{12}$"
+        ),
+    )
+    resource_group: str = Field(
+        alias="resourceGroup",
+        min_length=1,
+        max_length=90,
+    )
+    component: str = Field(pattern=r"^[a-z0-9][a-z0-9._-]{0,63}$")
+    image_repo_digest: str = Field(
+        alias="imageRepoDigest",
+        min_length=1,
+        max_length=512,
+    )
+    execution_template_configuration_sha256: str = Field(
+        alias="executionTemplateConfigurationSha256",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    attached_identity_resource_ids: tuple[str, ...] = Field(
+        alias="attachedIdentityResourceIds",
+        min_length=1,
+        max_length=32,
+    )
+    started_at: UtcDateTime = Field(alias="startedAt")
+    completed_at: UtcDateTime = Field(alias="completedAt")
+    platform_execution_status: Literal["Succeeded"] = Field(alias="platformExecutionStatus")
+    platform_exit_code: Literal[0] = Field(alias="platformExitCode")
+    execution_digest: str = Field(
+        alias="executionDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    execution_artifact_sha256: str = Field(
+        alias="executionArtifactSha256",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    readback_observed_at: UtcDateTime = Field(alias="readbackObservedAt")
+    platform_provisioning_state: Literal["Succeeded"] = Field(alias="platformProvisioningState")
+    platform_readback_status: Literal["Succeeded"] = Field(alias="platformReadbackStatus")
+    readback_digest: str = Field(
+        alias="readbackDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    readback_artifact_sha256: str = Field(
+        alias="readbackArtifactSha256",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    capture_anchor_resource_id: str = Field(
+        alias="captureAnchorResourceId",
+        min_length=1,
+        max_length=2048,
+    )
+    capture_record_id: str = Field(
+        alias="captureRecordId",
+        pattern=r"^job-platform-capture-[a-f0-9]{32}$",
+    )
+    capture_record_sha256: str = Field(
+        alias="captureRecordSha256",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    statement_digest: str = Field(
+        alias="statementDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+
+    def _digest_payload(self) -> dict[str, object]:
+        payload = self.model_dump(mode="json", by_alias=True, exclude_none=True)
+        payload.pop("statementId")
+        payload.pop("statementDigest")
+        return payload
+
+    @model_validator(mode="after")
+    def validate_statement(self) -> Wc029JobPlatformCaptureStatement:
+        _validate_job_resource_scope(
+            self.job_resource_id,
+            subscription_id=self.subscription_id,
+            resource_group=self.resource_group,
+            label="captured Job resource ID",
+        )
+        Wc029ImageVersion(
+            component=self.component,
+            image=self.image_repo_digest,
+        )
+        _validate_digest(
+            self.execution_template_configuration_sha256,
+            label="executionTemplateConfigurationSha256",
+        )
+        _validate_resource_id_set(
+            self.attached_identity_resource_ids,
+            subscription_id=self.subscription_id,
+            label="captured attached Job identities",
+        )
+        if _RESOURCE_ID_PATTERN.fullmatch(
+            self.capture_anchor_resource_id
+        ) is None or not self.capture_anchor_resource_id.casefold().startswith(
+            f"/subscriptions/{self.subscription_id}/".casefold()
+        ):
+            raise ValueError(
+                "captureAnchorResourceId must be one complete resource ID in the Job subscription"
+            )
+        if not self.started_at <= self.completed_at <= self.readback_observed_at:
+            raise ValueError("Job platform capture chronology is invalid")
+        expected_capture_record_id = (
+            "job-platform-capture-" + self.capture_record_sha256.removeprefix("sha256:")[:32]
+        )
+        if self.capture_record_id != expected_capture_record_id:
+            raise ValueError("captureRecordId is not bound to captureRecordSha256")
+        expected = compute_artifact_digest(self._digest_payload())
+        if self.statement_digest != expected:
+            raise ValueError("statementDigest does not bind the Job platform capture")
+        if self.statement_id != (
+            "job-platform-capture-statement-" + expected.removeprefix("sha256:")[:32]
+        ):
+            raise ValueError("statementId is not digest-bound")
+        return self
+
+
+class Wc029JobPlatformCaptureAttestation(_StrictAcceptanceModel):
+    schema_version: Literal["athena.wc029JobPlatformCaptureAttestation.v1"] = Field(
+        alias="schemaVersion"
+    )
+    statement: Wc029JobPlatformCaptureStatement
+    signature_algorithm: Literal["RS256"] = Field(alias="signatureAlgorithm")
+    key_vault_key_id: str = Field(
+        alias="keyVaultKeyId",
+        min_length=1,
+        max_length=512,
+    )
+    signed_preimage_digest: str = Field(
+        alias="signedPreimageDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    detached_signature: str = Field(
+        alias="detachedSignature",
+        pattern=r"^[A-Za-z0-9_-]+$",
+        min_length=1,
+        max_length=8192,
+    )
 
 
 class Wc029PreflightResultEvidence(_StrictAcceptanceModel):
@@ -2400,6 +2837,130 @@ class Wc029ScenarioArtifactBinding(_StrictAcceptanceModel):
     )
 
 
+class Wc029IncidentOccurrenceContinuity(_StrictAcceptanceModel):
+    schema_version: Literal["athena.wc029IncidentOccurrenceContinuity.v1"] = Field(
+        alias="schemaVersion"
+    )
+    scenario_id: str = Field(
+        alias="scenarioId",
+        pattern=r"^[a-z0-9][a-z0-9._-]{0,127}$",
+    )
+    scenario_execution_id: str = Field(
+        alias="scenarioExecutionId",
+        pattern=r"^wc029-execution-[a-f0-9]{32}$",
+    )
+    incident_id: str = Field(
+        alias="incidentId",
+        pattern=r"^inc-[a-f0-9]{12}$",
+    )
+    target_resource_id: str = Field(
+        alias="targetResourceId",
+        min_length=1,
+        max_length=2048,
+    )
+    correlation_request_id: str = Field(
+        alias="correlationRequestId",
+        pattern=r"^request-[a-f0-9]{32}$",
+    )
+    correlation_request_digest: str = Field(
+        alias="correlationRequestDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    incident_subject_id: str = Field(
+        alias="incidentSubjectId",
+        pattern=r"^incident-subject-[a-f0-9]{32}$",
+    )
+    incident_subject_digest: str = Field(
+        alias="incidentSubjectDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    incident_bound_request_id: str = Field(
+        alias="incidentBoundRequestId",
+        pattern=r"^incident-bound-request-[a-f0-9]{32}$",
+    )
+    incident_bound_request_digest: str = Field(
+        alias="incidentBoundRequestDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    target_binding: str = Field(
+        alias="targetBinding",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    workload_role: Literal["database-primary", "web", "load-balancer"] = Field(alias="workloadRole")
+    detected_at: UtcDateTime = Field(alias="detectedAt")
+    active_transition_id: str = Field(
+        alias="activeTransitionId",
+        pattern=r"^wc016-[a-f0-9]{64}$",
+    )
+    active_state_result_digest: str = Field(
+        alias="activeStateResultDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    active_state_content_sha256: str = Field(
+        alias="activeStateContentSha256",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    active_state_attestation_content_sha256: str = Field(
+        alias="activeStateAttestationContentSha256",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    active_occurrence_digest: str = Field(
+        alias="activeOccurrenceDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    resolved_transition_id: str = Field(
+        alias="resolvedTransitionId",
+        pattern=r"^wc016-[a-f0-9]{64}$",
+    )
+    resolved_state_result_digest: str = Field(
+        alias="resolvedStateResultDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    resolved_state_content_sha256: str = Field(
+        alias="resolvedStateContentSha256",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    resolved_state_attestation_content_sha256: str = Field(
+        alias="resolvedStateAttestationContentSha256",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    resolved_occurrence_digest: str = Field(
+        alias="resolvedOccurrenceDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    resolved_predecessor_state_result_digest: str = Field(
+        alias="resolvedPredecessorStateResultDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    continuity_digest: str = Field(
+        alias="continuityDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+
+    def _digest_payload(self) -> dict[str, object]:
+        payload = self.model_dump(mode="json", by_alias=True, exclude_none=True)
+        payload.pop("continuityDigest")
+        return payload
+
+    @model_validator(mode="after")
+    def validate_continuity(self) -> Wc029IncidentOccurrenceContinuity:
+        if _RESOURCE_ID_PATTERN.fullmatch(self.target_resource_id) is None:
+            raise ValueError("incident occurrence target must be one complete resource ID")
+        if (
+            self.active_transition_id == self.resolved_transition_id
+            or self.active_state_result_digest == self.resolved_state_result_digest
+            or self.active_occurrence_digest == self.resolved_occurrence_digest
+            or self.resolved_predecessor_state_result_digest != self.active_state_result_digest
+        ):
+            raise ValueError(
+                "resolved incident transition must name distinct active predecessor, "
+                "state, and occurrence"
+            )
+        if self.continuity_digest != compute_artifact_digest(self._digest_payload()):
+            raise ValueError("continuityDigest does not bind incident occurrence continuity")
+        return self
+
+
 class Wc029ScenarioExecutionManifest(_StrictAcceptanceModel):
     schema_version: Literal["athena.wc029ScenarioExecutionManifest.v1"] = Field(
         alias="schemaVersion"
@@ -2461,6 +3022,10 @@ class Wc029ScenarioExecutionManifest(_StrictAcceptanceModel):
         alias="recoveryActionResultDigest",
         pattern=r"^sha256:[a-f0-9]{64}$",
     )
+    incident_occurrence_continuity: Wc029IncidentOccurrenceContinuity | None = Field(
+        default=None,
+        alias="incidentOccurrenceContinuity",
+    )
     phase_windows: tuple[Wc029ScenarioPhaseWindow, ...] = Field(
         alias="phaseWindows",
         min_length=5,
@@ -2492,6 +3057,18 @@ class Wc029ScenarioExecutionManifest(_StrictAcceptanceModel):
         )
         if phases != expected_phases:
             raise ValueError("phaseWindows must use the exact lifecycle order")
+        if (self.evidence_mode == "incident-producing") != (
+            self.incident_occurrence_continuity is not None
+        ):
+            raise ValueError("incident-producing execution requires signed occurrence continuity")
+        continuity = self.incident_occurrence_continuity
+        if continuity is not None and (
+            continuity.scenario_id != self.scenario_id
+            or continuity.scenario_execution_id != self.scenario_execution_id
+            or continuity.target_resource_id.casefold() != self.target_resource_id.casefold()
+            or continuity.correlation_request_digest != self.correlation_request_digest
+        ):
+            raise ValueError("incident occurrence continuity does not bind the scenario execution")
         if any(
             current.completed_at >= following.started_at
             for current, following in zip(
@@ -3179,6 +3756,7 @@ _KNOWN_MODELS: dict[str, type[BaseModel]] = {
     DEPLOYMENT_READBACK_SCHEMA_VERSION: Wc029DeploymentReadbackEvidence,
     JOB_EXECUTION_SCHEMA_VERSION: Wc029JobExecutionEvidence,
     JOB_READBACK_SCHEMA_VERSION: Wc029JobReadbackEvidence,
+    JOB_PLATFORM_CAPTURE_ATTESTATION_SCHEMA_VERSION: (Wc029JobPlatformCaptureAttestation),
     PREFLIGHT_RESULT_SCHEMA_VERSION: Wc029PreflightResultEvidence,
     SCENARIO_PLAN_SCHEMA_VERSION: Wc029ScenarioPlanEvidence,
     RESOURCE_STATE_SCHEMA_VERSION: Wc029ResourceStateEvidence,
@@ -3353,13 +3931,19 @@ class _PinnedDirectoryHandle:
     windows_handle: int | None = None
 
     def close(self) -> None:
-        if self.descriptor is not None:
-            os.close(self.descriptor)
-            self.descriptor = None
-        if self.windows_handle is not None:
-            kernel32 = _windows_kernel32()
-            kernel32.CloseHandle(ctypes.c_void_p(self.windows_handle))
-            self.windows_handle = None
+        try:
+            if self.descriptor is not None:
+                descriptor = self.descriptor
+                self.descriptor = None
+                os.close(descriptor)
+            if self.windows_handle is not None:
+                windows_handle = self.windows_handle
+                self.windows_handle = None
+                _close_windows_handle(windows_handle)
+        except OSError as exc:
+            raise Wc029AcceptanceEvidenceError(
+                "pinned directory handle could not be closed"
+            ) from exc
 
 
 @dataclass(slots=True)
@@ -3369,9 +3953,13 @@ class _PinnedFileHandle:
     descriptor: int
 
     def close(self) -> None:
-        if self.descriptor >= 0:
-            os.close(self.descriptor)
-            self.descriptor = -1
+        try:
+            if self.descriptor >= 0:
+                descriptor = self.descriptor
+                self.descriptor = -1
+                os.close(descriptor)
+        except OSError as exc:
+            raise Wc029AcceptanceEvidenceError("pinned file handle could not be closed") from exc
 
 
 class _WindowsByHandleFileInformation(ctypes.Structure):
@@ -3407,6 +3995,18 @@ def _windows_kernel32() -> Any:
     if factory is None:
         raise OSError("Windows kernel APIs are unavailable")
     return factory("kernel32", use_last_error=True)
+
+
+def _close_windows_handle(handle: int) -> None:
+    kernel32 = _windows_kernel32()
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [ctypes.c_void_p]
+    close_handle.restype = ctypes.c_int
+    if close_handle(ctypes.c_void_p(handle)) == 0:
+        raise OSError(
+            _windows_last_error(),
+            "CloseHandle failed",
+        )
 
 
 def _windows_last_error() -> int:
@@ -3517,7 +4117,7 @@ def _windows_path_identity(
                 file_attributes=attributes,
             )
         finally:
-            kernel32.CloseHandle(ctypes.c_void_p(raw_handle))
+            _close_windows_handle(raw_handle)
         if current == previous:
             return current
         previous = current
@@ -3533,83 +4133,92 @@ def _open_pinned_directory(
     parent: _PinnedDirectoryHandle | None = None,
     name: str | None = None,
 ) -> _PinnedDirectoryHandle:
-    if os.name == "nt":
-        kernel32 = _windows_kernel32()
-        create_file = kernel32.CreateFileW
-        create_file.argtypes = [
-            ctypes.c_wchar_p,
-            ctypes.c_ulong,
-            ctypes.c_ulong,
-            ctypes.c_void_p,
-            ctypes.c_ulong,
-            ctypes.c_ulong,
-            ctypes.c_void_p,
-        ]
-        create_file.restype = ctypes.c_void_p
-        handle = create_file(
-            str(path),
-            0x0001 | 0x0080,
-            0x0001 | 0x0002,
-            None,
-            3,
-            0x02000000 | 0x00200000,
-            None,
-        )
-        invalid_handle = ctypes.c_void_p(-1).value
-        if handle in {None, invalid_handle}:
-            raise OSError(
-                _windows_last_error(),
-                "CreateFileW failed",
+    try:
+        if os.name == "nt":
+            kernel32 = _windows_kernel32()
+            create_file = kernel32.CreateFileW
+            create_file.argtypes = [
+                ctypes.c_wchar_p,
+                ctypes.c_ulong,
+                ctypes.c_ulong,
+                ctypes.c_void_p,
+                ctypes.c_ulong,
+                ctypes.c_ulong,
+                ctypes.c_void_p,
+            ]
+            create_file.restype = ctypes.c_void_p
+            handle = create_file(
+                str(path),
+                0x0001 | 0x0080,
+                0x0001 | 0x0002,
+                None,
+                3,
+                0x02000000 | 0x00200000,
+                None,
             )
-        raw_handle = int(handle)
-        try:
-            inode, link_count, attributes = _windows_directory_identity(raw_handle)
+            invalid_handle = ctypes.c_void_p(-1).value
+            if handle in {None, invalid_handle}:
+                raise OSError(
+                    _windows_last_error(),
+                    "CreateFileW failed",
+                )
+            raw_handle = int(handle)
+            with ExitStack() as cleanup:
+                cleanup.callback(_close_windows_handle, raw_handle)
+                inode, link_count, attributes = _windows_directory_identity(raw_handle)
+                if (
+                    inode != expected.inode
+                    or link_count != expected.link_count
+                    or attributes != expected.file_attributes
+                    or attributes & _REPARSE_POINT
+                    or not attributes & 0x10
+                ):
+                    raise Wc029AcceptanceEvidenceError(
+                        "directory handle identity does not match its validated path"
+                    )
+                pinned = _PinnedDirectoryHandle(
+                    path=path,
+                    identity=expected,
+                    windows_handle=raw_handle,
+                )
+                cleanup.pop_all()
+                return pinned
+
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        with ExitStack() as cleanup:
+            descriptor = os.open(
+                name if parent is not None and name is not None else path,
+                flags,
+                dir_fd=None if parent is None else parent.descriptor,
+            )
+            cleanup.callback(os.close, descriptor)
+            opened_stat = os.fstat(descriptor)
+            opened = _PathIdentity.from_stat(opened_stat)
             if (
-                inode != expected.inode
-                or link_count != expected.link_count
-                or attributes != expected.file_attributes
-                or attributes & _REPARSE_POINT
-                or not attributes & 0x10
+                opened != expected
+                or not stat.S_ISDIR(opened.mode)
+                or stat.S_ISLNK(opened.mode)
+                or _is_reparse_point(opened_stat)
             ):
                 raise Wc029AcceptanceEvidenceError(
                     "directory handle identity does not match its validated path"
                 )
-        except OSError, Wc029AcceptanceEvidenceError:
-            kernel32.CloseHandle(ctypes.c_void_p(raw_handle))
-            raise
-        return _PinnedDirectoryHandle(
-            path=path,
-            identity=expected,
-            windows_handle=raw_handle,
-        )
-
-    flags = (
-        os.O_RDONLY
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_CLOEXEC", 0)
-    )
-    descriptor = os.open(
-        name if parent is not None and name is not None else path,
-        flags,
-        dir_fd=None if parent is None else parent.descriptor,
-    )
-    opened = _PathIdentity.from_stat(os.fstat(descriptor))
-    if (
-        opened != expected
-        or not stat.S_ISDIR(opened.mode)
-        or stat.S_ISLNK(opened.mode)
-        or _is_reparse_point(os.fstat(descriptor))
-    ):
-        os.close(descriptor)
-        raise Wc029AcceptanceEvidenceError(
-            "directory handle identity does not match its validated path"
-        )
-    return _PinnedDirectoryHandle(
-        path=path,
-        identity=expected,
-        descriptor=descriptor,
-    )
+            pinned = _PinnedDirectoryHandle(
+                path=path,
+                identity=expected,
+                descriptor=descriptor,
+            )
+            cleanup.pop_all()
+            return pinned
+    except Wc029AcceptanceEvidenceError:
+        raise
+    except OSError as exc:
+        raise Wc029AcceptanceEvidenceError(f"directory {path} could not be pinned safely") from exc
 
 
 def _stable_directory_path(
@@ -3620,27 +4229,32 @@ def _stable_directory_path(
     absolute = Path(os.path.abspath(path))
     try:
         expected = _PathIdentity.from_stat(absolute.lstat())
-    except OSError as exc:
-        raise Wc029AcceptanceEvidenceError(f"{label} is unavailable") from exc
-    if (
-        not stat.S_ISDIR(expected.mode)
-        or stat.S_ISLNK(expected.mode)
-        or expected.file_attributes & _REPARSE_POINT
-    ):
-        raise Wc029AcceptanceEvidenceError(
-            f"{label} must be one real directory without reparse points"
-        )
-    pin = _open_pinned_directory(absolute, expected)
-    try:
-        resolved = absolute.resolve(strict=True)
         if (
-            os.path.normcase(str(resolved)) != os.path.normcase(str(absolute))
-            or _PathIdentity.from_stat(resolved.lstat()) != expected
+            not stat.S_ISDIR(expected.mode)
+            or stat.S_ISLNK(expected.mode)
+            or expected.file_attributes & _REPARSE_POINT
         ):
-            raise Wc029AcceptanceEvidenceError(f"{label} contains a linked or unstable parent path")
-    finally:
-        pin.close()
-    return absolute, expected
+            raise Wc029AcceptanceEvidenceError(
+                f"{label} must be one real directory without reparse points"
+            )
+        with ExitStack() as cleanup:
+            pin = _open_pinned_directory(absolute, expected)
+            cleanup.callback(pin.close)
+            resolved = absolute.resolve(strict=True)
+            if (
+                os.path.normcase(str(resolved)) != os.path.normcase(str(absolute))
+                or _PathIdentity.from_stat(resolved.lstat()) != expected
+            ):
+                raise Wc029AcceptanceEvidenceError(
+                    f"{label} contains a linked or unstable parent path"
+                )
+        return absolute, expected
+    except Wc029AcceptanceEvidenceError:
+        raise
+    except OSError as exc:
+        raise Wc029AcceptanceEvidenceError(
+            f"{label} is unavailable or changed during identity validation"
+        ) from exc
 
 
 @dataclass(frozen=True, slots=True)
@@ -3651,7 +4265,13 @@ class _BundleSnapshot:
 def _scan_bundle_tree(
     root: Path,
 ) -> tuple[dict[str, _PathIdentity], dict[str, _PathIdentity]]:
-    directories: dict[str, _PathIdentity] = {".": _PathIdentity.from_stat(root.lstat())}
+    try:
+        root_identity = _PathIdentity.from_stat(root.lstat())
+    except OSError as exc:
+        raise Wc029AcceptanceEvidenceError(
+            "evidence root cannot be stated during bundle traversal"
+        ) from exc
+    directories: dict[str, _PathIdentity] = {".": root_identity}
     files: dict[str, _PathIdentity] = {}
     total_path_characters = 0
 
@@ -3740,23 +4360,28 @@ def _scan_bundle_tree(
 
 
 def _pinned_file_identity(descriptor: int) -> _PathIdentity:
-    opened_stat = os.fstat(descriptor)
-    if os.name != "nt":
-        return _PathIdentity.from_stat(opened_stat)
-    msvcrt = importlib.import_module("msvcrt")
-    raw_handle = int(msvcrt.get_osfhandle(descriptor))
-    inode, link_count, attributes = _windows_directory_identity(raw_handle)
-    modified, changed = _windows_basic_times(raw_handle)
-    return _PathIdentity(
-        device=opened_stat.st_dev,
-        inode=inode,
-        mode=opened_stat.st_mode,
-        link_count=link_count,
-        size=opened_stat.st_size,
-        modified_ns=modified,
-        changed_ns=changed,
-        file_attributes=attributes,
-    )
+    try:
+        opened_stat = os.fstat(descriptor)
+        if os.name != "nt":
+            return _PathIdentity.from_stat(opened_stat)
+        msvcrt = importlib.import_module("msvcrt")
+        raw_handle = int(msvcrt.get_osfhandle(descriptor))
+        inode, link_count, attributes = _windows_directory_identity(raw_handle)
+        modified, changed = _windows_basic_times(raw_handle)
+        return _PathIdentity(
+            device=opened_stat.st_dev,
+            inode=inode,
+            mode=opened_stat.st_mode,
+            link_count=link_count,
+            size=opened_stat.st_size,
+            modified_ns=modified,
+            changed_ns=changed,
+            file_attributes=attributes,
+        )
+    except OSError as exc:
+        raise Wc029AcceptanceEvidenceError(
+            "pinned file platform identity could not be read"
+        ) from exc
 
 
 def _open_pinned_file(
@@ -3766,74 +4391,83 @@ def _open_pinned_file(
     parent: _PinnedDirectoryHandle,
     label: str,
 ) -> _PinnedFileHandle:
-    if os.name == "nt":
-        kernel32 = _windows_kernel32()
-        create_file = kernel32.CreateFileW
-        create_file.argtypes = [
-            ctypes.c_wchar_p,
-            ctypes.c_ulong,
-            ctypes.c_ulong,
-            ctypes.c_void_p,
-            ctypes.c_ulong,
-            ctypes.c_ulong,
-            ctypes.c_void_p,
-        ]
-        create_file.restype = ctypes.c_void_p
-        handle = create_file(
-            str(path),
-            0x80000000,
-            0x0001,
-            None,
-            3,
-            0x00200000 | 0x08000000,
-            None,
-        )
-        invalid_handle = ctypes.c_void_p(-1).value
-        if handle in {None, invalid_handle}:
-            raise OSError(
-                _windows_last_error(),
-                f"{label} CreateFileW failed",
+    try:
+        if os.name == "nt":
+            kernel32 = _windows_kernel32()
+            create_file = kernel32.CreateFileW
+            create_file.argtypes = [
+                ctypes.c_wchar_p,
+                ctypes.c_ulong,
+                ctypes.c_ulong,
+                ctypes.c_void_p,
+                ctypes.c_ulong,
+                ctypes.c_ulong,
+                ctypes.c_void_p,
+            ]
+            create_file.restype = ctypes.c_void_p
+            handle = create_file(
+                str(path),
+                0x80000000,
+                0x0001,
+                None,
+                3,
+                0x00200000 | 0x08000000,
+                None,
             )
-        raw_handle = int(handle)
-        try:
-            inode, link_count, attributes = _windows_directory_identity(raw_handle)
-            if (
-                inode != expected.inode
-                or link_count != 1
-                or attributes != expected.file_attributes
-                or attributes & _REPARSE_POINT
-                or attributes & 0x10
-            ):
+            invalid_handle = ctypes.c_void_p(-1).value
+            if handle in {None, invalid_handle}:
+                raise OSError(
+                    _windows_last_error(),
+                    f"{label} CreateFileW failed",
+                )
+            raw_handle = int(handle)
+            with ExitStack() as raw_cleanup:
+                raw_cleanup.callback(_close_windows_handle, raw_handle)
+                inode, link_count, attributes = _windows_directory_identity(raw_handle)
+                if (
+                    inode != expected.inode
+                    or link_count != 1
+                    or attributes != expected.file_attributes
+                    or attributes & _REPARSE_POINT
+                    or attributes & 0x10
+                ):
+                    raise Wc029AcceptanceEvidenceError(
+                        f"{label} stable file handle identity is invalid"
+                    )
+                msvcrt = importlib.import_module("msvcrt")
+                descriptor = int(
+                    msvcrt.open_osfhandle(
+                        raw_handle,
+                        os.O_RDONLY | getattr(os, "O_BINARY", 0),
+                    )
+                )
+                raw_cleanup.pop_all()
+        else:
+            descriptor = os.open(
+                path.name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=parent.descriptor,
+            )
+        with ExitStack() as descriptor_cleanup:
+            descriptor_cleanup.callback(os.close, descriptor)
+            opened = _pinned_file_identity(descriptor)
+            if opened != expected or not stat.S_ISREG(opened.mode) or opened.link_count != 1:
                 raise Wc029AcceptanceEvidenceError(
-                    f"{label} stable file handle identity is invalid"
+                    f"{label} changed before all file handles were pinned"
                 )
-            msvcrt = importlib.import_module("msvcrt")
-            descriptor = int(
-                msvcrt.open_osfhandle(
-                    raw_handle,
-                    os.O_RDONLY | getattr(os, "O_BINARY", 0),
-                )
+            pinned = _PinnedFileHandle(
+                path=path,
+                identity=expected,
+                descriptor=descriptor,
             )
-            raw_handle = -1
-        except OSError, Wc029AcceptanceEvidenceError:
-            if raw_handle >= 0:
-                kernel32.CloseHandle(ctypes.c_void_p(raw_handle))
-            raise
-    else:
-        descriptor = os.open(
-            path.name,
-            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
-            dir_fd=parent.descriptor,
-        )
-    opened = _pinned_file_identity(descriptor)
-    if opened != expected or not stat.S_ISREG(opened.mode) or opened.link_count != 1:
-        os.close(descriptor)
-        raise Wc029AcceptanceEvidenceError(f"{label} changed before all file handles were pinned")
-    return _PinnedFileHandle(
-        path=path,
-        identity=expected,
-        descriptor=descriptor,
-    )
+            descriptor_cleanup.pop_all()
+            return pinned
+    except Wc029AcceptanceEvidenceError:
+        raise
+    except OSError as exc:
+        raise Wc029AcceptanceEvidenceError(
+            f"{label} could not be opened and pinned safely"
+        ) from exc
 
 
 def _read_pinned_file(
@@ -3847,10 +4481,10 @@ def _read_pinned_file(
             f"{label} must contain between 1 and {maximum_bytes} bytes"
         )
     descriptor = pinned.descriptor
-    os.lseek(descriptor, 0, os.SEEK_SET)
-    chunks: list[bytes] = []
-    consumed = 0
     try:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        chunks: list[bytes] = []
+        consumed = 0
         while consumed <= maximum_bytes:
             chunk = os.read(
                 descriptor,
@@ -3860,16 +4494,18 @@ def _read_pinned_file(
                 break
             chunks.append(chunk)
             consumed += len(chunk)
+        content = b"".join(chunks)
+        if _pinned_file_identity(descriptor) != pinned.identity:
+            raise Wc029AcceptanceEvidenceError(f"{label} changed while its pinned handle was read")
+        if not content or len(content) > maximum_bytes:
+            raise Wc029AcceptanceEvidenceError(f"{label} is empty or oversized")
+        return content
+    except Wc029AcceptanceEvidenceError:
+        raise
     except OSError as exc:
         raise Wc029AcceptanceEvidenceError(
             f"{label} could not be read from its pinned handle"
         ) from exc
-    content = b"".join(chunks)
-    if _pinned_file_identity(descriptor) != pinned.identity:
-        raise Wc029AcceptanceEvidenceError(f"{label} changed while its pinned handle was read")
-    if not content or len(content) > maximum_bytes:
-        raise Wc029AcceptanceEvidenceError(f"{label} is empty or oversized")
-    return content
 
 
 def _capture_bundle_snapshot(
@@ -3877,88 +4513,99 @@ def _capture_bundle_snapshot(
     *,
     index_relative: str,
 ) -> _BundleSnapshot:
-    stable_root, root_identity = _stable_directory_path(
-        root,
-        label="evidence root",
-    )
-    pins: dict[str, _PinnedDirectoryHandle] = {}
-    file_pins: dict[str, _PinnedFileHandle] = {}
     try:
-        pins["."] = _open_pinned_directory(
-            stable_root,
-            root_identity,
+        stable_root, root_identity = _stable_directory_path(
+            root,
+            label="evidence root",
         )
-        before_directories, before_files = _scan_bundle_tree(stable_root)
-        if before_directories.get(".") != root_identity:
-            raise Wc029AcceptanceEvidenceError(
-                "evidence root changed after its stable handle was opened"
+        pins: dict[str, _PinnedDirectoryHandle] = {}
+        file_pins: dict[str, _PinnedFileHandle] = {}
+        with ExitStack() as cleanup:
+            pins["."] = _open_pinned_directory(
+                stable_root,
+                root_identity,
             )
-        for relative in sorted(
-            (item for item in before_directories if item != "."),
-            key=lambda item: (len(Path(item).parts), item),
-        ):
-            relative_path = Path(relative)
-            parent_relative = (
-                relative_path.parent.as_posix() if relative_path.parent != Path(".") else "."
+            cleanup.callback(pins["."].close)
+            before_directories, before_files = _scan_bundle_tree(stable_root)
+            if before_directories.get(".") != root_identity:
+                raise Wc029AcceptanceEvidenceError(
+                    "evidence root changed after its stable handle was opened"
+                )
+            for relative in sorted(
+                (item for item in before_directories if item != "."),
+                key=lambda item: (len(Path(item).parts), item),
+            ):
+                relative_path = Path(relative)
+                parent_relative = (
+                    relative_path.parent.as_posix() if relative_path.parent != Path(".") else "."
+                )
+                pins[relative] = _open_pinned_directory(
+                    stable_root / relative_path,
+                    before_directories[relative],
+                    parent=pins[parent_relative],
+                    name=relative_path.name,
+                )
+                cleanup.callback(pins[relative].close)
+            if index_relative not in before_files:
+                raise Wc029AcceptanceEvidenceError("acceptance index is missing")
+            artifact_bytes = sum(
+                identity.size
+                for relative, identity in before_files.items()
+                if relative != index_relative
             )
-            pins[relative] = _open_pinned_directory(
-                stable_root / relative_path,
-                before_directories[relative],
-                parent=pins[parent_relative],
-                name=relative_path.name,
-            )
-        if index_relative not in before_files:
-            raise Wc029AcceptanceEvidenceError("acceptance index is missing")
-        artifact_bytes = sum(
-            identity.size
-            for relative, identity in before_files.items()
-            if relative != index_relative
-        )
-        if artifact_bytes > MAX_TOTAL_EVIDENCE_BYTES:
-            raise Wc029AcceptanceEvidenceError("aggregate evidence exceeds its total byte bound")
-        for relative, identity in sorted(before_files.items()):
-            relative_path = Path(relative)
-            parent_relative = (
-                relative_path.parent.as_posix() if relative_path.parent != Path(".") else "."
-            )
-            file_pins[relative] = _open_pinned_file(
-                stable_root / relative_path,
-                identity,
-                parent=pins[parent_relative],
-                label=(
-                    "acceptance index"
-                    if relative == index_relative
-                    else f"evidence file {relative}"
-                ),
-            )
-        captured: dict[str, bytes] = {}
-        for relative, pinned in file_pins.items():
-            captured[relative] = _read_pinned_file(
-                pinned,
-                maximum_bytes=(
-                    MAX_INDEX_BYTES if relative == index_relative else MAX_ARTIFACT_TRANSFER_BYTES
-                ),
-                label=(
-                    "acceptance index"
-                    if relative == index_relative
-                    else f"evidence file {relative}"
-                ),
-            )
-        after_directories, after_files = _scan_bundle_tree(stable_root)
-        if before_directories != after_directories or before_files != after_files:
-            raise Wc029AcceptanceEvidenceError(
-                "evidence directory changed while the private snapshot was captured"
-            )
-        if any(_pinned_file_identity(pin.descriptor) != pin.identity for pin in file_pins.values()):
-            raise Wc029AcceptanceEvidenceError(
-                "evidence file identity changed before snapshot verification completed"
-            )
-        return _BundleSnapshot(files=captured)
-    finally:
-        for file_pin in reversed(tuple(file_pins.values())):
-            file_pin.close()
-        for directory_pin in reversed(tuple(pins.values())):
-            directory_pin.close()
+            if artifact_bytes > MAX_TOTAL_EVIDENCE_BYTES:
+                raise Wc029AcceptanceEvidenceError(
+                    "aggregate evidence exceeds its total byte bound"
+                )
+            for relative, identity in sorted(before_files.items()):
+                relative_path = Path(relative)
+                parent_relative = (
+                    relative_path.parent.as_posix() if relative_path.parent != Path(".") else "."
+                )
+                file_pins[relative] = _open_pinned_file(
+                    stable_root / relative_path,
+                    identity,
+                    parent=pins[parent_relative],
+                    label=(
+                        "acceptance index"
+                        if relative == index_relative
+                        else f"evidence file {relative}"
+                    ),
+                )
+                cleanup.callback(file_pins[relative].close)
+            captured: dict[str, bytes] = {}
+            for relative, pinned in file_pins.items():
+                captured[relative] = _read_pinned_file(
+                    pinned,
+                    maximum_bytes=(
+                        MAX_INDEX_BYTES
+                        if relative == index_relative
+                        else MAX_ARTIFACT_TRANSFER_BYTES
+                    ),
+                    label=(
+                        "acceptance index"
+                        if relative == index_relative
+                        else f"evidence file {relative}"
+                    ),
+                )
+            after_directories, after_files = _scan_bundle_tree(stable_root)
+            if before_directories != after_directories or before_files != after_files:
+                raise Wc029AcceptanceEvidenceError(
+                    "evidence directory changed while the private snapshot was captured"
+                )
+            if any(
+                _pinned_file_identity(pin.descriptor) != pin.identity for pin in file_pins.values()
+            ):
+                raise Wc029AcceptanceEvidenceError(
+                    "evidence file identity changed before snapshot verification completed"
+                )
+            return _BundleSnapshot(files=captured)
+    except Wc029AcceptanceEvidenceError:
+        raise
+    except OSError as exc:
+        raise Wc029AcceptanceEvidenceError(
+            "evidence snapshot failed during a pinned filesystem operation"
+        ) from exc
 
 
 def _raise_walk_error(error: OSError) -> NoReturn:
@@ -4693,6 +5340,105 @@ def _validate_signed_artifacts(
                 standard_base64=False,
                 artifact_id=artifact.declaration.artifact_id,
             )
+        elif evidence_class == "job-platform-attestation":
+            capture_attestation = _require_model(
+                artifact,
+                Wc029JobPlatformCaptureAttestation,
+            )
+            readback_artifact = cast(_LoadedArtifact, subject)
+            readback = _require_model(
+                readback_artifact,
+                Wc029JobReadbackEvidence,
+            )
+            execution_artifact = _require_loaded_artifact(
+                artifacts,
+                cast(str, readback_artifact.declaration.binds_artifact_id),
+                label=f"Job platform attestation {artifact.declaration.artifact_id}",
+            )
+            execution = _require_model(
+                execution_artifact,
+                Wc029JobExecutionEvidence,
+            )
+            approved_job = next(
+                (item for item in inventory.jobs if item.job_id == execution.job_inventory_id),
+                None,
+            )
+            capture_statement = capture_attestation.statement
+            if (
+                approved_job is None
+                or execution.scope != "global"
+                or readback.scope != "global"
+                or capture_statement.job_inventory_id != approved_job.job_id
+                or capture_statement.job_inventory_id != execution.job_inventory_id
+                or capture_statement.job_inventory_id != readback.job_inventory_id
+                or capture_statement.purpose != approved_job.purpose
+                or capture_statement.purpose != execution.purpose
+                or capture_statement.purpose != readback.purpose
+                or capture_statement.execution_id != execution.execution_id
+                or capture_statement.execution_id != readback.execution_id
+                or capture_statement.job_resource_id.casefold()
+                != approved_job.job_resource_id.casefold()
+                or capture_statement.job_resource_id.casefold()
+                != execution.job_resource_id.casefold()
+                or capture_statement.job_resource_id.casefold()
+                != readback.job_resource_id.casefold()
+                or capture_statement.subscription_id != approved_job.subscription_id
+                or capture_statement.subscription_id != execution.subscription_id
+                or capture_statement.subscription_id != readback.subscription_id
+                or capture_statement.resource_group.casefold()
+                != approved_job.resource_group.casefold()
+                or capture_statement.resource_group.casefold()
+                != execution.resource_group.casefold()
+                or capture_statement.resource_group.casefold() != readback.resource_group.casefold()
+                or capture_statement.component != approved_job.component
+                or capture_statement.component != execution.component
+                or capture_statement.component != readback.component
+                or capture_statement.image_repo_digest != approved_job.image_repo_digest
+                or capture_statement.image_repo_digest != execution.image
+                or capture_statement.image_repo_digest != readback.image
+                or capture_statement.execution_template_configuration_sha256
+                != approved_job.execution_template_configuration_sha256
+                or capture_statement.execution_template_configuration_sha256
+                != execution.execution_template_configuration_sha256
+                or capture_statement.execution_template_configuration_sha256
+                != readback.execution_template_configuration_sha256
+                or capture_statement.attached_identity_resource_ids
+                != approved_job.expected_attached_identity_resource_ids
+                or capture_statement.attached_identity_resource_ids
+                != execution.attached_identity_resource_ids
+                or capture_statement.attached_identity_resource_ids
+                != readback.attached_identity_resource_ids
+                or capture_statement.started_at != execution.started_at
+                or capture_statement.completed_at != execution.completed_at
+                or capture_statement.platform_execution_status != execution.status
+                or capture_statement.platform_exit_code != execution.exit_code
+                or capture_statement.execution_digest != execution.execution_digest
+                or capture_statement.execution_artifact_sha256
+                != execution_artifact.record.content_sha256
+                or capture_statement.readback_observed_at != readback.observed_at
+                or capture_statement.platform_provisioning_state != readback.provisioning_state
+                or capture_statement.platform_readback_status != readback.status
+                or capture_statement.readback_digest != readback.readback_digest
+                or capture_statement.readback_artifact_sha256
+                != readback_artifact.record.content_sha256
+                or capture_statement.capture_anchor_resource_id.casefold()
+                != approved_job.capture_anchor_resource_id.casefold()
+                or capture_attestation.key_vault_key_id.casefold()
+                != key.key_vault_key_id.casefold()
+                or capture_attestation.signed_preimage_digest
+                != sha256_hex(capture_statement.canonical_bytes())
+            ):
+                raise Wc029AcceptanceEvidenceError(
+                    "Job platform capture attestation does not bind the exact "
+                    "inventoried Job execution and read-back"
+                )
+            _verify_signature(
+                public_key,
+                preimage=capture_statement.canonical_bytes(),
+                signature=capture_attestation.detached_signature,
+                standard_base64=False,
+                artifact_id=artifact.declaration.artifact_id,
+            )
         elif evidence_class in {
             "incident-state-active-attestation",
             "incident-state-resolved-attestation",
@@ -4940,20 +5686,54 @@ def _validate_job_evidence(
         raise Wc029AcceptanceEvidenceError("every Job execution must have exactly one read-back")
     if len(bound_execution_ids) != len(readbacks):
         raise Wc029AcceptanceEvidenceError("multiple Job read-backs cannot bind one execution")
+    capture_attestations = tuple(
+        item
+        for item in artifacts.values()
+        if item.declaration.evidence_class == "job-platform-attestation"
+    )
+    capture_readback_ids = tuple(
+        cast(str, item.declaration.binds_artifact_id) for item in capture_attestations
+    )
+    global_readback_ids = {
+        item.declaration.artifact_id
+        for item, _readback in readbacks
+        if owners[item.declaration.artifact_id] is None
+    }
+    if set(capture_readback_ids) != global_readback_ids or len(capture_readback_ids) != len(
+        set(capture_readback_ids)
+    ):
+        raise Wc029AcceptanceEvidenceError(
+            "every global Job read-back requires one trusted platform capture attestation"
+        )
     inventory_images = {item.component: item.image for item in inventory.images}
+    inventory_jobs = {item.job_id: item for item in inventory.jobs}
     used_components: set[str] = set()
+    used_job_ids: set[str] = set()
     execution_ids: set[str] = set()
     for artifact, execution in executions.values():
         if execution.execution_id in execution_ids:
             raise Wc029AcceptanceEvidenceError("Job execution IDs must be unique")
         execution_ids.add(execution.execution_id)
+        approved_job = inventory_jobs.get(execution.job_inventory_id)
         if (
-            execution.source_commit != inventory.source_commit
+            approved_job is None
+            or execution.source_commit != inventory.source_commit
             or inventory_images.get(execution.component) != execution.image
+            or execution.scope != approved_job.job_scope
+            or execution.purpose != approved_job.purpose
+            or execution.job_resource_id.casefold() != approved_job.job_resource_id.casefold()
+            or execution.subscription_id != approved_job.subscription_id
+            or execution.resource_group.casefold() != approved_job.resource_group.casefold()
+            or execution.component != approved_job.component
+            or execution.image != approved_job.image_repo_digest
+            or execution.execution_template_configuration_sha256
+            != approved_job.execution_template_configuration_sha256
+            or execution.attached_identity_resource_ids
+            != approved_job.expected_attached_identity_resource_ids
         ):
             raise Wc029AcceptanceEvidenceError(
                 f"Job execution {artifact.declaration.artifact_id} "
-                "does not match inventoried source and image"
+                "does not match its exact approved Job inventory record"
             )
         owner = owners[artifact.declaration.artifact_id]
         if owner is None:
@@ -4968,6 +5748,7 @@ def _validate_job_evidence(
                 "scenario Job execution does not bind its index phase"
             )
         used_components.add(execution.component)
+        used_job_ids.add(execution.job_inventory_id)
 
     for artifact, readback in readbacks:
         execution_artifact, execution = executions[
@@ -4976,10 +5757,17 @@ def _validate_job_evidence(
         if (
             readback.execution_id != execution.execution_id
             or readback.execution_digest != execution.execution_digest
+            or readback.job_inventory_id != execution.job_inventory_id
+            or readback.purpose != execution.purpose
             or readback.job_resource_id.casefold() != execution.job_resource_id.casefold()
+            or readback.subscription_id != execution.subscription_id
+            or readback.resource_group.casefold() != execution.resource_group.casefold()
             or readback.source_commit != execution.source_commit
             or readback.component != execution.component
             or readback.image != execution.image
+            or readback.execution_template_configuration_sha256
+            != execution.execution_template_configuration_sha256
+            or readback.attached_identity_resource_ids != execution.attached_identity_resource_ids
             or readback.scope != execution.scope
             or readback.scenario_id != execution.scenario_id
             or readback.scenario_execution_id != execution.scenario_execution_id
@@ -5019,6 +5807,10 @@ def _validate_job_evidence(
     if used_components != set(inventory_images):
         raise Wc029AcceptanceEvidenceError(
             "Job evidence does not exercise every inventoried image component"
+        )
+    if used_job_ids != set(inventory_jobs):
+        raise Wc029AcceptanceEvidenceError(
+            "Job evidence does not exercise every exact approved Job resource"
         )
 
 
@@ -5264,6 +6056,58 @@ def _require_incident_state_digest(state: IncidentState) -> None:
         raise Wc029AcceptanceEvidenceError(
             "IncidentState resultDigest does not bind its signature preimage"
         )
+
+
+def _expected_incident_occurrence_continuity(
+    scenario: Wc029ScenarioEvidence,
+    plan: Wc029ScenarioPlanEvidence,
+    request: CorrelationRequest,
+    bound_request: IncidentBoundCorrelationRequest,
+    active_state_artifact: _LoadedArtifact,
+    active_attestation_artifact: _LoadedArtifact,
+    resolved_state_artifact: _LoadedArtifact,
+    resolved_attestation_artifact: _LoadedArtifact,
+    active_feed: IncidentEnrichmentFeedPointer,
+    resolved_feed: IncidentEnrichmentFeedPointer,
+) -> Wc029IncidentOccurrenceContinuity:
+    active_state = _require_model(active_state_artifact, IncidentState)
+    resolved_state = _require_model(resolved_state_artifact, IncidentState)
+    subject = bound_request.incident_subject
+    payload: dict[str, object] = {
+        "schemaVersion": "athena.wc029IncidentOccurrenceContinuity.v1",
+        "scenarioId": scenario.scenario_id,
+        "scenarioExecutionId": plan.scenario_execution_id,
+        "incidentId": active_state.incident_id,
+        "targetResourceId": plan.target_resource_id,
+        "correlationRequestId": request.request_id,
+        "correlationRequestDigest": request.request_digest,
+        "incidentSubjectId": subject.subject_id,
+        "incidentSubjectDigest": subject.subject_digest,
+        "incidentBoundRequestId": bound_request.request_id,
+        "incidentBoundRequestDigest": bound_request.binding_digest,
+        "targetBinding": active_state.target_binding,
+        "workloadRole": active_state.workload_role,
+        "detectedAt": active_state.detected_at,
+        "activeTransitionId": active_state.transition_id,
+        "activeStateResultDigest": active_state.result_digest,
+        "activeStateContentSha256": active_state_artifact.record.content_sha256,
+        "activeStateAttestationContentSha256": (active_attestation_artifact.record.content_sha256),
+        "activeOccurrenceDigest": active_feed.occurrence_digest,
+        "resolvedTransitionId": resolved_state.transition_id,
+        "resolvedStateResultDigest": resolved_state.result_digest,
+        "resolvedStateContentSha256": resolved_state_artifact.record.content_sha256,
+        "resolvedStateAttestationContentSha256": (
+            resolved_attestation_artifact.record.content_sha256
+        ),
+        "resolvedOccurrenceDigest": resolved_feed.occurrence_digest,
+        "resolvedPredecessorStateResultDigest": active_state.result_digest,
+    }
+    return Wc029IncidentOccurrenceContinuity.model_validate(
+        {
+            **payload,
+            "continuityDigest": compute_artifact_digest(payload),
+        }
+    )
 
 
 def _validate_incident_manifest_coverage(
@@ -5514,17 +6358,25 @@ def _validate_scenario_lifecycle(
     selected: Mapping[EvidenceClass, _LoadedArtifact],
     artifacts: Mapping[str, _LoadedArtifact],
 ) -> None:
+    active_state_artifact = selected["incident-state-active"]
+    active_attestation_artifact = selected["incident-state-active-attestation"]
+    resolved_state_artifact = selected["incident-state-resolved"]
+    resolved_attestation_artifact = selected["incident-state-resolved-attestation"]
     active_state = _require_model(
-        selected["incident-state-active"],
+        active_state_artifact,
         IncidentState,
     )
     active_state_attestation = _require_model(
-        selected["incident-state-active-attestation"],
+        active_attestation_artifact,
         IncidentStateAttestation,
     )
     resolved_state = _require_model(
-        selected["incident-state-resolved"],
+        resolved_state_artifact,
         IncidentState,
+    )
+    _require_model(
+        resolved_attestation_artifact,
+        IncidentStateAttestation,
     )
     expected_incident_scenario = {
         "web-tier-failure": "webServerFailure",
@@ -5537,9 +6389,19 @@ def _validate_scenario_lifecycle(
         or active_state.lifecycle != "active"
         or resolved_state.lifecycle != "resolved"
         or active_state.incident_id != resolved_state.incident_id
+        or active_state.transition_id == resolved_state.transition_id
+        or resolved_state.updated_at <= active_state.updated_at
     ):
         raise Wc029AcceptanceEvidenceError(
             f"scenario {scenario.scenario_id} incident lifecycle is inconsistent"
+        )
+    if (
+        active_state.target_binding != resolved_state.target_binding
+        or active_state.workload_role != resolved_state.workload_role
+        or active_state.detected_at != resolved_state.detected_at
+    ):
+        raise Wc029AcceptanceEvidenceError(
+            "active and resolved IncidentStates do not share immutable occurrence coordinates"
         )
     _require_incident_state_digest(active_state)
     _require_incident_state_digest(resolved_state)
@@ -5557,6 +6419,54 @@ def _validate_scenario_lifecycle(
         selected["incident-bound-request"],
         IncidentBoundCorrelationRequest,
     )
+    plan = _require_model(
+        selected["scenario-plan"],
+        Wc029ScenarioPlanEvidence,
+    )
+    execution_manifest = _require_model(
+        selected["scenario-execution-manifest"],
+        Wc029ScenarioExecutionManifest,
+    )
+    active_feed = _require_model(
+        selected["feed-active"],
+        IncidentEnrichmentFeedPointer,
+    )
+    resolved_feed = _require_model(
+        selected["feed-resolved"],
+        IncidentEnrichmentFeedPointer,
+    )
+    expected_continuity = _expected_incident_occurrence_continuity(
+        scenario,
+        plan,
+        request,
+        bound_request,
+        active_state_artifact,
+        active_attestation_artifact,
+        resolved_state_artifact,
+        resolved_attestation_artifact,
+        active_feed,
+        resolved_feed,
+    )
+    continuity = execution_manifest.incident_occurrence_continuity
+    if continuity is None or continuity.canonical_bytes() != expected_continuity.canonical_bytes():
+        raise Wc029AcceptanceEvidenceError(
+            "signed incident occurrence continuity does not bind the exact "
+            "active predecessor, resolved transition, and request context"
+        )
+    if (
+        active_feed.source_state_reference.content_digest
+        != active_state_artifact.record.content_sha256
+        or active_feed.source_state_attestation_reference.content_digest
+        != active_attestation_artifact.record.content_sha256
+        or resolved_feed.source_state_reference.content_digest
+        != resolved_state_artifact.record.content_sha256
+        or resolved_feed.source_state_attestation_reference.content_digest
+        != resolved_attestation_artifact.record.content_sha256
+    ):
+        raise Wc029AcceptanceEvidenceError(
+            "feed source-state references do not bind the exact captured "
+            "IncidentState and attestation bytes"
+        )
     _validate_incident_bound_request(
         bound_request,
         request,
@@ -5599,11 +6509,7 @@ def _validate_scenario_lifecycle(
     )
     if (
         citation.scenario_id != scenario.scenario_id
-        or citation.scenario_execution_id
-        != _require_model(
-            selected["scenario-plan"],
-            Wc029ScenarioPlanEvidence,
-        ).scenario_execution_id
+        or citation.scenario_execution_id != plan.scenario_execution_id
         or citation.manifest_id != manifest.manifest_id
         or citation.manifest_version != manifest.manifest_version
         or citation.profile_id != manifest.profile_id
@@ -5638,10 +6544,6 @@ def _validate_scenario_lifecycle(
         raise Wc029AcceptanceEvidenceError(
             "incident enrichment manifest does not bind the exact captured assets"
         ) from exc
-    active_feed = _require_model(
-        selected["feed-active"],
-        IncidentEnrichmentFeedPointer,
-    )
     guidance_attestation = _require_model(
         selected["guidance-attestation"],
         IncidentGuidanceAttestation,
@@ -5682,10 +6584,6 @@ def _validate_scenario_lifecycle(
         raise Wc029AcceptanceEvidenceError(
             "incident report, guidance, or enrichment references do not bind captured attestations"
         ) from exc
-    resolved_feed = _require_model(
-        selected["feed-resolved"],
-        IncidentEnrichmentFeedPointer,
-    )
     active_feed_index = _require_model(
         selected["feed-index-active"],
         IncidentFeedIndexV2,
@@ -6670,98 +7568,108 @@ def write_acceptance_record(
 ) -> Path:
     """Create a content-addressed record exclusively outside the captured input root."""
 
-    root, root_identity = _stable_directory_path(
-        evidence_root,
-        label="evidence root",
-    )
-    output_root, output_identity = _stable_directory_path(
-        output_directory,
-        label="output directory",
-    )
-    root_pin = _open_pinned_directory(root, root_identity)
-    output_pin = _open_pinned_directory(output_root, output_identity)
     try:
-        if output_root == root or output_root.is_relative_to(root):
-            raise Wc029AcceptanceEvidenceError(
-                "output directory must be outside the read-only evidence root"
+        root, root_identity = _stable_directory_path(
+            evidence_root,
+            label="evidence root",
+        )
+        output_root, output_identity = _stable_directory_path(
+            output_directory,
+            label="output directory",
+        )
+        with ExitStack() as cleanup:
+            root_pin = _open_pinned_directory(root, root_identity)
+            cleanup.callback(root_pin.close)
+            output_pin = _open_pinned_directory(output_root, output_identity)
+            cleanup.callback(output_pin.close)
+            if output_root == root or output_root.is_relative_to(root):
+                raise Wc029AcceptanceEvidenceError(
+                    "output directory must be outside the read-only evidence root"
+                )
+            filename = (
+                "wc029-acceptance-" + record.aggregate_digest.removeprefix("sha256:") + ".json"
             )
-        filename = "wc029-acceptance-" + record.aggregate_digest.removeprefix("sha256:") + ".json"
-        staging_name = f".{filename}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
-        output_path = output_root / filename
-        staging_path = output_root / staging_name
-        payload = record.canonical_bytes()
+            staging_name = f".{filename}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+            output_path = output_root / filename
+            staging_path = output_root / staging_name
+            payload = record.canonical_bytes()
 
-        descriptor = -1
-        try:
-            if os.name == "nt":
-                with staging_path.open("xb") as stream:
-                    stream.write(payload)
-                    stream.flush()
-                    os.fsync(stream.fileno())
-            else:
-                descriptor = os.open(
-                    staging_name,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
-                    0o600,
-                    dir_fd=output_pin.descriptor,
-                )
-                with os.fdopen(descriptor, "wb", closefd=True) as stream:
-                    descriptor = -1
-                    stream.write(payload)
-                    stream.flush()
-                    os.fsync(stream.fileno())
-        except FileExistsError as exc:
-            raise Wc029AcceptanceEvidenceError(
-                "acceptance staging path unexpectedly already exists"
-            ) from exc
-        except OSError as exc:
-            raise Wc029AcceptanceEvidenceError(
-                "acceptance record staging bytes could not be persisted"
-            ) from exc
-        finally:
-            if descriptor >= 0:
-                os.close(descriptor)
+            descriptor = -1
+            try:
+                if os.name == "nt":
+                    with staging_path.open("xb") as stream:
+                        stream.write(payload)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                else:
+                    descriptor = os.open(
+                        staging_name,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+                        0o600,
+                        dir_fd=output_pin.descriptor,
+                    )
+                    with os.fdopen(descriptor, "wb", closefd=True) as stream:
+                        descriptor = -1
+                        stream.write(payload)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+            except FileExistsError as exc:
+                raise Wc029AcceptanceEvidenceError(
+                    "acceptance staging path unexpectedly already exists"
+                ) from exc
+            except OSError as exc:
+                raise Wc029AcceptanceEvidenceError(
+                    "acceptance record staging bytes could not be persisted"
+                ) from exc
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
 
-        try:
+            try:
+                if os.name == "nt":
+                    os.link(staging_path, output_path)
+                else:
+                    os.link(
+                        staging_name,
+                        filename,
+                        src_dir_fd=output_pin.descriptor,
+                        dst_dir_fd=output_pin.descriptor,
+                        follow_symlinks=False,
+                    )
+            except FileExistsError as exc:
+                if os.name == "nt":
+                    with suppress(OSError):
+                        staging_path.unlink(missing_ok=True)
+                else:
+                    with suppress(OSError):
+                        os.unlink(staging_name, dir_fd=output_pin.descriptor)
+                raise Wc029AcceptanceEvidenceError(
+                    "refusing to overwrite an existing immutable acceptance record"
+                ) from exc
+            except OSError as exc:
+                if os.name == "nt":
+                    with suppress(OSError):
+                        staging_path.unlink(missing_ok=True)
+                else:
+                    with suppress(OSError):
+                        os.unlink(staging_name, dir_fd=output_pin.descriptor)
+                raise Wc029AcceptanceEvidenceError(
+                    "acceptance record could not be created exclusively"
+                ) from exc
+
             if os.name == "nt":
-                os.link(staging_path, output_path)
-            else:
-                os.link(
-                    staging_name,
-                    filename,
-                    src_dir_fd=output_pin.descriptor,
-                    dst_dir_fd=output_pin.descriptor,
-                    follow_symlinks=False,
-                )
-        except FileExistsError as exc:
-            if os.name == "nt":
-                staging_path.unlink(missing_ok=True)
+                with suppress(OSError):
+                    staging_path.unlink()
             else:
                 with suppress(OSError):
                     os.unlink(staging_name, dir_fd=output_pin.descriptor)
-            raise Wc029AcceptanceEvidenceError(
-                "refusing to overwrite an existing immutable acceptance record"
-            ) from exc
-        except OSError as exc:
-            if os.name == "nt":
-                staging_path.unlink(missing_ok=True)
-            else:
-                with suppress(OSError):
-                    os.unlink(staging_name, dir_fd=output_pin.descriptor)
-            raise Wc029AcceptanceEvidenceError(
-                "acceptance record could not be created exclusively"
-            ) from exc
-
-        if os.name == "nt":
-            with suppress(OSError):
-                staging_path.unlink()
-        else:
-            with suppress(OSError):
-                os.unlink(staging_name, dir_fd=output_pin.descriptor)
-        return output_path
-    finally:
-        output_pin.close()
-        root_pin.close()
+            return output_path
+    except Wc029AcceptanceEvidenceError:
+        raise
+    except OSError as exc:
+        raise Wc029AcceptanceEvidenceError(
+            "acceptance record filesystem operation failed closed"
+        ) from exc
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -6830,6 +7738,8 @@ __all__ = [
     "DEPLOYMENT_READBACK_SCHEMA_VERSION",
     "INCIDENT_OMISSION_SCHEMA_VERSION",
     "JOB_EXECUTION_SCHEMA_VERSION",
+    "JOB_PLATFORM_CAPTURE_ATTESTATION_SCHEMA_VERSION",
+    "JOB_PLATFORM_CAPTURE_STATEMENT_SCHEMA_VERSION",
     "JOB_READBACK_SCHEMA_VERSION",
     "MANIFEST_CITATION_SCHEMA_VERSION",
     "MAX_EVIDENCE_DIRECTORIES",
@@ -6866,8 +7776,12 @@ __all__ = [
     "Wc029EvidenceFileDeclaration",
     "Wc029ImageVersion",
     "Wc029IncidentOmission",
+    "Wc029IncidentOccurrenceContinuity",
     "Wc029JobExecutionEvidence",
+    "Wc029JobPlatformCaptureAttestation",
+    "Wc029JobPlatformCaptureStatement",
     "Wc029JobReadbackEvidence",
+    "Wc029JobVersion",
     "Wc029KeyVersion",
     "Wc029ManifestCitationEvidence",
     "Wc029ManifestVersion",

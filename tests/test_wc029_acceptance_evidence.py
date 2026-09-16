@@ -91,10 +91,27 @@ _TEMPLATE_DIGEST = "sha256:" + ("b" * 64)
 _MANIFEST_DIGEST = "sha256:" + ("c" * 64)
 _IMAGE = "synthetic.azurecr.io/athena/wc029-acceptance@sha256:" + ("d" * 64)
 _PRINCIPAL_ID = "00000000-0000-0000-0000-000000000001"
-_JOB_RESOURCE_ID = (
+_SUBSCRIPTION_ID = "00000000-0000-0000-0000-000000000000"
+_JOB_RESOURCE_GROUP = "rg-athena-wc029-synthetic"
+_GLOBAL_JOB_RESOURCE_ID = (
     "/subscriptions/00000000-0000-0000-0000-000000000000/"
     "resourceGroups/rg-athena-wc029-synthetic/providers/Microsoft.App/"
-    "jobs/athena-wc029-synthetic"
+    "jobs/athena-wc029-global-synthetic"
+)
+_SCENARIO_JOB_RESOURCE_ID = (
+    "/subscriptions/00000000-0000-0000-0000-000000000000/"
+    "resourceGroups/rg-athena-wc029-synthetic/providers/Microsoft.App/"
+    "jobs/athena-wc029-scenario-synthetic"
+)
+_JOB_IDENTITY_RESOURCE_IDS = (
+    "/subscriptions/00000000-0000-0000-0000-000000000000/"
+    "resourceGroups/rg-athena-wc029-synthetic/providers/Microsoft.ManagedIdentity/"
+    "userAssignedIdentities/athena-wc029-job-synthetic",
+)
+_JOB_CAPTURE_ANCHOR_RESOURCE_ID = (
+    "/subscriptions/00000000-0000-0000-0000-000000000000/"
+    "resourceGroups/rg-athena-wc029-synthetic/providers/Microsoft.Storage/"
+    "storageAccounts/athenawc029synthetic/blobServices/default/containers/job-captures"
 )
 _TARGETS = {
     scenario_class: (
@@ -1352,6 +1369,12 @@ def _trusted_incident_assets(
     resolved_payload.update(
         {
             "lifecycle": "resolved",
+            "transitionId": (
+                "wc016-"
+                + sha256_hex(
+                    f"{active_state.incident_id}:resolved:{resolved_updated_at.isoformat()}"
+                ).removeprefix("sha256:")
+            ),
             "updatedAt": resolved_updated_at,
             "availability": "normal",
             "blastRadius": "none",
@@ -1903,10 +1926,44 @@ def _digest_bound_model[Model: BaseModel](
     )
 
 
+def _job_versions() -> tuple[acceptance.Wc029JobVersion, ...]:
+    return (
+        acceptance.Wc029JobVersion(
+            jobId="global-acceptance",
+            purpose="global-acceptance",
+            jobResourceId=_GLOBAL_JOB_RESOURCE_ID,
+            subscriptionId=_SUBSCRIPTION_ID,
+            resourceGroup=_JOB_RESOURCE_GROUP,
+            component="acceptance",
+            imageRepoDigest=_IMAGE,
+            executionTemplateConfigurationSha256=sha256_hex(
+                "global-acceptance:complete-execution-template-and-configuration"
+            ),
+            expectedAttachedIdentityResourceIds=_JOB_IDENTITY_RESOURCE_IDS,
+            captureAnchorResourceId=_JOB_CAPTURE_ANCHOR_RESOURCE_ID,
+        ),
+        acceptance.Wc029JobVersion(
+            jobId="scenario-recovery-verification",
+            purpose="scenario-recovery-verification",
+            jobResourceId=_SCENARIO_JOB_RESOURCE_ID,
+            subscriptionId=_SUBSCRIPTION_ID,
+            resourceGroup=_JOB_RESOURCE_GROUP,
+            component="acceptance",
+            imageRepoDigest=_IMAGE,
+            executionTemplateConfigurationSha256=sha256_hex(
+                "scenario-recovery:complete-execution-template-and-configuration"
+            ),
+            expectedAttachedIdentityResourceIds=_JOB_IDENTITY_RESOURCE_IDS,
+            captureAnchorResourceId=_JOB_CAPTURE_ANCHOR_RESOURCE_ID,
+        ),
+    )
+
+
 def _job_execution(
     *,
     execution_id: str,
     scope: str,
+    job_version: acceptance.Wc029JobVersion | None = None,
     scenario_id: str | None = None,
     scenario_execution_id: str | None = None,
     scenario_plan_digest: str | None = None,
@@ -1914,19 +1971,30 @@ def _job_execution(
     phase: str | None = None,
     started_at: datetime = _NOW,
 ) -> acceptance.Wc029JobExecutionEvidence:
+    if job_version is None:
+        purpose = "global-acceptance" if scope == "global" else "scenario-recovery-verification"
+        job_version = next(item for item in _job_versions() if item.purpose == purpose)
     payload: dict[str, object] = {
         "schemaVersion": acceptance.JOB_EXECUTION_SCHEMA_VERSION,
         "scope": scope,
+        "jobInventoryId": job_version.job_id,
+        "purpose": job_version.purpose,
         "scenarioId": scenario_id,
         "scenarioExecutionId": scenario_execution_id,
         "scenarioPlanDigest": scenario_plan_digest,
         "inputDigest": input_digest,
         "phase": phase,
         "executionId": execution_id,
-        "jobResourceId": _JOB_RESOURCE_ID,
+        "jobResourceId": job_version.job_resource_id,
+        "subscriptionId": job_version.subscription_id,
+        "resourceGroup": job_version.resource_group,
         "sourceCommit": _SOURCE_COMMIT,
-        "component": "acceptance",
-        "image": _IMAGE,
+        "component": job_version.component,
+        "image": job_version.image_repo_digest,
+        "executionTemplateConfigurationSha256": (
+            job_version.execution_template_configuration_sha256
+        ),
+        "attachedIdentityResourceIds": (job_version.expected_attached_identity_resource_ids),
         "startedAt": started_at,
         "completedAt": started_at + timedelta(minutes=1),
         "status": "Succeeded",
@@ -1947,6 +2015,8 @@ def _job_readback(
     payload: dict[str, object] = {
         "schemaVersion": acceptance.JOB_READBACK_SCHEMA_VERSION,
         "scope": execution.scope,
+        "jobInventoryId": execution.job_inventory_id,
+        "purpose": execution.purpose,
         "scenarioId": execution.scenario_id,
         "scenarioExecutionId": execution.scenario_execution_id,
         "scenarioPlanDigest": execution.scenario_plan_digest,
@@ -1954,9 +2024,13 @@ def _job_readback(
         "executionId": execution.execution_id,
         "executionDigest": execution.execution_digest,
         "jobResourceId": execution.job_resource_id,
+        "subscriptionId": execution.subscription_id,
+        "resourceGroup": execution.resource_group,
         "sourceCommit": execution.source_commit,
         "component": execution.component,
         "image": execution.image,
+        "executionTemplateConfigurationSha256": (execution.execution_template_configuration_sha256),
+        "attachedIdentityResourceIds": execution.attached_identity_resource_ids,
         "observedAt": execution.completed_at + timedelta(minutes=1),
         "provisioningState": "Succeeded",
         "status": "Succeeded",
@@ -1969,6 +2043,84 @@ def _job_readback(
         acceptance.Wc029JobReadbackEvidence,
         payload,
         digest_field="readbackDigest",
+    )
+
+
+def _job_platform_capture_attestation(
+    execution: acceptance.Wc029JobExecutionEvidence,
+    readback: acceptance.Wc029JobReadbackEvidence,
+    *,
+    execution_artifact_sha256: str,
+    readback_artifact_sha256: str,
+    capture_anchor_resource_id: str,
+    key: KeyMaterial,
+    private_key: rsa.RSAPrivateKey,
+) -> acceptance.Wc029JobPlatformCaptureAttestation:
+    capture_record_sha256 = compute_artifact_digest(
+        {
+            "provider": "Microsoft.App/jobs/executions",
+            "executionId": execution.execution_id,
+            "jobResourceId": execution.job_resource_id,
+            "executionDigest": execution.execution_digest,
+            "readbackDigest": readback.readback_digest,
+        }
+    )
+    statement_payload: dict[str, object] = {
+        "schemaVersion": acceptance.JOB_PLATFORM_CAPTURE_STATEMENT_SCHEMA_VERSION,
+        "scope": "global",
+        "jobInventoryId": execution.job_inventory_id,
+        "purpose": execution.purpose,
+        "executionId": execution.execution_id,
+        "jobResourceId": execution.job_resource_id,
+        "subscriptionId": execution.subscription_id,
+        "resourceGroup": execution.resource_group,
+        "component": execution.component,
+        "imageRepoDigest": execution.image,
+        "executionTemplateConfigurationSha256": (execution.execution_template_configuration_sha256),
+        "attachedIdentityResourceIds": execution.attached_identity_resource_ids,
+        "startedAt": execution.started_at,
+        "completedAt": execution.completed_at,
+        "platformExecutionStatus": execution.status,
+        "platformExitCode": execution.exit_code,
+        "executionDigest": execution.execution_digest,
+        "executionArtifactSha256": execution_artifact_sha256,
+        "readbackObservedAt": readback.observed_at,
+        "platformProvisioningState": readback.provisioning_state,
+        "platformReadbackStatus": readback.status,
+        "readbackDigest": readback.readback_digest,
+        "readbackArtifactSha256": readback_artifact_sha256,
+        "captureAnchorResourceId": capture_anchor_resource_id,
+        "captureRecordId": (
+            "job-platform-capture-" + capture_record_sha256.removeprefix("sha256:")[:32]
+        ),
+        "captureRecordSha256": capture_record_sha256,
+    }
+    statement_digest = compute_artifact_digest(_json_value(statement_payload))
+    statement = acceptance.Wc029JobPlatformCaptureStatement(
+        **statement_payload,
+        statementId=(
+            "job-platform-capture-statement-" + statement_digest.removeprefix("sha256:")[:32]
+        ),
+        statementDigest=statement_digest,
+    )
+    signature = (
+        base64.urlsafe_b64encode(
+            private_key.sign(
+                statement.canonical_bytes(),
+                padding.PKCS1v15(),
+                hashes.SHA256(),
+            )
+        )
+        .decode("ascii")
+        .rstrip("=")
+    )
+    return acceptance.Wc029JobPlatformCaptureAttestation(
+        schemaVersion=acceptance.JOB_PLATFORM_CAPTURE_ATTESTATION_SCHEMA_VERSION,
+        statement=statement,
+        signatureAlgorithm="RS256",
+        keyVaultKeyId=key.key_id,
+        signedPreimageDigest=sha256_hex(statement.canonical_bytes()),
+        detachedSignature=signature,
     )
 
 
@@ -2028,6 +2180,56 @@ def _scenario_plan(
         acceptance.Wc029ScenarioPlanEvidence,
         payload,
         digest_field="planDigest",
+    )
+
+
+def _incident_occurrence_continuity(
+    *,
+    scenario_id: str,
+    scenario_execution_id: str,
+    target_resource_id: str,
+    request: CorrelationRequest,
+    bound_request: IncidentBoundCorrelationRequest,
+    active_state: IncidentState,
+    active_state_content_sha256: str,
+    active_state_attestation_content_sha256: str,
+    active_occurrence_digest: str,
+    resolved_state: IncidentState,
+    resolved_state_content_sha256: str,
+    resolved_state_attestation_content_sha256: str,
+    resolved_occurrence_digest: str,
+) -> acceptance.Wc029IncidentOccurrenceContinuity:
+    payload: dict[str, object] = {
+        "schemaVersion": "athena.wc029IncidentOccurrenceContinuity.v1",
+        "scenarioId": scenario_id,
+        "scenarioExecutionId": scenario_execution_id,
+        "incidentId": active_state.incident_id,
+        "targetResourceId": target_resource_id,
+        "correlationRequestId": request.request_id,
+        "correlationRequestDigest": request.request_digest,
+        "incidentSubjectId": bound_request.incident_subject.subject_id,
+        "incidentSubjectDigest": bound_request.incident_subject.subject_digest,
+        "incidentBoundRequestId": bound_request.request_id,
+        "incidentBoundRequestDigest": bound_request.binding_digest,
+        "targetBinding": active_state.target_binding,
+        "workloadRole": active_state.workload_role,
+        "detectedAt": active_state.detected_at,
+        "activeTransitionId": active_state.transition_id,
+        "activeStateResultDigest": active_state.result_digest,
+        "activeStateContentSha256": active_state_content_sha256,
+        "activeStateAttestationContentSha256": (active_state_attestation_content_sha256),
+        "activeOccurrenceDigest": active_occurrence_digest,
+        "resolvedTransitionId": resolved_state.transition_id,
+        "resolvedStateResultDigest": resolved_state.result_digest,
+        "resolvedStateContentSha256": resolved_state_content_sha256,
+        "resolvedStateAttestationContentSha256": (resolved_state_attestation_content_sha256),
+        "resolvedOccurrenceDigest": resolved_occurrence_digest,
+        "resolvedPredecessorStateResultDigest": active_state.result_digest,
+    }
+    return _digest_bound_model(
+        acceptance.Wc029IncidentOccurrenceContinuity,
+        payload,
+        digest_field="continuityDigest",
     )
 
 
@@ -2983,10 +3185,15 @@ def _build_bundle(tmp_path: Path) -> BundleFixture:
         "scenario-authority",
         "3",
     )
+    job_capture_key, job_capture_private = _private_key_material(
+        "job-capture",
+        "4",
+    )
     keys = {
         **incident.keys,
         "change": change_key,
         "context-authority": publication.key,
+        "job-capture": job_capture_key,
         "monitoring": monitoring_key,
         "scenario-authority": scenario_key,
     }
@@ -3196,6 +3403,7 @@ def _build_bundle(tmp_path: Path) -> BundleFixture:
                 image=_IMAGE,
             ),
         ),
+        jobs=_job_versions(),
         endpoints=(
             acceptance.Wc029EndpointVersion(
                 endpointId="presentation",
@@ -3438,9 +3646,11 @@ def _build_bundle(tmp_path: Path) -> BundleFixture:
         _probe("presentation-runtime-manifest", "/runtime-manifest.json"),
         global_evidence=True,
     )
+    global_job = next(item for item in inventory.jobs if item.purpose == "global-acceptance")
     global_execution = _job_execution(
         execution_id="foundation-execution",
         scope="global",
+        job_version=global_job,
     )
     global_execution_id = add(
         "global-job-execution",
@@ -3448,23 +3658,42 @@ def _build_bundle(tmp_path: Path) -> BundleFixture:
         global_execution,
         global_evidence=True,
     )
-    add(
+    global_readback = _job_readback(
+        global_execution,
+        result_artifacts=[
+            (
+                capability_readback_id,
+                artifact_digests[capability_readback_id],
+            ),
+        ],
+    )
+    global_readback_id = add(
         "global-job-readback",
         "job-readback",
-        _job_readback(
-            global_execution,
-            result_artifacts=[
-                (
-                    capability_readback_id,
-                    artifact_digests[capability_readback_id],
-                ),
-            ],
-        ),
+        global_readback,
         global_evidence=True,
         binds_artifact_id=global_execution_id,
     )
+    add(
+        "global-job-platform-attestation",
+        "job-platform-attestation",
+        _job_platform_capture_attestation(
+            global_execution,
+            global_readback,
+            execution_artifact_sha256=artifact_digests[global_execution_id],
+            readback_artifact_sha256=artifact_digests[global_readback_id],
+            capture_anchor_resource_id=global_job.capture_anchor_resource_id,
+            key=job_capture_key,
+            private_key=job_capture_private,
+        ),
+        global_evidence=True,
+        binds_artifact_id=global_readback_id,
+    )
 
     capability_by_class = {item.scenario_class: item for item in capabilities}
+    scenario_job = next(
+        item for item in inventory.jobs if item.purpose == "scenario-recovery-verification"
+    )
     scenarios: list[dict[str, object]] = []
     for scenario_class in acceptance.REQUIRED_SCENARIO_CLASSES:
         capability = capability_by_class[scenario_class]
@@ -3621,6 +3850,7 @@ def _build_bundle(tmp_path: Path) -> BundleFixture:
                 change,
                 phase="observe",
             )
+        incident_occurrence_continuity: acceptance.Wc029IncidentOccurrenceContinuity | None = None
         if capability.evidence_mode == "correlation-only":
             add_scenario(
                 "incident-omission",
@@ -3652,7 +3882,7 @@ def _build_bundle(tmp_path: Path) -> BundleFixture:
                 incident.active_state,
                 phase="observe",
             )
-            add_scenario(
+            active_state_attestation_id = add_scenario(
                 "incident-active-attestation",
                 "incident-state-active-attestation",
                 incident.active_state_attestation,
@@ -3790,6 +4020,7 @@ def _build_bundle(tmp_path: Path) -> BundleFixture:
         execution = _job_execution(
             execution_id=f"{scenario_id}-verify",
             scope="scenario",
+            job_version=scenario_job,
             scenario_id=scenario_id,
             scenario_execution_id=scenario_execution_id,
             scenario_plan_digest=scenario_plan.plan_digest,
@@ -3824,12 +4055,31 @@ def _build_bundle(tmp_path: Path) -> BundleFixture:
                 incident.resolved_state,
                 phase="verify",
             )
-            add_scenario(
+            resolved_state_attestation_id = add_scenario(
                 "incident-resolved-attestation",
                 "incident-state-resolved-attestation",
                 incident.resolved_state_attestation,
                 phase="verify",
                 binds_artifact_id=resolved_state_id,
+            )
+            incident_occurrence_continuity = _incident_occurrence_continuity(
+                scenario_id=scenario_id,
+                scenario_execution_id=scenario_execution_id,
+                target_resource_id=capability.target_resource_id,
+                request=scenario_request,
+                bound_request=incident.incident_bound_request,
+                active_state=incident.active_state,
+                active_state_content_sha256=artifact_digests[active_state_id],
+                active_state_attestation_content_sha256=(
+                    artifact_digests[active_state_attestation_id]
+                ),
+                active_occurrence_digest=incident.active_feed.occurrence_digest,
+                resolved_state=incident.resolved_state,
+                resolved_state_content_sha256=artifact_digests[resolved_state_id],
+                resolved_state_attestation_content_sha256=(
+                    artifact_digests[resolved_state_attestation_id]
+                ),
+                resolved_occurrence_digest=incident.resolved_feed.occurrence_digest,
             )
             resolved_feed_id = add_scenario(
                 "feed-resolved",
@@ -4006,6 +4256,7 @@ def _build_bundle(tmp_path: Path) -> BundleFixture:
             "planDigest": scenario_plan.plan_digest,
             "mutationReceiptDigest": mutation.result_digest,
             "recoveryActionResultDigest": recovery.result_digest,
+            "incidentOccurrenceContinuity": incident_occurrence_continuity,
             "phaseWindows": phase_windows,
             "artifacts": tuple(manifest_bindings),
         }
@@ -4072,6 +4323,7 @@ def _build_bundle(tmp_path: Path) -> BundleFixture:
         keys=keys,
         private_keys={
             **incident.private_keys,
+            "job-capture": job_capture_private,
             "monitoring": monitoring_private,
             "scenario-authority": scenario_private,
         },
@@ -4198,6 +4450,422 @@ def _refresh_scenario_execution_binding(
         detachedSignature=signature,
     )
     _write(bundle.artifact_paths[attestation_id], attestation)
+
+
+def _refresh_global_job_capture_attestation(
+    bundle: BundleFixture,
+    *,
+    capture_anchor_resource_id: str | None = None,
+) -> None:
+    execution_id = "global-job-execution"
+    readback_id = "global-job-readback"
+    attestation_id = "global-job-platform-attestation"
+    execution = acceptance.Wc029JobExecutionEvidence.model_validate_json(
+        bundle.artifact_paths[execution_id].read_bytes()
+    )
+    readback = acceptance.Wc029JobReadbackEvidence.model_validate_json(
+        bundle.artifact_paths[readback_id].read_bytes()
+    )
+    inventory = acceptance.Wc029VersionInventory.model_validate_json(
+        bundle.artifact_paths["version-inventory"].read_bytes()
+    )
+    approved_job = next(
+        item for item in inventory.jobs if item.job_id == execution.job_inventory_id
+    )
+    attestation = _job_platform_capture_attestation(
+        execution,
+        readback,
+        execution_artifact_sha256=sha256_hex(bundle.artifact_paths[execution_id].read_bytes()),
+        readback_artifact_sha256=sha256_hex(bundle.artifact_paths[readback_id].read_bytes()),
+        capture_anchor_resource_id=(
+            capture_anchor_resource_id or approved_job.capture_anchor_resource_id
+        ),
+        key=bundle.keys["job-capture"],
+        private_key=bundle.private_keys["job-capture"],
+    )
+    _write(bundle.artifact_paths[attestation_id], attestation)
+
+
+def _rewrite_global_job_chain(
+    bundle: BundleFixture,
+    updates: dict[str, object],
+    *,
+    capture_anchor_resource_id: str | None = None,
+) -> None:
+    execution_path = bundle.artifact_paths["global-job-execution"]
+    execution = _read_json(execution_path)
+    execution.update(updates)
+    execution_payload = dict(execution)
+    execution_payload.pop("executionDigest")
+    execution["executionDigest"] = compute_artifact_digest(execution_payload)
+    _write(execution_path, execution)
+
+    readback_path = bundle.artifact_paths["global-job-readback"]
+    readback = _read_json(readback_path)
+    for field in (
+        "jobInventoryId",
+        "purpose",
+        "executionId",
+        "jobResourceId",
+        "subscriptionId",
+        "resourceGroup",
+        "sourceCommit",
+        "component",
+        "image",
+        "executionTemplateConfigurationSha256",
+        "attachedIdentityResourceIds",
+    ):
+        readback[field] = execution[field]
+    readback["executionDigest"] = execution["executionDigest"]
+    readback_payload = dict(readback)
+    readback_payload.pop("readbackDigest")
+    readback["readbackDigest"] = compute_artifact_digest(readback_payload)
+    _write(readback_path, readback)
+    _refresh_global_job_capture_attestation(
+        bundle,
+        capture_anchor_resource_id=capture_anchor_resource_id,
+    )
+
+
+def _refresh_incident_occurrence_continuity(
+    bundle: BundleFixture,
+    scenario_class: str = "web-tier-failure",
+) -> None:
+    prefix = f"scenario-{scenario_class}"
+    plan = acceptance.Wc029ScenarioPlanEvidence.model_validate_json(
+        bundle.artifact_paths[f"{prefix}-plan"].read_bytes()
+    )
+    request = CorrelationRequest.model_validate_json(
+        bundle.artifact_paths[f"{prefix}-correlation-request"].read_bytes()
+    )
+    bound_request = IncidentBoundCorrelationRequest.model_validate_json(
+        bundle.artifact_paths[f"{prefix}-incident-bound-request"].read_bytes()
+    )
+    active_state_path = bundle.artifact_paths[f"{prefix}-incident-active"]
+    active_attestation_path = bundle.artifact_paths[f"{prefix}-incident-active-attestation"]
+    resolved_state_path = bundle.artifact_paths[f"{prefix}-incident-resolved"]
+    resolved_attestation_path = bundle.artifact_paths[f"{prefix}-incident-resolved-attestation"]
+    active_state = IncidentState.model_validate_json(active_state_path.read_bytes())
+    resolved_state = IncidentState.model_validate_json(resolved_state_path.read_bytes())
+    active_feed = IncidentEnrichmentFeedPointer.model_validate_json(
+        bundle.artifact_paths[f"{prefix}-feed-active"].read_bytes()
+    )
+    resolved_feed = IncidentEnrichmentFeedPointer.model_validate_json(
+        bundle.artifact_paths[f"{prefix}-feed-resolved"].read_bytes()
+    )
+    continuity = _incident_occurrence_continuity(
+        scenario_id=prefix,
+        scenario_execution_id=plan.scenario_execution_id,
+        target_resource_id=plan.target_resource_id,
+        request=request,
+        bound_request=bound_request,
+        active_state=active_state,
+        active_state_content_sha256=sha256_hex(active_state_path.read_bytes()),
+        active_state_attestation_content_sha256=sha256_hex(active_attestation_path.read_bytes()),
+        active_occurrence_digest=active_feed.occurrence_digest,
+        resolved_state=resolved_state,
+        resolved_state_content_sha256=sha256_hex(resolved_state_path.read_bytes()),
+        resolved_state_attestation_content_sha256=sha256_hex(
+            resolved_attestation_path.read_bytes()
+        ),
+        resolved_occurrence_digest=resolved_feed.occurrence_digest,
+    )
+    manifest_path = bundle.artifact_paths[f"{prefix}-execution-manifest"]
+    manifest = acceptance.Wc029ScenarioExecutionManifest.model_validate_json(
+        manifest_path.read_bytes()
+    )
+    payload = manifest.model_dump(
+        mode="python",
+        by_alias=True,
+        exclude={"manifest_digest"},
+    )
+    payload["incidentOccurrenceContinuity"] = continuity
+    _write(
+        manifest_path,
+        _digest_bound_model(
+            acceptance.Wc029ScenarioExecutionManifest,
+            payload,
+            digest_field="manifestDigest",
+        ),
+    )
+    _refresh_scenario_execution_binding(bundle, scenario_class)
+
+
+def _rewrite_signed_incident_continuity(
+    bundle: BundleFixture,
+    updates: dict[str, object],
+) -> None:
+    scenario_class = "web-tier-failure"
+    manifest_path = bundle.artifact_paths[f"scenario-{scenario_class}-execution-manifest"]
+    manifest = acceptance.Wc029ScenarioExecutionManifest.model_validate_json(
+        manifest_path.read_bytes()
+    )
+    assert manifest.incident_occurrence_continuity is not None
+    continuity_payload = manifest.incident_occurrence_continuity.model_dump(
+        mode="python",
+        by_alias=True,
+        exclude={"continuity_digest"},
+    )
+    continuity_payload.update(updates)
+    continuity = _digest_bound_model(
+        acceptance.Wc029IncidentOccurrenceContinuity,
+        continuity_payload,
+        digest_field="continuityDigest",
+    )
+    manifest_payload = manifest.model_dump(
+        mode="python",
+        by_alias=True,
+        exclude={"manifest_digest"},
+    )
+    manifest_payload["incidentOccurrenceContinuity"] = continuity
+    _write(
+        manifest_path,
+        _digest_bound_model(
+            acceptance.Wc029ScenarioExecutionManifest,
+            manifest_payload,
+            digest_field="manifestDigest",
+        ),
+    )
+    _refresh_scenario_execution_binding(bundle, scenario_class)
+
+
+def _rewrite_feed_source_digest(
+    bundle: BundleFixture,
+    *,
+    lifecycle: str,
+    reference_field: str,
+) -> None:
+    prefix = "scenario-web-tier-failure"
+    pointer_path = bundle.artifact_paths[f"{prefix}-feed-{lifecycle}"]
+    pointer_payload = _read_json(pointer_path)
+    reference = pointer_payload[reference_field]
+    assert isinstance(reference, dict)
+    reference["contentDigest"] = "sha256:" + ("e" * 64)
+    pointer_payload.pop("pointerId")
+    pointer_payload.pop("pointerDigest")
+    pointer_digest = compute_artifact_digest(pointer_payload)
+    pointer = IncidentEnrichmentFeedPointer(
+        **pointer_payload,
+        pointerId=("incident-feed-v2-pointer-" + pointer_digest.removeprefix("sha256:")[:32]),
+        pointerDigest=pointer_digest,
+    )
+    _write(pointer_path, pointer)
+
+    attestation_path = bundle.artifact_paths[f"{prefix}-feed-{lifecycle}-attestation"]
+    signature = (
+        base64.urlsafe_b64encode(
+            bundle.private_keys["feed"].sign(
+                pointer.canonical_bytes(),
+                padding.PKCS1v15(),
+                hashes.SHA256(),
+            )
+        )
+        .decode("ascii")
+        .rstrip("=")
+    )
+    _write(
+        attestation_path,
+        IncidentEnrichmentFeedPointerAttestation(
+            schemaVersion=("athena.wc027IncidentEnrichmentFeedPointerAttestation.v2"),
+            pointerId=pointer.pointer_id,
+            pointerDigest=pointer.pointer_digest,
+            signatureAlgorithm="RS256",
+            keyVaultKeyId=bundle.keys["feed"].key_id,
+            signedPreimageDigest=sha256_hex(pointer.canonical_bytes()),
+            detachedSignature=signature,
+        ),
+    )
+    _refresh_scenario_execution_binding(bundle, "web-tier-failure")
+
+
+def _rewrite_resolved_occurrence_digest_as_active(
+    bundle: BundleFixture,
+) -> None:
+    prefix = "scenario-web-tier-failure"
+    active_pointer = IncidentEnrichmentFeedPointer.model_validate_json(
+        bundle.artifact_paths[f"{prefix}-feed-active"].read_bytes()
+    )
+    resolved_pointer_path = bundle.artifact_paths[f"{prefix}-feed-resolved"]
+    resolved_pointer = IncidentEnrichmentFeedPointer.model_validate_json(
+        resolved_pointer_path.read_bytes()
+    )
+    pointer_payload = resolved_pointer.model_dump(
+        mode="python",
+        by_alias=True,
+        exclude={"pointer_id", "pointer_digest"},
+    )
+    pointer_payload["occurrenceDigest"] = active_pointer.occurrence_digest
+    pointer_digest = compute_artifact_digest(_json_value(pointer_payload))
+    resolved_pointer = IncidentEnrichmentFeedPointer(
+        **pointer_payload,
+        pointerId=("incident-feed-v2-pointer-" + pointer_digest.removeprefix("sha256:")[:32]),
+        pointerDigest=pointer_digest,
+    )
+    resolved_pointer_raw = _write(resolved_pointer_path, resolved_pointer)
+
+    resolved_pointer_attestation_path = bundle.artifact_paths[f"{prefix}-feed-resolved-attestation"]
+    resolved_pointer_signature = (
+        base64.urlsafe_b64encode(
+            bundle.private_keys["feed"].sign(
+                resolved_pointer.canonical_bytes(),
+                padding.PKCS1v15(),
+                hashes.SHA256(),
+            )
+        )
+        .decode("ascii")
+        .rstrip("=")
+    )
+    resolved_pointer_attestation = IncidentEnrichmentFeedPointerAttestation(
+        schemaVersion=("athena.wc027IncidentEnrichmentFeedPointerAttestation.v2"),
+        pointerId=resolved_pointer.pointer_id,
+        pointerDigest=resolved_pointer.pointer_digest,
+        signatureAlgorithm="RS256",
+        keyVaultKeyId=bundle.keys["feed"].key_id,
+        signedPreimageDigest=sha256_hex(resolved_pointer.canonical_bytes()),
+        detachedSignature=resolved_pointer_signature,
+    )
+    resolved_pointer_attestation_raw = _write(
+        resolved_pointer_attestation_path,
+        resolved_pointer_attestation,
+    )
+
+    resolved_index_path = bundle.artifact_paths[f"{prefix}-feed-index-resolved"]
+    old_index = IncidentFeedIndexV2.model_validate_json(resolved_index_path.read_bytes())
+    old_entry = old_index.recently_resolved[0]
+    resolved_entry = old_entry.model_copy(
+        update={
+            "feed_pointer_reference": old_entry.feed_pointer_reference.model_copy(
+                update={"content_digest": sha256_hex(resolved_pointer_raw)}
+            ),
+            "feed_pointer_attestation_reference": (
+                old_entry.feed_pointer_attestation_reference.model_copy(
+                    update={"content_digest": sha256_hex(resolved_pointer_attestation_raw)}
+                )
+            ),
+        }
+    )
+    resolved_index = build_incident_feed_index_v2(
+        active=old_index.active,
+        recently_resolved=(resolved_entry,),
+        resolved_retention_start=old_index.resolved_retention_start,
+        resolved_history_truncated=old_index.resolved_history_truncated,
+        resolved_history_total_count=old_index.resolved_history_total_count,
+        omitted_resolved_count=old_index.omitted_resolved_count,
+        source_active_index_digest=old_index.source_active_index_digest,
+        key_id=old_index.key_id,
+        key_fingerprint=old_index.key_fingerprint,
+        published_at=old_index.published_at,
+    )
+    resolved_index_raw = _write(resolved_index_path, resolved_index)
+
+    resolved_index_attestation_path = bundle.artifact_paths[
+        f"{prefix}-feed-index-resolved-attestation"
+    ]
+    resolved_index_signature = (
+        base64.urlsafe_b64encode(
+            bundle.private_keys["feed"].sign(
+                resolved_index.canonical_bytes(),
+                padding.PKCS1v15(),
+                hashes.SHA256(),
+            )
+        )
+        .decode("ascii")
+        .rstrip("=")
+    )
+    resolved_index_attestation = IncidentFeedIndexAttestationV2(
+        schemaVersion="athena.wc027IncidentFeedIndexAttestation.v2",
+        indexDigest=sha256_hex(resolved_index.canonical_bytes()),
+        signatureAlgorithm="RS256",
+        keyVaultKeyId=bundle.keys["feed"].key_id,
+        detachedSignature=resolved_index_signature,
+    )
+    resolved_index_attestation_raw = _write(
+        resolved_index_attestation_path,
+        resolved_index_attestation,
+    )
+
+    resolved_state = IncidentState.model_validate_json(
+        bundle.artifact_paths[f"{prefix}-incident-resolved"].read_bytes()
+    )
+    resolved_notification = _notification(
+        state=resolved_state,
+        pointer=resolved_pointer,
+        feed_index=resolved_index,
+        feed_pointer_reference=resolved_entry.feed_pointer_reference,
+        feed_pointer_attestation_reference=(resolved_entry.feed_pointer_attestation_reference),
+        guidance_reference=_resolved_guidance_reference(resolved_state),
+        key_id=bundle.keys["notification"].key_id,
+        private_key=bundle.private_keys["notification"],
+    )
+    resolved_notification_path = bundle.artifact_paths[f"{prefix}-notification-resolved"]
+    resolved_notification_raw = _write(
+        resolved_notification_path,
+        resolved_notification,
+    )
+
+    manifest_path = bundle.artifact_paths[f"{prefix}-execution-manifest"]
+    manifest = _read_json(manifest_path)
+    continuity = manifest["incidentOccurrenceContinuity"]
+    assert isinstance(continuity, dict)
+    continuity["resolvedOccurrenceDigest"] = active_pointer.occurrence_digest
+    continuity.pop("continuityDigest")
+    continuity["continuityDigest"] = compute_artifact_digest(continuity)
+    binding_updates = {
+        f"{prefix}-feed-resolved": (
+            sha256_hex(resolved_pointer_raw),
+            resolved_pointer.pointer_digest,
+        ),
+        f"{prefix}-feed-resolved-attestation": (
+            sha256_hex(resolved_pointer_attestation_raw),
+            resolved_pointer.pointer_digest,
+        ),
+        f"{prefix}-feed-index-resolved": (
+            sha256_hex(resolved_index_raw),
+            sha256_hex(resolved_index.canonical_bytes()),
+        ),
+        f"{prefix}-feed-index-resolved-attestation": (
+            sha256_hex(resolved_index_attestation_raw),
+            resolved_index_attestation.index_digest,
+        ),
+        f"{prefix}-notification-resolved": (
+            sha256_hex(resolved_notification_raw),
+            resolved_notification.notification.notification_digest,
+        ),
+    }
+    bindings = manifest["artifacts"]
+    assert isinstance(bindings, list)
+    for binding in bindings:
+        assert isinstance(binding, dict)
+        update = binding_updates.get(binding["artifactId"])
+        if update is not None:
+            binding["contentSha256"], binding["inputDigest"] = update
+    manifest.pop("manifestDigest")
+    manifest["manifestDigest"] = compute_artifact_digest(manifest)
+    manifest_raw = _write(manifest_path, manifest)
+
+    manifest_signature = (
+        base64.urlsafe_b64encode(
+            bundle.private_keys["scenario-authority"].sign(
+                manifest_raw,
+                padding.PKCS1v15(),
+                hashes.SHA256(),
+            )
+        )
+        .decode("ascii")
+        .rstrip("=")
+    )
+    _write(
+        bundle.artifact_paths[f"{prefix}-execution-attestation"],
+        acceptance.Wc029ScenarioExecutionAttestation(
+            schemaVersion=(acceptance.SCENARIO_EXECUTION_ATTESTATION_SCHEMA_VERSION),
+            scenarioExecutionId=manifest["scenarioExecutionId"],
+            manifestDigest=manifest["manifestDigest"],
+            signatureAlgorithm="RS256",
+            keyVaultKeyId=bundle.keys["scenario-authority"].key_id,
+            signedPreimageDigest=sha256_hex(manifest_raw),
+            detachedSignature=manifest_signature,
+        ),
+    )
 
 
 def _declaration(bundle: BundleFixture, artifact_id: str) -> dict[str, Any]:
@@ -4499,6 +5167,171 @@ def test_rejects_failed_deployment_and_job_evidence(tmp_path: Path) -> None:
         _aggregate(job)
 
 
+def test_global_job_requires_trusted_platform_capture_attestation(
+    tmp_path: Path,
+) -> None:
+    missing = _build_bundle(tmp_path / "missing")
+    attestation_id = "global-job-platform-attestation"
+    missing.index["globalArtifactIds"].remove(attestation_id)
+    missing.index["artifacts"] = [
+        item for item in missing.index["artifacts"] if item["artifactId"] != attestation_id
+    ]
+    missing.artifact_paths[attestation_id].unlink()
+    _rewrite_index(missing)
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="acceptance index failed closed validation",
+    ):
+        _aggregate(missing)
+
+    fabricated = _build_bundle(tmp_path / "fabricated")
+    execution_path = fabricated.artifact_paths["global-job-execution"]
+    execution = _read_json(execution_path)
+    execution["executionId"] = "caller-fabricated-succeeded"
+    execution_payload = dict(execution)
+    execution_payload.pop("executionDigest")
+    execution["executionDigest"] = compute_artifact_digest(execution_payload)
+    _write(execution_path, execution)
+    readback_path = fabricated.artifact_paths["global-job-readback"]
+    readback = _read_json(readback_path)
+    readback["executionId"] = execution["executionId"]
+    readback["executionDigest"] = execution["executionDigest"]
+    readback_payload = dict(readback)
+    readback_payload.pop("readbackDigest")
+    readback["readbackDigest"] = compute_artifact_digest(readback_payload)
+    _write(readback_path, readback)
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="platform capture attestation",
+    ):
+        _aggregate(fabricated)
+
+
+@pytest.mark.parametrize(
+    ("updates", "capture_anchor_resource_id"),
+    [
+        (
+            {
+                "jobResourceId": (
+                    "/subscriptions/00000000-0000-0000-0000-000000000000/"
+                    "resourceGroups/rg-athena-wc029-synthetic/providers/"
+                    "Microsoft.App/jobs/unrelated-synthetic"
+                )
+            },
+            None,
+        ),
+        (
+            {"executionTemplateConfigurationSha256": ("sha256:" + ("f" * 64))},
+            None,
+        ),
+        (
+            {
+                "attachedIdentityResourceIds": [
+                    (
+                        "/subscriptions/00000000-0000-0000-0000-000000000000/"
+                        "resourceGroups/rg-athena-wc029-synthetic/providers/"
+                        "Microsoft.ManagedIdentity/userAssignedIdentities/"
+                        "unrelated-synthetic"
+                    )
+                ]
+            },
+            None,
+        ),
+        (
+            {
+                "jobResourceId": (
+                    "/subscriptions/11111111-1111-1111-1111-111111111111/"
+                    "resourceGroups/rg-athena-wc029-synthetic/providers/"
+                    "Microsoft.App/jobs/athena-wc029-global-synthetic"
+                ),
+                "subscriptionId": "11111111-1111-1111-1111-111111111111",
+                "attachedIdentityResourceIds": [
+                    (
+                        "/subscriptions/11111111-1111-1111-1111-111111111111/"
+                        "resourceGroups/rg-athena-wc029-synthetic/providers/"
+                        "Microsoft.ManagedIdentity/userAssignedIdentities/"
+                        "athena-wc029-job-synthetic"
+                    )
+                ],
+            },
+            (
+                "/subscriptions/11111111-1111-1111-1111-111111111111/"
+                "resourceGroups/rg-athena-wc029-synthetic/providers/"
+                "Microsoft.Storage/storageAccounts/athenawc029synthetic/"
+                "blobServices/default/containers/job-captures"
+            ),
+        ),
+    ],
+)
+def test_job_evidence_matches_exact_approved_resource_configuration_and_identity(
+    tmp_path: Path,
+    updates: dict[str, object],
+    capture_anchor_resource_id: str | None,
+) -> None:
+    bundle = _build_bundle(tmp_path)
+    _rewrite_global_job_chain(
+        bundle,
+        updates,
+        capture_anchor_resource_id=capture_anchor_resource_id,
+    )
+
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="exact inventoried Job|exact approved Job inventory",
+    ):
+        _aggregate(bundle)
+
+
+def test_job_inventory_rejects_non_identity_attached_resources() -> None:
+    approved = _job_versions()[0]
+    payload = approved.model_dump(
+        mode="python",
+        by_alias=True,
+    )
+    payload["expectedAttachedIdentityResourceIds"] = (
+        "/subscriptions/00000000-0000-0000-0000-000000000000/"
+        "resourceGroups/rg-athena-wc029-synthetic/providers/Microsoft.Storage/"
+        "storageAccounts/not-an-identity",
+    )
+
+    with pytest.raises(ValueError, match="expected attached Job identities"):
+        acceptance.Wc029JobVersion.model_validate(payload)
+
+
+def test_scenario_job_rejects_unapproved_job_with_resigned_manifest(
+    tmp_path: Path,
+) -> None:
+    bundle = _build_bundle(tmp_path)
+    scenario_class = "disk-capacity-pressure"
+    execution_path = bundle.artifact_paths[f"scenario-{scenario_class}-verify-execution"]
+    execution = _read_json(execution_path)
+    execution["jobResourceId"] = (
+        "/subscriptions/00000000-0000-0000-0000-000000000000/"
+        "resourceGroups/rg-athena-wc029-synthetic/providers/Microsoft.App/"
+        "jobs/unrelated-scenario-synthetic"
+    )
+    execution_payload = dict(execution)
+    execution_payload.pop("executionDigest")
+    execution["executionDigest"] = compute_artifact_digest(execution_payload)
+    _write(execution_path, execution)
+
+    readback_path = bundle.artifact_paths[f"scenario-{scenario_class}-verify-readback"]
+    readback = _read_json(readback_path)
+    readback["jobResourceId"] = execution["jobResourceId"]
+    readback["executionDigest"] = execution["executionDigest"]
+    readback_payload = dict(readback)
+    readback_payload.pop("readbackDigest")
+    readback["readbackDigest"] = compute_artifact_digest(readback_payload)
+    _write(readback_path, readback)
+    _refresh_scenario_execution_binding(bundle, scenario_class)
+
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="exact approved Job inventory",
+    ):
+        _aggregate(bundle)
+
+
 def test_rejects_rbac_gaps_and_failed_preflight(tmp_path: Path) -> None:
     missing_principal = _build_bundle(tmp_path / "principal")
     rbac = json.loads(
@@ -4667,6 +5500,139 @@ def test_incident_chain_requires_resolved_state_and_queue_drain(
 
 
 @pytest.mark.parametrize(
+    "coordinate",
+    [
+        "targetBinding",
+        "workloadRole",
+        "detectedAt",
+    ],
+)
+def test_incident_states_reject_cross_occurrence_coordinate_splicing(
+    tmp_path: Path,
+    coordinate: str,
+) -> None:
+    bundle = _build_bundle(tmp_path)
+    prefix = "scenario-web-tier-failure"
+    active_state = IncidentState.model_validate_json(
+        bundle.artifact_paths[f"{prefix}-incident-active"].read_bytes()
+    )
+    resolved_path = bundle.artifact_paths[f"{prefix}-incident-resolved"]
+    resolved_payload = _read_json(resolved_path)
+    if coordinate == "targetBinding":
+        resolved_payload[coordinate] = "sha256:" + ("f" * 64)
+    elif coordinate == "workloadRole":
+        resolved_payload[coordinate] = "load-balancer"
+    else:
+        resolved_payload[coordinate] = (
+            (active_state.detected_at + timedelta(minutes=1)).isoformat().replace("+00:00", "Z")
+        )
+    resolved_payload.pop("resultDigest")
+    resolved_payload["resultDigest"] = sha256_hex(
+        canonicalize_json(resolved_payload).encode("utf-8")
+    )
+    resolved_state = IncidentState.model_validate_json(_canonical_bytes(resolved_payload))
+    _write(resolved_path, resolved_state)
+    signature = (
+        base64.urlsafe_b64encode(
+            bundle.private_keys["incident"].sign(
+                incident_state_signature_preimage(resolved_state),
+                padding.PKCS1v15(),
+                hashes.SHA256(),
+            )
+        )
+        .decode("ascii")
+        .rstrip("=")
+    )
+    _write(
+        bundle.artifact_paths[f"{prefix}-incident-resolved-attestation"],
+        IncidentStateAttestation(
+            schemaVersion="athena.incidentStateAttestation.v1",
+            resultDigest=resolved_state.result_digest,
+            signatureAlgorithm="RS256",
+            keyVaultKeyId=bundle.keys["incident"].key_id,
+            detachedSignature=signature,
+        ),
+    )
+    _refresh_incident_occurrence_continuity(bundle)
+
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="immutable occurrence coordinates",
+    ):
+        _aggregate(bundle)
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {
+            "activeStateResultDigest": "sha256:" + ("e" * 64),
+            "resolvedPredecessorStateResultDigest": "sha256:" + ("e" * 64),
+        },
+        {
+            "incidentBoundRequestDigest": "sha256:" + ("e" * 64),
+        },
+        {
+            "incidentSubjectDigest": "sha256:" + ("e" * 64),
+        },
+    ],
+)
+def test_signed_incident_continuity_rejects_predecessor_and_context_splicing(
+    tmp_path: Path,
+    updates: dict[str, object],
+) -> None:
+    bundle = _build_bundle(tmp_path)
+    _rewrite_signed_incident_continuity(bundle, updates)
+
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="signed incident occurrence continuity",
+    ):
+        _aggregate(bundle)
+
+
+def test_active_and_resolved_occurrence_receipts_must_be_distinct(
+    tmp_path: Path,
+) -> None:
+    bundle = _build_bundle(tmp_path)
+    _rewrite_resolved_occurrence_digest_as_active(bundle)
+
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="scenario-web-tier-failure-execution-manifest violates",
+    ):
+        _aggregate(bundle)
+
+
+@pytest.mark.parametrize(
+    ("lifecycle", "reference_field"),
+    [
+        ("active", "sourceStateReference"),
+        ("active", "sourceStateAttestationReference"),
+        ("resolved", "sourceStateReference"),
+        ("resolved", "sourceStateAttestationReference"),
+    ],
+)
+def test_feed_source_references_bind_exact_captured_state_and_attestation_bytes(
+    tmp_path: Path,
+    lifecycle: str,
+    reference_field: str,
+) -> None:
+    bundle = _build_bundle(tmp_path)
+    _rewrite_feed_source_digest(
+        bundle,
+        lifecycle=lifecycle,
+        reference_field=reference_field,
+    )
+
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="feed source-state references",
+    ):
+        _aggregate(bundle)
+
+
+@pytest.mark.parametrize(
     "url",
     [
         "https://unrelated.synthetic.invalid/healthz",
@@ -4708,6 +5674,182 @@ def test_unreadable_subtree_walk_error_fails_closed(
         match="unreadable subtree",
     ):
         _aggregate(bundle)
+
+
+@pytest.mark.parametrize("error_type", [FileNotFoundError, PermissionError])
+def test_scan_to_pin_os_errors_close_all_partial_handles(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[OSError],
+) -> None:
+    bundle = _build_bundle(tmp_path)
+    real_open_directory = acceptance._open_pinned_directory
+    real_open_file = acceptance._open_pinned_file
+    directory_pins: list[acceptance._PinnedDirectoryHandle] = []
+    file_pins: list[acceptance._PinnedFileHandle] = []
+
+    def tracked_open_directory(
+        path: Path,
+        expected: acceptance._PathIdentity,
+        *,
+        parent: acceptance._PinnedDirectoryHandle | None = None,
+        name: str | None = None,
+    ) -> acceptance._PinnedDirectoryHandle:
+        pin = real_open_directory(
+            path,
+            expected,
+            parent=parent,
+            name=name,
+        )
+        directory_pins.append(pin)
+        return pin
+
+    def racing_open_file(
+        path: Path,
+        expected: acceptance._PathIdentity,
+        *,
+        parent: acceptance._PinnedDirectoryHandle,
+        label: str,
+    ) -> acceptance._PinnedFileHandle:
+        if file_pins:
+            raise error_type("synthetic scan-to-pin race")
+        pin = real_open_file(
+            path,
+            expected,
+            parent=parent,
+            label=label,
+        )
+        file_pins.append(pin)
+        return pin
+
+    monkeypatch.setattr(
+        acceptance,
+        "_open_pinned_directory",
+        tracked_open_directory,
+    )
+    monkeypatch.setattr(acceptance, "_open_pinned_file", racing_open_file)
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="pinned filesystem operation",
+    ):
+        _aggregate(bundle)
+
+    assert file_pins
+    assert all(pin.descriptor == -1 for pin in file_pins)
+    assert directory_pins
+    assert all(pin.descriptor is None and pin.windows_handle is None for pin in directory_pins)
+
+
+def test_identity_permission_error_closes_partial_file_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle = _build_bundle(tmp_path)
+    real_close = acceptance.os.close
+    closed_descriptors: list[int] = []
+
+    def tracked_close(descriptor: int) -> None:
+        closed_descriptors.append(descriptor)
+        real_close(descriptor)
+
+    def fail_identity(_descriptor: int) -> acceptance._PathIdentity:
+        raise PermissionError("synthetic inaccessible identity")
+
+    monkeypatch.setattr(acceptance.os, "close", tracked_close)
+    monkeypatch.setattr(acceptance, "_pinned_file_identity", fail_identity)
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="opened and pinned safely",
+    ):
+        _aggregate(bundle)
+
+    assert closed_descriptors
+
+
+def test_cli_stat_file_not_found_is_bounded_exit_two(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    bundle = _build_bundle(tmp_path)
+    real_lstat = Path.lstat
+
+    def missing_root(path: Path) -> os.stat_result:
+        if path == bundle.root:
+            raise FileNotFoundError("synthetic root rename")
+        return real_lstat(path)
+
+    monkeypatch.setattr(Path, "lstat", missing_root)
+    result = acceptance.main(_cli_arguments(bundle))
+
+    assert result == 2
+    assert json.loads(capsys.readouterr().err)["complete"] is False
+    assert list(bundle.output.iterdir()) == []
+
+
+def test_output_pin_failure_closes_already_acquired_root_handle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle = _build_bundle(tmp_path)
+    record = _aggregate(bundle)
+    stable_root = acceptance._stable_directory_path(
+        bundle.root,
+        label="evidence root",
+    )
+    stable_output = acceptance._stable_directory_path(
+        bundle.output,
+        label="output directory",
+    )
+    real_open_directory = acceptance._open_pinned_directory
+    opened: list[acceptance._PinnedDirectoryHandle] = []
+
+    def stable_path(
+        path: Path,
+        *,
+        label: str,
+    ) -> tuple[Path, acceptance._PathIdentity]:
+        del label
+        return stable_root if Path(path) == bundle.root else stable_output
+
+    def fail_output_pin(
+        path: Path,
+        expected: acceptance._PathIdentity,
+        *,
+        parent: acceptance._PinnedDirectoryHandle | None = None,
+        name: str | None = None,
+    ) -> acceptance._PinnedDirectoryHandle:
+        if opened:
+            raise PermissionError("synthetic output pin failure")
+        pin = real_open_directory(
+            path,
+            expected,
+            parent=parent,
+            name=name,
+        )
+        opened.append(pin)
+        return pin
+
+    monkeypatch.setattr(acceptance, "_stable_directory_path", stable_path)
+    monkeypatch.setattr(
+        acceptance,
+        "_open_pinned_directory",
+        fail_output_pin,
+    )
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="filesystem operation failed closed",
+    ):
+        acceptance.write_acceptance_record(
+            record,
+            output_directory=bundle.output,
+            evidence_root=bundle.root,
+        )
+
+    assert len(opened) == 1
+    assert opened[0].descriptor is None
+    assert opened[0].windows_handle is None
+    assert list(bundle.output.iterdir()) == []
 
 
 def test_output_write_is_exclusive_and_cleans_failed_staging(
@@ -5401,6 +6543,7 @@ def test_deployment_baseline_proof_and_final_queue_chronology_is_ordered(
     global_job_payload.pop("readbackDigest")
     global_job["readbackDigest"] = compute_artifact_digest(global_job_payload)
     _write(global_job_path, global_job)
+    _refresh_global_job_capture_attestation(deployment)
     with pytest.raises(
         acceptance.Wc029AcceptanceEvidenceError,
         match="global deployment, baseline, scenario, and final chronology",

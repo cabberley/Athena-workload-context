@@ -117,6 +117,9 @@ The index names exactly one canonical `athena.wc029VersionInventory.v1` artifact
   exact plan artifact ID/SHA-256, template path/SHA-256, base/effective parameter SHA-256, reviewed
   what-if allowlist, orchestrator SHA-256, and exact upstream deployment roots;
 - every lowercase digest-pinned container image;
+- every exact Container Apps Job ARM ID, subscription/resource group, operational purpose,
+  complete execution-template/configuration digest, expected attached managed-identity resource
+  set, image RepoDigest, and trusted platform-capture anchor;
 - every approved HTTPS endpoint origin and exact probed path;
 - every managed-identity boundary, forbidden role set, and forbidden scope set whose effective
   RBAC must be present;
@@ -159,7 +162,12 @@ Global evidence must contain:
 - public-key evidence for every inventoried signing purpose;
 - exact published-manifest, publication-authority, and authority-attestation evidence;
 - deployment plan, what-if, output, and read-back evidence for every inventoried deployment;
-- at least one successful Job execution and its exact post-run read-back;
+- at least one successful Job execution and its exact post-run read-back, with every execution
+  matched to an approved Job inventory record;
+- one trusted `job-capture` RSA attestation for every global Job read-back. Its signed statement
+  binds the exact execution/read-back artifact bytes, execution ID, Job ARM ID, subscription and
+  resource group, purpose, configuration digest, attached identities, image RepoDigest, start/end
+  timestamps, platform statuses, capture record, and approved capture anchor;
 - one canonical successful HTTPS URL probe for every inventoried endpoint/path coordinate;
 - captured effective RBAC covering exactly the inventoried principals;
 - the reviewed non-vacuous RBAC separation policy, with one exact rule for every approved
@@ -265,6 +273,11 @@ not chosen by the index. The harness verifies:
 - WC-026 report publication statements and signatures bound to the exact captured request;
 - signed WC-027 incident-subject and incident-bound-request attestations;
 - WC-016 active/resolved IncidentState signatures;
+- immutable active/resolved occurrence coordinates (`targetBinding`, `workloadRole`, and
+  `detectedAt`) plus the exact correlation request, incident subject, and incident-bound request;
+- the independently signed scenario-execution manifest's incident-continuity statement, including
+  the active predecessor digest, resolved transition/result digest, both occurrence digests, and
+  exact active/resolved state and attestation byte digests;
 - WC-027 guidance, enrichment, feed-pointer, authoritative v1 source-index, v2 feed-index, and
   notification signatures;
 - each v2 feed index against the canonical digest of its corresponding signed v1 active-state
@@ -281,7 +294,10 @@ not chosen by the index. The harness verifies:
   verify artifact, its exact bytes, phase, input/request digest, execution ID, target, action, and
   bounded chronological window; and
 - the exact active report/state/guidance/enrichment/feed/notification lineage for each
-  incident-producing scenario.
+  incident-producing scenario; and
+- each active and resolved feed pointer's `sourceStateReference` and
+  `sourceStateAttestationReference` content digests against the exact captured IncidentState and
+  attestation bytes.
 
 Runtime verification remains required before capture; offline verification is a second acceptance
 check, not a replacement.
@@ -336,6 +352,12 @@ separate listed evidence artifact when operational review requires it.
 Every `bindsArtifactId` is validated as an existing declared artifact before any binding lookup.
 Unknown index, attestation, Job, key, manifest, or scenario binding references fail as bounded
 domain errors and the CLI returns exit code `2`; they never escape as `KeyError` tracebacks.
+
+Every scan, pin, open, stat, and platform-identity `OSError` is likewise translated to
+`Wc029AcceptanceEvidenceError`. Directory/file pins and output-publication pins are registered in
+`ExitStack` immediately after acquisition so scan-to-pin deletion, rename, permission, or identity
+races cannot leak a partially acquired handle. The CLI reports these failures with exit code `2`
+and creates no acceptance record.
 
 ## Run
 
