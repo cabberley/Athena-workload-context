@@ -8,8 +8,10 @@ import pytest
 from scripts import wc029_deployment_orchestration as orchestration
 
 from test_wc024_monitoring_contract import _collector_contract
+from test_wc027_guidance_authority_publisher import _publisher, _request
 
 REQUIRED_TEMPLATE_PARAMETER_NAMES = orchestration._required_template_parameter_names
+COMPILED_TEMPLATE = orchestration._compiled_template
 ROOT = Path(__file__).resolve().parents[1]
 RUNBOOK = ROOT / "docs" / "operations" / "wc029-deployment-live-validation.md"
 WC013_ROOT = ROOT / "infra" / "wc013-live-acceptance" / "main.bicep"
@@ -18,6 +20,10 @@ PRODUCER_ROOT = ROOT / "infra" / "wc027-enrichment-feed-runtime" / "main.bicep"
 PUBLISHER_ROOT = ROOT / "infra" / "wc027-guidance-authority-publisher" / "main.bicep"
 SUBSCRIPTION_ID = "00000000-0000-0000-0000-000000000001"
 RUNTIME_RESOURCE_GROUP = "rg"
+SYNTHETIC_COMPILED_TEMPLATE: dict[str, object] = {"parameters": {}}
+SYNTHETIC_COMPILED_TEMPLATE_SHA256 = orchestration._sha256_bytes(
+    orchestration._canonical_json_bytes(SYNTHETIC_COMPILED_TEMPLATE)
+)
 
 
 @pytest.fixture(autouse=True)
@@ -29,6 +35,14 @@ def _stub_required_template_parameter_names(
         "_required_template_parameter_names",
         lambda _stage: set(),
     )
+    monkeypatch.setattr(
+        orchestration,
+        "_compiled_template",
+        lambda _stage: (
+            dict(SYNTHETIC_COMPILED_TEMPLATE),
+            SYNTHETIC_COMPILED_TEMPLATE_SHA256,
+        ),
+    )
 
 
 def _digest(value: str) -> str:
@@ -36,8 +50,8 @@ def _digest(value: str) -> str:
 
 
 def _write_parameters(path: Path, values: dict[str, object]) -> None:
-    path.write_text(
-        json.dumps(
+    path.write_bytes(
+        orchestration._canonical_json_file_bytes(
             {
                 "$schema": (
                     "https://schema.management.azure.com/schemas/"
@@ -46,9 +60,97 @@ def _write_parameters(path: Path, values: dict[str, object]) -> None:
                 "contentVersion": "1.0.0.0",
                 "parameters": {name: {"value": value} for name, value in values.items()},
             }
-        ),
-        encoding="utf-8",
+        )
     )
+
+
+def _empty_authority_inventory(
+    *,
+    container_exists: bool,
+    previous_checkpoint_sha256: str | None = None,
+) -> dict[str, object]:
+    return {
+        "schemaVersion": orchestration.AUTHORITY_BLOB_INVENTORY_SCHEMA_VERSION,
+        "containerResourceId": (
+            f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/"
+            "providers/Microsoft.Storage/storageAccounts/"
+            "athenacorrelation/blobServices/default/containers/"
+            "wc027-guidance-authority"
+        ),
+        "containerExists": container_exists,
+        "previousCheckpointSha256": previous_checkpoint_sha256,
+        "currentBlobs": [],
+        "versions": [],
+    }
+
+
+def _rotation_transition(
+    assignment_resource_id: str,
+    retired_principal_id: str = "99999999-9999-4999-8999-999999999999",
+) -> dict[str, str]:
+    return {
+        "assignmentResourceId": assignment_resource_id,
+        "retiredPrincipalId": retired_principal_id,
+    }
+
+
+def _synthetic_authority_checkpoint_with_pair(
+    *,
+    previous_checkpoint_sha256: str | None,
+) -> dict[str, object]:
+    authority_id = "guidance-authority-" + "a" * 32
+    binding_id = "guidance-binding-" + "b" * 32
+    authority_name = f"guidance-authority/{authority_id}/authority.json"
+    authority_digest = f"sha256:{'a' * 64}"
+    versions = [
+        {
+            "name": authority_name,
+            "versionId": "version-authority",
+            "etag": '"etag-authority"',
+            "contentLength": 128,
+            "contentSha256": authority_digest,
+            "contract": {
+                "kind": "authority",
+                "artifactId": authority_id,
+            },
+        },
+        {
+            "name": f"guidance-bindings/{binding_id}/binding.json",
+            "versionId": "version-binding",
+            "etag": '"etag-binding"',
+            "contentLength": 256,
+            "contentSha256": f"sha256:{'b' * 64}",
+            "contract": {
+                "kind": "binding",
+                "artifactId": binding_id,
+                "authorityReference": {
+                    "name": authority_name,
+                    "versionId": "version-authority",
+                    "contentSha256": authority_digest,
+                },
+            },
+        },
+    ]
+    return {
+        **_empty_authority_inventory(
+            container_exists=True,
+            previous_checkpoint_sha256=previous_checkpoint_sha256,
+        ),
+        "currentBlobs": [
+            {
+                key: item[key]
+                for key in (
+                    "name",
+                    "versionId",
+                    "etag",
+                    "contentLength",
+                    "contentSha256",
+                )
+            }
+            for item in versions
+        ],
+        "versions": versions,
+    }
 
 
 def _foundation_parameter_bindings(
@@ -66,8 +168,15 @@ def _write_handoff(
     parameter_bindings: dict[str, object] | None = None,
     predecessor_receipt_sha256s: dict[str, object] | None = None,
     plan_manifest_sha256: str | None = None,
+    effective_parameter_sha256: str | None = None,
+    authority_inventory: dict[str, object] | None = None,
 ) -> None:
     bindings = {} if parameter_bindings is None else parameter_bindings
+    if stage != "foundation" and authority_inventory is None:
+        authority_inventory = _empty_authority_inventory(
+            container_exists=True,
+            previous_checkpoint_sha256=f"sha256:{'d' * 64}",
+        )
     predecessor_hashes = (
         {
             predecessor: f"sha256:{str(index + 1) * 64}"
@@ -98,6 +207,20 @@ def _write_handoff(
                     f"sha256:{'a' * 64}" if plan_manifest_sha256 is None else plan_manifest_sha256
                 ),
                 "predecessorReceiptSha256s": predecessor_hashes,
+                "effectiveParameterSha256": (
+                    f"sha256:{'b' * 64}"
+                    if effective_parameter_sha256 is None
+                    else effective_parameter_sha256
+                ),
+                "applicationMode": "create",
+                "deploymentRecordSha256": f"sha256:{'c' * 64}",
+                "deployedTemplateSha256": SYNTHETIC_COMPILED_TEMPLATE_SHA256,
+                "authorityBlobInventory": authority_inventory,
+                "authorityBlobInventorySha256": (
+                    orchestration._authority_checkpoint_sha256(
+                        authority_inventory
+                    )
+                ),
             }
         ),
         encoding="utf-8",
@@ -112,8 +235,18 @@ def _write_plan(
     what_if_path: Path,
     predecessor_handoffs: dict[str, Path],
     predecessor_receipts: dict[str, dict[str, object]],
+    authority_inventory: dict[str, object] | None = None,
 ) -> None:
     resource_group = RUNTIME_RESOURCE_GROUP if stage in {"producer", "publisher"} else None
+    required_checkpoint_sha256s: dict[str, str] = {}
+    if stage in {"publisher", "live-acceptance"}:
+        predecessor_name = "producer" if stage == "publisher" else "publisher"
+        predecessor_handoff = json.loads(
+            predecessor_handoffs[predecessor_name].read_text(encoding="utf-8")
+        )
+        required_checkpoint_sha256s[predecessor_name] = predecessor_handoff[
+            "authorityBlobInventorySha256"
+        ]
     document: dict[str, object] = {
         "schemaVersion": orchestration.PLAN_SCHEMA_VERSION,
         "stage": stage,
@@ -124,6 +257,7 @@ def _write_plan(
         "deploymentName": f"synthetic-{stage}",
         "templatePath": str(orchestration.TEMPLATES[stage].relative_to(ROOT)).replace("\\", "/"),
         "templateSha256": orchestration._sha256_file(orchestration.TEMPLATES[stage]),
+        "compiledTemplateSha256": SYNTHETIC_COMPILED_TEMPLATE_SHA256,
         "orchestratorSha256": orchestration._sha256_file(Path(orchestration.__file__).resolve()),
         "preflightSha256": orchestration._sha256_file(orchestration.PREFLIGHT_PATH),
         "baseParameterPath": str(parameter_path.resolve()),
@@ -133,24 +267,13 @@ def _write_plan(
         "whatIfPath": str(what_if_path.resolve()),
         "whatIfSha256": orchestration._sha256_file(what_if_path),
         "allowedChangeResourceIds": [],
-        "rotationTransitionAssignmentIds": [],
+        "rotationTransitionAssignments": [],
         "legacyCryptoUserMigrationAssignmentIds": [],
-        "authorityBlobInventory": (
-            None
-            if stage == "foundation"
-            else {
-                "schemaVersion": (orchestration.AUTHORITY_BLOB_INVENTORY_SCHEMA_VERSION),
-                "containerResourceId": (
-                    f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/"
-                    "providers/Microsoft.Storage/storageAccounts/"
-                    "athenacorrelation/blobServices/default/containers/"
-                    "wc027-guidance-authority"
-                ),
-                "containerExists": True,
-                "currentBlobs": [],
-                "versions": [],
-            }
+        "authorityBlobInventory": authority_inventory,
+        "authorityBlobInventorySha256": (
+            orchestration._authority_checkpoint_sha256(authority_inventory)
         ),
+        "requiredAuthorityCheckpointSha256s": required_checkpoint_sha256s,
         "priorStageHandoffPath": None,
         "priorStageHandoffSha256": None,
         "priorStageReceipt": None,
@@ -196,6 +319,21 @@ def _write_receipt(
                 "handoffPath": str(handoff_path.resolve()),
                 "handoffSha256": orchestration._sha256_file(handoff_path),
                 "predecessorReceiptSha256s": predecessor_receipt_sha256s,
+                "effectiveParameterSha256": json.loads(
+                    handoff_path.read_text(encoding="utf-8")
+                )["effectiveParameterSha256"],
+                "applicationMode": json.loads(
+                    handoff_path.read_text(encoding="utf-8")
+                )["applicationMode"],
+                "deploymentRecordSha256": json.loads(
+                    handoff_path.read_text(encoding="utf-8")
+                )["deploymentRecordSha256"],
+                "deployedTemplateSha256": json.loads(
+                    handoff_path.read_text(encoding="utf-8")
+                )["deployedTemplateSha256"],
+                "authorityBlobInventorySha256": json.loads(
+                    handoff_path.read_text(encoding="utf-8")
+                )["authorityBlobInventorySha256"],
             }
         ),
         encoding="utf-8",
@@ -206,9 +344,10 @@ def _write_safe_plan_inputs(tmp_path: Path, stage: str) -> tuple[Path, Path]:
     parameter_path = tmp_path / f"{stage}.parameters.json"
     _write_parameters(parameter_path, {})
     what_if_path = tmp_path / f"{stage}.what-if.json"
-    what_if_path.write_text(
-        json.dumps({"status": "Succeeded", "properties": {"changes": []}}),
-        encoding="utf-8",
+    what_if_path.write_bytes(
+        orchestration._canonical_json_file_bytes(
+            {"status": "Succeeded", "properties": {"changes": []}}
+        )
     )
     return parameter_path, what_if_path
 
@@ -811,6 +950,27 @@ def _write_stage_bundle(
         }
         for predecessor, bundle in predecessors.items()
     }
+    trusted_inventory = (
+        None
+        if stage == "foundation"
+        else (
+            None
+            if stage == "producer"
+            else predecessors[
+                "producer" if stage == "publisher" else "publisher"
+            ]["authorityInventory"]
+        )
+    )
+    plan_authority_inventory = (
+        None
+        if stage == "foundation"
+        else _empty_authority_inventory(
+            container_exists=stage != "producer",
+            previous_checkpoint_sha256=(
+                orchestration._authority_checkpoint_sha256(trusted_inventory)
+            ),
+        )
+    )
     plan_path = stage_directory / f"{stage}.plan.json"
     _write_plan(
         plan_path,
@@ -819,11 +979,24 @@ def _write_stage_bundle(
         what_if_path=what_if_path,
         predecessor_handoffs=predecessor_handoffs,
         predecessor_receipts=predecessor_receipts,
+        authority_inventory=plan_authority_inventory,
     )
     predecessor_hashes = {
         predecessor: bundle["receiptSha256"] for predecessor, bundle in predecessors.items()
     }
     handoff_path = stage_directory / f"{stage}.handoff.json"
+    handoff_authority_inventory = (
+        None
+        if plan_authority_inventory is None
+        else _empty_authority_inventory(
+            container_exists=True,
+            previous_checkpoint_sha256=(
+                orchestration._authority_checkpoint_sha256(
+                    plan_authority_inventory
+                )
+            ),
+        )
+    )
     _write_handoff(
         handoff_path,
         stage,
@@ -831,6 +1004,8 @@ def _write_stage_bundle(
         parameter_bindings=parameter_bindings,
         predecessor_receipt_sha256s=predecessor_hashes,
         plan_manifest_sha256=orchestration._sha256_file(plan_path),
+        effective_parameter_sha256=orchestration._sha256_file(parameter_path),
+        authority_inventory=handoff_authority_inventory,
     )
     receipt_path = stage_directory / f"{stage}.receipt.json"
     _write_receipt(
@@ -845,6 +1020,7 @@ def _write_stage_bundle(
         "handoffPath": handoff_path,
         "receiptPath": receipt_path,
         "receiptSha256": orchestration._sha256_file(receipt_path),
+        "authorityInventory": handoff_authority_inventory,
     }
 
 
@@ -1168,6 +1344,223 @@ def test_azure_command_stdin_is_closed(
     assert captured["stdin"] is orchestration.subprocess.DEVNULL
 
 
+def test_reviewed_create_uses_one_private_pinned_parameter_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parameter_path = tmp_path / "reviewed.parameters.json"
+    parameter_document = {
+        "$schema": (
+            "https://schema.management.azure.com/schemas/"
+            "2019-04-01/deploymentParameters.json#"
+        ),
+        "contentVersion": "1.0.0.0",
+        "parameters": {"reviewed": {"value": "exact"}},
+    }
+    parameter_path.write_bytes(
+        orchestration._canonical_json_file_bytes(parameter_document)
+    )
+    artifact = orchestration._ArtifactReader().capture_json(
+        parameter_path,
+        field="reviewed parameters",
+    )
+    parameter_path.write_bytes(
+        orchestration._canonical_json_file_bytes(
+            {
+                **parameter_document,
+                "parameters": {"reviewed": {"value": "path-swapped"}},
+            }
+        )
+    )
+    reviewed_what_if = {"status": "Succeeded", "properties": {"changes": []}}
+    parameter_paths: list[Path] = []
+
+    def run_json(command: object, *, field: str) -> object:
+        arguments = list(command)
+        pinned_path = Path(arguments[arguments.index("--parameters") + 1])
+        parameter_paths.append(pinned_path)
+        assert pinned_path != parameter_path
+        assert pinned_path.read_bytes() == artifact.raw_bytes
+        if "what-if" in arguments:
+            return reviewed_what_if
+        return {
+            "name": "synthetic",
+            "properties": {
+                "provisioningState": "Succeeded",
+                "outputs": {},
+            },
+        }
+
+    monkeypatch.setattr(orchestration, "_run_json", run_json)
+    monkeypatch.setattr(
+        orchestration,
+        "_attest_succeeded_deployment",
+        lambda **_kwargs: (
+            {},
+            f"sha256:{'1' * 64}",
+            f"sha256:{'2' * 64}",
+        ),
+    )
+    outputs, _, _ = orchestration._execute_reviewed_deployment(
+        resume_succeeded_deployment=False,
+        stage="producer",
+        deployment_name="synthetic",
+        subscription_id=SUBSCRIPTION_ID,
+        location="australiaeast",
+        resource_group=RUNTIME_RESOURCE_GROUP,
+        effective_parameter_artifact=artifact,
+        effective_parameters={"reviewed": {"value": "exact"}},
+        reviewed_what_if=reviewed_what_if,
+        compiled_template={"parameters": {"reviewed": {"type": "string"}}},
+        compiled_template_sha256=f"sha256:{'2' * 64}",
+    )
+    assert outputs == {}
+    assert len(parameter_paths) == 2
+    assert parameter_paths[0] == parameter_paths[1]
+    assert not parameter_paths[0].exists()
+
+
+def test_resume_retries_attestation_without_recreating(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+    sleeps: list[float] = []
+
+    def attest(**_kwargs: object) -> tuple[dict[str, object], str, str]:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise orchestration.OrchestrationError("synthetic propagation delay")
+        return {}, f"sha256:{'3' * 64}", f"sha256:{'4' * 64}"
+
+    monkeypatch.setattr(orchestration, "_attest_succeeded_deployment", attest)
+    monkeypatch.setattr(
+        orchestration,
+        "_run_json",
+        lambda *_args, **_kwargs: pytest.fail(
+            "resume must not invoke what-if or deployment create"
+        ),
+    )
+    monkeypatch.setattr(
+        orchestration.time,
+        "sleep",
+        lambda seconds: sleeps.append(seconds),
+    )
+    artifact = orchestration._CapturedJsonArtifact(
+        path=Path("captured.parameters.json"),
+        raw_bytes=b"{}\n",
+        document={},
+        sha256=orchestration._sha256_bytes(b"{}\n"),
+        identity=orchestration._FileIdentity(1, 1, 3, 1),
+    )
+
+    outputs, _, _ = orchestration._execute_reviewed_deployment(
+        resume_succeeded_deployment=True,
+        stage="producer",
+        deployment_name="synthetic",
+        subscription_id=SUBSCRIPTION_ID,
+        location="australiaeast",
+        resource_group=RUNTIME_RESOURCE_GROUP,
+        effective_parameter_artifact=artifact,
+        effective_parameters={},
+        reviewed_what_if={},
+        compiled_template={"parameters": {}},
+        compiled_template_sha256=f"sha256:{'4' * 64}",
+    )
+    assert outputs == {}
+    assert attempts == 3
+    assert sleeps == [
+        orchestration.READBACK_RETRY_SECONDS,
+        orchestration.READBACK_RETRY_SECONDS,
+    ]
+
+
+def test_succeeded_deployment_attestation_binds_template_and_parameters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    compiled_template = {
+        "parameters": {
+            "reviewed": {"type": "string"},
+            "defaulted": {"type": "string", "defaultValue": "default"},
+        },
+        "resources": [],
+    }
+    compiled_digest = orchestration._sha256_bytes(
+        orchestration._canonical_json_bytes(compiled_template)
+    )
+    recorded_value = "exact"
+
+    def run_json(command: object, *, field: str) -> object:
+        arguments = list(command)
+        if "export" in arguments:
+            return compiled_template
+        return {
+            "name": "synthetic",
+            "properties": {
+                "provisioningState": "Succeeded",
+                "mode": "Incremental",
+                "parameters": {
+                    "reviewed": {"value": recorded_value},
+                    "defaulted": {"value": "default"},
+                },
+                "outputs": {},
+            },
+        }
+
+    monkeypatch.setattr(orchestration, "_run_json", run_json)
+    _, _, deployed_digest = orchestration._attest_succeeded_deployment(
+        stage="producer",
+        deployment_name="synthetic",
+        subscription_id=SUBSCRIPTION_ID,
+        location="australiaeast",
+        resource_group=RUNTIME_RESOURCE_GROUP,
+        effective_parameters={"reviewed": {"value": "exact"}},
+        compiled_template=compiled_template,
+        compiled_template_sha256=compiled_digest,
+    )
+    assert deployed_digest == compiled_digest
+
+    recorded_value = "unreviewed"
+    with pytest.raises(orchestration.OrchestrationError, match="differs from reviewed"):
+        orchestration._attest_succeeded_deployment(
+            stage="producer",
+            deployment_name="synthetic",
+            subscription_id=SUBSCRIPTION_ID,
+            location="australiaeast",
+            resource_group=RUNTIME_RESOURCE_GROUP,
+            effective_parameters={"reviewed": {"value": "exact"}},
+            compiled_template=compiled_template,
+            compiled_template_sha256=compiled_digest,
+        )
+
+
+def test_resume_is_limited_to_fresh_producer_bootstrap() -> None:
+    fresh = _empty_authority_inventory(container_exists=False)
+    orchestration._validate_resume_succeeded_deployment(
+        requested=True,
+        stage="producer",
+        reviewed_authority_inventory=fresh,
+        trusted_prior_inventory=None,
+    )
+    with pytest.raises(orchestration.OrchestrationError, match="fresh producer"):
+        orchestration._validate_resume_succeeded_deployment(
+            requested=True,
+            stage="publisher",
+            reviewed_authority_inventory=fresh,
+            trusted_prior_inventory=None,
+        )
+    with pytest.raises(orchestration.OrchestrationError, match="fresh producer"):
+        orchestration._validate_resume_succeeded_deployment(
+            requested=True,
+            stage="producer",
+            reviewed_authority_inventory={
+                **fresh,
+                "containerExists": True,
+            },
+            trusted_prior_inventory=None,
+        )
+
+
 def test_effective_parameters_require_every_required_template_parameter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1204,6 +1597,7 @@ def test_required_template_parameters_come_from_compiled_bicep(
         }
 
     monkeypatch.setattr(orchestration, "_run_json", run_json)
+    monkeypatch.setattr(orchestration, "_compiled_template", COMPILED_TEMPLATE)
     assert REQUIRED_TEMPLATE_PARAMETER_NAMES("producer") == {"required"}
     assert captured[0][:3] == ["az", "bicep", "build"]
 
@@ -1212,15 +1606,16 @@ def test_parameter_completeness_precedes_azure_validation() -> None:
     source = (ROOT / "scripts" / "wc029_deployment_orchestration.py").read_text(encoding="utf-8")
     plan_start = source.index("def plan(")
     completeness = source.index(
-        "_verify_effective_parameter_completeness(args.stage, effective)",
+        "_verify_effective_parameter_completeness(",
         plan_start,
     )
-    parameter_write = source.index(
-        "_write_new_json(effective_path",
+    pinned_parameters = source.index(
+        "_materialized_private_artifact(effective_raw_bytes)",
         completeness,
     )
-    azure_validate = source.index('operation="validate"', parameter_write)
-    assert completeness < parameter_write < azure_validate
+    azure_validate = source.index('operation="validate"', pinned_parameters)
+    parameter_write = source.index("_write_new_bytes(effective_path", azure_validate)
+    assert completeness < pinned_parameters < azure_validate < parameter_write
 
 
 def test_subscription_boundary_rejects_cross_subscription_and_noncanonical_ids() -> None:
@@ -1568,6 +1963,59 @@ def test_prior_same_stage_receipt_carries_trusted_authority_inventory(
     assert inventory["versions"] == []
 
 
+def test_authority_checkpoints_chain_through_plan_handoff_and_receipt(
+    tmp_path: Path,
+) -> None:
+    foundation = _write_stage_bundle(
+        tmp_path,
+        stage="foundation",
+        outputs=_foundation_outputs(),
+        parameter_bindings=_foundation_parameter_bindings({}),
+        predecessors={},
+    )
+    producer = _write_stage_bundle(
+        tmp_path,
+        stage="producer",
+        outputs=_producer_outputs(),
+        parameter_bindings=_producer_parameter_bindings(),
+        predecessors={"foundation": foundation},
+    )
+    publisher = _write_stage_bundle(
+        tmp_path,
+        stage="publisher",
+        outputs=_publisher_outputs(_producer_outputs()),
+        parameter_bindings=_publisher_parameter_bindings(),
+        predecessors={"foundation": foundation, "producer": producer},
+    )
+
+    producer_plan = json.loads(
+        Path(str(producer["planPath"])).read_text(encoding="utf-8")
+    )
+    producer_handoff = json.loads(
+        Path(str(producer["handoffPath"])).read_text(encoding="utf-8")
+    )
+    producer_receipt = json.loads(
+        Path(str(producer["receiptPath"])).read_text(encoding="utf-8")
+    )
+    publisher_plan = json.loads(
+        Path(str(publisher["planPath"])).read_text(encoding="utf-8")
+    )
+    assert producer_handoff["authorityBlobInventory"][
+        "previousCheckpointSha256"
+    ] == orchestration._authority_checkpoint_sha256(
+        producer_plan["authorityBlobInventory"]
+    )
+    assert producer_receipt["authorityBlobInventorySha256"] == (
+        producer_handoff["authorityBlobInventorySha256"]
+    )
+    assert publisher_plan["authorityBlobInventory"][
+        "previousCheckpointSha256"
+    ] == producer_handoff["authorityBlobInventorySha256"]
+    assert publisher_plan["requiredAuthorityCheckpointSha256s"] == {
+        "producer": producer_handoff["authorityBlobInventorySha256"]
+    }
+
+
 def test_prior_same_stage_receipt_accepts_an_exact_older_source_lineage(
     tmp_path: Path,
 ) -> None:
@@ -1705,12 +2153,30 @@ def test_prior_same_stage_receipt_rejects_inventory_for_another_container(
     plan["authorityBlobInventory"]["containerResourceId"] = str(
         plan["authorityBlobInventory"]["containerResourceId"]
     ).replace("athenacorrelation", "athenadecoy")
+    plan["authorityBlobInventorySha256"] = (
+        orchestration._authority_checkpoint_sha256(
+            plan["authorityBlobInventory"]
+        )
+    )
     plan_path.write_text(json.dumps(plan), encoding="utf-8")
     plan_digest = orchestration._sha256_file(plan_path)
 
     handoff_path = Path(str(producer["handoffPath"]))
     handoff = json.loads(handoff_path.read_text(encoding="utf-8"))
     handoff["planManifestSha256"] = plan_digest
+    handoff["authorityBlobInventory"]["containerResourceId"] = plan[
+        "authorityBlobInventory"
+    ]["containerResourceId"]
+    handoff["authorityBlobInventory"]["previousCheckpointSha256"] = (
+        orchestration._authority_checkpoint_sha256(
+            plan["authorityBlobInventory"]
+        )
+    )
+    handoff["authorityBlobInventorySha256"] = (
+        orchestration._authority_checkpoint_sha256(
+            handoff["authorityBlobInventory"]
+        )
+    )
     handoff_path.write_text(json.dumps(handoff), encoding="utf-8")
 
     receipt_path = Path(str(producer["receiptPath"]))
@@ -1718,6 +2184,9 @@ def test_prior_same_stage_receipt_rejects_inventory_for_another_container(
     receipt["planManifestSha256"] = plan_digest
     receipt["reviewedPlanSha256"] = plan_digest
     receipt["handoffSha256"] = orchestration._sha256_file(handoff_path)
+    receipt["authorityBlobInventorySha256"] = handoff[
+        "authorityBlobInventorySha256"
+    ]
     receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
 
     with pytest.raises(orchestration.OrchestrationError, match="exact handoff output"):
@@ -1745,6 +2214,44 @@ def test_reviewed_json_artifacts_reject_reparse_links(tmp_path: Path) -> None:
             link,
             field="reviewed test artifact",
         )
+
+
+def test_artifact_reader_preserves_first_bytes_across_path_swap(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "reviewed.json"
+    original = {"reviewed": "original"}
+    replacement = {"reviewed": "replacement"}
+    path.write_bytes(orchestration._canonical_json_file_bytes(original))
+    reader = orchestration._ArtifactReader()
+
+    captured = reader.capture_json(path, field="reviewed artifact")
+    path.write_bytes(orchestration._canonical_json_file_bytes(replacement))
+    reused = reader.capture_json(path, field="reviewed artifact")
+
+    assert reused is captured
+    assert reused.document == original
+    assert reused.raw_bytes == orchestration._canonical_json_file_bytes(original)
+    assert (
+        orchestration._ArtifactReader()
+        .capture_json(path, field="replacement artifact")
+        .document
+        == replacement
+    )
+
+
+def test_private_parameter_materialization_detects_identity_replacement() -> None:
+    raw_bytes = orchestration._canonical_json_file_bytes(
+        {"parameters": {"reviewed": {"value": "exact"}}}
+    )
+
+    with pytest.raises(
+        orchestration.OrchestrationError,
+        match="changed during Azure execution",
+    ), orchestration._materialized_private_artifact(raw_bytes) as pinned:
+        assert pinned.raw_bytes == raw_bytes
+        pinned.path.unlink()
+        pinned.path.write_bytes(raw_bytes)
 
 
 def test_live_acceptance_requires_exact_job_readback() -> None:
@@ -2660,7 +3167,7 @@ def test_prospective_publisher_sender_transition_is_exact(
     additional = orchestration._verify_trigger_queue_assignment_set(
         producer_expected_assignments=producer_expected,
         prospective_publisher_assignments=prospective,
-        approved_transition_assignment_ids=set(),
+        approved_transitions=[],
         require_transition_revoked=True,
         subscription_id=SUBSCRIPTION_ID,
     )
@@ -2736,7 +3243,7 @@ def test_prospective_publisher_sender_rejects_nondeterministic_assignment_id(
         orchestration._verify_trigger_queue_assignment_set(
             producer_expected_assignments=producer_expected,
             prospective_publisher_assignments=prospective,
-            approved_transition_assignment_ids=set(),
+            approved_transitions=[],
             require_transition_revoked=True,
             subscription_id=SUBSCRIPTION_ID,
         )
@@ -2826,7 +3333,7 @@ def test_prospective_publisher_sender_rejects_wrong_existing_principal(
         orchestration._verify_trigger_queue_assignment_set(
             producer_expected_assignments=producer_expected,
             prospective_publisher_assignments=prospective,
-            approved_transition_assignment_ids=set(),
+            approved_transitions=[],
             require_transition_revoked=True,
             subscription_id=SUBSCRIPTION_ID,
         )
@@ -2921,13 +3428,15 @@ def test_broker_identity_rotation_requires_controlled_stale_sender_revocation(
         }
 
     monkeypatch.setattr(orchestration, "_get_resource", get_resource)
-    approved_transition_ids = {retired_sender_id}
+    approved_transitions = [
+        _rotation_transition(retired_sender_id, retired_principal_id)
+    ]
 
     assert (
         orchestration._verify_trigger_queue_assignment_set(
             producer_expected_assignments=producer_expected,
             prospective_publisher_assignments=prospective,
-            approved_transition_assignment_ids=approved_transition_ids,
+            approved_transitions=approved_transitions,
             require_transition_revoked=False,
             subscription_id=SUBSCRIPTION_ID,
         )
@@ -2935,12 +3444,12 @@ def test_broker_identity_rotation_requires_controlled_stale_sender_revocation(
     )
     with pytest.raises(
         orchestration.OrchestrationError,
-        match="controlled revocation before readiness",
+        match="retired trigger-queue assignment",
     ):
         orchestration._verify_trigger_queue_assignment_set(
             producer_expected_assignments=producer_expected,
             prospective_publisher_assignments=prospective,
-            approved_transition_assignment_ids=approved_transition_ids,
+            approved_transitions=approved_transitions,
             require_transition_revoked=True,
             subscription_id=SUBSCRIPTION_ID,
         )
@@ -2951,11 +3460,216 @@ def test_broker_identity_rotation_requires_controlled_stale_sender_revocation(
         orchestration._verify_trigger_queue_assignment_set(
             producer_expected_assignments=producer_expected,
             prospective_publisher_assignments=prospective,
-            approved_transition_assignment_ids=approved_transition_ids,
+            approved_transitions=approved_transitions,
             require_transition_revoked=True,
             subscription_id=SUBSCRIPTION_ID,
         )
         == {}
+    )
+
+
+def test_same_name_uami_trigger_assignment_reuse_requires_current_principal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue_scope = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
+        "Microsoft.ServiceBus/namespaces/athena/queues/requests"
+    )
+    assignment_id = (
+        f"{queue_scope}/providers/Microsoft.Authorization/roleAssignments/"
+        "96969696-1111-4111-8111-111111111111"
+    )
+    retired_principal_id = "96969696-2222-4222-8222-222222222222"
+    current_principal_id = "96969696-3333-4333-8333-333333333333"
+    role_definition_id = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+        "Microsoft.Authorization/roleDefinitions/"
+        f"{orchestration.SERVICE_BUS_DATA_RECEIVER_ROLE_ID}"
+    )
+    expected = orchestration._ExpectedRoleAssignment(
+        label="recreated trigger receiver",
+        principal_id=current_principal_id,
+        scope=queue_scope,
+        role_definition_id=role_definition_id,
+    )
+    live_principal_id = current_principal_id
+    monkeypatch.setattr(
+        orchestration,
+        "_run_json",
+        lambda _command, *, field: [{"id": assignment_id, "scope": queue_scope}],
+    )
+
+    def get_resource(resource_id: str, *, subscription_id: str) -> dict[str, object]:
+        return {
+            "id": resource_id,
+            "properties": {
+                "principalId": live_principal_id,
+                "principalType": "ServicePrincipal",
+                "roleDefinitionId": role_definition_id,
+                "scope": queue_scope,
+            },
+        }
+
+    monkeypatch.setattr(orchestration, "_get_resource", get_resource)
+    verified = orchestration._verify_complete_trigger_queue_assignment_set(
+        current_expected_assignments={assignment_id.casefold(): expected},
+        required_current_assignment_ids={assignment_id},
+        approved_transitions=[
+            _rotation_transition(assignment_id, retired_principal_id)
+        ],
+        transition_state="absent",
+        subscription_id=SUBSCRIPTION_ID,
+    )
+    assert verified == {
+        current_principal_id: {assignment_id.casefold()}
+    }
+
+    live_principal_id = retired_principal_id
+    with pytest.raises(orchestration.OrchestrationError, match="retired principal"):
+        orchestration._verify_complete_trigger_queue_assignment_set(
+            current_expected_assignments={assignment_id.casefold(): expected},
+            required_current_assignment_ids={assignment_id},
+            approved_transitions=[
+                _rotation_transition(assignment_id, retired_principal_id)
+            ],
+            transition_state="absent",
+            subscription_id=SUBSCRIPTION_ID,
+        )
+
+
+def test_same_name_uami_nonqueue_assignment_reuse_is_exact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
+        "Microsoft.Storage/storageAccounts/athena/blobServices/default/"
+        "containers/wc027-enrichment-feed-v2"
+    )
+    assignment_id = (
+        f"{scope}/providers/Microsoft.Authorization/roleAssignments/"
+        "97979797-1111-4111-8111-111111111111"
+    )
+    retired_principal_id = "97979797-2222-4222-8222-222222222222"
+    current_principal_id = "97979797-3333-4333-8333-333333333333"
+    role_definition_id = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+        "Microsoft.Authorization/roleDefinitions/"
+        f"{orchestration.BLOB_DATA_READER_ROLE_ID}"
+    )
+    expected = orchestration._ExpectedRoleAssignment(
+        label="recreated Blob reader",
+        principal_id=current_principal_id,
+        scope=scope,
+        role_definition_id=role_definition_id,
+        condition_version="2.0",
+        condition=orchestration.BLOB_LIST_DENY_CONDITION,
+    )
+    live_principal_id = current_principal_id
+    live_condition = orchestration.BLOB_LIST_DENY_CONDITION
+    monkeypatch.setattr(
+        orchestration,
+        "_run_json",
+        lambda _command, *, field: [{"id": assignment_id, "scope": scope}],
+    )
+
+    def get_resource(resource_id: str, *, subscription_id: str) -> dict[str, object]:
+        return {
+            "id": resource_id,
+            "properties": {
+                "principalId": live_principal_id,
+                "principalType": "ServicePrincipal",
+                "roleDefinitionId": role_definition_id,
+                "scope": scope,
+                "conditionVersion": "2.0",
+                "condition": live_condition,
+            },
+        }
+
+    monkeypatch.setattr(orchestration, "_get_resource", get_resource)
+    transition = _rotation_transition(assignment_id, retired_principal_id)
+    orchestration._verify_reviewed_rotation_transitions(
+        [transition],
+        current_principal_ids={current_principal_id},
+        transition_state="absent",
+        subscription_id=SUBSCRIPTION_ID,
+        current_expected_assignments={assignment_id.casefold(): expected},
+    )
+
+    live_principal_id = retired_principal_id
+    with pytest.raises(orchestration.OrchestrationError, match="retired principal"):
+        orchestration._verify_reviewed_rotation_transitions(
+            [transition],
+            current_principal_ids={current_principal_id},
+            transition_state="absent",
+            subscription_id=SUBSCRIPTION_ID,
+            current_expected_assignments={assignment_id.casefold(): expected},
+        )
+
+    live_principal_id = current_principal_id
+    live_condition = None
+    with pytest.raises(orchestration.OrchestrationError, match="condition"):
+        orchestration._verify_reviewed_rotation_transitions(
+            [transition],
+            current_principal_ids={current_principal_id},
+            transition_state="absent",
+            subscription_id=SUBSCRIPTION_ID,
+            current_expected_assignments={assignment_id.casefold(): expected},
+        )
+
+
+def test_removed_scope_rotation_transition_must_be_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    retired_scope = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
+        "Microsoft.Storage/storageAccounts/retired/tableServices/default/"
+        "tables/Retired"
+    )
+    assignment_id = (
+        f"{retired_scope}/providers/Microsoft.Authorization/roleAssignments/"
+        "98989898-1111-4111-8111-111111111111"
+    )
+    retired_principal_id = "98989898-2222-4222-8222-222222222222"
+    transition = _rotation_transition(assignment_id, retired_principal_id)
+    assignment_present = True
+
+    def run_json(command: object, *, field: str) -> object:
+        return (
+            [{"id": assignment_id, "scope": retired_scope}]
+            if assignment_present
+            else []
+        )
+
+    monkeypatch.setattr(orchestration, "_run_json", run_json)
+    monkeypatch.setattr(
+        orchestration,
+        "_get_resource",
+        lambda resource_id, *, subscription_id: {
+            "id": resource_id,
+            "properties": {
+                "principalId": retired_principal_id,
+                "principalType": "ServicePrincipal",
+                "roleDefinitionId": (
+                    f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+                    "Microsoft.Authorization/roleDefinitions/"
+                    f"{orchestration.TABLE_DATA_READER_ROLE_ID}"
+                ),
+                "scope": retired_scope,
+            },
+        },
+    )
+    with pytest.raises(orchestration.OrchestrationError, match="retired principal"):
+        orchestration._verify_unmatched_rotation_transitions_absent(
+            [transition],
+            handled_transition_ids=set(),
+            subscription_id=SUBSCRIPTION_ID,
+        )
+
+    assignment_present = False
+    orchestration._verify_unmatched_rotation_transitions_absent(
+        [transition],
+        handled_transition_ids=set(),
+        subscription_id=SUBSCRIPTION_ID,
     )
 
 
@@ -3032,6 +3746,7 @@ def test_rotation_transitions_cover_all_deterministic_assignment_domains(
         ),
     )
     transition_ids: set[str] = set()
+    transition_documents: list[dict[str, str]] = []
     resources: dict[str, dict[str, object]] = {
         custom_role_id.casefold(): {
             "id": custom_role_id,
@@ -3063,6 +3778,9 @@ def test_rotation_transitions_cover_all_deterministic_assignment_domains(
         )
         principal_id = f"98989898-{index:04d}-4{index:03d}-8{index:03d}-{index:012d}"
         transition_ids.add(assignment_id)
+        transition_documents.append(
+            _rotation_transition(assignment_id, principal_id)
+        )
         assignments_by_scope.setdefault(scope.casefold(), []).append(
             {"id": assignment_id, "scope": scope}
         )
@@ -3090,7 +3808,7 @@ def test_rotation_transitions_cover_all_deterministic_assignment_domains(
 
     monkeypatch.setattr(orchestration, "_run_json", run_json)
     orchestration._verify_reviewed_rotation_transitions(
-        transition_ids,
+        transition_documents,
         current_principal_ids={"99999999-9999-4999-8999-999999999999"},
         transition_state="present",
         subscription_id=SUBSCRIPTION_ID,
@@ -3100,9 +3818,30 @@ def test_rotation_transitions_cover_all_deterministic_assignment_domains(
         custom_role_id,
     }
 
+    mismatched_assignment_id = sorted(transition_ids)[0]
+    original_principal_id = resources[mismatched_assignment_id.casefold()][
+        "properties"
+    ]["principalId"]
+    resources[mismatched_assignment_id.casefold()]["properties"][
+        "principalId"
+    ] = "98989898-9999-4999-8999-999999999999"
+    with pytest.raises(
+        orchestration.OrchestrationError,
+        match="reviewed retired principal",
+    ):
+        orchestration._verify_reviewed_rotation_transitions(
+            transition_documents,
+            current_principal_ids={"99999999-9999-4999-8999-999999999999"},
+            transition_state="present",
+            subscription_id=SUBSCRIPTION_ID,
+        )
+    resources[mismatched_assignment_id.casefold()]["properties"][
+        "principalId"
+    ] = original_principal_id
+
     transitions_present = False
     orchestration._verify_reviewed_rotation_transitions(
-        transition_ids,
+        transition_documents,
         current_principal_ids={"99999999-9999-4999-8999-999999999999"},
         transition_state="absent",
         subscription_id=SUBSCRIPTION_ID,
@@ -3116,10 +3855,10 @@ def test_rotation_transition_manifest_is_bounded_and_role_assignment_only() -> N
     )
     with pytest.raises(
         orchestration.OrchestrationError,
-        match="only role assignment",
+        match="identify one role assignment",
     ):
         orchestration._canonical_rotation_transition_assignments(
-            [non_assignment],
+            [_rotation_transition(non_assignment)],
             subscription_id=SUBSCRIPTION_ID,
             field="rotation transitions",
         )
@@ -3241,7 +3980,7 @@ def test_fresh_producer_plan_allows_empty_trigger_queue_assignment_set(
                 )
             },
             required_current_assignment_ids=set(),
-            approved_transition_assignment_ids=set(),
+            approved_transitions=[],
             transition_state="present",
             subscription_id=SUBSCRIPTION_ID,
         )
@@ -3354,17 +4093,18 @@ def test_identity_reads_preserve_original_canonical_arm_ids(
     assert verified == {identity_id.casefold(): principal_id}
 
 
-def test_predecessor_transition_ids_preserve_canonical_arm_casing() -> None:
+def test_predecessor_transitions_preserve_canonical_arm_casing() -> None:
     assignment_id = (
         f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
         "Microsoft.ServiceBus/namespaces/athena/queues/requests/providers/"
         "Microsoft.Authorization/roleAssignments/"
         "71717171-1111-4111-8111-111111111111"
     )
-    assert orchestration._predecessor_rotation_transition_assignment_ids(
-        {"producer": {"plan": {"rotationTransitionAssignmentIds": [assignment_id]}}},
+    transition = _rotation_transition(assignment_id)
+    assert orchestration._predecessor_rotation_transition_assignments(
+        {"producer": {"plan": {"rotationTransitionAssignments": [transition]}}},
         subscription_id=SUBSCRIPTION_ID,
-    ) == {assignment_id}
+    ) == [transition]
 
 
 def test_dependency_security_properties_fail_closed(
@@ -3455,6 +4195,7 @@ def test_authority_blob_inventory_requires_versioning_and_preserves_canonical_id
         "schemaVersion": (orchestration.AUTHORITY_BLOB_INVENTORY_SCHEMA_VERSION),
         "containerResourceId": container_id,
         "containerExists": False,
+        "previousCheckpointSha256": None,
         "currentBlobs": [],
         "versions": [],
     }
@@ -3475,8 +4216,8 @@ def test_authority_blob_inventory_fresh_and_recovery_rules(
         "Microsoft.Storage/storageAccounts/athenacorrelation/"
         "blobServices/default/containers/wc027-guidance-authority"
     )
-    current_blobs: list[dict[str, object]] = []
     versioned_blobs: list[dict[str, object]] = []
+    payloads: dict[tuple[str, str], bytes] = {}
 
     def run_json(command: object, *, field: str) -> object:
         arguments = list(command)
@@ -3490,179 +4231,231 @@ def test_authority_blob_inventory_fresh_and_recovery_rules(
             return {"exists": True}
         if "--include" in arguments:
             return versioned_blobs
-        return current_blobs
+        return []
 
     monkeypatch.setattr(orchestration, "_run_json", run_json)
+    monkeypatch.setattr(
+        orchestration,
+        "_run_bytes",
+        lambda command: payloads[
+            (
+                list(command)[list(command).index("--name") + 1],
+                list(command)[list(command).index("--version-id") + 1],
+            )
+        ],
+    )
+    reviewed_absent = _empty_authority_inventory(container_exists=False)
     empty_inventory = orchestration._authority_blob_inventory(
         container_id,
         subscription_id=SUBSCRIPTION_ID,
+        previous_inventory=reviewed_absent,
     )
     orchestration._verify_post_deployment_authority_inventory(
         stage="producer",
-        reviewed_inventory={
-            **empty_inventory,
-            "containerExists": False,
-        },
+        reviewed_inventory=reviewed_absent,
         current_inventory=empty_inventory,
     )
 
-    current_blobs.append(
-        {
-            "name": "authority/occurrence-1.json",
-            "properties": {
-                "etag": '"etag-current"',
-                "contentLength": 128,
-            },
-        }
+    fixture, publisher, writer, _activation, _trigger, _correlation, _incident = (
+        _publisher()
     )
-    versioned_blobs.append(
-        {
-            "name": "authority/occurrence-1.json",
-            "versionId": "2026-09-15T12:00:00.0000000Z",
-            "isCurrentVersion": True,
-            "properties": {
-                "etag": '"etag-current"',
-                "contentLength": 128,
-            },
-        }
+    publication = publisher.publish(
+        _request(fixture),
+        now=_request(fixture).evaluated_at,
     )
-    reviewed_inventory = orchestration._authority_blob_inventory(
+    for reference in (
+        publication.authority_reference,
+        publication.binding_reference,
+    ):
+        payload = writer.payloads[reference.name]
+        payloads[(reference.name, reference.version)] = payload
+        versioned_blobs.append(
+            {
+                "name": reference.name,
+                "versionId": reference.version,
+                "isCurrentVersion": True,
+                "properties": {
+                    "etag": f'"etag-{reference.version}"',
+                    "contentLength": len(payload),
+                },
+            }
+        )
+    advanced_inventory = orchestration._authority_blob_inventory(
         container_id,
         subscription_id=SUBSCRIPTION_ID,
+        previous_inventory=empty_inventory,
     )
     orchestration._verify_post_deployment_authority_inventory(
         stage="publisher",
-        reviewed_inventory=reviewed_inventory,
-        current_inventory=reviewed_inventory,
+        reviewed_inventory=empty_inventory,
+        current_inventory=advanced_inventory,
     )
-    conflicting_inventory = json.loads(json.dumps(reviewed_inventory))
+    assert [item["contract"]["kind"] for item in advanced_inventory["versions"]] == [
+        "authority",
+        "binding",
+    ]
+
+    monkeypatch.setattr(
+        orchestration,
+        "_run_bytes",
+        lambda _command: pytest.fail(
+            "reviewed immutable versions must not be downloaded again"
+        ),
+    )
+    stable_successor = orchestration._authority_blob_inventory(
+        container_id,
+        subscription_id=SUBSCRIPTION_ID,
+        previous_inventory=advanced_inventory,
+    )
+    assert stable_successor["versions"] == advanced_inventory["versions"]
+
+    conflicting_inventory = json.loads(json.dumps(stable_successor))
     conflicting_inventory["versions"][0]["etag"] = '"etag-conflict"'
     with pytest.raises(
         orchestration.OrchestrationError,
-        match="changed from the independently reviewed plan",
+        match="changed reviewed version",
     ):
-        orchestration._verify_post_deployment_authority_inventory(
-            stage="publisher",
-            reviewed_inventory=reviewed_inventory,
+        orchestration._verify_authority_checkpoint_successor(
+            previous_inventory=advanced_inventory,
             current_inventory=conflicting_inventory,
+            allow_container_creation=False,
         )
 
 
 def test_authority_blob_inventory_rejects_missing_or_conflicting_versions() -> None:
-    container_id = (
-        f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
-        "Microsoft.Storage/storageAccounts/athenacorrelation/"
-        "blobServices/default/containers/wc027-guidance-authority"
-    )
-    inventory = {
-        "schemaVersion": (orchestration.AUTHORITY_BLOB_INVENTORY_SCHEMA_VERSION),
-        "containerResourceId": container_id,
-        "containerExists": True,
-        "currentBlobs": [
-            {
-                "name": "authority/occurrence-1.json",
-                "etag": '"etag-current"',
-                "contentLength": 128,
-            }
-        ],
-        "versions": [],
-    }
-    with pytest.raises(orchestration.OrchestrationError, match="conflict"):
-        orchestration._validated_authority_blob_inventory(
-            inventory,
-            subscription_id=SUBSCRIPTION_ID,
-        )
-
-    inventory["versions"] = [
+    authority_id = "guidance-authority-" + "a" * 32
+    binding_id = "guidance-binding-" + "b" * 32
+    authority_name = f"guidance-authority/{authority_id}/authority.json"
+    binding_name = f"guidance-bindings/{binding_id}/binding.json"
+    authority_digest = f"sha256:{'a' * 64}"
+    versions = [
         {
-            "name": "authority/occurrence-1.json",
-            "versionId": "2026-09-15T12:00:00.0000000Z",
-            "isCurrentVersion": True,
-            "etag": '"etag-conflict"',
+            "name": authority_name,
+            "versionId": "version-authority",
+            "etag": '"etag-authority"',
+            "contentLength": 128,
+            "contentSha256": authority_digest,
+            "contract": {
+                "kind": "authority",
+                "artifactId": authority_id,
+            },
+        },
+        {
+            "name": binding_name,
+            "versionId": "version-binding",
+            "etag": '"etag-binding"',
             "contentLength": 256,
-        }
+            "contentSha256": f"sha256:{'b' * 64}",
+            "contract": {
+                "kind": "binding",
+                "artifactId": binding_id,
+                "authorityReference": {
+                    "name": authority_name,
+                    "versionId": "version-authority",
+                    "contentSha256": authority_digest,
+                },
+            },
+        },
     ]
+    current_blobs = [
+        {
+            key: item[key]
+            for key in (
+                "name",
+                "versionId",
+                "etag",
+                "contentLength",
+                "contentSha256",
+            )
+        }
+        for item in versions
+    ]
+    inventory = {
+        **_empty_authority_inventory(container_exists=True),
+        "currentBlobs": current_blobs,
+        "versions": versions,
+    }
+    orchestration._validated_authority_blob_inventory(
+        inventory,
+        subscription_id=SUBSCRIPTION_ID,
+    )
+
+    conflicting_current = json.loads(json.dumps(inventory))
+    conflicting_current["currentBlobs"][0]["contentSha256"] = f"sha256:{'f' * 64}"
     with pytest.raises(orchestration.OrchestrationError, match="conflict"):
         orchestration._validated_authority_blob_inventory(
-            inventory,
+            conflicting_current,
             subscription_id=SUBSCRIPTION_ID,
         )
 
-    inventory["versions"] = [
-        {
-            "name": "authority/occurrence-1.json",
-            "versionId": "2026-09-15T12:00:00.0000000Z",
-            "isCurrentVersion": True,
-            "etag": '"etag-current"',
-            "contentLength": 128,
-        },
-        {
-            "name": "authority/occurrence-1.json",
-            "versionId": "2026-09-15T12:01:00.0000000Z",
-            "isCurrentVersion": True,
-            "etag": '"etag-current"',
-            "contentLength": 128,
-        },
-    ]
-    with pytest.raises(orchestration.OrchestrationError, match="current more than once"):
+    duplicate_version = json.loads(json.dumps(inventory))
+    duplicate_version["versions"].append(dict(duplicate_version["versions"][0]))
+    duplicate_version["versions"].sort(
+        key=lambda item: (item["name"], item["versionId"])
+    )
+    with pytest.raises(orchestration.OrchestrationError, match="duplicates|multiple versions"):
         orchestration._validated_authority_blob_inventory(
-            inventory,
+            duplicate_version,
+            subscription_id=SUBSCRIPTION_ID,
+        )
+
+    unpaired = json.loads(json.dumps(inventory))
+    unpaired["currentBlobs"] = unpaired["currentBlobs"][:1]
+    unpaired["versions"] = unpaired["versions"][:1]
+    with pytest.raises(orchestration.OrchestrationError, match="unpaired"):
+        orchestration._validated_authority_blob_inventory(
+            unpaired,
             subscription_id=SUBSCRIPTION_ID,
         )
 
 
 def test_authority_blob_inventory_uses_trusted_predecessor_plan_evidence() -> None:
-    container_id = (
-        f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
-        "Microsoft.Storage/storageAccounts/athenacorrelation/"
-        "blobServices/default/containers/wc027-guidance-authority"
+    producer_inventory = _empty_authority_inventory(
+        container_exists=True,
+        previous_checkpoint_sha256=f"sha256:{'1' * 64}",
     )
-    producer_inventory = {
-        "schemaVersion": (orchestration.AUTHORITY_BLOB_INVENTORY_SCHEMA_VERSION),
-        "containerResourceId": container_id,
-        "containerExists": False,
-        "currentBlobs": [],
-        "versions": [],
-    }
-    expected_publisher_inventory = {
-        **producer_inventory,
-        "containerExists": True,
-    }
     assert (
         orchestration._predecessor_authority_blob_inventory(
             stage="publisher",
             verified_predecessors={
-                "producer": {"plan": {"authorityBlobInventory": producer_inventory}}
+                "producer": {
+                    "handoff": {
+                        "authorityBlobInventory": producer_inventory,
+                        "authorityBlobInventorySha256": (
+                            orchestration._authority_checkpoint_sha256(
+                                producer_inventory
+                            )
+                        ),
+                    }
+                }
             },
             subscription_id=SUBSCRIPTION_ID,
         )
-        == expected_publisher_inventory
+        == producer_inventory
     )
     assert (
         orchestration._predecessor_authority_blob_inventory(
             stage="live-acceptance",
             verified_predecessors={
-                "publisher": {"plan": {"authorityBlobInventory": expected_publisher_inventory}}
+                "publisher": {
+                    "handoff": {
+                        "authorityBlobInventory": producer_inventory,
+                        "authorityBlobInventorySha256": (
+                            orchestration._authority_checkpoint_sha256(
+                                producer_inventory
+                            )
+                        ),
+                    }
+                }
             },
             subscription_id=SUBSCRIPTION_ID,
         )
-        == expected_publisher_inventory
+        == producer_inventory
     )
 
 
 def test_authority_blob_planning_requires_absent_fresh_or_trusted_predecessor() -> None:
-    container_id = (
-        f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
-        "Microsoft.Storage/storageAccounts/athenacorrelation/"
-        "blobServices/default/containers/wc027-guidance-authority"
-    )
-    absent_inventory = {
-        "schemaVersion": (orchestration.AUTHORITY_BLOB_INVENTORY_SCHEMA_VERSION),
-        "containerResourceId": container_id,
-        "containerExists": False,
-        "currentBlobs": [],
-        "versions": [],
-    }
+    absent_inventory = _empty_authority_inventory(container_exists=False)
     existing_empty_inventory = {
         **absent_inventory,
         "containerExists": True,
@@ -3678,16 +4471,55 @@ def test_authority_blob_planning_requires_absent_fresh_or_trusted_predecessor() 
             current_inventory=existing_empty_inventory,
             trusted_inventory=None,
         )
+    trusted_inventory = _empty_authority_inventory(
+        container_exists=True,
+        previous_checkpoint_sha256=f"sha256:{'3' * 64}",
+    )
+    successor_inventory = _empty_authority_inventory(
+        container_exists=True,
+        previous_checkpoint_sha256=(
+            orchestration._authority_checkpoint_sha256(trusted_inventory)
+        ),
+    )
     orchestration._verify_planned_authority_blob_inventory(
         stage="producer",
-        current_inventory=existing_empty_inventory,
-        trusted_inventory=existing_empty_inventory,
+        current_inventory=successor_inventory,
+        trusted_inventory=trusted_inventory,
     )
     with pytest.raises(orchestration.OrchestrationError, match="predecessor evidence"):
         orchestration._verify_planned_authority_blob_inventory(
             stage="publisher",
             current_inventory=existing_empty_inventory,
             trusted_inventory=None,
+        )
+
+
+def test_publisher_recovery_preserves_newer_producer_checkpoint() -> None:
+    prior_publisher = _empty_authority_inventory(
+        container_exists=True,
+        previous_checkpoint_sha256=f"sha256:{'4' * 64}",
+    )
+    newer_producer = _synthetic_authority_checkpoint_with_pair(
+        previous_checkpoint_sha256=f"sha256:{'5' * 64}",
+    )
+    candidate = _empty_authority_inventory(
+        container_exists=True,
+        previous_checkpoint_sha256=(
+            orchestration._authority_checkpoint_sha256(prior_publisher)
+        ),
+    )
+    orchestration._verify_planned_authority_blob_inventory(
+        stage="publisher",
+        current_inventory=candidate,
+        trusted_inventory=prior_publisher,
+    )
+    with pytest.raises(
+        orchestration.OrchestrationError,
+        match="removed a reviewed immutable version",
+    ):
+        orchestration._verify_authority_checkpoint_contains(
+            required_inventory=newer_producer,
+            current_inventory=candidate,
         )
 
 
@@ -4155,7 +4987,8 @@ def test_live_acceptance_revalidates_predecessor_rotation_transitions(
         "Microsoft.Authorization/roleAssignments/"
         "99919191-1111-4111-8111-111111111111"
     )
-    captured: list[tuple[str, set[str], bool]] = []
+    transition = _rotation_transition(transition_id)
+    captured: list[tuple[str, list[dict[str, str]], bool]] = []
     monkeypatch.setattr(
         orchestration,
         "_verify_foundation_resources",
@@ -4166,10 +4999,11 @@ def test_live_acceptance_revalidates_predecessor_rotation_transitions(
         _outputs: object,
         **kwargs: object,
     ) -> dict[str, set[str]]:
+        kwargs["handled_transition_ids"].add(transition_id.casefold())
         captured.append(
             (
                 "producer",
-                set(kwargs["approved_transition_assignment_ids"]),
+                list(kwargs["approved_transitions"]),
                 bool(kwargs["require_transition_revoked"]),
             )
         )
@@ -4182,7 +5016,7 @@ def test_live_acceptance_revalidates_predecessor_rotation_transitions(
         captured.append(
             (
                 "publisher",
-                set(kwargs["approved_transition_assignment_ids"]),
+                list(kwargs["approved_transitions"]),
                 bool(kwargs["require_transition_revoked"]),
             )
         )
@@ -4203,11 +5037,11 @@ def test_live_acceptance_revalidates_predecessor_rotation_transitions(
         producer={"outputs": {}},
         publisher={"outputs": {}},
         subscription_id=SUBSCRIPTION_ID,
-        rotation_transition_assignment_ids={transition_id},
+        rotation_transitions=[transition],
     )
     assert captured == [
-        ("producer", {transition_id}, True),
-        ("publisher", {transition_id}, True),
+        ("producer", [transition], True),
+        ("publisher", [transition], True),
     ]
 
 
@@ -4576,14 +5410,18 @@ def test_apply_is_bound_to_external_digest_and_fresh_what_if() -> None:
     assert '--foundation-reviewed-receipt-sha256"' in source
     assert '--producer-reviewed-receipt-sha256"' in source
     assert '--publisher-reviewed-receipt-sha256"' in source
-    assert "athena.wc029DeploymentPlan.v5" in source
-    assert "athena.wc029DeploymentReceipt.v1" in source
+    assert "athena.wc029DeploymentPlan.v6" in source
+    assert "athena.wc029DeploymentReceipt.v2" in source
     assert "predecessorReceiptSha256s" in source
     assert "--rotation-transition-assignment" in source
-    assert "rotationTransitionAssignmentIds" in source
+    assert "rotationTransitionAssignments" in source
     assert "--legacy-crypto-user-migration-assignment" in source
     assert "legacyCryptoUserMigrationAssignmentIds" in source
     assert "authorityBlobInventory" in source
+    assert "authorityBlobInventorySha256" in source
+    assert "requiredAuthorityCheckpointSha256s" in source
+    assert "--resume-succeeded-deployment" in source
+    assert "_materialized_private_artifact" in source
     assert "--prior-stage-handoff" in source
     assert "--prior-stage-receipt" in source
     assert "--prior-stage-reviewed-receipt-sha256" in source
@@ -4612,9 +5450,12 @@ def test_trigger_queue_transition_cleanup_precedes_apply_mutation() -> None:
     apply_start = source.index("def apply(")
     apply_source = source[apply_start:]
     apply_transition_check = apply_source.index('transition_state="absent"')
-    current_what_if = apply_source.index("current_what_if = _run_json(")
-    deployment_create = apply_source.index('operation="create"', current_what_if)
-    assert apply_transition_check < current_what_if < deployment_create
+    execute = apply_source.index("_execute_reviewed_deployment(")
+    helper_start = source.index("def _execute_reviewed_deployment(")
+    current_what_if = source.index("current_what_if = _run_json(", helper_start)
+    deployment_create = source.index('operation="create"', current_what_if)
+    assert apply_transition_check < execute
+    assert current_what_if < deployment_create
     assert "require_transition_revoked=False" not in apply_source
 
 
@@ -4631,15 +5472,13 @@ def test_authority_blob_inventory_gates_plan_apply_and_handoff() -> None:
     apply_start = source.index("def apply(")
     apply_source = source[apply_start:]
     pre_inventory = apply_source.index("current_authority_blob_inventory =")
-    current_what_if = apply_source.index("current_what_if = _run_json(")
-    deployment_create = apply_source.index('operation="create"', current_what_if)
+    deployment_execute = apply_source.index("_execute_reviewed_deployment(")
     post_inventory = apply_source.index(
         "post_deployment_authority_inventory =",
-        deployment_create,
+        deployment_execute,
     )
     handoff = apply_source.index("handoff = {", post_inventory)
-    assert pre_inventory < current_what_if < deployment_create
-    assert deployment_create < post_inventory < handoff
+    assert pre_inventory < deployment_execute < post_inventory < handoff
 
 
 def test_runbook_keeps_wc027_roots_and_order_governed() -> None:

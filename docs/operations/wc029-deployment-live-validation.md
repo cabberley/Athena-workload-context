@@ -277,33 +277,50 @@ Run the four orchestration stages in order. Use a unique deployment name and a n
 directory for each plan. Review the generated `*.what-if.json` and `*.plan.json` before running
 `apply`; the apply command rejects any changed byte.
 
-The plan schema is `athena.wc029DeploymentPlan.v5`. Every Azure deployment validate, what-if, and
-create command includes `--no-prompt true`, and the subprocess receives no stdin. Before any Azure
-validation, the orchestrator compiles the exact Bicep template and requires the effective parameter
-document to contain every template parameter without a default value. Missing reviewed values
-cannot be supplied interactively.
+The plan schema is `athena.wc029DeploymentPlan.v6`. Every reviewed plan, base/effective parameter
+document, what-if, predecessor handoff, and receipt is read exactly once through the secure
+non-reparse artifact reader. Its immutable raw bytes, parsed document, file identity, and SHA-256
+remain attached to that orchestration invocation; later checks never reopen the reviewed path.
+Every Azure deployment validate, what-if, and create command includes `--no-prompt true`, and the
+subprocess receives no stdin. Before Azure validation, the orchestrator compiles the exact Bicep
+template and requires every non-defaulted parameter. It writes the derived effective bytes once to
+a private, identity-pinned temporary file; validate and what-if use that same file. Apply
+rematerializes the captured reviewed bytes privately, and its repeated what-if and create consume
+that same pinned copy. Identity and bytes are checked before and after each Azure command.
 
 For producer, publisher, and live-acceptance stages the plan also records
-`authorityBlobInventory`. Blob service versioning must be enabled. The inventory is canonical,
-complete, and independently reviewable: one version-inclusive listing supplies every version ID,
-current-version flag, exact case-sensitive Blob name, ETag, and content length; the current-Blob
-projection must exactly equal the versions marked current. Publisher and live-acceptance planning
-compare it with the trusted predecessor plan. Apply requires the live inventory to still match
-before create and again after deployment. The only fresh exception is a producer plan that proved
-the container was absent; post-deployment verification then requires the newly created container
-to contain zero current and versioned blobs.
+`authorityBlobInventory` plus its exact checkpoint SHA-256. Blob service versioning must be enabled.
+Each checkpoint points to the digest of the reviewed predecessor checkpoint. One version-inclusive
+listing supplies every version ID, exact case-sensitive Blob name, ETag, and content length. New
+versions are downloaded by exact version, SHA-256 hashed, and parsed as canonical
+`PublishedGuidanceAuthority.v2` or `PublishedGuidanceAuthorityBinding.v2`; path-bound IDs and each
+binding's exact authority name, version, and digest must match. Previously checkpointed versions
+and digests must remain byte-identical, no content-addressed name may be overwritten or removed,
+and every authority must have a conforming binding. Legitimate publications therefore advance the
+checkpoint append-only instead of being compared circularly with the original deployment-time
+snapshot. Apply requires the pre-create checkpoint to equal the reviewed plan and emits the
+post-deployment successor checkpoint in the handoff and receipt chain. The plan's
+`requiredAuthorityCheckpointSha256s` map records every producer/publisher predecessor and prior
+same-stage checkpoint that the candidate must preserve, so publisher recovery cannot discard a
+newer producer checkpoint.
 
 Producer upgrades and publisher recovery must additionally supply
 `--prior-stage-handoff`, `--prior-stage-receipt`, and
 `--prior-stage-reviewed-receipt-sha256`. The reviewed prior same-stage receipt may come from an
 earlier source commit, but its receipt, plan, handoff, stage scope, and inventory hashes must remain
 internally exact, including deployment name and predecessor-receipt lineage. Every pre-existing
-producer authority container, even an empty one, requires prior producer evidence; an out-of-band or
-partially failed deployment cannot establish a new baseline. Publisher recovery binds to the prior
-publisher inventory rather than silently replacing it with the producer's older empty baseline.
+producer authority container, even an empty one, requires prior producer evidence; an out-of-band
+deployment cannot establish a new baseline. If a reviewed fresh producer create succeeds but
+eventually consistent ARM/RBAC readback prevents the handoff and receipt, rerun the same apply with
+`--resume-succeeded-deployment`. That read-only recovery path is limited to the original fresh
+producer plan: it never runs what-if or create, and it requires the exact succeeded deployment name,
+incremental mode, reviewed parameters, exported compiled template, outputs, enabled versioning, and
+empty container before issuing the recovery receipt. Deployment and readiness readbacks use eight
+bounded attempts with no delete or unreviewed mutation.
 
-Use `--rotation-transition-assignment <exact-role-assignment-id>` for retired-principal
-assignments. Producer upgrades from the earlier signer grants use the distinct
+Use `--rotation-transition-assignment <exact-role-assignment-id>
+<exact-retired-principal-id>` for retired-principal assignments. Producer upgrades from the earlier
+signer grants use the distinct
 `--legacy-crypto-user-migration-assignment <exact-role-assignment-id>` option because those
 assignments remain bound to the current signer principals while their role profile changes.
 
@@ -321,6 +338,12 @@ python $Orchestrator plan --stage producer `
   <reviewed producer arguments>
 python $Orchestrator apply --plan-manifest <reviewed producer plan> `
   --reviewed-plan-sha256 <independently recorded sha256:...>
+
+# Only after the exact fresh producer deployment succeeded but receipt issuance was
+# blocked by eventually consistent readback:
+python $Orchestrator apply --plan-manifest <same reviewed producer plan> `
+  --reviewed-plan-sha256 <same independently recorded sha256:...> `
+  --resume-succeeded-deployment
 
 python $Orchestrator plan --stage publisher `
   --foundation-handoff <foundation handoff> `
@@ -353,8 +376,8 @@ parameter artifact, evidence directory, and explicit `--allow-change` entry for 
 create or modify. WC-027 resource-group stages additionally require
 `--resource-group rg-athena-wc013-live`. Do not treat these abbreviated placeholders as executable
 approval; record the complete reviewed commands and plan-file SHA-256 values separately in the
-evidence bundle. `apply` writes the immutable deployment handoff and a separate
-`athena.wc029DeploymentReceipt.v1`, then prints the receipt path. Independently record the receipt
+evidence bundle. `apply` writes the immutable `athena.wc029DeploymentHandoff.v3` handoff and a separate
+`athena.wc029DeploymentReceipt.v2`, then prints the receipt path. Independently record the receipt
 SHA-256 before using it in a later stage. Each later `plan` loads the predecessor receipt, its
 referenced plan, effective parameters, what-if, handoff, and earlier receipt chain; a handoff's
 self-computed hashes alone are never approval evidence. The evidence directory must be outside the
@@ -394,18 +417,21 @@ publisher retry, or a later producer upgrade, only the deterministic assignment 
 its live principal, queue scope, sender role, principal type, and absent condition are revalidated.
 The complete set of direct assignments at the dedicated trigger queue must contain only the current
 producer assignments, the current deterministic publisher assignment when present, and at most
-four exact retired queue transition IDs. Record transition IDs separately with
+four exact retired queue transition pairs. Record each assignment ID and retired principal ID with
 `--rotation-transition-assignment`; do not overload the what-if `--allow-change` list. The reviewed
 plan carries a bounded maximum of 32 transition assignments across all rotated-identity scopes,
 including notification sender, publisher request receiver, exact Key Vault roles, Blob and Table
-assignments, and ACR pull. Planning requires every approved transition ID to be present, bound to a
-retired service principal, and constrained to an approved exact scope/role/condition profile.
+assignments, and ACR pull. Planning requires every approved transition ID to be present, bound to
+the independently reviewed retired service-principal ID, and constrained to an approved exact
+scope/role/condition profile.
 After independent plan review, an operator performs separately approved controlled revocation.
-`apply` requires every transition ID to be absent before rerunning the final byte-exact what-if or
-starting deployment, and post-deployment verification repeats that absence requirement before
-emitting a handoff. The orchestrator never deletes RBAC automatically. Any stale unapproved queue
-assignment, current-principal duplicate, missing current assignment, malformed transition role, or
-leaked assignment page fails closed.
+Post-deployment verification requires the retired principal to be absent before emitting a
+handoff. If deletion and recreation of a same-name UAMI causes ARM's deterministic assignment ID to
+be reused, the live assignment is accepted only when its principal is the exact current principal
+and its role, scope, principal type, condition, and custom-role permissions exactly match the
+current expected assignment. The stale reviewed retired principal always fails. The orchestrator
+never deletes RBAC automatically. Any stale or unapproved queue assignment, missing current
+assignment, malformed transition pair or role, or leaked assignment page fails closed.
 
 The five deterministic legacy Key Vault Crypto User assignments are not classified as retired
 identity transitions. Producer planning carries them in the separately bounded

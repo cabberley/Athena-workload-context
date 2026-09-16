@@ -142,19 +142,24 @@ public material, EC keys, version drift, wrong fingerprints, or extra/missing ke
 before readiness.
 
 The guidance-authority storage account must have Blob versioning enabled. Each reviewed
-`athena.wc029DeploymentPlan.v5` records the authority container's exact current Blob and version
-inventory from one version-inclusive listing, including exact case-sensitive names, version IDs,
-current-version flags, ETags, and content lengths. The current projection must exactly match the
-versions marked current. A fresh producer deployment must prove the container absent and then
-create an empty container with zero current and versioned blobs. Every pre-existing producer
-container, including an empty one, requires prior same-stage evidence. Publisher recovery, producer
-upgrade, and live acceptance must match the inventory carried by the trusted predecessor plan and
-the newly reviewed plan before and after deployment.
+`athena.wc029DeploymentPlan.v6` records a digest-chained authority checkpoint. One
+version-inclusive listing supplies exact case-sensitive names, version IDs, ETags, and lengths.
+Every newly observed exact version is downloaded, SHA-256 hashed, and validated as the canonical
+published authority or binding contract. Prior versions and digests must remain byte-identical;
+overwrites, deletions, orphan authorities, bindings that reference the wrong authority version, or
+any other non-append-only change fail closed. A fresh producer deployment must prove the container
+absent and then create an empty versioned container. Every pre-existing producer container,
+including an empty one, requires prior same-stage evidence. Publisher recovery, producer upgrade,
+and live acceptance review an append-only successor of the receipt-carried checkpoint rather than
+requiring equality with the original deployment snapshot.
 
 For a producer upgrade or publisher recovery, pass the independently reviewed prior same-stage
 handoff and receipt. The new plan reads each reviewed artifact once, verifies the exact historical
-deployment scope and predecessor-receipt lineage, and carries its post-deployment inventory
-forward; it cannot approve out-of-band content merely by observing it again.
+deployment scope and predecessor-receipt lineage, and carries its post-deployment checkpoint
+forward; it cannot approve out-of-band content merely by observing it again. If fresh producer
+deployment succeeds before RBAC/readback convergence, the same reviewed plan can use the bounded,
+read-only `--resume-succeeded-deployment` path to re-attest the exact deployment and empty
+versioned container before issuing the missing receipt; it never creates or deletes resources.
 
 Upgrades from the earlier built-in Key Vault Crypto User assignments use a separate reviewed
 same-principal migration list. Supply each of the five exact legacy deterministic assignment IDs
@@ -310,14 +315,17 @@ rejected. The publisher must be ready and the WC-016 runtime must be enabled.
   already-created publisher sender assignment on `wc027-enrichment-feed-requests`. Producer
   verification enumerates the complete direct assignment set at that queue. It accepts only current
   producer assignments, the deterministic current publisher assignment, and up to four exact
-  retired queue-assignment IDs explicitly approved with
-  `--rotation-transition-assignment`. The same reviewed transition model covers every other
+  retired queue assignment/principal pairs explicitly approved with
+  `--rotation-transition-assignment <assignment-id> <retired-principal-id>`. The same reviewed
+  transition model covers every other
   deterministic assignment affected by identity rotation, including notification and publisher
   queues, exact keys, Blob containers, Tables, and ACR. Planning proves every approved retired
-  assignment is present and conforms to an approved exact role/condition profile; controlled
-  operator revocation must then remove all of them before `apply` reruns the final what-if or
-  performs any deployment. Post-deployment readiness verifies their continued absence. The
-  orchestrator performs no automatic RBAC deletion and allows no broad publisher exemption.
+  assignment is present for the exact reviewed retired principal and conforms to an approved
+  role/condition profile; controlled operator revocation then removes the stale grant.
+  Post-deployment readiness rejects that retired principal. When a same-name UAMI recreation
+  deterministically reuses the assignment ID, it is accepted only for the exact current principal,
+  role, scope, type, condition, and custom permissions. The orchestrator performs no automatic RBAC
+  deletion and allows no broad publisher exemption.
 
 Never delete partial immutable assets to retry. They are undiscoverable until the signed feed-v2
 head includes the exact pointer.
