@@ -5,12 +5,15 @@ from azure.core import MatchConditions
 from azure.core.exceptions import ResourceExistsError
 from azure.data.tables import UpdateMode
 
+from athena_context.contracts import GuidancePublicationRequestDeliveryBudget
 from athena_context.guidance import GuidanceAuthorityActivationConflictError
 from athena_context.guidance.azure import (
     AzureServiceBusGuidanceAuthorityTrigger,
     AzureTableGuidanceAuthorityActivationStore,
 )
 from test_wc027_guidance_authority_publisher import _publisher, _request
+
+_DELIVERY_BUDGET = GuidancePublicationRequestDeliveryBudget.reviewed()
 
 
 class _Entity(dict):
@@ -99,7 +102,11 @@ def test_binding_trigger_has_deterministic_identity_session_and_ttl() -> None:
     sender = _Sender()
     trigger = AzureServiceBusGuidanceAuthorityTrigger(sender)
 
-    trigger.enqueue(binding, time_to_live_seconds=60)
+    trigger.enqueue(
+        binding,
+        time_to_live_seconds=150,
+        delivery_budget=_DELIVERY_BUDGET,
+    )
 
     message = sender.messages[0]
     assert str(message.message_id) == binding.binding_id
@@ -107,8 +114,10 @@ def test_binding_trigger_has_deterministic_identity_session_and_ttl() -> None:
         binding.incident_bound_request.incident_subject.incident_id
     )
     assert message.content_type == "application/json"
-    assert int(message.time_to_live.total_seconds()) == 60
+    assert int(message.time_to_live.total_seconds()) == 150
     assert message.application_properties["bindingDigest"] == binding.binding_digest
+    for key, value in _DELIVERY_BUDGET.broker_properties().items():
+        assert message.application_properties[key] == value
 
 
 def test_binding_trigger_rejects_out_of_window_ttl_before_send() -> None:
@@ -117,6 +126,16 @@ def test_binding_trigger_rejects_out_of_window_ttl_before_send() -> None:
     trigger = AzureServiceBusGuidanceAuthorityTrigger(sender)
 
     with pytest.raises(ValueError, match="TTL"):
-        trigger.enqueue(binding, time_to_live_seconds=0)
+        trigger.enqueue(
+            binding,
+            time_to_live_seconds=149,
+            delivery_budget=_DELIVERY_BUDGET,
+        )
+    with pytest.raises(ValueError, match="TTL"):
+        trigger.enqueue(
+            binding,
+            time_to_live_seconds=751,
+            delivery_budget=_DELIVERY_BUDGET,
+        )
 
     assert sender.messages == []

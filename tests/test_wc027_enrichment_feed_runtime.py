@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -8,6 +9,7 @@ import pytest
 
 import athena_context.enrichment.production as production
 from athena_context.contracts import (
+    GuidancePublicationRequestDeliveryBudget,
     IncidentNotificationEnvelopeV2,
     PublishedGuidanceAuthorityActivation,
     PublishedGuidanceAuthorityActivationAttestation,
@@ -19,6 +21,7 @@ from athena_context.enrichment import (
     Wc027EnrichmentFeedRuntime,
     Wc027EnrichmentSourceNotReadyError,
     parse_wc027_enrichment_trigger,
+    validate_wc027_enrichment_broker_metadata,
 )
 from athena_context.enrichment.feed_pipeline import (
     IncidentEnrichmentFeedPublicationService,
@@ -54,6 +57,8 @@ from test_wc027_incident_enrichment_publication import (
     _publication_service,
     _Store,
 )
+
+_DELIVERY_BUDGET = GuidancePublicationRequestDeliveryBudget.reviewed()
 
 
 class _Signer:
@@ -100,21 +105,27 @@ class _Authority:
 
 
 class _Activation:
-    def __init__(self, binding, occurrence) -> None:
+    def __init__(
+        self,
+        binding,
+        occurrence,
+        *,
+        delivery_budget: GuidancePublicationRequestDeliveryBudget = _DELIVERY_BUDGET,
+    ) -> None:
+        publication_request_expires_at = (
+            binding.incident_bound_request.correlation_request.expires_at
+        )
+        trigger_delivery_deadline = (
+            publication_request_expires_at + delivery_budget.feed_trigger_recovery
+        )
         payload = {
-            "schemaVersion": (
-                "athena.wc027PublishedGuidanceAuthorityActivation.v1"
-            ),
-            "incidentId": (
-                binding.incident_bound_request.incident_subject.incident_id
-            ),
+            "schemaVersion": ("athena.wc027PublishedGuidanceAuthorityActivation.v1"),
+            "incidentId": (binding.incident_bound_request.incident_subject.incident_id),
             "incidentStateDigest": (
                 binding.incident_bound_request.incident_subject.incident_state_digest
             ),
             "occurrenceDigest": occurrence.occurrence_digest,
-            "publicationRequestId": (
-                "guidance-publication-request-" + "8" * 32
-            ),
+            "publicationRequestId": ("guidance-publication-request-" + "8" * 32),
             "publicationRequestDigest": "sha256:" + "8" * 64,
             "bindingId": binding.binding_id,
             "bindingDigest": binding.binding_digest,
@@ -123,9 +134,16 @@ class _Activation:
                 version="synthetic-binding-version",
                 contentDigest=sha256_hex(binding.canonical_bytes()),
             ),
+            "triggerMessageId": binding.binding_id,
+            "deliveryBudget": delivery_budget.model_dump(
+                mode="json",
+                by_alias=True,
+            ),
             "activatedAt": binding.evaluated_at,
+            "publicationRequestExpiresAt": publication_request_expires_at,
+            "triggerDeliveryDeadline": trigger_delivery_deadline,
             "expiresAt": (
-                binding.incident_bound_request.correlation_request.expires_at
+                trigger_delivery_deadline + delivery_budget.feed_minimum_remaining_lifetime
             ),
         }
         digest_payload = {
@@ -136,9 +154,7 @@ class _Activation:
             ),
         }
         attestation = PublishedGuidanceAuthorityActivationAttestation(
-            schemaVersion=(
-                "athena.wc027PublishedGuidanceAuthorityActivationAttestation.v1"
-            ),
+            schemaVersion=("athena.wc027PublishedGuidanceAuthorityActivationAttestation.v1"),
             signatureAlgorithm="RS256",
             keyId=binding.binding_attestation.key_id,
             signedPreimageDigest=compute_artifact_digest(digest_payload),
@@ -157,9 +173,7 @@ class _Activation:
         self.snapshot = GuidanceAuthorityActivationSnapshot(
             activation=PublishedGuidanceAuthorityActivation(
                 **complete,
-                activationId=(
-                    f"guidance-activation-{digest.removeprefix('sha256:')[:32]}"
-                ),
+                activationId=(f"guidance-activation-{digest.removeprefix('sha256:')[:32]}"),
                 activationDigest=digest,
             ),
             etag='"synthetic"',
@@ -250,9 +264,7 @@ class _ArtifactReaderProbe:
 
 
 def _bicep_generated_runtime_configuration() -> dict[str, object]:
-    identity_client_ids = [
-        f"00000000-0000-0000-0000-{index:012d}" for index in range(1, 18)
-    ]
+    identity_client_ids = [f"00000000-0000-0000-0000-{index:012d}" for index in range(1, 18)]
 
     def identity_resource_id(index: int) -> str:
         return (
@@ -268,16 +280,14 @@ def _bicep_generated_runtime_configuration() -> dict[str, object]:
             "identityClientId": identity_client_ids[index],
             "identityResourceId": identity_resource_id(index),
         }
+
     def key(
         index: int,
         identity_index: int,
         *,
         logical_key_id: str | None = None,
     ) -> dict[str, str]:
-        key_vault_key_id = (
-            "https://athena-wc027.vault.azure.net/keys/"
-            f"key-{index}/{index:032x}"
-        )
+        key_vault_key_id = f"https://athena-wc027.vault.azure.net/keys/key-{index}/{index:032x}"
         return {
             "keyId": logical_key_id or key_vault_key_id,
             "keyVaultKeyId": key_vault_key_id,
@@ -286,9 +296,7 @@ def _bicep_generated_runtime_configuration() -> dict[str, object]:
             "identityResourceId": identity_resource_id(identity_index),
         }
 
-    attached_identity_resource_ids = [
-        identity_resource_id(index) for index in range(17)
-    ]
+    attached_identity_resource_ids = [identity_resource_id(index) for index in range(17)]
     monitoring_collector_key: dict[str, object] = {
         **key(1, 10),
         "activatedAt": NOW.isoformat().replace("+00:00", "Z"),
@@ -296,6 +304,7 @@ def _bicep_generated_runtime_configuration() -> dict[str, object]:
     }
     return {
         "schemaVersion": "athena.wc027EnrichmentFeedRuntimeConfiguration.v1",
+        "deliveryBudget": _DELIVERY_BUDGET.model_dump(mode="json", by_alias=True),
         "serviceBus": {
             "namespace": "athena-wc027.servicebus.windows.net",
             "triggerQueueName": "wc027-enrichment-trigger",
@@ -352,10 +361,7 @@ def _bicep_generated_runtime_configuration() -> dict[str, object]:
             "incident": key(
                 4,
                 10,
-                logical_key_id=(
-                    "synthetic-key://athena-argus-demo/"
-                    "wc016-incidents-rs256-v1"
-                ),
+                logical_key_id=("synthetic-key://athena-argus-demo/wc016-incidents-rs256-v1"),
             ),
             "correlationBinding": key(5, 10),
             "guidanceBinding": key(6, 10),
@@ -406,6 +412,7 @@ def _bicep_generated_publisher_configuration() -> dict[str, object]:
         identity_resource_id(3),
         identity_resource_id(4),
         identity_resource_id(5),
+        identity_resource_id(6),
         runtime["incidentLifecycleAssets"]["identityResourceId"],  # type: ignore[index]
         runtime["correlationSources"]["monitoring"]["identityResourceId"],  # type: ignore[index]
         runtime["correlationSources"]["change"]["identityResourceId"],  # type: ignore[index]
@@ -419,15 +426,21 @@ def _bicep_generated_publisher_configuration() -> dict[str, object]:
         runtime["keys"]["correlationBinding"]["identityResourceId"],  # type: ignore[index]
     }
     return {
-        "schemaVersion": (
-            "athena.wc027GuidanceAuthorityPublisherConfiguration.v1"
-        ),
+        "schemaVersion": ("athena.wc027GuidanceAuthorityPublisherConfiguration.v1"),
         "serviceBus": {
             "namespace": "athena-wc027.servicebus.windows.net",
             "requestQueueName": "wc027-guidance-authority-requests",
             "triggerQueueName": "wc027-enrichment-trigger",
             "brokerIdentityClientId": client_id(0),
             "brokerIdentityResourceId": identity_resource_id(0),
+            "requestSubmitterIdentityClientId": client_id(7),
+            "requestSubmitterIdentityResourceId": identity_resource_id(7),
+        },
+        "requestOutbox": {
+            "blobEndpoint": "https://athenawc027.blob.core.windows.net",
+            "containerName": "wc027-guidance-request-outbox",
+            "identityClientId": client_id(6),
+            "identityResourceId": identity_resource_id(6),
         },
         "authorityAssets": {
             "blobEndpoint": "https://athenawc027.blob.core.windows.net",
@@ -446,6 +459,7 @@ def _bicep_generated_publisher_configuration() -> dict[str, object]:
         },
         "requestKey": request_key,
         "bindingSigningKey": binding_signing_key,
+        "deliveryBudget": _DELIVERY_BUDGET.model_dump(mode="json", by_alias=True),
         "enrichmentRuntimeConfiguration": runtime,
         "deploymentBinding": {
             "bindingEvidenceId": "10000000-0000-0000-0000-000000000099",
@@ -466,15 +480,13 @@ def test_publisher_configuration_preserves_logical_and_physical_binding_keys() -
         json.dumps(payload)
     )
 
-    assert configuration.binding_signing_key.key_id == (
-        payload["enrichmentRuntimeConfiguration"]["keys"]["guidanceBinding"][
-            "keyId"
-        ]
+    assert (
+        configuration.binding_signing_key.key_id
+        == (payload["enrichmentRuntimeConfiguration"]["keys"]["guidanceBinding"]["keyId"])
     )
-    assert configuration.binding_signing_key.key_vault_key_id == (
-        payload["enrichmentRuntimeConfiguration"]["keys"]["guidanceBinding"][
-            "keyVaultKeyId"
-        ]
+    assert (
+        configuration.binding_signing_key.key_vault_key_id
+        == (payload["enrichmentRuntimeConfiguration"]["keys"]["guidanceBinding"]["keyVaultKeyId"])
     )
     assert (
         configuration.binding_signing_key.identity_resource_id
@@ -484,18 +496,56 @@ def test_publisher_configuration_preserves_logical_and_physical_binding_keys() -
         configuration.binding_signing_key.key_fingerprint
         == configuration.enrichment_runtime.guidance_binding_key.key_fingerprint
     )
+    assert configuration.delivery_budget.publisher_keda_polling_interval_seconds == 30
+    assert configuration.delivery_budget.publisher_cold_start_seconds == 30
+    assert configuration.delivery_budget.publisher_connection_setup_seconds == 30
+    assert configuration.delivery_budget.publisher_processing_seconds == 60
+    assert configuration.delivery_budget.publisher_minimum_remaining_lifetime_seconds == 150
+    assert configuration.delivery_budget.feed_keda_polling_interval_seconds == 30
+    assert configuration.delivery_budget.feed_cold_start_seconds == 30
+    assert configuration.delivery_budget.feed_connection_setup_seconds == 30
+    assert configuration.delivery_budget.feed_processing_seconds == 60
+    assert configuration.delivery_budget.feed_minimum_remaining_lifetime_seconds == 150
+    assert configuration.delivery_budget.feed_trigger_recovery_seconds == 300
+    assert configuration.delivery_budget.minimum_remaining_lifetime_seconds == 150
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("publisherKedaPollingIntervalSeconds", 31),
+        ("publisherColdStartSeconds", 29),
+        ("publisherConnectionSetupSeconds", 29),
+        ("publisherProcessingSeconds", 59),
+        ("publisherMinimumRemainingLifetimeSeconds", 149),
+        ("feedKedaPollingIntervalSeconds", 31),
+        ("feedColdStartSeconds", 29),
+        ("feedConnectionSetupSeconds", 29),
+        ("feedProcessingSeconds", 59),
+        ("feedMinimumRemainingLifetimeSeconds", 149),
+        ("feedTriggerRecoverySeconds", 299),
+        ("minimumRemainingLifetimeSeconds", 149),
+    ),
+)
+def test_publisher_configuration_rejects_delivery_budget_drift(
+    field: str,
+    value: int,
+) -> None:
+    payload = _bicep_generated_publisher_configuration()
+    payload["deliveryBudget"][field] = value  # type: ignore[index]
+
+    with pytest.raises(ValueError, match="delivery budget"):
+        Wc027GuidanceAuthorityPublisherConfiguration.model_validate_json(json.dumps(payload))
 
 
 def test_publisher_configuration_rejects_reused_request_authority() -> None:
     payload = _bicep_generated_publisher_configuration()
-    payload["requestKey"]["keyId"] = payload["enrichmentRuntimeConfiguration"][
-        "keys"
-    ]["incident"]["keyId"]
+    payload["requestKey"]["keyId"] = payload["enrichmentRuntimeConfiguration"]["keys"]["incident"][
+        "keyId"
+    ]
 
     with pytest.raises(ValueError, match="distinct trust domain"):
-        Wc027GuidanceAuthorityPublisherConfiguration.model_validate_json(
-            json.dumps(payload)
-        )
+        Wc027GuidanceAuthorityPublisherConfiguration.model_validate_json(json.dumps(payload))
 
 
 def test_publisher_configuration_rejects_reused_request_public_key_material() -> None:
@@ -505,9 +555,7 @@ def test_publisher_configuration_rejects_reused_request_public_key_material() ->
     ]["keys"]["incident"]["keyFingerprint"]  # type: ignore[index]
 
     with pytest.raises(ValueError, match="distinct trust domain"):
-        Wc027GuidanceAuthorityPublisherConfiguration.model_validate_json(
-            json.dumps(payload)
-        )
+        Wc027GuidanceAuthorityPublisherConfiguration.model_validate_json(json.dumps(payload))
 
 
 def test_publisher_configuration_rejects_binding_fingerprint_mismatch() -> None:
@@ -515,24 +563,74 @@ def test_publisher_configuration_rejects_binding_fingerprint_mismatch() -> None:
     payload["bindingSigningKey"]["keyFingerprint"] = "sha256:" + "d" * 64  # type: ignore[index]
 
     with pytest.raises(ValueError, match="does not match runtime guidance trust"):
-        Wc027GuidanceAuthorityPublisherConfiguration.model_validate_json(
-            json.dumps(payload)
-        )
+        Wc027GuidanceAuthorityPublisherConfiguration.model_validate_json(json.dumps(payload))
 
 
 def test_publisher_configuration_rejects_reused_managed_identity() -> None:
     payload = _bicep_generated_publisher_configuration()
-    payload["requestKey"]["identityClientId"] = payload["serviceBus"][
-        "brokerIdentityClientId"
-    ]
-    payload["requestKey"]["identityResourceId"] = payload["serviceBus"][
-        "brokerIdentityResourceId"
-    ]
+    payload["requestKey"]["identityClientId"] = payload["serviceBus"]["brokerIdentityClientId"]
+    payload["requestKey"]["identityResourceId"] = payload["serviceBus"]["brokerIdentityResourceId"]
 
     with pytest.raises(ValueError, match="managed identities must be distinct"):
-        Wc027GuidanceAuthorityPublisherConfiguration.model_validate_json(
-            json.dumps(payload)
-        )
+        Wc027GuidanceAuthorityPublisherConfiguration.model_validate_json(json.dumps(payload))
+
+
+def test_publisher_configuration_requires_dedicated_request_submitter() -> None:
+    payload = _bicep_generated_publisher_configuration()
+    payload["serviceBus"]["requestSubmitterIdentityClientId"] = payload[  # type: ignore[index]
+        "serviceBus"
+    ]["brokerIdentityClientId"]  # type: ignore[index]
+    payload["serviceBus"]["requestSubmitterIdentityResourceId"] = payload[  # type: ignore[index]
+        "serviceBus"
+    ]["brokerIdentityResourceId"]  # type: ignore[index]
+
+    with pytest.raises(ValueError, match="submitter identity must be dedicated"):
+        Wc027GuidanceAuthorityPublisherConfiguration.model_validate_json(json.dumps(payload))
+
+
+def test_publisher_configuration_rejects_submitter_reusing_unattached_runtime_identity() -> None:
+    payload = _bicep_generated_publisher_configuration()
+    runtime_identity = payload["enrichmentRuntimeConfiguration"]["keys"][  # type: ignore[index]
+        "feed"
+    ]
+    payload["serviceBus"]["requestSubmitterIdentityClientId"] = runtime_identity[  # type: ignore[index]
+        "identityClientId"
+    ]
+    payload["serviceBus"]["requestSubmitterIdentityResourceId"] = runtime_identity[  # type: ignore[index]
+        "identityResourceId"
+    ]
+
+    with pytest.raises(ValueError, match="submitter identity must be dedicated"):
+        Wc027GuidanceAuthorityPublisherConfiguration.model_validate_json(json.dumps(payload))
+
+
+def test_publisher_configuration_rejects_owned_identity_reusing_runtime_identity() -> None:
+    payload = _bicep_generated_publisher_configuration()
+    previous_resource_id = payload["serviceBus"]["brokerIdentityResourceId"]  # type: ignore[index]
+    runtime_identity = payload["enrichmentRuntimeConfiguration"]["keys"][  # type: ignore[index]
+        "feed"
+    ]
+    payload["serviceBus"]["brokerIdentityClientId"] = runtime_identity[  # type: ignore[index]
+        "identityClientId"
+    ]
+    payload["serviceBus"]["brokerIdentityResourceId"] = runtime_identity[  # type: ignore[index]
+        "identityResourceId"
+    ]
+    attached = payload["deploymentBinding"]["attachedIdentityResourceIds"]  # type: ignore[index]
+    attached[attached.index(previous_resource_id)] = runtime_identity[  # type: ignore[union-attr]
+        "identityResourceId"
+    ]
+
+    with pytest.raises(ValueError, match="separate from runtime identities"):
+        Wc027GuidanceAuthorityPublisherConfiguration.model_validate_json(json.dumps(payload))
+
+
+def test_publisher_configuration_requires_exact_request_outbox() -> None:
+    payload = _bicep_generated_publisher_configuration()
+    payload["requestOutbox"]["containerName"] = "different-outbox"  # type: ignore[index]
+
+    with pytest.raises(ValueError, match="request outbox"):
+        Wc027GuidanceAuthorityPublisherConfiguration.model_validate_json(json.dumps(payload))
 
 
 @pytest.mark.parametrize(
@@ -580,21 +678,17 @@ def test_publisher_configuration_rejects_runtime_store_drift(
     payload[section][field] = value
 
     with pytest.raises(ValueError, match=message):
-        Wc027GuidanceAuthorityPublisherConfiguration.model_validate_json(
-            json.dumps(payload)
-        )
+        Wc027GuidanceAuthorityPublisherConfiguration.model_validate_json(json.dumps(payload))
 
 
 def test_runtime_rejects_guidance_authority_storage_domain_reuse() -> None:
     payload = _bicep_generated_runtime_configuration()
-    payload["guidanceAuthoritySource"]["containerName"] = payload[
-        "correlationSources"
-    ]["monitoring"]["containerName"]
+    payload["guidanceAuthoritySource"]["containerName"] = payload["correlationSources"][
+        "monitoring"
+    ]["containerName"]
 
     with pytest.raises(ValueError, match="storage domains must be distinct"):
-        Wc027EnrichmentFeedProductionConfiguration.model_validate_json(
-            json.dumps(payload)
-        )
+        Wc027EnrichmentFeedProductionConfiguration.model_validate_json(json.dumps(payload))
 
 
 def test_runtime_rejects_reused_public_key_material_across_trust_domains() -> None:
@@ -604,9 +698,7 @@ def test_runtime_rejects_reused_public_key_material_across_trust_domains() -> No
     ]
 
     with pytest.raises(ValueError, match="public key fingerprints must be distinct"):
-        Wc027EnrichmentFeedProductionConfiguration.model_validate_json(
-            json.dumps(payload)
-        )
+        Wc027EnrichmentFeedProductionConfiguration.model_validate_json(json.dumps(payload))
 
 
 def test_complete_bicep_generated_configuration_starts_with_bound_key_authorities() -> None:
@@ -626,13 +718,21 @@ def test_complete_bicep_generated_configuration_starts_with_bound_key_authoritie
         == "synthetic-key://athena-argus-demo/wc016-incidents-rs256-v1"
     )
     assert (
-        configuration.incident_key.key_vault_key_id
-        == payload["keys"]["incident"]["keyVaultKeyId"]  # type: ignore[index]
+        configuration.incident_key.key_vault_key_id == payload["keys"]["incident"]["keyVaultKeyId"]  # type: ignore[index]
     )
     assert (
         configuration.incident_key.anchor.key_vault_key_id
         == configuration.incident_key.key_vault_key_id
     )
+    assert configuration.delivery_budget == _DELIVERY_BUDGET
+
+
+def test_runtime_configuration_rejects_feed_delivery_budget_drift() -> None:
+    payload = _bicep_generated_runtime_configuration()
+    payload["deliveryBudget"]["feedProcessingSeconds"] = 59  # type: ignore[index]
+
+    with pytest.raises(ValueError, match="delivery budget"):
+        Wc027EnrichmentFeedProductionConfiguration.model_validate_json(json.dumps(payload))
 
 
 def test_only_lifecycle_and_guidance_binding_may_use_logical_key_ids() -> None:
@@ -658,12 +758,13 @@ def test_only_lifecycle_and_guidance_binding_may_use_logical_key_ids() -> None:
         ValueError,
         match=r"keys\.feed\.keyId must equal the referenced key version",
     ):
-        Wc027EnrichmentFeedProductionConfiguration.model_validate_json(
-            json.dumps(payload)
-        )
+        Wc027EnrichmentFeedProductionConfiguration.model_validate_json(json.dumps(payload))
 
 
-def _runtime(*, fail_feed_pointer_once: bool = False):
+def _runtime(
+    *,
+    fail_feed_pointer_once: bool = False,
+):
     fixture = _fixture()
     operations: list[str] = []
     enrichment_store = _Store()
@@ -696,9 +797,7 @@ def _runtime(*, fail_feed_pointer_once: bool = False):
     binding_verifier = _SignatureVerifier()
     incident_authority = _Authority(fixture.publication_reader)
     runtime = Wc027EnrichmentFeedRuntime(
-        guidance_binding_key_id=(
-            fixture.guidance_binding.binding_attestation.key_id
-        ),
+        guidance_binding_key_id=(fixture.guidance_binding.binding_attestation.key_id),
         guidance_binding_signature_verifier=binding_verifier,
         correlation=_Correlation(fixture.correlation_service, operations),
         incident_authority=incident_authority,
@@ -709,6 +808,7 @@ def _runtime(*, fail_feed_pointer_once: bool = False):
         enrichment_publication=_Enrichment(enrichment, operations),
         feed_publication=_Feed(feed, operations),
         notification_publication=notification,
+        delivery_budget=_DELIVERY_BUDGET,
     )
     return (
         fixture,
@@ -748,6 +848,81 @@ def test_runtime_orders_correlation_enrichment_feed_then_notification() -> None:
     assert operations.index("feed.complete") < operations.index("notification")
     assert notification.calls == 1
     assert receipt.binding_id == fixture.guidance_binding.binding_id
+
+
+@pytest.mark.parametrize(
+    ("remaining_seconds", "should_publish"),
+    ((60, True), (59, False)),
+)
+def test_runtime_enforces_exact_feed_processing_boundary(
+    remaining_seconds: int,
+    should_publish: bool,
+) -> None:
+    (
+        fixture,
+        runtime,
+        store,
+        writer,
+        registry,
+        index,
+        notification,
+        operations,
+        _binding_verifier,
+        _incident_authority,
+    ) = _runtime()
+    activation_expires_at = runtime.guidance_activation.snapshot.activation.expires_at
+    published_at = activation_expires_at - timedelta(seconds=remaining_seconds)
+
+    if should_publish:
+        runtime.publish(
+            fixture.guidance_binding,
+            published_at=published_at,
+        )
+        assert notification.calls == 1
+    else:
+        with pytest.raises(
+            Wc027EnrichmentSourceNotReadyError,
+            match="feed processing window",
+        ):
+            runtime.publish(
+                fixture.guidance_binding,
+                published_at=published_at,
+            )
+        assert operations == []
+        assert store.calls == []
+        assert writer.values == {}
+        assert registry.records == {}
+        assert index.calls == 0
+        assert notification.calls == 0
+
+
+def test_feed_trigger_metadata_binds_the_complete_delivery_budget() -> None:
+    binding = _fixture().guidance_binding
+    properties: dict[str, object] = {
+        "schemaVersion": "athena.wc027PublishedGuidanceAuthorityBinding.v2",
+        "bindingDigest": binding.binding_digest,
+    }
+    properties.update(_DELIVERY_BUDGET.broker_properties())
+    message = SimpleNamespace(
+        content_type="application/json",
+        message_id=binding.binding_id,
+        session_id=binding.incident_bound_request.incident_subject.incident_id,
+        application_properties=properties,
+    )
+
+    validate_wc027_enrichment_broker_metadata(
+        message,
+        binding,
+        expected_delivery_budget=_DELIVERY_BUDGET,
+    )
+
+    message.application_properties["feedMinimumRemainingLifetimeSeconds"] = 149
+    with pytest.raises(ValueError, match="broker metadata"):
+        validate_wc027_enrichment_broker_metadata(
+            message,
+            binding,
+            expected_delivery_budget=_DELIVERY_BUDGET,
+        )
 
 
 def test_runtime_rejects_invalid_outer_signature_before_any_authority_or_storage_call() -> None:
@@ -839,6 +1014,7 @@ def test_runtime_rejects_missing_authority_before_correlation_or_writes() -> Non
         enrichment_publication=runtime.enrichment_publication,
         feed_publication=runtime.feed_publication,
         notification_publication=runtime.notification_publication,
+        delivery_budget=runtime.delivery_budget,
     )
 
     with pytest.raises(Wc027EnrichmentSourceNotReadyError):
@@ -869,9 +1045,7 @@ def test_runtime_rejects_stale_signed_binding_before_writes() -> None:
         _incident_authority,
     ) = _runtime()
     stale_current = SimpleNamespace(
-        state=fixture.publication_reader.current.state.model_copy(
-            update={"updated_at": NOW}
-        ),
+        state=fixture.publication_reader.current.state.model_copy(update={"updated_at": NOW}),
         occurrence=fixture.publication_reader.current.occurrence,
         pointer_sha256=fixture.publication_reader.current.pointer_sha256,
     )
@@ -887,6 +1061,7 @@ def test_runtime_rejects_stale_signed_binding_before_writes() -> None:
         enrichment_publication=runtime.enrichment_publication,
         feed_publication=runtime.feed_publication,
         notification_publication=runtime.notification_publication,
+        delivery_budget=runtime.delivery_budget,
     )
 
     with pytest.raises(ValueError, match="stale"):
@@ -916,9 +1091,7 @@ def test_runtime_rejects_binding_that_is_not_the_current_activation() -> None:
         binding_verifier,
         incident_authority,
     ) = _runtime()
-    correlation_request = (
-        fixture.guidance_binding.incident_bound_request.correlation_request
-    )
+    correlation_request = fixture.guidance_binding.incident_bound_request.correlation_request
     report = fixture.guidance_binding.correlation_report
     other_binding = _binding(
         request=correlation_request,
@@ -942,6 +1115,7 @@ def test_runtime_rejects_binding_that_is_not_the_current_activation() -> None:
         enrichment_publication=runtime.enrichment_publication,
         feed_publication=runtime.feed_publication,
         notification_publication=runtime.notification_publication,
+        delivery_budget=runtime.delivery_budget,
     )
 
     with pytest.raises(ValueError, match="activation is invalid or stale"):
@@ -978,9 +1152,7 @@ def test_runtime_retry_recovers_partial_feed_without_early_notification() -> Non
         guidance_binding=fixture.guidance_binding,
     )
     pointer_path = (
-        enrichment.enrichment_asset.manifest_reference.name.removesuffix(
-            "/manifest.json"
-        )
+        enrichment.enrichment_asset.manifest_reference.name.removesuffix("/manifest.json")
         + "/feed-pointer.json"
     )
     writer.fail_after_persist.add(pointer_path)
@@ -1094,10 +1266,7 @@ def test_production_configuration_rejects_identity_and_key_reuse() -> None:
     def key(index: int, identity_index: int) -> _KeyAuthority:
         return _KeyAuthority(
             key_id=f"synthetic-key://wc027/{index}",
-            key_vault_key_id=(
-                "https://synthetic.vault.azure.net/keys/"
-                f"key-{index}/{index:032x}"
-            ),
+            key_vault_key_id=(f"https://synthetic.vault.azure.net/keys/key-{index}/{index:032x}"),
             key_fingerprint="sha256:" + f"{index:x}" * 64,
             identity_client_id=identity_ids[identity_index],
             identity_resource_id=resource_id(identity_index),
@@ -1145,9 +1314,7 @@ def test_production_configuration_rejects_identity_and_key_reuse() -> None:
         "feed_key": key(10, 14),
         "notification_key": key(11, 15),
         "binding_evidence_id": "00000000-0000-0000-0000-000000000099",
-        "attached_identity_resource_ids": tuple(
-            resource_id(index) for index in range(17)
-        ),
+        "attached_identity_resource_ids": tuple(resource_id(index) for index in range(17)),
         "rbac_resource_ids": (
             "/subscriptions/00000000-0000-0000-0000-000000000000/"
             "providers/Microsoft.Authorization/roleDefinitions/"
@@ -1171,9 +1338,7 @@ def test_production_configuration_rejects_identity_and_key_reuse() -> None:
             reader_identity_resource_id=(
                 configuration.enrichment_feed_assets.reader_identity_resource_id
             ),
-            writer_identity_client_id=(
-                configuration.incident_lifecycle_assets.identity_client_id
-            ),
+            writer_identity_client_id=(configuration.incident_lifecycle_assets.identity_client_id),
             writer_identity_resource_id=(
                 configuration.incident_lifecycle_assets.identity_resource_id
             ),

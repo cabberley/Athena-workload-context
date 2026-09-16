@@ -30,6 +30,8 @@ from athena_context.azure_adapters import (
     production_managed_identity_credential,
 )
 from athena_context.contracts import (
+    WC027_GUIDANCE_ACTIVATION_MAX_LIFETIME_SECONDS,
+    GuidancePublicationRequestDeliveryBudget,
     PublishedGuidanceAuthorityActivation,
     PublishedGuidanceAuthorityBinding,
     VersionPinnedBlobReference,
@@ -157,6 +159,24 @@ class AzureBlobGuidanceAuthorityArtifactWriter:
             contentDigest=request.hashes.payload_sha256,
         )
 
+    def read_reference(
+        self,
+        reference: VersionPinnedBlobReference,
+    ) -> bytes:
+        if type(reference) is not VersionPinnedBlobReference:
+            raise TypeError(
+                "reference must be an exact VersionPinnedBlobReference"
+            )
+        if _GUIDANCE_AUTHORITY_ASSET_PATH.fullmatch(reference.name) is None:
+            raise ValueError("artifact path is outside guidance authority storage")
+        return self._reader.read(
+            ArtifactReadRequest(
+                blob_name=reference.name,
+                version_id=reference.version,
+                expected_payload_sha256=reference.content_digest,
+            )
+        ).payload
+
 
 class AzureTableGuidanceAuthorityActivationStore:
     """CAS store for one active authority binding per incident."""
@@ -273,11 +293,34 @@ class AzureServiceBusGuidanceAuthorityTrigger:
         binding: PublishedGuidanceAuthorityBinding,
         *,
         time_to_live_seconds: int,
+        delivery_budget: GuidancePublicationRequestDeliveryBudget,
     ) -> None:
         from azure.servicebus import ServiceBusMessage
 
-        if not 1 <= time_to_live_seconds <= 900:
-            raise ValueError("guidance trigger TTL must be between 1 and 900 seconds")
+        if (
+            type(delivery_budget)
+            is not GuidancePublicationRequestDeliveryBudget
+        ):
+            raise TypeError(
+                "delivery_budget must be an exact "
+                "GuidancePublicationRequestDeliveryBudget"
+            )
+        if not (
+            delivery_budget.feed_minimum_remaining_lifetime_seconds
+            <= time_to_live_seconds
+            <= WC027_GUIDANCE_ACTIVATION_MAX_LIFETIME_SECONDS
+        ):
+            raise ValueError(
+                "guidance trigger TTL does not retain the reviewed feed "
+                "delivery budget"
+            )
+        application_properties: dict[str | bytes, Any] = {
+            "schemaVersion": (
+                "athena.wc027PublishedGuidanceAuthorityBinding.v2"
+            ),
+            "bindingDigest": binding.binding_digest,
+        }
+        application_properties.update(delivery_budget.broker_properties())
         message = ServiceBusMessage(
             binding.canonical_bytes(),
             content_type="application/json",
@@ -286,12 +329,7 @@ class AzureServiceBusGuidanceAuthorityTrigger:
                 binding.incident_bound_request.incident_subject.incident_id
             ),
             time_to_live=timedelta(seconds=time_to_live_seconds),
-            application_properties={
-                "schemaVersion": (
-                    "athena.wc027PublishedGuidanceAuthorityBinding.v2"
-                ),
-                "bindingDigest": binding.binding_digest,
-            },
+            application_properties=application_properties,
         )
         cast(Any, self._sender).send_messages(message)
 

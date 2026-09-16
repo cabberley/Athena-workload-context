@@ -262,6 +262,24 @@ param wc027EnrichmentFeedProducerConfigurationDigest string = ''
 @description('Exact non-secret runtime configuration JSON deployed to the WC-027 producer Job.')
 param wc027EnrichmentFeedProducerConfigurationJson string = ''
 
+@description('Exact digest-pinned image deployed to the WC-027 enrichment/feed producer Job.')
+param wc027EnrichmentFeedProducerImage string = ''
+
+@description('Explicit confirmation that the separate WC-027 guidance publication-request producer is deployed and ready. False by default keeps the complete production chain fail-closed.')
+param wc027RequestProducerReady bool = false
+
+@description('Exact deployed WC-027 guidance publication-request producer Job resource ID.')
+param wc027RequestProducerJobResourceId string = ''
+
+@description('SHA-256 digest of the exact deployed guidance publication-request producer configuration.')
+param wc027RequestProducerConfigurationDigest string = ''
+
+@description('Exact non-secret configuration JSON deployed to the guidance publication-request producer Job.')
+param wc027RequestProducerConfigurationJson string = ''
+
+@description('Exact digest-pinned image deployed to the guidance publication-request producer Job.')
+param wc027RequestProducerImage string = ''
+
 @description('Explicit confirmation that the separately governed PublishedGuidanceAuthorityBinding.v2 publisher is deployed and ready. False by default keeps Notification v2 fail-closed even when a producer Job exists.')
 param wc027PublisherReady bool = false
 
@@ -317,12 +335,12 @@ var validatedWc016RuntimeEnabled = wc016RuntimeEnabled && !wc016LegacyCleanupCon
   : wc016RuntimeEnabled && signingKeyFingerprint == rejectedIncidentFixtureFingerprint
     ? fail('WC-016 cannot be activated with the checked-in incident trust fixture; pin the deployed key first')
     : wc016RuntimeEnabled
-var wc027ProducerJobResourceIdRawSegments = split(
-  wc027EnrichmentFeedProducerJobResourceId,
+var wc027RequestProducerJobResourceIdRawSegments = split(
+  wc027RequestProducerJobResourceId,
   '/'
 )
-var wc027PublisherJobResourceIdRawSegments = split(wc027PublisherJobResourceId, '/')
-var wc027PublisherJobResourceIdSegments = concat(
+var wc027RequestProducerJobResourceIdSegments = concat(
+  wc027RequestProducerJobResourceIdRawSegments,
   [
     ''
     ''
@@ -333,10 +351,266 @@ var wc027PublisherJobResourceIdSegments = concat(
     ''
     ''
     ''
-  ],
-  wc027PublisherJobResourceIdRawSegments
+  ]
 )
-var wc027PublisherJobResourceIdValid = length(wc027PublisherJobResourceIdRawSegments) == 9 && wc027PublisherJobResourceIdSegments[1] == 'subscriptions' && wc027PublisherJobResourceIdSegments[3] == 'resourceGroups' && toLower(wc027PublisherJobResourceIdSegments[6]) == 'microsoft.app' && toLower(wc027PublisherJobResourceIdSegments[7]) == 'jobs' && !empty(wc027PublisherJobResourceIdSegments[8])
+var wc027RequestProducerJobResourceIdShapeValid = length(wc027RequestProducerJobResourceIdRawSegments) == 9 && empty(wc027RequestProducerJobResourceIdSegments[0]) && wc027RequestProducerJobResourceIdSegments[1] == 'subscriptions' && !empty(wc027RequestProducerJobResourceIdSegments[2]) && toLower(wc027RequestProducerJobResourceIdSegments[2]) == toLower(subscription().subscriptionId) && wc027RequestProducerJobResourceIdSegments[3] == 'resourceGroups' && !empty(wc027RequestProducerJobResourceIdSegments[4]) && toLower(wc027RequestProducerJobResourceIdSegments[4]) == toLower(foundationResourceGroupName) && wc027RequestProducerJobResourceIdSegments[5] == 'providers' && wc027RequestProducerJobResourceIdSegments[6] == 'Microsoft.App' && wc027RequestProducerJobResourceIdSegments[7] == 'jobs' && !empty(wc027RequestProducerJobResourceIdSegments[8]) && !contains(wc027RequestProducerJobResourceId, '//') && !contains(wc027RequestProducerJobResourceId, '?') && !contains(wc027RequestProducerJobResourceId, '#') && !contains(wc027RequestProducerJobResourceId, '%')
+var wc027RequestProducerJobResourceIdValid = wc027RequestProducerJobResourceIdShapeValid
+var wc027RequestProducerConfigurationDigestHex = replace(
+  wc027RequestProducerConfigurationDigest,
+  'sha256:',
+  ''
+)
+var wc027RequestProducerConfigurationDigestWithoutDigits = replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(
+  wc027RequestProducerConfigurationDigestHex,
+  '0',
+  ''
+), '1', ''), '2', ''), '3', ''), '4', ''), '5', ''), '6', ''), '7', ''), '8', ''), '9', '')
+var wc027RequestProducerConfigurationDigestInvalidCharacters = replace(replace(replace(replace(replace(replace(
+  wc027RequestProducerConfigurationDigestWithoutDigits,
+  'a',
+  ''
+), 'b', ''), 'c', ''), 'd', ''), 'e', ''), 'f', '')
+var wc027RequestProducerConfigurationDigestValid = length(wc027RequestProducerConfigurationDigest) == 71 && wc027RequestProducerConfigurationDigest == toLower(
+  wc027RequestProducerConfigurationDigest
+) && empty(wc027RequestProducerConfigurationDigestInvalidCharacters)
+var wc027RequestProducerImageDigest = contains(wc027RequestProducerImage, '@sha256:')
+  ? last(split(wc027RequestProducerImage, '@sha256:'))
+  : ''
+var wc027RequestProducerImageDigestWithoutDigits = replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(
+  wc027RequestProducerImageDigest,
+  '0',
+  ''
+), '1', ''), '2', ''), '3', ''), '4', ''), '5', ''), '6', ''), '7', ''), '8', ''), '9', '')
+var wc027RequestProducerImageInvalidCharacters = replace(replace(replace(replace(replace(replace(
+  wc027RequestProducerImageDigestWithoutDigits,
+  'a',
+  ''
+), 'b', ''), 'c', ''), 'd', ''), 'e', ''), 'f', '')
+var wc027RequestProducerImageValid = wc027RequestProducerImage == toLower(wc027RequestProducerImage) && length(wc027RequestProducerImageDigest) == 64 && empty(wc027RequestProducerImageInvalidCharacters) && wc027RequestProducerImageDigest != '0000000000000000000000000000000000000000000000000000000000000000'
+var wc027ReviewedPublisherKedaPollingIntervalSeconds = 30
+var wc027ReviewedPublisherColdStartSeconds = 30
+var wc027ReviewedPublisherConnectionSetupSeconds = 30
+var wc027ReviewedPublisherProcessingSeconds = 60
+var wc027ReviewedPublisherMinimumRemainingLifetimeSeconds = wc027ReviewedPublisherKedaPollingIntervalSeconds + wc027ReviewedPublisherColdStartSeconds + wc027ReviewedPublisherConnectionSetupSeconds + wc027ReviewedPublisherProcessingSeconds
+var wc027ReviewedFeedKedaPollingIntervalSeconds = 30
+var wc027ReviewedFeedColdStartSeconds = 30
+var wc027ReviewedFeedConnectionSetupSeconds = 30
+var wc027ReviewedFeedProcessingSeconds = 60
+var wc027ReviewedFeedMinimumRemainingLifetimeSeconds = wc027ReviewedFeedKedaPollingIntervalSeconds + wc027ReviewedFeedColdStartSeconds + wc027ReviewedFeedConnectionSetupSeconds + wc027ReviewedFeedProcessingSeconds
+var wc027ReviewedFeedTriggerRecoverySeconds = 300
+var wc027ReviewedMinimumRemainingLifetimeSeconds = wc027ReviewedPublisherMinimumRemainingLifetimeSeconds
+var wc027ParsedRequestProducerConfiguration = json(
+  empty(wc027RequestProducerConfigurationJson)
+    ? '{"deliveryBudget":{"feedColdStartSeconds":0,"feedConnectionSetupSeconds":0,"feedKedaPollingIntervalSeconds":0,"feedMinimumRemainingLifetimeSeconds":0,"feedProcessingSeconds":0,"feedTriggerRecoverySeconds":0,"minimumRemainingLifetimeSeconds":0,"publisherColdStartSeconds":0,"publisherConnectionSetupSeconds":0,"publisherKedaPollingIntervalSeconds":0,"publisherMinimumRemainingLifetimeSeconds":0,"publisherProcessingSeconds":0},"deploymentBinding":{"attachedIdentityResourceIds":[],"bindingEvidenceId":"","rbacResourceIds":[]},"requestSigningKey":{"keyFingerprint":"","keyId":"","keyVaultKeyId":""},"serviceBus":{"inputQueueName":"","namespace":"","outputQueueName":"","receiverIdentityResourceId":""}}'
+    : wc027RequestProducerConfigurationJson
+)
+var wc027RequestProducerDeliveryBudget = wc027ParsedRequestProducerConfiguration.deliveryBudget
+var wc027RequestProducerDeliveryBudgetValid = !contains([
+  wc027RequestProducerDeliveryBudget.publisherKedaPollingIntervalSeconds == wc027ReviewedPublisherKedaPollingIntervalSeconds
+  wc027RequestProducerDeliveryBudget.publisherColdStartSeconds == wc027ReviewedPublisherColdStartSeconds
+  wc027RequestProducerDeliveryBudget.publisherConnectionSetupSeconds == wc027ReviewedPublisherConnectionSetupSeconds
+  wc027RequestProducerDeliveryBudget.publisherProcessingSeconds == wc027ReviewedPublisherProcessingSeconds
+  wc027RequestProducerDeliveryBudget.publisherMinimumRemainingLifetimeSeconds == wc027ReviewedPublisherMinimumRemainingLifetimeSeconds
+  wc027RequestProducerDeliveryBudget.feedKedaPollingIntervalSeconds == wc027ReviewedFeedKedaPollingIntervalSeconds
+  wc027RequestProducerDeliveryBudget.feedColdStartSeconds == wc027ReviewedFeedColdStartSeconds
+  wc027RequestProducerDeliveryBudget.feedConnectionSetupSeconds == wc027ReviewedFeedConnectionSetupSeconds
+  wc027RequestProducerDeliveryBudget.feedProcessingSeconds == wc027ReviewedFeedProcessingSeconds
+  wc027RequestProducerDeliveryBudget.feedMinimumRemainingLifetimeSeconds == wc027ReviewedFeedMinimumRemainingLifetimeSeconds
+  wc027RequestProducerDeliveryBudget.feedTriggerRecoverySeconds == wc027ReviewedFeedTriggerRecoverySeconds
+  wc027RequestProducerDeliveryBudget.minimumRemainingLifetimeSeconds == wc027ReviewedMinimumRemainingLifetimeSeconds
+  wc027RequestProducerDeliveryBudget.publisherMinimumRemainingLifetimeSeconds == wc027RequestProducerDeliveryBudget.publisherKedaPollingIntervalSeconds + wc027RequestProducerDeliveryBudget.publisherColdStartSeconds + wc027RequestProducerDeliveryBudget.publisherConnectionSetupSeconds + wc027RequestProducerDeliveryBudget.publisherProcessingSeconds
+  wc027RequestProducerDeliveryBudget.feedMinimumRemainingLifetimeSeconds == wc027RequestProducerDeliveryBudget.feedKedaPollingIntervalSeconds + wc027RequestProducerDeliveryBudget.feedColdStartSeconds + wc027RequestProducerDeliveryBudget.feedConnectionSetupSeconds + wc027RequestProducerDeliveryBudget.feedProcessingSeconds
+  wc027RequestProducerDeliveryBudget.minimumRemainingLifetimeSeconds == wc027RequestProducerDeliveryBudget.publisherMinimumRemainingLifetimeSeconds
+], false)
+var wc027RequestProducerImageRegistryServer = first(split(wc027RequestProducerImage, '/'))
+var wc027RequestProducerExpectedIdentityResourceIds = map(
+  wc027ParsedRequestProducerConfiguration.deploymentBinding.attachedIdentityResourceIds,
+  identityResourceId => toLower(identityResourceId)
+)
+var wc027RequestProducerConfiguredIdentityResourceIds = wc027RequestProducerReady && !empty(wc027RequestProducerConfigurationJson)
+  ? map([
+      wc027ParsedRequestProducerConfiguration.serviceBus.receiverIdentityResourceId
+      wc027ParsedRequestProducerConfiguration.serviceBus.senderIdentityResourceId
+      wc027ParsedRequestProducerConfiguration.incidentLifecycleAssets.identityResourceId
+      wc027ParsedRequestProducerConfiguration.contextAuthoritySource.identityResourceId
+      wc027ParsedRequestProducerConfiguration.requestOutbox.readerIdentityResourceId
+      wc027ParsedRequestProducerConfiguration.requestOutbox.writerIdentityResourceId
+      wc027ParsedRequestProducerConfiguration.incidentKey.identityResourceId
+      wc027ParsedRequestProducerConfiguration.correlationBindingKey.identityResourceId
+      wc027ParsedRequestProducerConfiguration.requestSigningKey.signerIdentityResourceId
+      wc027ParsedRequestProducerConfiguration.requestSigningKey.verifierIdentityResourceId
+    ], identityResourceId => toLower(identityResourceId))
+  : []
+var wc027DistinctRequestProducerConfiguredIdentityResourceIds = union(
+  wc027RequestProducerConfiguredIdentityResourceIds,
+  wc027RequestProducerConfiguredIdentityResourceIds
+)
+var wc027RequestProducerConfigurationIdentitiesMatchBinding = !empty(wc027DistinctRequestProducerConfiguredIdentityResourceIds) && length(wc027RequestProducerExpectedIdentityResourceIds) == length(union(wc027RequestProducerExpectedIdentityResourceIds, wc027RequestProducerExpectedIdentityResourceIds)) && length(wc027DistinctRequestProducerConfiguredIdentityResourceIds) == length(wc027RequestProducerExpectedIdentityResourceIds) && length(union(wc027DistinctRequestProducerConfiguredIdentityResourceIds, wc027RequestProducerExpectedIdentityResourceIds)) == length(wc027DistinctRequestProducerConfiguredIdentityResourceIds)
+var wc027RequestProducerRbacResourceIds = wc027ParsedRequestProducerConfiguration.deploymentBinding.rbacResourceIds
+var wc027RequestProducerRbacEvidenceMatches = !empty(wc027RequestProducerRbacResourceIds) && guid(
+  join(wc027RequestProducerRbacResourceIds, '|')
+) == wc027ParsedRequestProducerConfiguration.deploymentBinding.bindingEvidenceId
+var wc027RequestProducerAttachedIdentityResourceIds = wc027RequestProducerReady && wc027RequestProducerJobResourceIdValid
+  ? map(items(wc027RequestProducerJob!.identity.?userAssignedIdentities ?? {}), identity => toLower(identity.key))
+  : []
+var wc027RequestProducerIdentitiesMatch = !empty(wc027RequestProducerExpectedIdentityResourceIds) && length(
+  wc027RequestProducerAttachedIdentityResourceIds
+) == length(wc027RequestProducerExpectedIdentityResourceIds) && length(union(
+  wc027RequestProducerAttachedIdentityResourceIds,
+  wc027RequestProducerExpectedIdentityResourceIds
+)) == length(wc027RequestProducerExpectedIdentityResourceIds)
+var wc027RequestProducerRuntimeIdentityOverlap = intersection(
+  wc027DistinctRequestProducerConfiguredIdentityResourceIds,
+  wc027DistinctConfiguredIdentityResourceIds
+)
+var wc027RequestProducerPublisherIdentityOverlap = intersection(
+  wc027DistinctRequestProducerConfiguredIdentityResourceIds,
+  wc027DistinctPublisherConfiguredIdentityResourceIds
+)
+var wc027RequestProducerHasExactContainerCount = wc027RequestProducerReady && wc027RequestProducerJobResourceIdValid
+  ? length(wc027RequestProducerJob!.properties.template.containers) == 1
+  : false
+var wc027RequestProducerIdentityTypeMatches = wc027RequestProducerReady && wc027RequestProducerJobResourceIdValid
+  ? (wc027RequestProducerJob!.identity.?type ?? '') == 'UserAssigned'
+  : false
+var wc027RequestProducerTemplateMatches = wc027RequestProducerReady && wc027RequestProducerJobResourceIdValid && wc027RequestProducerHasExactContainerCount && !empty(wc027RequestProducerConfigurationJson)
+  ? !contains([
+      wc027RequestProducerJob!.properties.template.containers[0].name == 'wc027-guidance-publication-request-producer'
+      wc027RequestProducerJob!.properties.template.containers[0].image == wc027RequestProducerImage
+      length(wc027RequestProducerJob!.properties.template.containers[0].command) == 1
+      wc027RequestProducerJob!.properties.template.containers[0].command[0] == 'athena-context'
+      length(wc027RequestProducerJob!.properties.template.containers[0].args) == 1
+      wc027RequestProducerJob!.properties.template.containers[0].args[0] == 'wc027-guidance-publication-request-producer'
+      length(wc027RequestProducerJob!.properties.template.containers[0].env) == 2
+      wc027RequestProducerJob!.properties.template.containers[0].env[0].name == 'AZURE_CLIENT_ID'
+      wc027RequestProducerJob!.properties.template.containers[0].env[0].value == wc027ParsedRequestProducerConfiguration.serviceBus.receiverIdentityClientId
+      wc027RequestProducerJob!.properties.template.containers[0].env[1].name == 'ATHENA_WC027_GUIDANCE_REQUEST_PRODUCER_CONFIG_JSON'
+      wc027RequestProducerJob!.properties.template.containers[0].env[1].value == wc027RequestProducerConfigurationJson
+      wc027RequestProducerJob!.properties.template.containers[0].resources.cpu == 1
+      wc027RequestProducerJob!.properties.template.containers[0].resources.memory == '2Gi'
+      empty(wc027RequestProducerJob!.properties.template.containers[0].?probes ?? [])
+      empty(wc027RequestProducerJob!.properties.template.containers[0].?volumeMounts ?? [])
+      empty(wc027RequestProducerJob!.properties.template.?initContainers ?? [])
+      empty(wc027RequestProducerJob!.properties.template.?volumes ?? [])
+    ], false)
+  : false
+var wc027RequestProducerExecutionConfigurationMatches = wc027RequestProducerReady && wc027RequestProducerJobResourceIdValid
+  ? !contains([
+      wc027RequestProducerJob!.properties.environmentId == azureMcp.outputs.managedEnvironmentResourceId
+      wc027RequestProducerJob!.properties.configuration.replicaTimeout == 900
+      wc027RequestProducerJob!.properties.configuration.replicaRetryLimit == 0
+      wc027RequestProducerJob!.properties.configuration.triggerType == 'Event'
+      empty(wc027RequestProducerJob!.properties.configuration.?identitySettings ?? [])
+      empty(wc027RequestProducerJob!.properties.configuration.?secrets ?? [])
+      wc027RequestProducerJob!.properties.configuration.eventTriggerConfig.parallelism == 1
+      wc027RequestProducerJob!.properties.configuration.eventTriggerConfig.replicaCompletionCount == 1
+      wc027RequestProducerJob!.properties.configuration.eventTriggerConfig.scale.minExecutions == 0
+      wc027RequestProducerJob!.properties.configuration.eventTriggerConfig.scale.maxExecutions == 1
+      wc027RequestProducerJob!.properties.configuration.eventTriggerConfig.scale.pollingInterval == 30
+      length(wc027RequestProducerJob!.properties.configuration.eventTriggerConfig.scale.rules) == 1
+    ], false)
+  : false
+var wc027RequestProducerHasExactScalerRuleCount = wc027RequestProducerReady && wc027RequestProducerJobResourceIdValid
+  ? length(wc027RequestProducerJob!.properties.configuration.eventTriggerConfig.scale.rules) == 1
+  : false
+var wc027RequestProducerScalerMatches = wc027RequestProducerReady && wc027RequestProducerJobResourceIdValid && !empty(wc027RequestProducerConfigurationJson) && wc027RequestProducerHasExactScalerRuleCount
+  ? !contains([
+      wc027RequestProducerJob!.properties.configuration.eventTriggerConfig.scale.rules[0].name == 'wc027-guidance-publication-request-input'
+      wc027RequestProducerJob!.properties.configuration.eventTriggerConfig.scale.rules[0].type == 'azure-servicebus'
+      wc027RequestProducerJob!.properties.configuration.eventTriggerConfig.scale.rules[0].identity == wc027ParsedRequestProducerConfiguration.serviceBus.receiverIdentityResourceId
+      empty(wc027RequestProducerJob!.properties.configuration.eventTriggerConfig.scale.rules[0].?auth ?? [])
+      length(items(wc027RequestProducerJob!.properties.configuration.eventTriggerConfig.scale.rules[0].metadata)) == 5
+      wc027RequestProducerJob!.properties.configuration.eventTriggerConfig.scale.rules[0].metadata.namespace == first(split(wc027ParsedRequestProducerConfiguration.serviceBus.namespace, '.'))
+      wc027RequestProducerJob!.properties.configuration.eventTriggerConfig.scale.rules[0].metadata.queueName == wc027ParsedRequestProducerConfiguration.serviceBus.inputQueueName
+      wc027RequestProducerJob!.properties.configuration.eventTriggerConfig.scale.rules[0].metadata.messageCount == '1'
+      wc027RequestProducerJob!.properties.configuration.eventTriggerConfig.scale.rules[0].metadata.cloud == 'AzurePublicCloud'
+      wc027RequestProducerJob!.properties.configuration.eventTriggerConfig.scale.rules[0].metadata.isSessionsEnabled == 'true'
+    ], false)
+  : false
+var wc027RequestProducerHasExactRegistryCount = wc027RequestProducerReady && wc027RequestProducerJobResourceIdValid
+  ? length(wc027RequestProducerJob!.properties.configuration.registries) == 1
+  : false
+var wc027RequestProducerRegistryMatches = wc027RequestProducerReady && wc027RequestProducerJobResourceIdValid && !empty(wc027RequestProducerConfigurationJson) && wc027RequestProducerHasExactRegistryCount
+  ? !contains([
+      wc027RequestProducerJob!.properties.configuration.registries[0].server == wc027RequestProducerImageRegistryServer
+      wc027RequestProducerJob!.properties.configuration.registries[0].identity == wc027ParsedRequestProducerConfiguration.serviceBus.receiverIdentityResourceId
+      length(items(wc027RequestProducerJob!.properties.configuration.registries[0])) == 2
+    ], false)
+  : false
+var wc027RequestProducerTagsMatch = wc027RequestProducerReady && wc027RequestProducerJobResourceIdValid
+  ? !contains([
+      wc027RequestProducerJob!.tags.runtimeConfigurationDigest == wc027RequestProducerConfigurationDigest
+      wc027RequestProducerJob!.tags.enrichmentRuntimeConfigurationDigest == wc027EnrichmentFeedProducerConfigurationDigest
+    ], false)
+  : false
+var validatedWc027RequestProducerReady = wc027RequestProducerReady && !wc027RequestProducerJobResourceIdValid
+  ? fail('wc027RequestProducerJobResourceId must identify one Microsoft.App/jobs resource')
+  : wc027RequestProducerReady && !wc027RequestProducerConfigurationDigestValid
+    ? fail('WC-027 request producer requires the exact deployed configuration digest')
+    : wc027RequestProducerReady && empty(wc027RequestProducerConfigurationJson)
+      ? fail('WC-027 request producer requires the exact deployed configuration JSON')
+      : wc027RequestProducerReady && (empty(wc027EnrichmentFeedProducerConfigurationJson) || !wc027ConfigurationDigestValid)
+        ? fail('WC-027 request producer requires the exact deployed enrichment runtime configuration')
+        : wc027RequestProducerReady && !wc027ConfigurationIdentitiesMatchBinding
+          ? fail('WC-027 enrichment runtime identities do not exactly match its deployment binding')
+          : wc027RequestProducerReady && !wc027RequestProducerConfigurationIdentitiesMatchBinding
+            ? fail('WC-027 request producer configuration identities do not exactly match its deployment binding')
+            : wc027RequestProducerReady && !empty(wc027RequestProducerRuntimeIdentityOverlap)
+              ? fail('WC-027 request producer identities overlap the enrichment runtime identity boundary')
+              : wc027RequestProducerReady && wc027PublisherReady && !empty(wc027RequestProducerPublisherIdentityOverlap)
+                ? fail('WC-027 request producer identities overlap the publisher identity boundary')
+                : wc027RequestProducerReady && !wc027RequestProducerImageValid
+                  ? fail('WC-027 request producer requires the exact digest-pinned deployed image')
+                  : wc027RequestProducerReady && !wc027RequestProducerIdentityTypeMatches
+                    ? fail('WC-027 request producer Job must use only user-assigned identities')
+                    : wc027RequestProducerReady && !wc027RequestProducerHasExactContainerCount
+                      ? fail('WC-027 request producer Job must contain exactly one reviewed container')
+                      : wc027RequestProducerReady && !wc027RequestProducerTemplateMatches
+                        ? fail('WC-027 request producer Job execution template does not exactly match')
+                        : wc027RequestProducerReady && !wc027RequestProducerExecutionConfigurationMatches
+                          ? fail('WC-027 request producer Job replica and concurrency configuration does not exactly match')
+                          : wc027RequestProducerReady && !wc027RequestProducerScalerMatches
+                            ? fail('WC-027 request producer Job scaler configuration does not exactly match')
+                            : wc027RequestProducerReady && wc027ParsedRequestProducerConfiguration.serviceBus.inputQueueName != 'wc027-guidance-publication-inputs'
+                              ? fail('WC-027 request producer input queue does not match the production chain')
+                              : wc027RequestProducerReady && wc027ParsedRequestProducerConfiguration.serviceBus.outputQueueName != 'wc027-guidance-authority-requests'
+                                ? fail('WC-027 request producer output queue does not match the authority publisher')
+                                : wc027RequestProducerReady && !wc027RequestProducerRegistryMatches
+                                  ? fail('WC-027 request producer Job registry configuration does not exactly match')
+                                  : wc027RequestProducerReady && !wc027RequestProducerTagsMatch
+                                    ? fail('WC-027 request producer Job configuration digest tags do not match')
+                                    : wc027RequestProducerReady && !wc027RequestProducerDeliveryBudgetValid
+                                      ? fail('WC-027 request producer delivery budget does not match the reviewed publisher and feed delivery phases')
+                                      : wc027RequestProducerReady && !wc027RuntimeDeliveryBudgetValid
+                                        ? fail('WC-027 enrichment runtime delivery budget does not match the reviewed publisher and feed delivery phases')
+                                        : wc027RequestProducerReady && !wc027RequestProducerRuntimeDeliveryBudgetsMatch
+                                          ? fail('WC-027 request producer and enrichment runtime delivery budgets do not match')
+                                          : wc027RequestProducerReady && !wc027RequestProducerRbacEvidenceMatches
+                                            ? fail('WC-027 request producer RBAC evidence does not match its deployed configuration')
+                                            : wc027RequestProducerReady && !wc027RequestProducerIdentitiesMatch
+                                              ? fail('WC-027 request producer identities do not match its deployed configuration')
+                                              : wc027RequestProducerReady
+var wc027ProducerJobResourceIdRawSegments = split(
+  wc027EnrichmentFeedProducerJobResourceId,
+  '/'
+)
+var wc027PublisherJobResourceIdRawSegments = split(wc027PublisherJobResourceId, '/')
+var wc027PublisherJobResourceIdSegments = concat(
+  wc027PublisherJobResourceIdRawSegments,
+  [
+    ''
+    ''
+    ''
+    ''
+    ''
+    ''
+    ''
+    ''
+    ''
+  ]
+)
+var wc027PublisherJobResourceIdShapeValid = length(wc027PublisherJobResourceIdRawSegments) == 9 && empty(wc027PublisherJobResourceIdSegments[0]) && wc027PublisherJobResourceIdSegments[1] == 'subscriptions' && !empty(wc027PublisherJobResourceIdSegments[2]) && toLower(wc027PublisherJobResourceIdSegments[2]) == toLower(subscription().subscriptionId) && wc027PublisherJobResourceIdSegments[3] == 'resourceGroups' && !empty(wc027PublisherJobResourceIdSegments[4]) && toLower(wc027PublisherJobResourceIdSegments[4]) == toLower(foundationResourceGroupName) && wc027PublisherJobResourceIdSegments[5] == 'providers' && wc027PublisherJobResourceIdSegments[6] == 'Microsoft.App' && wc027PublisherJobResourceIdSegments[7] == 'jobs' && !empty(wc027PublisherJobResourceIdSegments[8]) && !contains(wc027PublisherJobResourceId, '//') && !contains(wc027PublisherJobResourceId, '?') && !contains(wc027PublisherJobResourceId, '#') && !contains(wc027PublisherJobResourceId, '%')
+var wc027PublisherJobResourceIdValid = wc027PublisherJobResourceIdShapeValid
 var wc027PublisherConfigurationDigestHex = replace(wc027PublisherConfigurationDigest, 'sha256:', '')
 var wc027PublisherConfigurationDigestInvalidCharacters = replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(
   wc027PublisherConfigurationDigestHex,
@@ -360,25 +634,103 @@ var wc027PublisherImageInvalidCharacters = replace(replace(replace(replace(repla
 var wc027PublisherImageValid = wc027PublisherImage == toLower(wc027PublisherImage) && length(wc027PublisherImageDigest) == 64 && empty(wc027PublisherImageInvalidCharacters) && wc027PublisherImageDigest != '0000000000000000000000000000000000000000000000000000000000000000'
 var wc027ParsedPublisherConfiguration = json(
   empty(wc027PublisherConfigurationJson)
-    ? '{"deploymentBinding":{"attachedIdentityResourceIds":[],"bindingEvidenceId":"","rbacResourceIds":[]},"enrichmentRuntimeConfiguration":{},"serviceBus":{"brokerIdentityResourceId":"","namespace":"","requestQueueName":""}}'
+    ? '{"deliveryBudget":{"feedColdStartSeconds":0,"feedConnectionSetupSeconds":0,"feedKedaPollingIntervalSeconds":0,"feedMinimumRemainingLifetimeSeconds":0,"feedProcessingSeconds":0,"feedTriggerRecoverySeconds":0,"minimumRemainingLifetimeSeconds":0,"publisherColdStartSeconds":0,"publisherConnectionSetupSeconds":0,"publisherKedaPollingIntervalSeconds":0,"publisherMinimumRemainingLifetimeSeconds":0,"publisherProcessingSeconds":0},"deploymentBinding":{"attachedIdentityResourceIds":[],"bindingEvidenceId":"","rbacResourceIds":[]},"enrichmentRuntimeConfiguration":{},"requestOutbox":{"blobEndpoint":"","containerName":"","identityResourceId":""},"serviceBus":{"brokerIdentityResourceId":"","namespace":"","requestQueueName":"","requestSubmitterIdentityResourceId":""}}'
     : wc027PublisherConfigurationJson
 )
 var wc027ParsedProducerConfiguration = json(
   empty(wc027EnrichmentFeedProducerConfigurationJson)
-    ? '{}'
+    ? '{"deliveryBudget":{"feedColdStartSeconds":0,"feedConnectionSetupSeconds":0,"feedKedaPollingIntervalSeconds":0,"feedMinimumRemainingLifetimeSeconds":0,"feedProcessingSeconds":0,"feedTriggerRecoverySeconds":0,"minimumRemainingLifetimeSeconds":0,"publisherColdStartSeconds":0,"publisherConnectionSetupSeconds":0,"publisherKedaPollingIntervalSeconds":0,"publisherMinimumRemainingLifetimeSeconds":0,"publisherProcessingSeconds":0}}'
     : wc027EnrichmentFeedProducerConfigurationJson
 )
 var wc027PublisherImageRegistryServer = first(split(wc027PublisherImage, '/'))
+var wc027PublisherDeliveryBudget = wc027ParsedPublisherConfiguration.deliveryBudget
+var wc027PublisherDeliveryBudgetValid = !contains([
+  wc027PublisherDeliveryBudget.publisherKedaPollingIntervalSeconds == wc027ReviewedPublisherKedaPollingIntervalSeconds
+  wc027PublisherDeliveryBudget.publisherColdStartSeconds == wc027ReviewedPublisherColdStartSeconds
+  wc027PublisherDeliveryBudget.publisherConnectionSetupSeconds == wc027ReviewedPublisherConnectionSetupSeconds
+  wc027PublisherDeliveryBudget.publisherProcessingSeconds == wc027ReviewedPublisherProcessingSeconds
+  wc027PublisherDeliveryBudget.publisherMinimumRemainingLifetimeSeconds == wc027ReviewedPublisherMinimumRemainingLifetimeSeconds
+  wc027PublisherDeliveryBudget.feedKedaPollingIntervalSeconds == wc027ReviewedFeedKedaPollingIntervalSeconds
+  wc027PublisherDeliveryBudget.feedColdStartSeconds == wc027ReviewedFeedColdStartSeconds
+  wc027PublisherDeliveryBudget.feedConnectionSetupSeconds == wc027ReviewedFeedConnectionSetupSeconds
+  wc027PublisherDeliveryBudget.feedProcessingSeconds == wc027ReviewedFeedProcessingSeconds
+  wc027PublisherDeliveryBudget.feedMinimumRemainingLifetimeSeconds == wc027ReviewedFeedMinimumRemainingLifetimeSeconds
+  wc027PublisherDeliveryBudget.feedTriggerRecoverySeconds == wc027ReviewedFeedTriggerRecoverySeconds
+  wc027PublisherDeliveryBudget.minimumRemainingLifetimeSeconds == wc027ReviewedMinimumRemainingLifetimeSeconds
+  wc027PublisherDeliveryBudget.publisherMinimumRemainingLifetimeSeconds == wc027PublisherDeliveryBudget.publisherKedaPollingIntervalSeconds + wc027PublisherDeliveryBudget.publisherColdStartSeconds + wc027PublisherDeliveryBudget.publisherConnectionSetupSeconds + wc027PublisherDeliveryBudget.publisherProcessingSeconds
+  wc027PublisherDeliveryBudget.feedMinimumRemainingLifetimeSeconds == wc027PublisherDeliveryBudget.feedKedaPollingIntervalSeconds + wc027PublisherDeliveryBudget.feedColdStartSeconds + wc027PublisherDeliveryBudget.feedConnectionSetupSeconds + wc027PublisherDeliveryBudget.feedProcessingSeconds
+  wc027PublisherDeliveryBudget.minimumRemainingLifetimeSeconds == wc027PublisherDeliveryBudget.publisherMinimumRemainingLifetimeSeconds
+], false)
+var wc027RuntimeDeliveryBudget = wc027ParsedProducerConfiguration.deliveryBudget
+var wc027RuntimeDeliveryBudgetValid = !contains([
+  wc027RuntimeDeliveryBudget.publisherKedaPollingIntervalSeconds == wc027ReviewedPublisherKedaPollingIntervalSeconds
+  wc027RuntimeDeliveryBudget.publisherColdStartSeconds == wc027ReviewedPublisherColdStartSeconds
+  wc027RuntimeDeliveryBudget.publisherConnectionSetupSeconds == wc027ReviewedPublisherConnectionSetupSeconds
+  wc027RuntimeDeliveryBudget.publisherProcessingSeconds == wc027ReviewedPublisherProcessingSeconds
+  wc027RuntimeDeliveryBudget.publisherMinimumRemainingLifetimeSeconds == wc027ReviewedPublisherMinimumRemainingLifetimeSeconds
+  wc027RuntimeDeliveryBudget.feedKedaPollingIntervalSeconds == wc027ReviewedFeedKedaPollingIntervalSeconds
+  wc027RuntimeDeliveryBudget.feedColdStartSeconds == wc027ReviewedFeedColdStartSeconds
+  wc027RuntimeDeliveryBudget.feedConnectionSetupSeconds == wc027ReviewedFeedConnectionSetupSeconds
+  wc027RuntimeDeliveryBudget.feedProcessingSeconds == wc027ReviewedFeedProcessingSeconds
+  wc027RuntimeDeliveryBudget.feedMinimumRemainingLifetimeSeconds == wc027ReviewedFeedMinimumRemainingLifetimeSeconds
+  wc027RuntimeDeliveryBudget.feedTriggerRecoverySeconds == wc027ReviewedFeedTriggerRecoverySeconds
+  wc027RuntimeDeliveryBudget.minimumRemainingLifetimeSeconds == wc027ReviewedMinimumRemainingLifetimeSeconds
+  wc027RuntimeDeliveryBudget.publisherMinimumRemainingLifetimeSeconds == wc027RuntimeDeliveryBudget.publisherKedaPollingIntervalSeconds + wc027RuntimeDeliveryBudget.publisherColdStartSeconds + wc027RuntimeDeliveryBudget.publisherConnectionSetupSeconds + wc027RuntimeDeliveryBudget.publisherProcessingSeconds
+  wc027RuntimeDeliveryBudget.feedMinimumRemainingLifetimeSeconds == wc027RuntimeDeliveryBudget.feedKedaPollingIntervalSeconds + wc027RuntimeDeliveryBudget.feedColdStartSeconds + wc027RuntimeDeliveryBudget.feedConnectionSetupSeconds + wc027RuntimeDeliveryBudget.feedProcessingSeconds
+  wc027RuntimeDeliveryBudget.minimumRemainingLifetimeSeconds == wc027RuntimeDeliveryBudget.publisherMinimumRemainingLifetimeSeconds
+], false)
+var wc027ProducerPublisherDeliveryBudgetsMatch = !wc027RequestProducerReady || !wc027PublisherReady || string(wc027RequestProducerDeliveryBudget) == string(wc027PublisherDeliveryBudget)
+var wc027RequestProducerRuntimeDeliveryBudgetsMatch = !wc027RequestProducerReady || string(wc027RequestProducerDeliveryBudget) == string(wc027RuntimeDeliveryBudget)
+var wc027PublisherRuntimeDeliveryBudgetsMatch = !wc027PublisherReady || string(wc027PublisherDeliveryBudget) == string(wc027RuntimeDeliveryBudget)
 var wc027PublisherExpectedIdentityResourceIds = map(
   wc027ParsedPublisherConfiguration.deploymentBinding.attachedIdentityResourceIds,
   identityResourceId => toLower(identityResourceId)
 )
+var wc027PublisherOwnedConfiguredIdentityResourceIds = wc027PublisherReady && !empty(wc027PublisherConfigurationJson)
+  ? map([
+      wc027ParsedPublisherConfiguration.serviceBus.brokerIdentityResourceId
+      wc027ParsedPublisherConfiguration.requestOutbox.identityResourceId
+      wc027ParsedPublisherConfiguration.authorityAssets.readerIdentityResourceId
+      wc027ParsedPublisherConfiguration.authorityAssets.writerIdentityResourceId
+      wc027ParsedPublisherConfiguration.guidanceActivation.identityResourceId
+      wc027ParsedPublisherConfiguration.requestKey.identityResourceId
+      wc027ParsedPublisherConfiguration.bindingSigningKey.identityResourceId
+    ], identityResourceId => toLower(identityResourceId))
+  : []
+var wc027PublisherDelegatedRuntimeIdentityResourceIds = wc027PublisherReady && !empty(wc027PublisherConfigurationJson)
+  ? map([
+      wc027ParsedPublisherConfiguration.enrichmentRuntimeConfiguration.incidentLifecycleAssets.identityResourceId
+      wc027ParsedPublisherConfiguration.enrichmentRuntimeConfiguration.correlationSources.monitoring.identityResourceId
+      wc027ParsedPublisherConfiguration.enrichmentRuntimeConfiguration.correlationSources.change.identityResourceId
+      wc027ParsedPublisherConfiguration.enrichmentRuntimeConfiguration.correlationSources.contextAuthority.identityResourceId
+      wc027ParsedPublisherConfiguration.enrichmentRuntimeConfiguration.correlationSources.monitoringIntent.identityResourceId
+      wc027ParsedPublisherConfiguration.enrichmentRuntimeConfiguration.monitoringCollectorKey.identityResourceId
+      wc027ParsedPublisherConfiguration.enrichmentRuntimeConfiguration.keys.change.identityResourceId
+      wc027ParsedPublisherConfiguration.enrichmentRuntimeConfiguration.keys.monitoringIntent.identityResourceId
+      wc027ParsedPublisherConfiguration.enrichmentRuntimeConfiguration.keys.incident.identityResourceId
+      wc027ParsedPublisherConfiguration.enrichmentRuntimeConfiguration.keys.correlationBinding.identityResourceId
+      wc027ParsedPublisherConfiguration.enrichmentRuntimeConfiguration.keys.guidanceBinding.identityResourceId
+    ], identityResourceId => toLower(identityResourceId))
+  : []
+var wc027DistinctPublisherOwnedConfiguredIdentityResourceIds = union(
+  wc027PublisherOwnedConfiguredIdentityResourceIds,
+  wc027PublisherOwnedConfiguredIdentityResourceIds
+)
+var wc027DistinctPublisherDelegatedRuntimeIdentityResourceIds = union(
+  wc027PublisherDelegatedRuntimeIdentityResourceIds,
+  wc027PublisherDelegatedRuntimeIdentityResourceIds
+)
+var wc027DistinctPublisherConfiguredIdentityResourceIds = union(
+  wc027DistinctPublisherOwnedConfiguredIdentityResourceIds,
+  wc027DistinctPublisherDelegatedRuntimeIdentityResourceIds
+)
+var wc027PublisherConfigurationIdentitiesMatchBinding = !empty(wc027DistinctPublisherConfiguredIdentityResourceIds) && length(wc027PublisherExpectedIdentityResourceIds) == length(union(wc027PublisherExpectedIdentityResourceIds, wc027PublisherExpectedIdentityResourceIds)) && length(wc027DistinctPublisherConfiguredIdentityResourceIds) == length(wc027PublisherExpectedIdentityResourceIds) && length(union(wc027DistinctPublisherConfiguredIdentityResourceIds, wc027PublisherExpectedIdentityResourceIds)) == length(wc027DistinctPublisherConfiguredIdentityResourceIds)
 var wc027PublisherRbacResourceIds = wc027ParsedPublisherConfiguration.deploymentBinding.rbacResourceIds
 var wc027PublisherRbacEvidenceMatches = !empty(wc027PublisherRbacResourceIds) && guid(
   join(wc027PublisherRbacResourceIds, '|')
 ) == wc027ParsedPublisherConfiguration.deploymentBinding.bindingEvidenceId
 var wc027PublisherAttachedIdentityResourceIds = wc027PublisherReady && wc027PublisherJobResourceIdValid
-  ? map(items(wc027PublisherJob!.identity.userAssignedIdentities), identity => toLower(identity.key))
+  ? map(items(wc027PublisherJob!.identity.?userAssignedIdentities ?? {}), identity => toLower(identity.key))
   : []
 var wc027PublisherIdentitiesMatch = !empty(wc027PublisherExpectedIdentityResourceIds) && length(
   wc027PublisherAttachedIdentityResourceIds
@@ -386,59 +738,168 @@ var wc027PublisherIdentitiesMatch = !empty(wc027PublisherExpectedIdentityResourc
   wc027PublisherAttachedIdentityResourceIds,
   wc027PublisherExpectedIdentityResourceIds
 )) == length(wc027PublisherExpectedIdentityResourceIds)
+var wc027PublisherOwnedRuntimeIdentityOverlap = intersection(
+  wc027DistinctPublisherOwnedConfiguredIdentityResourceIds,
+  wc027DistinctConfiguredIdentityResourceIds
+)
+var wc027PublisherRequestSubmitterIdentityResourceId = toLower(
+  wc027ParsedPublisherConfiguration.serviceBus.requestSubmitterIdentityResourceId
+)
+var wc027PublisherRequestSubmitterRuntimeIdentityOverlap = intersection(
+  [
+    wc027PublisherRequestSubmitterIdentityResourceId
+  ],
+  wc027DistinctConfiguredIdentityResourceIds
+)
+var wc027PublisherRequestSubmitterAttachedIdentityOverlap = intersection(
+  [
+    wc027PublisherRequestSubmitterIdentityResourceId
+  ],
+  wc027DistinctPublisherConfiguredIdentityResourceIds
+)
+var wc027PublisherHasExactContainerCount = wc027PublisherReady && wc027PublisherJobResourceIdValid
+  ? length(wc027PublisherJob!.properties.template.containers) == 1
+  : false
+var wc027PublisherIdentityTypeMatches = wc027PublisherReady && wc027PublisherJobResourceIdValid
+  ? (wc027PublisherJob!.identity.?type ?? '') == 'UserAssigned'
+  : false
+var wc027PublisherTemplateMatches = wc027PublisherReady && wc027PublisherJobResourceIdValid && wc027PublisherHasExactContainerCount && !empty(wc027PublisherConfigurationJson)
+  ? !contains([
+      wc027PublisherJob!.properties.template.containers[0].name == 'wc027-guidance-authority-publisher'
+      wc027PublisherJob!.properties.template.containers[0].image == wc027PublisherImage
+      length(wc027PublisherJob!.properties.template.containers[0].command) == 1
+      wc027PublisherJob!.properties.template.containers[0].command[0] == 'athena-context'
+      length(wc027PublisherJob!.properties.template.containers[0].args) == 1
+      wc027PublisherJob!.properties.template.containers[0].args[0] == 'wc027-guidance-authority-publisher'
+      length(wc027PublisherJob!.properties.template.containers[0].env) == 2
+      wc027PublisherJob!.properties.template.containers[0].env[0].name == 'AZURE_CLIENT_ID'
+      wc027PublisherJob!.properties.template.containers[0].env[0].value == wc027ParsedPublisherConfiguration.serviceBus.brokerIdentityClientId
+      wc027PublisherJob!.properties.template.containers[0].env[1].name == 'ATHENA_WC027_GUIDANCE_AUTHORITY_PUBLISHER_CONFIG_JSON'
+      wc027PublisherJob!.properties.template.containers[0].env[1].value == wc027PublisherConfigurationJson
+      wc027PublisherJob!.properties.template.containers[0].resources.cpu == 1
+      wc027PublisherJob!.properties.template.containers[0].resources.memory == '2Gi'
+      empty(wc027PublisherJob!.properties.template.containers[0].?probes ?? [])
+      empty(wc027PublisherJob!.properties.template.containers[0].?volumeMounts ?? [])
+      empty(wc027PublisherJob!.properties.template.?initContainers ?? [])
+      empty(wc027PublisherJob!.properties.template.?volumes ?? [])
+    ], false)
+  : false
+var wc027PublisherExecutionConfigurationMatches = wc027PublisherReady && wc027PublisherJobResourceIdValid
+  ? !contains([
+      wc027PublisherJob!.properties.environmentId == azureMcp.outputs.managedEnvironmentResourceId
+      wc027PublisherJob!.properties.configuration.replicaTimeout == 900
+      wc027PublisherJob!.properties.configuration.replicaRetryLimit == 0
+      wc027PublisherJob!.properties.configuration.triggerType == 'Event'
+      empty(wc027PublisherJob!.properties.configuration.?identitySettings ?? [])
+      empty(wc027PublisherJob!.properties.configuration.?secrets ?? [])
+      wc027PublisherJob!.properties.configuration.eventTriggerConfig.parallelism == 1
+      wc027PublisherJob!.properties.configuration.eventTriggerConfig.replicaCompletionCount == 1
+      wc027PublisherJob!.properties.configuration.eventTriggerConfig.scale.minExecutions == 0
+      wc027PublisherJob!.properties.configuration.eventTriggerConfig.scale.maxExecutions == 1
+      wc027PublisherJob!.properties.configuration.eventTriggerConfig.scale.pollingInterval == wc027PublisherDeliveryBudget.publisherKedaPollingIntervalSeconds
+      length(wc027PublisherJob!.properties.configuration.eventTriggerConfig.scale.rules) == 1
+    ], false)
+  : false
+var wc027PublisherHasExactScalerRuleCount = wc027PublisherReady && wc027PublisherJobResourceIdValid
+  ? length(wc027PublisherJob!.properties.configuration.eventTriggerConfig.scale.rules) == 1
+  : false
+var wc027PublisherScalerMatches = wc027PublisherReady && wc027PublisherJobResourceIdValid && !empty(wc027PublisherConfigurationJson) && wc027PublisherHasExactScalerRuleCount
+  ? !contains([
+      wc027PublisherJob!.properties.configuration.eventTriggerConfig.scale.rules[0].name == 'wc027-guidance-authority-request'
+      wc027PublisherJob!.properties.configuration.eventTriggerConfig.scale.rules[0].type == 'azure-servicebus'
+      wc027PublisherJob!.properties.configuration.eventTriggerConfig.scale.rules[0].identity == wc027ParsedPublisherConfiguration.serviceBus.brokerIdentityResourceId
+      empty(wc027PublisherJob!.properties.configuration.eventTriggerConfig.scale.rules[0].?auth ?? [])
+      length(items(wc027PublisherJob!.properties.configuration.eventTriggerConfig.scale.rules[0].metadata)) == 5
+      wc027PublisherJob!.properties.configuration.eventTriggerConfig.scale.rules[0].metadata.namespace == first(split(wc027ParsedPublisherConfiguration.serviceBus.namespace, '.'))
+      wc027PublisherJob!.properties.configuration.eventTriggerConfig.scale.rules[0].metadata.queueName == wc027ParsedPublisherConfiguration.serviceBus.requestQueueName
+      wc027PublisherJob!.properties.configuration.eventTriggerConfig.scale.rules[0].metadata.messageCount == '1'
+      wc027PublisherJob!.properties.configuration.eventTriggerConfig.scale.rules[0].metadata.cloud == 'AzurePublicCloud'
+      wc027PublisherJob!.properties.configuration.eventTriggerConfig.scale.rules[0].metadata.isSessionsEnabled == 'true'
+    ], false)
+  : false
+var wc027PublisherHasExactRegistryCount = wc027PublisherReady && wc027PublisherJobResourceIdValid
+  ? length(wc027PublisherJob!.properties.configuration.registries) == 1
+  : false
+var wc027PublisherRegistryMatches = wc027PublisherReady && wc027PublisherJobResourceIdValid && !empty(wc027PublisherConfigurationJson) && wc027PublisherHasExactRegistryCount
+  ? !contains([
+      wc027PublisherJob!.properties.configuration.registries[0].server == wc027PublisherImageRegistryServer
+      wc027PublisherJob!.properties.configuration.registries[0].identity == wc027ParsedPublisherConfiguration.serviceBus.brokerIdentityResourceId
+      length(items(wc027PublisherJob!.properties.configuration.registries[0])) == 2
+    ], false)
+  : false
+var wc027PublisherTagsMatch = wc027PublisherReady && wc027PublisherJobResourceIdValid
+  ? !contains([
+      wc027PublisherJob!.tags.enrichmentRuntimeConfigurationDigest == wc027EnrichmentFeedProducerConfigurationDigest
+      wc027PublisherJob!.tags.runtimeConfigurationDigest == wc027PublisherConfigurationDigest
+    ], false)
+  : false
 var validatedWc027PublisherReady = wc027PublisherReady && !wc027PublisherJobResourceIdValid
   ? fail('wc027PublisherJobResourceId must identify one Microsoft.App/jobs resource')
   : wc027PublisherReady && !wc027PublisherConfigurationDigestValid
     ? fail('WC-027 publisher requires the exact deployed configuration digest')
     : wc027PublisherReady && empty(wc027PublisherConfigurationJson)
       ? fail('WC-027 publisher requires the exact deployed configuration JSON')
-      : wc027PublisherReady && !wc027PublisherImageValid
-        ? fail('WC-027 publisher requires the exact digest-pinned deployed image')
-        : wc027PublisherReady && wc027PublisherJob!.properties.template.containers[0].image != wc027PublisherImage
-          ? fail('WC-027 publisher Job image does not match')
-          : wc027PublisherReady && length(wc027PublisherJob!.properties.template.containers[0].command) != 1
-            ? fail('WC-027 publisher Job command array does not match')
-          : wc027PublisherReady && wc027PublisherJob!.properties.template.containers[0].command[0] != 'athena-context'
-            ? fail('WC-027 publisher Job command does not match')
-            : wc027PublisherReady && length(wc027PublisherJob!.properties.template.containers[0].args) != 1
-              ? fail('WC-027 publisher Job arguments array does not match')
-            : wc027PublisherReady && wc027PublisherJob!.properties.template.containers[0].args[0] != 'wc027-guidance-authority-publisher'
-              ? fail('WC-027 publisher Job arguments do not match')
-              : wc027PublisherReady && wc027PublisherJob!.properties.configuration.triggerType != 'Event'
-                ? fail('WC-027 publisher Job trigger type does not match')
-                : wc027PublisherReady && wc027PublisherJob!.properties.configuration.eventTriggerConfig.scale.maxExecutions != 1
-                  ? fail('WC-027 publisher Job concurrency does not match')
-                  : wc027PublisherReady && length(wc027PublisherJob!.properties.configuration.eventTriggerConfig.scale.rules) != 1
-                    ? fail('WC-027 publisher Job scaler rules do not match')
-                  : wc027PublisherReady && wc027PublisherJob!.properties.configuration.eventTriggerConfig.scale.rules[0].type != 'azure-servicebus'
-                    ? fail('WC-027 publisher Job scaler type does not match')
-                  : wc027PublisherReady && wc027PublisherJob!.properties.configuration.eventTriggerConfig.scale.rules[0].identity != wc027ParsedPublisherConfiguration.serviceBus.brokerIdentityResourceId
-                    ? fail('WC-027 publisher Job scaler identity does not match')
-                    : wc027PublisherReady && wc027PublisherJob!.properties.configuration.eventTriggerConfig.scale.rules[0].metadata.namespace != first(split(wc027ParsedPublisherConfiguration.serviceBus.namespace, '.'))
-                      ? fail('WC-027 publisher Job scaler namespace does not match')
-                    : wc027PublisherReady && wc027PublisherJob!.properties.configuration.eventTriggerConfig.scale.rules[0].metadata.queueName != wc027ParsedPublisherConfiguration.serviceBus.requestQueueName
-                      ? fail('WC-027 publisher Job scaler queue does not match')
-                    : wc027PublisherReady && length(wc027PublisherJob!.properties.configuration.registries) != 1
-                      ? fail('WC-027 publisher Job registry array does not match')
-                    : wc027PublisherReady && wc027PublisherJob!.properties.configuration.registries[0].identity != wc027ParsedPublisherConfiguration.serviceBus.brokerIdentityResourceId
-                      ? fail('WC-027 publisher Job registry identity does not match')
-                    : wc027PublisherReady && wc027PublisherJob!.properties.configuration.registries[0].server != wc027PublisherImageRegistryServer
-                      ? fail('WC-027 publisher Job registry server does not match')
-                      : wc027PublisherReady && wc027PublisherJob!.tags.enrichmentRuntimeConfigurationDigest != wc027EnrichmentFeedProducerConfigurationDigest
-                        ? fail('WC-027 publisher embedded runtime configuration does not match the producer')
-                      : wc027PublisherReady && string(wc027ParsedPublisherConfiguration.enrichmentRuntimeConfiguration) != string(wc027ParsedProducerConfiguration)
-                        ? fail('WC-027 publisher embedded runtime configuration JSON does not match the producer')
-      : wc027PublisherReady && wc027PublisherJob!.tags.runtimeConfigurationDigest != wc027PublisherConfigurationDigest
-        ? fail('WC-027 publisher Job configuration digest tag does not match')
-        : wc027PublisherReady && wc027PublisherJob!.properties.template.containers[0].env[1].name != 'ATHENA_WC027_GUIDANCE_AUTHORITY_PUBLISHER_CONFIG_JSON'
-          ? fail('WC-027 publisher Job does not contain the exact activation configuration')
-          : wc027PublisherReady && wc027PublisherJob!.properties.template.containers[0].env[1].value != wc027PublisherConfigurationJson
-            ? fail('WC-027 publisher Job configuration does not match')
-            : wc027PublisherReady && !wc027PublisherRbacEvidenceMatches
-              ? fail('WC-027 publisher RBAC evidence does not match its deployed configuration')
-              : wc027PublisherReady && !wc027PublisherIdentitiesMatch
-                ? fail('WC-027 publisher identities do not match its deployed configuration')
-                : wc027PublisherReady
+      : wc027PublisherReady && (empty(wc027EnrichmentFeedProducerConfigurationJson) || !wc027ConfigurationDigestValid)
+        ? fail('WC-027 publisher requires the exact deployed enrichment runtime configuration')
+        : wc027PublisherReady && !wc027ConfigurationIdentitiesMatchBinding
+          ? fail('WC-027 enrichment runtime identities do not exactly match its deployment binding')
+          : wc027PublisherReady && !wc027PublisherConfigurationIdentitiesMatchBinding
+            ? fail('WC-027 publisher configuration identities do not exactly match its deployment binding')
+            : wc027PublisherReady && !empty(wc027PublisherOwnedRuntimeIdentityOverlap)
+              ? fail('WC-027 publisher-owned identities overlap the enrichment runtime identity boundary')
+              : wc027PublisherReady && !empty(wc027PublisherRequestSubmitterRuntimeIdentityOverlap)
+                ? fail('WC-027 publisher request submitter overlaps the enrichment runtime identity boundary')
+                : wc027PublisherReady && !empty(wc027PublisherRequestSubmitterAttachedIdentityOverlap)
+                  ? fail('WC-027 publisher request submitter overlaps an attached publisher identity')
+                  : wc027PublisherReady && wc027RequestProducerReady && !empty(wc027RequestProducerPublisherIdentityOverlap)
+                    ? fail('WC-027 request producer identities overlap the publisher identity boundary')
+                    : wc027PublisherReady && wc027RequestProducerReady && wc027ParsedPublisherConfiguration.serviceBus.namespace != wc027ParsedRequestProducerConfiguration.serviceBus.namespace
+                      ? fail('WC-027 publisher namespace does not match the request producer')
+                      : wc027PublisherReady && wc027RequestProducerReady && wc027ParsedPublisherConfiguration.serviceBus.requestQueueName != wc027ParsedRequestProducerConfiguration.serviceBus.outputQueueName
+                        ? fail('WC-027 publisher request queue does not match the request producer output queue')
+                        : wc027PublisherReady && wc027RequestProducerReady && toLower(wc027ParsedPublisherConfiguration.serviceBus.requestSubmitterIdentityResourceId) != toLower(wc027ParsedRequestProducerConfiguration.serviceBus.senderIdentityResourceId)
+                          ? fail('WC-027 publisher request submitter does not match the dedicated request producer sender')
+                          : wc027PublisherReady && wc027RequestProducerReady && wc027ParsedPublisherConfiguration.requestOutbox.blobEndpoint != wc027ParsedRequestProducerConfiguration.requestOutbox.blobEndpoint
+                            ? fail('WC-027 publisher request outbox endpoint does not match the request producer')
+                            : wc027PublisherReady && wc027RequestProducerReady && wc027ParsedPublisherConfiguration.requestOutbox.containerName != wc027ParsedRequestProducerConfiguration.requestOutbox.containerName
+                              ? fail('WC-027 publisher request outbox container does not match the request producer')
+                              : wc027PublisherReady && wc027RequestProducerReady && wc027ParsedPublisherConfiguration.requestKey.keyId != wc027ParsedRequestProducerConfiguration.requestSigningKey.keyId
+                                ? fail('WC-027 publisher request logical key does not match the request producer')
+                                : wc027PublisherReady && wc027RequestProducerReady && wc027ParsedPublisherConfiguration.requestKey.keyVaultKeyId != wc027ParsedRequestProducerConfiguration.requestSigningKey.keyVaultKeyId
+                                  ? fail('WC-027 publisher request key version does not match the request producer')
+                                  : wc027PublisherReady && wc027RequestProducerReady && wc027ParsedPublisherConfiguration.requestKey.keyFingerprint != wc027ParsedRequestProducerConfiguration.requestSigningKey.keyFingerprint
+                                    ? fail('WC-027 publisher request key fingerprint does not match the request producer')
+                                    : wc027PublisherReady && !wc027PublisherImageValid
+                                      ? fail('WC-027 publisher requires the exact digest-pinned deployed image')
+                                      : wc027PublisherReady && !wc027PublisherIdentityTypeMatches
+                                        ? fail('WC-027 publisher Job must use only user-assigned identities')
+                                        : wc027PublisherReady && !wc027PublisherHasExactContainerCount
+                                          ? fail('WC-027 publisher Job must contain exactly one reviewed container')
+                                          : wc027PublisherReady && !wc027PublisherTemplateMatches
+                                            ? fail('WC-027 publisher Job execution template does not exactly match')
+                                            : wc027PublisherReady && !wc027PublisherExecutionConfigurationMatches
+                                              ? fail('WC-027 publisher Job replica and concurrency configuration does not exactly match')
+                                              : wc027PublisherReady && !wc027PublisherScalerMatches
+                                                ? fail('WC-027 publisher Job scaler configuration does not exactly match')
+                                                : wc027PublisherReady && !wc027PublisherRegistryMatches
+                                                  ? fail('WC-027 publisher Job registry configuration does not exactly match')
+                                                  : wc027PublisherReady && !wc027PublisherTagsMatch
+                                                    ? fail('WC-027 publisher Job configuration digest tags do not match')
+                                                    : wc027PublisherReady && !wc027PublisherDeliveryBudgetValid
+                                                      ? fail('WC-027 publisher delivery budget does not match the reviewed publisher and feed delivery phases')
+                                                      : wc027PublisherReady && !wc027RuntimeDeliveryBudgetValid
+                                                        ? fail('WC-027 enrichment runtime delivery budget does not match the reviewed publisher and feed delivery phases')
+                                                        : wc027PublisherReady && !wc027ProducerPublisherDeliveryBudgetsMatch
+                                                          ? fail('WC-027 producer and publisher delivery budgets do not match')
+                                                          : wc027PublisherReady && !wc027PublisherRuntimeDeliveryBudgetsMatch
+                                                            ? fail('WC-027 publisher and enrichment runtime delivery budgets do not match')
+                                                            : wc027PublisherReady && string(wc027ParsedPublisherConfiguration.enrichmentRuntimeConfiguration) != string(wc027ParsedProducerConfiguration)
+                                                              ? fail('WC-027 publisher embedded runtime configuration JSON does not match the producer')
+                                                              : wc027PublisherReady && !wc027PublisherRbacEvidenceMatches
+                                                                ? fail('WC-027 publisher RBAC evidence does not match its deployed configuration')
+                                                                : wc027PublisherReady && !wc027PublisherIdentitiesMatch
+                                                                  ? fail('WC-027 publisher identities do not match its deployed configuration')
+                                                                  : wc027PublisherReady
 var wc027ProducerJobResourceIdSegments = concat(
   wc027ProducerJobResourceIdRawSegments,
   [
@@ -453,7 +914,8 @@ var wc027ProducerJobResourceIdSegments = concat(
     ''
   ]
 )
-var wc027ProducerJobResourceIdValid = length(wc027ProducerJobResourceIdRawSegments) == 9 && wc027ProducerJobResourceIdSegments[1] == 'subscriptions' && wc027ProducerJobResourceIdSegments[3] == 'resourceGroups' && toLower(wc027ProducerJobResourceIdSegments[6]) == 'microsoft.app' && toLower(wc027ProducerJobResourceIdSegments[7]) == 'jobs' && !empty(wc027ProducerJobResourceIdSegments[8])
+var wc027ProducerJobResourceIdShapeValid = length(wc027ProducerJobResourceIdRawSegments) == 9 && empty(wc027ProducerJobResourceIdSegments[0]) && wc027ProducerJobResourceIdSegments[1] == 'subscriptions' && !empty(wc027ProducerJobResourceIdSegments[2]) && toLower(wc027ProducerJobResourceIdSegments[2]) == toLower(subscription().subscriptionId) && wc027ProducerJobResourceIdSegments[3] == 'resourceGroups' && !empty(wc027ProducerJobResourceIdSegments[4]) && toLower(wc027ProducerJobResourceIdSegments[4]) == toLower(foundationResourceGroupName) && wc027ProducerJobResourceIdSegments[5] == 'providers' && wc027ProducerJobResourceIdSegments[6] == 'Microsoft.App' && wc027ProducerJobResourceIdSegments[7] == 'jobs' && !empty(wc027ProducerJobResourceIdSegments[8]) && !contains(wc027EnrichmentFeedProducerJobResourceId, '//') && !contains(wc027EnrichmentFeedProducerJobResourceId, '?') && !contains(wc027EnrichmentFeedProducerJobResourceId, '#') && !contains(wc027EnrichmentFeedProducerJobResourceId, '%')
+var wc027ProducerJobResourceIdValid = wc027ProducerJobResourceIdShapeValid
 var wc027ConfigurationDigestHex = replace(
   wc027EnrichmentFeedProducerConfigurationDigest,
   'sha256:',
@@ -472,19 +934,34 @@ var wc027ConfigurationDigestInvalidCharacters = replace(replace(replace(replace(
 var wc027ConfigurationDigestValid = length(wc027EnrichmentFeedProducerConfigurationDigest) == 71 && wc027EnrichmentFeedProducerConfigurationDigest == toLower(
   wc027EnrichmentFeedProducerConfigurationDigest
 ) && empty(wc027ConfigurationDigestInvalidCharacters)
+var wc027ProducerImageDigest = contains(wc027EnrichmentFeedProducerImage, '@sha256:')
+  ? last(split(wc027EnrichmentFeedProducerImage, '@sha256:'))
+  : ''
+var wc027ProducerImageDigestWithoutDigits = replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(
+  wc027ProducerImageDigest,
+  '0',
+  ''
+), '1', ''), '2', ''), '3', ''), '4', ''), '5', ''), '6', ''), '7', ''), '8', ''), '9', '')
+var wc027ProducerImageInvalidCharacters = replace(replace(replace(replace(replace(replace(
+  wc027ProducerImageDigestWithoutDigits,
+  'a',
+  ''
+), 'b', ''), 'c', ''), 'd', ''), 'e', ''), 'f', '')
+var wc027ProducerImageValid = wc027EnrichmentFeedProducerImage == toLower(wc027EnrichmentFeedProducerImage) && length(wc027ProducerImageDigest) == 64 && empty(wc027ProducerImageInvalidCharacters) && wc027ProducerImageDigest != '0000000000000000000000000000000000000000000000000000000000000000'
 var wc027ParsedConfiguration = json(
   empty(wc027EnrichmentFeedProducerConfigurationJson)
     ? '{"deploymentBinding":{"attachedIdentityResourceIds":[],"bindingEvidenceId":"","rbacResourceIds":[]}}'
     : wc027EnrichmentFeedProducerConfigurationJson
 )
+var wc027ProducerImageRegistryServer = first(split(wc027EnrichmentFeedProducerImage, '/'))
 var wc027AttachedIdentityResourceIds = wc027FeedV2ProducerReady && wc027ProducerJobResourceIdValid
-  ? map(items(wc027ProducerJob!.identity.userAssignedIdentities), attachedIdentity => toLower(attachedIdentity.key))
+  ? map(items(wc027ProducerJob!.identity.?userAssignedIdentities ?? {}), attachedIdentity => toLower(attachedIdentity.key))
   : []
 var wc027ExpectedIdentityResourceIds = map(
   wc027ParsedConfiguration.deploymentBinding.attachedIdentityResourceIds,
   expectedIdentityResourceId => toLower(expectedIdentityResourceId)
 )
-var wc027ConfiguredIdentityResourceIds = wc027FeedV2ProducerReady && !empty(wc027EnrichmentFeedProducerConfigurationJson)
+var wc027ConfiguredIdentityResourceIds = !empty(wc027EnrichmentFeedProducerConfigurationJson)
   ? map([
       wc027ParsedConfiguration.serviceBus.brokerIdentityResourceId
       wc027ParsedConfiguration.incidentLifecycleAssets.identityResourceId
@@ -524,6 +1001,82 @@ var wc027RbacEvidenceMatchesConfiguration = !empty(wc027RbacResourceIds) && guid
   join(wc027RbacResourceIds, '|')
 ) == wc027ParsedConfiguration.deploymentBinding.bindingEvidenceId
 var wc027ProducerIdentitiesMatchExactly = !empty(wc027ExpectedIdentityResourceIds) && length(wc027AttachedIdentityResourceIds) == length(wc027ExpectedIdentityResourceIds) && length(union(wc027AttachedIdentityResourceIds, wc027ExpectedIdentityResourceIds)) == length(wc027ExpectedIdentityResourceIds)
+var wc027ProducerHasExactContainerCount = wc027FeedV2ProducerReady && wc027ProducerJobResourceIdValid
+  ? length(wc027ProducerJob!.properties.template.containers) == 1
+  : false
+var wc027ProducerIdentityTypeMatches = wc027FeedV2ProducerReady && wc027ProducerJobResourceIdValid
+  ? (wc027ProducerJob!.identity.?type ?? '') == 'UserAssigned'
+  : false
+var wc027ProducerTemplateMatches = wc027FeedV2ProducerReady && wc027ProducerJobResourceIdValid && wc027ProducerHasExactContainerCount && !empty(wc027EnrichmentFeedProducerConfigurationJson)
+  ? !contains([
+      wc027ProducerJob!.properties.template.containers[0].name == 'wc027-enrichment-feed-producer'
+      wc027ProducerJob!.properties.template.containers[0].image == wc027EnrichmentFeedProducerImage
+      length(wc027ProducerJob!.properties.template.containers[0].command) == 1
+      wc027ProducerJob!.properties.template.containers[0].command[0] == 'athena-context'
+      length(wc027ProducerJob!.properties.template.containers[0].args) == 1
+      wc027ProducerJob!.properties.template.containers[0].args[0] == 'wc027-enrichment-feed-producer'
+      length(wc027ProducerJob!.properties.template.containers[0].env) == 2
+      wc027ProducerJob!.properties.template.containers[0].env[0].name == 'AZURE_CLIENT_ID'
+      wc027ProducerJob!.properties.template.containers[0].env[0].value == wc027ParsedConfiguration.serviceBus.brokerIdentityClientId
+      wc027ProducerJob!.properties.template.containers[0].env[1].name == 'ATHENA_WC027_ENRICHMENT_FEED_CONFIG_JSON'
+      wc027ProducerJob!.properties.template.containers[0].env[1].value == wc027EnrichmentFeedProducerConfigurationJson
+      wc027ProducerJob!.properties.template.containers[0].resources.cpu == 1
+      wc027ProducerJob!.properties.template.containers[0].resources.memory == '2Gi'
+      empty(wc027ProducerJob!.properties.template.containers[0].?probes ?? [])
+      empty(wc027ProducerJob!.properties.template.containers[0].?volumeMounts ?? [])
+      empty(wc027ProducerJob!.properties.template.?initContainers ?? [])
+      empty(wc027ProducerJob!.properties.template.?volumes ?? [])
+    ], false)
+  : false
+var wc027ProducerExecutionConfigurationMatches = wc027FeedV2ProducerReady && wc027ProducerJobResourceIdValid
+  ? !contains([
+      wc027ProducerJob!.properties.environmentId == azureMcp.outputs.managedEnvironmentResourceId
+      wc027ProducerJob!.properties.configuration.replicaTimeout == 900
+      wc027ProducerJob!.properties.configuration.replicaRetryLimit == 0
+      wc027ProducerJob!.properties.configuration.triggerType == 'Event'
+      empty(wc027ProducerJob!.properties.configuration.?identitySettings ?? [])
+      empty(wc027ProducerJob!.properties.configuration.?secrets ?? [])
+      wc027ProducerJob!.properties.configuration.eventTriggerConfig.parallelism == 1
+      wc027ProducerJob!.properties.configuration.eventTriggerConfig.replicaCompletionCount == 1
+      wc027ProducerJob!.properties.configuration.eventTriggerConfig.scale.minExecutions == 0
+      wc027ProducerJob!.properties.configuration.eventTriggerConfig.scale.maxExecutions == 1
+      wc027ProducerJob!.properties.configuration.eventTriggerConfig.scale.pollingInterval == wc027RuntimeDeliveryBudget.feedKedaPollingIntervalSeconds
+      length(wc027ProducerJob!.properties.configuration.eventTriggerConfig.scale.rules) == 1
+    ], false)
+  : false
+var wc027ProducerHasExactScalerRuleCount = wc027FeedV2ProducerReady && wc027ProducerJobResourceIdValid
+  ? length(wc027ProducerJob!.properties.configuration.eventTriggerConfig.scale.rules) == 1
+  : false
+var wc027ProducerScalerMatches = wc027FeedV2ProducerReady && wc027ProducerJobResourceIdValid && !empty(wc027EnrichmentFeedProducerConfigurationJson) && wc027ProducerHasExactScalerRuleCount
+  ? !contains([
+      wc027ProducerJob!.properties.configuration.eventTriggerConfig.scale.rules[0].name == 'wc027-signed-binding'
+      wc027ProducerJob!.properties.configuration.eventTriggerConfig.scale.rules[0].type == 'azure-servicebus'
+      wc027ProducerJob!.properties.configuration.eventTriggerConfig.scale.rules[0].identity == wc027ParsedConfiguration.serviceBus.brokerIdentityResourceId
+      empty(wc027ProducerJob!.properties.configuration.eventTriggerConfig.scale.rules[0].?auth ?? [])
+      length(items(wc027ProducerJob!.properties.configuration.eventTriggerConfig.scale.rules[0].metadata)) == 5
+      wc027ProducerJob!.properties.configuration.eventTriggerConfig.scale.rules[0].metadata.namespace == first(split(wc027ParsedConfiguration.serviceBus.namespace, '.'))
+      wc027ProducerJob!.properties.configuration.eventTriggerConfig.scale.rules[0].metadata.queueName == wc027ParsedConfiguration.serviceBus.triggerQueueName
+      wc027ProducerJob!.properties.configuration.eventTriggerConfig.scale.rules[0].metadata.messageCount == '1'
+      wc027ProducerJob!.properties.configuration.eventTriggerConfig.scale.rules[0].metadata.cloud == 'AzurePublicCloud'
+      wc027ProducerJob!.properties.configuration.eventTriggerConfig.scale.rules[0].metadata.isSessionsEnabled == 'true'
+    ], false)
+  : false
+var wc027ProducerHasExactRegistryCount = wc027FeedV2ProducerReady && wc027ProducerJobResourceIdValid
+  ? length(wc027ProducerJob!.properties.configuration.registries) == 1
+  : false
+var wc027ProducerRegistryMatches = wc027FeedV2ProducerReady && wc027ProducerJobResourceIdValid && !empty(wc027EnrichmentFeedProducerConfigurationJson) && wc027ProducerHasExactRegistryCount
+  ? !contains([
+      wc027ProducerJob!.properties.configuration.registries[0].server == wc027ProducerImageRegistryServer
+      wc027ProducerJob!.properties.configuration.registries[0].identity == wc027ParsedConfiguration.serviceBus.brokerIdentityResourceId
+      length(items(wc027ProducerJob!.properties.configuration.registries[0])) == 2
+    ], false)
+  : false
+var wc027ProducerTagsMatch = wc027FeedV2ProducerReady && wc027ProducerJobResourceIdValid
+  ? !contains([
+      wc027ProducerJob!.tags.runtimeConfigurationDigest == wc027EnrichmentFeedProducerConfigurationDigest
+      wc027ProducerJob!.tags.bindingEvidenceDigest == wc027ParsedConfiguration.deploymentBinding.bindingEvidenceId
+    ], false)
+  : false
 var validatedWc027FeedV2ProducerReady = wc027FeedV2ProducerReady && !startsWith(
   toLower(wc027EnrichmentFeedProducerJobResourceId),
   '/subscriptions/'
@@ -535,31 +1088,39 @@ var validatedWc027FeedV2ProducerReady = wc027FeedV2ProducerReady && !startsWith(
       ? fail('WC-027 Notification v2 requires the exact deployed producer configuration digest')
       : wc027FeedV2ProducerReady && empty(wc027EnrichmentFeedProducerConfigurationJson)
         ? fail('WC-027 Notification v2 requires the exact deployed producer configuration JSON')
-        : wc027FeedV2ProducerReady && wc027ProducerJob!.tags.runtimeConfigurationDigest != wc027EnrichmentFeedProducerConfigurationDigest
-          ? fail('WC-027 producer Job configuration digest tag does not match the activation input')
-          : wc027FeedV2ProducerReady && wc027ProducerJob!.properties.template.containers[0].env[1].name != 'ATHENA_WC027_ENRICHMENT_FEED_CONFIG_JSON'
-            ? fail('WC-027 producer Job does not contain the exact activation configuration')
-            : wc027FeedV2ProducerReady && wc027ProducerJob!.properties.template.containers[0].env[1].value != wc027EnrichmentFeedProducerConfigurationJson
-              ? fail('WC-027 producer Job configuration does not match the activation input')
-              : wc027FeedV2ProducerReady && !validatedWc027PublisherReady
-                ? fail('WC-027 Notification v2 requires an explicitly ready PublishedGuidanceAuthorityBinding.v2 publisher (wc027PublisherReady)')
-                : wc027FeedV2ProducerReady && empty(wc027ParsedConfiguration.deploymentBinding.bindingEvidenceId)
-                  ? fail('WC-027 Notification v2 requires deployment-derived RBAC binding evidence')
-                  : wc027FeedV2ProducerReady && !wc027RbacEvidenceMatchesConfiguration
-                    ? fail('WC-027 runtime configuration RBAC resources do not match its binding evidence')
-                  : wc027FeedV2ProducerReady && wc027ProducerJob!.tags.bindingEvidenceDigest != wc027ParsedConfiguration.deploymentBinding.bindingEvidenceId
-                      ? fail('WC-027 producer Job RBAC binding evidence tag does not match its deployed configuration')
-                      : wc027FeedV2ProducerReady && !wc027ConfigurationIdentitiesMatchBinding
-                        ? fail('WC-027 runtime configuration identities do not exactly match its deployment binding')
-                        : wc027FeedV2ProducerReady && !wc027ProducerIdentitiesMatchExactly
-                          ? fail('WC-027 producer Job attached user-assigned identities do not exactly match the expected identity resource IDs')
-                          : wc027FeedV2ProducerReady && wc027ProducerJob!.properties.template.containers[0].env[0].name != 'AZURE_CLIENT_ID'
-                            ? fail('WC-027 producer Job does not expose its derived broker client ID')
-                            : wc027FeedV2ProducerReady && wc027ProducerJob!.properties.template.containers[0].env[0].value != wc027ParsedConfiguration.serviceBus.brokerIdentityClientId
-                              ? fail('WC-027 producer Job broker identity does not match its deployed configuration')
-                              : wc027FeedV2ProducerReady && !validatedWc016RuntimeEnabled
-                                ? fail('WC-027 Notification v2 requires the deployed WC-016 runtime and notification outbox')
-                                : wc027FeedV2ProducerReady && validatedWc027PublisherReady
+        : wc027FeedV2ProducerReady && !wc027RuntimeDeliveryBudgetValid
+          ? fail('WC-027 enrichment runtime delivery budget does not match the reviewed publisher and feed delivery phases')
+          : wc027FeedV2ProducerReady && !wc027ProducerImageValid
+            ? fail('WC-027 producer requires the exact digest-pinned deployed image')
+            : wc027FeedV2ProducerReady && !wc027ProducerIdentityTypeMatches
+              ? fail('WC-027 producer Job must use only user-assigned identities')
+              : wc027FeedV2ProducerReady && !wc027ProducerHasExactContainerCount
+                ? fail('WC-027 producer Job must contain exactly one reviewed container')
+                : wc027FeedV2ProducerReady && !wc027ProducerTemplateMatches
+                  ? fail('WC-027 producer Job execution template does not exactly match')
+                  : wc027FeedV2ProducerReady && !wc027ProducerExecutionConfigurationMatches
+                    ? fail('WC-027 producer Job replica and concurrency configuration does not exactly match')
+                    : wc027FeedV2ProducerReady && !wc027ProducerScalerMatches
+                      ? fail('WC-027 producer Job scaler configuration does not exactly match')
+                      : wc027FeedV2ProducerReady && !wc027ProducerRegistryMatches
+                        ? fail('WC-027 producer Job registry configuration does not exactly match')
+                        : wc027FeedV2ProducerReady && !wc027ProducerTagsMatch
+                          ? fail('WC-027 producer Job configuration and binding-evidence digest tags do not exactly match')
+                          : wc027FeedV2ProducerReady && !validatedWc027RequestProducerReady
+                          ? fail('WC-027 Notification v2 requires an explicitly ready guidance publication-request producer (wc027RequestProducerReady)')
+                          : wc027FeedV2ProducerReady && !validatedWc027PublisherReady
+                            ? fail('WC-027 Notification v2 requires an explicitly ready PublishedGuidanceAuthorityBinding.v2 publisher (wc027PublisherReady)')
+                            : wc027FeedV2ProducerReady && empty(wc027ParsedConfiguration.deploymentBinding.bindingEvidenceId)
+                              ? fail('WC-027 Notification v2 requires deployment-derived RBAC binding evidence')
+                              : wc027FeedV2ProducerReady && !wc027RbacEvidenceMatchesConfiguration
+                                ? fail('WC-027 runtime configuration RBAC resources do not match its binding evidence')
+                                : wc027FeedV2ProducerReady && !wc027ConfigurationIdentitiesMatchBinding
+                                  ? fail('WC-027 runtime configuration identities do not exactly match its deployment binding')
+                                  : wc027FeedV2ProducerReady && !wc027ProducerIdentitiesMatchExactly
+                                    ? fail('WC-027 producer Job attached user-assigned identities do not exactly match the expected identity resource IDs')
+                                    : wc027FeedV2ProducerReady && !validatedWc016RuntimeEnabled
+                                      ? fail('WC-027 Notification v2 requires the deployed WC-016 runtime and notification outbox')
+                                      : wc027FeedV2ProducerReady && validatedWc027PublisherReady
 var expectedAcceptanceImageRegistryServer = '${toLower(last(split(acceptanceImageRegistryResourceId, '/')))}.azurecr.io'
 var validatedAcceptanceImageRegistryServer = acceptanceImageRegistryServer == toLower(acceptanceImageRegistryServer) && acceptanceImageRegistryServer == expectedAcceptanceImageRegistryServer
   ? acceptanceImageRegistryServer
@@ -720,7 +1281,7 @@ resource foundationResourceGroup 'Microsoft.Resources/resourceGroups@2025-04-01'
   tags: resourceTags
 }
 
-resource wc027ProducerJob 'Microsoft.App/jobs@2025-01-01' existing = if (wc027FeedV2ProducerReady && wc027ProducerJobResourceIdValid) {
+resource wc027ProducerJob 'Microsoft.App/jobs@2025-01-01' existing = if (wc027FeedV2ProducerReady && wc027ProducerJobResourceIdShapeValid) {
   name: wc027ProducerJobResourceIdSegments[8]
   scope: resourceGroup(
     wc027ProducerJobResourceIdSegments[2],
@@ -728,7 +1289,15 @@ resource wc027ProducerJob 'Microsoft.App/jobs@2025-01-01' existing = if (wc027Fe
   )
 }
 
-resource wc027PublisherJob 'Microsoft.App/jobs@2025-01-01' existing = if (wc027PublisherReady && wc027PublisherJobResourceIdValid) {
+resource wc027RequestProducerJob 'Microsoft.App/jobs@2025-01-01' existing = if (wc027RequestProducerReady && wc027RequestProducerJobResourceIdShapeValid) {
+  name: wc027RequestProducerJobResourceIdSegments[8]
+  scope: resourceGroup(
+    wc027RequestProducerJobResourceIdSegments[2],
+    wc027RequestProducerJobResourceIdSegments[4]
+  )
+}
+
+resource wc027PublisherJob 'Microsoft.App/jobs@2025-01-01' existing = if (wc027PublisherReady && wc027PublisherJobResourceIdShapeValid) {
   name: wc027PublisherJobResourceIdSegments[8]
   scope: resourceGroup(
     wc027PublisherJobResourceIdSegments[2],

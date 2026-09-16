@@ -226,6 +226,32 @@ var storageBlobDataReaderRoleDefinitionId = '2a2b9908-6ea1-4ae2-8e65-a410df84e7d
 var storageTableDataContributorRoleDefinitionId = '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3'
 var storageTableDataReaderRoleDefinitionId = '76199698-9eea-4c19-bc75-cec21354c6b6'
 var keyVaultCryptoUserRoleDefinitionId = '12338af0-0e69-4776-bea7-57ae8d297424'
+var guidancePublisherKedaPollingIntervalSeconds = 30
+var guidancePublisherColdStartSeconds = 30
+var guidancePublisherConnectionSetupSeconds = 30
+var guidancePublisherProcessingSeconds = 60
+var guidancePublisherMinimumRemainingLifetimeSeconds = guidancePublisherKedaPollingIntervalSeconds + guidancePublisherColdStartSeconds + guidancePublisherConnectionSetupSeconds + guidancePublisherProcessingSeconds
+var guidanceFeedKedaPollingIntervalSeconds = 30
+var guidanceFeedColdStartSeconds = 30
+var guidanceFeedConnectionSetupSeconds = 30
+var guidanceFeedProcessingSeconds = 60
+var guidanceFeedMinimumRemainingLifetimeSeconds = guidanceFeedKedaPollingIntervalSeconds + guidanceFeedColdStartSeconds + guidanceFeedConnectionSetupSeconds + guidanceFeedProcessingSeconds
+var guidanceFeedTriggerRecoverySeconds = 300
+var guidanceMinimumRemainingLifetimeSeconds = guidancePublisherMinimumRemainingLifetimeSeconds
+var guidancePublicationDeliveryBudget = {
+  publisherKedaPollingIntervalSeconds: guidancePublisherKedaPollingIntervalSeconds
+  publisherColdStartSeconds: guidancePublisherColdStartSeconds
+  publisherConnectionSetupSeconds: guidancePublisherConnectionSetupSeconds
+  publisherProcessingSeconds: guidancePublisherProcessingSeconds
+  publisherMinimumRemainingLifetimeSeconds: guidancePublisherMinimumRemainingLifetimeSeconds
+  feedKedaPollingIntervalSeconds: guidanceFeedKedaPollingIntervalSeconds
+  feedColdStartSeconds: guidanceFeedColdStartSeconds
+  feedConnectionSetupSeconds: guidanceFeedConnectionSetupSeconds
+  feedProcessingSeconds: guidanceFeedProcessingSeconds
+  feedMinimumRemainingLifetimeSeconds: guidanceFeedMinimumRemainingLifetimeSeconds
+  feedTriggerRecoverySeconds: guidanceFeedTriggerRecoverySeconds
+  minimumRemainingLifetimeSeconds: guidanceMinimumRemainingLifetimeSeconds
+}
 
 var expectedRegistryServer = '${toLower(registry.name)}.azurecr.io'
 var imagePrefix = '${expectedRegistryServer}/athena/wc027-enrichment-feed-producer@sha256:'
@@ -931,6 +957,7 @@ var runtimeConfiguration = {
     identityClientId: guidanceActivationReaderIdentity.properties.clientId
     identityResourceId: guidanceActivationReaderIdentity.id
   }
+  deliveryBudget: guidancePublicationDeliveryBudget
   deploymentBinding: {
     bindingEvidenceId: bindingEvidenceDigest
     attachedIdentityResourceIds: validatedAttachedIdentityResourceIds
@@ -1131,12 +1158,13 @@ resource producerJob 'Microsoft.App/jobs@2025-01-01' = {
         scale: {
           minExecutions: 0
           maxExecutions: 1
-          pollingInterval: 30
+          pollingInterval: guidanceFeedKedaPollingIntervalSeconds
           rules: [
             {
               name: 'wc027-signed-binding'
               type: 'azure-servicebus'
               identity: brokerIdentity.id
+              auth: []
               metadata: {
                 namespace: serviceBusNamespaceName
                 queueName: triggerQueueName
@@ -1192,6 +1220,9 @@ resource producerJob 'Microsoft.App/jobs@2025-01-01' = {
 
 @description('Resource ID proving that the WC-027 producer Job/config was deployed.')
 output producerJobResourceId string = producerJob.id
+
+@description('Exact digest-pinned image deployed to the WC-027 producer Job.')
+output producerImage string = validatedProducerImage
 
 @description('Digest of the exact non-secret runtime configuration deployed to the Job.')
 output deployedRuntimeConfigurationDigest string = startsWith(runtimeConfigurationDigest, 'sha256:')

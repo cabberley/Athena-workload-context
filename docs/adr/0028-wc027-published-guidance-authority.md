@@ -2,6 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-09-11
+- **Last updated:** 2026-09-15
 
 ADR 0029 advances the pre-runtime guidance authority wire contracts to v2 so runbook references
 carry immutable versions and content digests.
@@ -59,6 +60,62 @@ request and every nested lifecycle/subject/correlation-binding signature before 
 assets, re-reads the signed current occurrence and active index, and recomputes correlation rather
 than trusting a caller-supplied report.
 
+The publication request is now produced by a separate production runtime rather than by the
+authority publisher or a caller-side submit command. That producer consumes only the exact
+canonical signed `IncidentBoundCorrelationRequest.v1` from a private session-enabled queue. Before
+any output Blob or Service Bus write it verifies the nested incident-state, incident-subject, and
+incident-bound request signatures against exact pinned key versions; reads the current signed
+occurrence, pointer, and active index from the lifecycle authority; rejects draft context; and
+reads the exact version-pinned `PublishedContextAuthority` bytes to prove the manifest, resolved
+profile, dependency graph, context payload, publication record, and audit-head binding.
+
+`evaluatedAt` is derived deterministically from stable signed inputs: the maximum of the
+correlation request `trustedAsOf`, current occurrence `publishedAt`, and published-context
+authority `publishedAt`. It is never derived from wall-clock time. Expiry is the earlier of five
+minutes after that stable time or the nested correlation expiry. The producer signs with a
+dedicated request-signing identity, normalizes the detached signature with the same guidance
+signing rules as the publisher, and immediately verifies it using a separate exact-key public-key
+reader identity.
+
+Before enqueue, the producer create-or-recovers the exact canonical request in an isolated
+immutable Blob outbox. Its logical path is keyed only by the signed occurrence ID, so an identical
+retry recovers the same version while a different request for the same occurrence conflicts
+closed. The writer has create-only permission; a separate reader has exact read permission with
+Blob listing denied. Immediately before persistence and enqueue, the producer preserves the
+reviewed 150-second upstream minimum: 30 seconds each for publisher KEDA polling, cold start, and
+Service Bus setup plus 60 seconds for publisher processing. The exact minimum is accepted; anything
+below it fails before the corresponding persistence or send action. After persistence, the
+producer re-reads the signed lifecycle authority and the exact immutable context authority. It
+then establishes the sender, resamples the trusted clock, and calculates a broker TTL from the
+remaining request lifetime plus the bounded 300-second trigger-recovery allowance. Only then does a
+distinct Service Bus sender identity send the canonical request to
+`wc027-guidance-authority-requests`, using
+`requestId` as `MessageId`, incident ID as `SessionId`, a bounded TTL, and occurrence, incident,
+context-authority, request, outbox, and delivery-budget binding metadata. Service Bus duplicate
+detection and immutable outbox recovery make an uncertain send safely retryable with
+byte-identical identity.
+
+The publisher accepts exactly one configured request submitter identity, which must be the
+producer's dedicated sender and must not overlap any publisher, signer, reader, or runtime identity.
+Every other request-producer identity is disjoint from the complete enrichment-runtime deployment
+identity set and from every identity attached to the publisher Job. The sender-to-submitter
+authorization is the only cross-component identity handoff and does not attach the sender identity
+to the publisher Job.
+Before publication, a separate publisher outbox-reader identity validates the complete broker
+metadata and exact-reads the referenced Blob version, requiring byte-for-byte equality with the
+canonical signed request. A correctly signed request without durable outbox evidence therefore
+cannot activate guidance authority. The publisher and feed runtime require the same signed and
+configured delivery budget. After publisher KEDA polling, cold start, and Service Bus setup, a new
+publication must retain the exact 60-second processing phase. The signed activation establishes an
+independent feed-delivery timeline derived from the signed request: its trigger deadline is request
+expiry plus 300 seconds, and activation expiry is one complete 150-second feed phase later. The
+activation is the durable trigger outbox and binds the immutable binding reference, deterministic
+trigger message ID, both deadlines, and delivery budget. The publisher submits the trigger after
+CAS and completes its input only after submission returns. Definite or uncertain submission
+failure is retryable; replay exact-reads the same committed activation and immutable binding,
+resubmits the same message identity, and performs no second CAS—even after request expiry. An
+uncertain CAS that actually committed follows the same recovery path.
+
 The initial production publisher emits only the deterministic zero-option authority with
 `noMatchingControl`. It first create-or-recovers the immutable authority Blob, then signs and
 immediately verifies the binding, then create-or-recovers the binding Blob. Existing paths are
@@ -67,10 +124,12 @@ match.
 
 Activation is a separate signed `PublishedGuidanceAuthorityActivation.v1` CAS row keyed by
 incident ID. It binds the exact occurrence, request, binding digest, version-pinned binding
-reference, activation time, and expiry. A retry may reuse the same activation; a different
-activation for the same occurrence, an ETag conflict, a changed lifecycle authority, changed
-correlation result, or a superseding activation fails closed. The enrichment runtime verifies the
-current activation before correlation or any external write, closing replay of an older valid
+reference, deterministic trigger message ID, complete delivery budget, activation time, original
+request expiry, trigger recovery deadline, and independently bounded activation expiry. A retry
+may reuse the same activation; a different activation for the same occurrence, an ETag conflict,
+a changed lifecycle authority, changed correlation result, or a superseding activation fails
+closed. The enrichment runtime verifies the current activation, trigger metadata, and exact feed
+processing budget before correlation or any external write, closing replay of an older valid
 binding.
 
 Publication-request signing and guidance-binding signing are distinct from lifecycle,
@@ -80,11 +139,26 @@ configuration only. The lifecycle pointer and active-index `keyId` are checked a
 configured logical lifecycle ID, while lifecycle attestations and cryptographic verification are
 checked against the separately configured versioned Key Vault URI.
 
+The request producer, authority publisher, and enrichment/feed producer are separate runtime Jobs.
+The request producer does not create or activate `PublishedGuidanceAuthorityBinding.v2`, does not
+trigger enrichment, does not execute actions, and does not fabricate correlation or occurrence
+evidence. The authority publisher remains the only component that creates and activates the
+binding.
+
+Root readiness accepts those Jobs only by canonical absolute ARM IDs in the current subscription
+and reviewed foundation resource group. Complete syntactic parsing closes malformed prefixes,
+provider/type aliases, suffixes, duplicate separators, encoded/query/fragment forms, and
+cross-scope substitution. Existing-resource `.id` expressions are not claimed as server-returned
+identity evidence; readiness instead validates the referenced Job's complete configuration and
+identity surfaces.
+
 The publisher configuration is rejected unless its authority Blob endpoint/container and
 activation Table endpoint/name/partition exactly match the embedded feed runtime's read
 locations. The publisher deployment derives those destinations from that runtime configuration.
 Its authority writer has only Blob create permission, its activation writer has only Table entity
 read/add/update permission, and its binding signer has only exact-key sign permission.
+The publisher validates the ACR ID canonically and scopes its image-pull module to the exact parsed
+registry subscription and resource group.
 
 ## Consequences
 
@@ -96,8 +170,11 @@ read/add/update permission, and its binding signer has only exact-key sign permi
 - Manifest authoring must later add an applicable operator-guidance control before production
   authorities can contain selectable options.
 - Readiness remains an operational assertion. Shipping the publisher and feed runtime does not
-  set `wc027PublisherReady` or `wc027FeedV2ProducerReady`; both remain false until exact deployed
-  Job/configuration/RBAC evidence and end-to-end behavior are proven.
+  set `wc027RequestProducerReady`, `wc027PublisherReady`, or
+  `wc027FeedV2ProducerReady`; all remain false until exact deployed Job/configuration/RBAC evidence
+  and end-to-end behavior are proven. Readiness requires user-assigned-only identity mode, exactly
+  one reviewed container, and the complete environment, command, resource, probe, replica, scaler,
+  registry, volume, secret, and managed-identity lifecycle surfaces to match.
 
 ## Alternatives considered
 
@@ -117,3 +194,9 @@ read/add/update permission, and its binding signer has only exact-key sign permi
   mismatched occurrence authority, deterministic retries, conflicting activation, changed
   authority before activation/enqueue, strict request bytes, logical/physical key separation,
   and activation expiry/currentness.
+- Adversarial publication-request producer tests cover invalid nested signatures and key versions,
+  draft or stale inputs with zero output I/O, current occurrence and immutable context-authority
+  mismatch, separate signer verification failure, occurrence-keyed immutable outbox conflict,
+  retry after uncertain enqueue, exact replay/concurrency identity, broker metadata, strict
+  configuration and identity separation, required Blob versioning, digest-pinned non-root image,
+  least-privilege Bicep/RBAC, and the separate root readiness gate.

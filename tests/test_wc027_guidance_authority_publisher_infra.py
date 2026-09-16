@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 PUBLISHER = ROOT / "infra" / "wc027-guidance-authority-publisher" / "main.bicep"
 RUNTIME = ROOT / "infra" / "wc027-enrichment-feed-runtime" / "main.bicep"
@@ -27,13 +29,33 @@ KEY_SIGNER = (
 )
 
 
+def _evaluate_registry_resource_id(resource_id: str) -> tuple[list[str], bool]:
+    raw_segments = resource_id.split("/")
+    segments = [*raw_segments, *([""] * 9)]
+    valid = (
+        len(raw_segments) == 9
+        and not segments[0]
+        and segments[1] == "subscriptions"
+        and bool(segments[2])
+        and segments[3] == "resourceGroups"
+        and bool(segments[4])
+        and segments[5] == "providers"
+        and segments[6] == "Microsoft.ContainerRegistry"
+        and segments[7] == "registries"
+        and bool(segments[8])
+        and not any(alias in resource_id for alias in ("//", "?", "#", "%"))
+    )
+    return segments, valid
+
+
 def test_publisher_is_private_idempotent_and_uses_separated_authorities() -> None:
     source = PUBLISHER.read_text(encoding="utf-8")
 
     for expected in (
         "requiresSession: true",
         "requiresDuplicateDetection: true",
-        "defaultMessageTimeToLive: 'PT5M'",
+        "defaultMessageTimeToLive: 'PT10M'",
+        "maxDeliveryCount: 10",
         "maxMessageSizeInKilobytes: 12288",
         "maxExecutions: 1",
         "wc027-guidance-authority-requests",
@@ -45,6 +67,17 @@ def test_publisher_is_private_idempotent_and_uses_separated_authorities() -> Non
         "bindingSignerIdentityResourceId",
         "requestTrustReaderIdentityResourceId",
         "bindingTrustReaderIdentityResourceId",
+        "requestOutboxReaderIdentityResourceId",
+        "requestOutboxStorageAccountResourceId",
+        "@maxLength(1)\nparam requestSubmitterIdentityResourceIds array",
+        "@minLength(5)\n@maxLength(5)\nparam sourceIdentityResourceIds array",
+        "requires one dedicated request submitter identity",
+        "requestSubmitterIdentityClientId",
+        "requestSubmitterIdentityResourceId",
+        "requestOutbox:",
+        "wc027-guidance-request-outbox",
+        "requestOutboxReaderRbac",
+        "requestOutboxBlobService.properties.isVersioningEnabled == true",
         "keyId: requestLogicalKeyId",
         "keyId: bindingLogicalKeyId",
         "keyVaultKeyId: requestKey.properties.keyUriWithVersion",
@@ -52,6 +85,15 @@ def test_publisher_is_private_idempotent_and_uses_separated_authorities() -> Non
         "validatedRequestKeyFingerprint",
         "validatedBindingKeyFingerprint",
         "runtimeTrustDomainFingerprints",
+        "validatedRuntimeIdentityResourceIds",
+        "validatedSourceIdentityResourceIds",
+        "normalizedPublisherOwnedIdentityResourceIds",
+        "normalizedAttachedIdentityResourceIds",
+        "publisherRuntimeIdentityOverlap = intersection(",
+        "requestSubmitterRuntimeIdentityOverlap = intersection(",
+        "requestSubmitterAttachedIdentityOverlap = intersection(",
+        "binding trust reader must match the embedded runtime trust identity",
+        "separate from publisher and runtime identities",
         "public key fingerprints must be distinct",
         "must match runtime guidance trust",
         "authorityStorageAccountResourceId",
@@ -63,7 +105,9 @@ def test_publisher_is_private_idempotent_and_uses_separated_authorities() -> Non
         "runtimeActivation.partitionKey",
         "modules/blob-create-rbac.bicep",
         "modules/table-cas-rbac.bicep",
+        "../wc027-enrichment-feed-runtime/modules/blob-reader-rbac.bicep",
         "ATHENA_WC027_GUIDANCE_AUTHORITY_PUBLISHER_CONFIG_JSON",
+        "auth: []",
         "athena-context",
         "wc027-guidance-authority-publisher",
         "output publisherImage string = validatedPublisherImage",
@@ -81,6 +125,103 @@ def test_publisher_is_private_idempotent_and_uses_separated_authorities() -> Non
         "param activationPartitionKey",
     ):
         assert drift_prone_parameter not in source
+
+
+@pytest.mark.parametrize(
+    ("variant", "expected_valid"),
+    (
+        ("canonical", True),
+        ("cross-subscription", True),
+        ("cross-resource-group", True),
+        ("missing-leading-slash", False),
+        ("provider-case-alias", False),
+        ("type-case-alias", False),
+        ("empty-name", False),
+        ("child-resource", False),
+        ("duplicate-separator", False),
+        ("query", False),
+        ("fragment", False),
+        ("encoded-separator", False),
+    ),
+)
+def test_publisher_registry_id_and_image_pull_scope_are_evaluated_canonically(
+    variant: str,
+    expected_valid: bool,
+) -> None:
+    source = PUBLISHER.read_text(encoding="utf-8")
+    subscription_id = "11111111-1111-1111-1111-111111111111"
+    resource_group_name = "rg-shared-acr"
+    canonical = (
+        f"/subscriptions/{subscription_id}/resourceGroups/{resource_group_name}/"
+        "providers/Microsoft.ContainerRegistry/registries/athenashared"
+    )
+    variants = {
+        "canonical": canonical,
+        "cross-subscription": canonical.replace(
+            subscription_id,
+            "22222222-2222-2222-2222-222222222222",
+        ),
+        "cross-resource-group": canonical.replace(
+            resource_group_name,
+            "rg-central-acr",
+        ),
+        "missing-leading-slash": canonical.removeprefix("/"),
+        "provider-case-alias": canonical.replace(
+            "Microsoft.ContainerRegistry",
+            "microsoft.containerregistry",
+        ),
+        "type-case-alias": canonical.replace("/registries/", "/Registries/"),
+        "empty-name": canonical.removesuffix("athenashared"),
+        "child-resource": canonical + "/replications/eastus",
+        "duplicate-separator": canonical.replace("/providers/", "//providers/"),
+        "query": canonical + "?api-version=2025-04-01",
+        "fragment": canonical + "#registry",
+        "encoded-separator": canonical.replace("/registries/", "/registries%2F"),
+    }
+
+    segments, valid = _evaluate_registry_resource_id(variants[variant])
+
+    assert valid is expected_valid
+    if expected_valid:
+        assert segments[2] in {
+            subscription_id,
+            "22222222-2222-2222-2222-222222222222",
+        }
+        assert segments[4] in {resource_group_name, "rg-central-acr"}
+        assert segments[8] == "athenashared"
+
+    for expected in (
+        "registryResourceIdRawSegments = split(registryResourceId, '/')",
+        "length(registryResourceIdRawSegments) == 9",
+        "empty(registryResourceIdSegments[0])",
+        "registryResourceIdSegments[1] == 'subscriptions'",
+        "registryResourceIdSegments[3] == 'resourceGroups'",
+        "registryResourceIdSegments[5] == 'providers'",
+        "registryResourceIdSegments[6] == 'Microsoft.ContainerRegistry'",
+        "registryResourceIdSegments[7] == 'registries'",
+        "!contains(registryResourceId, '//')",
+        "!contains(registryResourceId, '?')",
+        "!contains(registryResourceId, '#')",
+        "!contains(registryResourceId, '%')",
+        "registryResourceId must identify one canonical "
+        "Microsoft.ContainerRegistry/registries resource",
+    ):
+        assert expected in source
+
+    registry_block = source.split(
+        "resource registry 'Microsoft.ContainerRegistry/registries@2025-04-01' existing =",
+        maxsplit=1,
+    )[1].split("var expectedRegistryServer", maxsplit=1)[0]
+    image_pull_block = source.split(
+        "module publisherImagePull "
+        "'../wc027-enrichment-feed-runtime/modules/acr-pull-rbac.bicep' =",
+        maxsplit=1,
+    )[1].split("var requestKeyVerifierRoleId", maxsplit=1)[0]
+    for block in (registry_block, image_pull_block):
+        assert "scope: resourceGroup(" in block
+        assert "validatedRegistryScope.subscriptionId" in block
+        assert "validatedRegistryScope.resourceGroupName" in block
+        assert "resourceGroup().name" not in block
 
 
 def test_publisher_data_plane_roles_are_exact_and_non_destructive() -> None:

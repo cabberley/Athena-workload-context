@@ -106,6 +106,17 @@ every runtime value from them. Supply `runtimeConfigurationDigest` as the extern
 Record the `deployedRuntimeConfigurationDigest`, `attachedIdentityResourceIds`, and
 `bindingEvidenceDigest` outputs with the Job resource ID for the root readiness gate.
 
+## Guidance publication-request producer
+
+`infra/wc027-guidance-publication-request-producer/main.bicep` deploys the separate production
+request producer documented in
+`docs/operations/wc027-guidance-publication-request-producer.md`. It consumes a canonical signed
+incident-bound request, verifies the current signed occurrence and immutable published-context
+authority, deterministically signs and self-verifies one request, persists occurrence-keyed
+immutable outbox evidence, revalidates authority, and sends the canonical request to the existing
+publisher queue. It does not create or activate guidance authority and it does not trigger this
+enrichment runtime.
+
 ## Guidance-authority publisher
 
 `infra/wc027-guidance-authority-publisher/main.bicep` deploys the separately governed production
@@ -117,10 +128,13 @@ publisher:
 - an immutable `wc027-guidance-authority` Blob container;
 - the `Wc027GuidanceActivation` Table;
 - one event-triggered Container Apps Job with distinct broker, authority reader/writer,
-  activation writer, request-trust reader, binding-trust reader, and binding-signer identities;
+  activation writer, request-trust reader, binding-trust reader, request-outbox reader, and
+  binding-signer identities;
 - a create-only authority Blob identity plus a separate exact-version readback identity;
 - Table entity read/add/update RBAC for activation CAS with no entity-delete permission;
 - exact-key public-key read/verify RBAC and exact-key sign-only binding RBAC; and
+- a singleton request-queue sender assignment for the dedicated request-producer identity plus
+  exact-version, no-list read access to its immutable request outbox; and
 - generated strict configuration in
   `ATHENA_WC027_GUIDANCE_AUTHORITY_PUBLISHER_CONFIG_JSON`.
 
@@ -130,15 +144,24 @@ configuration separately carries exact versioned Key Vault URIs. Lifecycle point
 `keyId` checks use the logical lifecycle ID; lifecycle attestation verification uses the physical
 versioned Key Vault URI.
 
-Submit one canonical, already-signed publication request:
+Production publication requests arrive only from the separate request-producer sender identity,
+carry the exact occurrence-keyed outbox reference in their broker metadata, and are rejected unless
+the publisher can exact-read matching immutable outbox bytes. No direct authority-request submit
+command is exposed. Producer, publisher, and feed configurations bind the same reviewed
+delivery contract. It preserves the request producer's 150-second upstream minimum and the
+publisher's 30/30/30/60 phase set. The feed has its own 150-second 30/30/30/60 phase set plus a
+300-second trigger-recovery allowance. The broker metadata, signed activation, publisher request,
+and feed trigger carry the same values. After feed startup and transport setup have completed, the
+runtime accepts the exact 60-second processing boundary and abandons less without writing
+enrichment, feed, or notification state.
 
-```powershell
-athena-context wc027-guidance-authority-submit `
-  --request .\guidance-authority-publication-request.json `
-  --service-bus-namespace <private-namespace>.servicebus.windows.net `
-  --request-queue wc027-guidance-authority-requests `
-  --managed-identity-client-id <authorized-submitter-identity-client-id>
-```
+The signed activation derives an independent trigger deadline from signed request expiry plus the
+300-second recovery allowance; activation expiry is one complete 150-second feed phase later. The
+activation is the durable trigger outbox and binds the immutable binding reference, trigger
+`MessageId`, both deadlines, and delivery budget. The publisher sends only after CAS. If CAS or
+trigger submission is uncertain, replay exact-reads the activation and binding outbox—even after
+request expiry—and resubmits the same deterministic message without a second activation;
+duplicate detection contains uncertain acceptance.
 
 The publisher verifies the outer request and nested lifecycle, subject, and correlation-binding
 signatures; confirms the exact current signed occurrence and active index; recomputes correlation;
@@ -152,23 +175,29 @@ The module grants each configured reader only its exact container with `Blob.Lis
 grants the trust-reader identity only exact-key read/verify data actions on the configured
 verification keys. Publisher authority and activation destinations are derived from the embedded
 runtime configuration, and startup fails closed if either location differs from the runtime read
-location. Do not grant workload Reader to the producer identities.
+location. Publisher-owned identities must not intersect the complete runtime deployment identity
+set. The only runtime identities attached to the publisher Job are the exact source readers and
+shared upstream trust reader consumed by publication; the module derives and validates that
+subset after normalizing resource IDs, so casing aliases cannot bypass uniqueness or submitter
+separation. Do not grant workload Reader to the producer identities.
 
-The job must be attached to every identity named in the runtime configuration. The Bicep module
-rejects duplicate attached identity IDs/client IDs. Its image must be digest-pinned.
+The Bicep module rejects duplicate attached identity IDs/client IDs. Its image must be
+digest-pinned.
 
 ## Activation gate
 
 Keep:
 
 ```text
+wc027RequestProducerReady=false
 wc027PublisherReady=false
 wc027FeedV2ProducerReady=false
 ```
 
 until all of the following are evidenced:
 
-1. the publisher and producer Jobs and their exact generated configurations are deployed;
+1. the request producer, publisher, and enrichment/feed producer Jobs and their exact generated
+   configurations are deployed;
 2. the trigger and notification queues are private and RBAC-only;
 3. every source reader can read only its configured exact container;
 4. each signing identity can use only its dedicated exact key;
@@ -177,25 +206,48 @@ until all of the following are evidenced:
 7. a stale or non-current binding is rejected by activation verification; and
 8. Notification v2 is observed only after the feed entry is verifiable.
 
-Code delivery does not flip either readiness flag. To assert publisher readiness, supply
+Code delivery does not flip any readiness flag. Assert request-producer readiness with the exact
+Job ID, configuration JSON/digest, digest-pinned image, attached identities, and deterministic RBAC
+evidence. Confirm separately that the publisher request queue grants sender access only to the
+request-producer sender identity. To assert publisher readiness, supply
 `wc027PublisherJobResourceId`, `wc027PublisherConfigurationDigest`, and
 `wc027PublisherConfigurationJson`, and `wc027PublisherImage` from the deployed publisher module.
-The root template reads the existing Job and fails closed unless the exact digest-pinned image,
-command/arguments, scaler and registry identity, configuration value and digest tag, embedded
-producer-runtime digest, attached identities, and deterministic RBAC binding evidence match.
+The root template reads the existing Job and fails closed unless it uses user-assigned identities
+only and has exactly one reviewed container with the exact digest-pinned image, command/arguments,
+environment, resources, empty probe/init-container/volume/secret and managed-identity lifecycle
+surfaces, complete replica/concurrency and scaler configuration, registry identity, configuration
+value and digest tag, embedded producer-runtime digest, attached identities, and deterministic RBAC
+binding evidence. Canonical publisher Job IDs are evaluated from their parsed segments before
+safety padding. All three WC-027 Jobs must resolve to the current subscription and
+`foundationResourceGroupName`; malformed prefixes, provider/type aliases, child resources,
+duplicate separators, query/fragment/encoding aliases, empty components, and cross-scope IDs fail
+readiness. The existing-resource `.id` expression is not treated as server-returned proof; exact
+syntactic validation plus the referenced Job's complete configuration and identity surfaces form
+the readiness evidence.
+When both jobs are asserted ready, the root gate also requires exact queue plus request-key handoff
+equality. Feed-v2 readiness requires both `wc027RequestProducerReady=true` and
+`wc027PublisherReady=true`.
 
 To assert producer readiness, supply
 `wc027EnrichmentFeedProducerJobResourceId` with the exact deployed `Microsoft.App/jobs` resource
 ID, `wc027EnrichmentFeedProducerConfigurationDigest` and
-`wc027EnrichmentFeedProducerConfigurationJson` from the producer module output. The root
-deployment derives the expected attached identity resource IDs and RBAC evidence ID from that
-exact deployed configuration; it does not accept independent identity arrays or evidence values.
-It reads the existing Job and fails closed unless the deployed configuration value and digest
-tag, derived broker identity, exact attached user-assigned identities, and RBAC evidence tag all
-match, the publisher is ready, and the WC-016 runtime is enabled.
+`wc027EnrichmentFeedProducerConfigurationJson`, and `wc027EnrichmentFeedProducerImage` from the
+producer module outputs. The root deployment derives the expected attached identity resource IDs
+and RBAC evidence ID from that exact deployed configuration; it does not accept independent
+identity arrays or evidence values. It reads the existing Job and fails closed unless the canonical
+Job ID, user-assigned-only identity mode, exact one-container image, command, arguments,
+environment, and resources, empty probes/init containers/volumes/volume mounts/secrets/identity
+lifecycle settings, complete replica/concurrency and Service Bus scaler metadata/auth, exact
+registry identity and shape, deployed configuration and binding-evidence tags, attached identities,
+and RBAC evidence all match. The publisher must also be ready and the WC-016 runtime enabled.
 
 ## Failure and retry
 
+- Request-producer invalid canonical/signature/key/draft/stale inputs: dead-letter with zero output
+  writes.
+- Request-producer immutable occurrence-slot conflict: dead-letter; never overwrite or delete.
+- Request-producer current authority or transport uncertainty: abandon and recover the same
+  occurrence-keyed request.
 - Transient absence of current occurrence/active-index authority: abandon and retry.
 - Noncanonical, expired, signature-invalid, occurrence-mismatched, or replay-conflicting
   publication request: dead-letter as `AthenaWc027GuidanceAuthorityRejected` without publishing.
