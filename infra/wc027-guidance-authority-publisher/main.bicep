@@ -99,6 +99,9 @@ var validatedRequestKeyFingerprint = !contains(validatedRuntimeTrustDomainFinger
 var validatedBindingKeyFingerprint = bindingKeyFingerprint == parsedEnrichmentRuntimeConfiguration.keys.guidanceBinding.keyFingerprint
   ? bindingKeyFingerprint
   : fail('publisher binding signer fingerprint must match runtime guidance trust')
+var validatedBindingLogicalKeyId = bindingLogicalKeyId == parsedEnrichmentRuntimeConfiguration.keys.guidanceBinding.keyId
+  ? bindingLogicalKeyId
+  : fail('publisher binding logical key ID must match runtime guidance trust')
 var authorityStorageAccountName = last(split(authorityStorageAccountResourceId, '/'))
 var activationStorageAccountName = last(split(activationStorageAccountResourceId, '/'))
 var expectedAuthorityBlobEndpoint = 'https://${toLower(authorityStorageAccountName)}.blob.${environment().suffixes.storage}'
@@ -114,10 +117,12 @@ var authorityContainerName = runtimeAuthorityAssets.containerName == 'wc027-guid
   : fail('runtime guidanceAuthoritySource container must be wc027-guidance-authority')
 var activationTableName = runtimeActivation.tableName
 var activationPartitionKey = runtimeActivation.partitionKey
+var registrySubscriptionId = split(registryResourceId, '/')[2]
+var registryResourceGroupName = split(registryResourceId, '/')[4]
 
 resource registry 'Microsoft.ContainerRegistry/registries@2025-04-01' existing = {
   name: last(split(registryResourceId, '/'))
-  scope: resourceGroup(split(registryResourceId, '/')[2], split(registryResourceId, '/')[4])
+  scope: resourceGroup(registrySubscriptionId, registryResourceGroupName)
 }
 
 var expectedRegistryServer = '${toLower(registry.name)}.azurecr.io'
@@ -203,11 +208,17 @@ resource requestQueue 'Microsoft.ServiceBus/namespaces/queues@2026-01-01' = {
   parent: serviceBus
   name: requestQueueName
   properties: {
+    status: 'Active'
+    autoDeleteOnIdle: 'P10675199DT2H48M5.4775807S'
     requiresSession: true
     requiresDuplicateDetection: true
     duplicateDetectionHistoryTimeWindow: 'PT15M'
+    enableBatchedOperations: true
+    enableExpress: false
+    enablePartitioning: false
     defaultMessageTimeToLive: 'PT5M'
     maxMessageSizeInKilobytes: 12288
+    maxSizeInMegabytes: 1024
     deadLetteringOnMessageExpiration: true
     lockDuration: 'PT5M'
     maxDeliveryCount: 5
@@ -339,6 +350,7 @@ module bindingSigner 'modules/key-signer-rbac.bicep' = {
 
 module publisherImagePull '../wc027-enrichment-feed-runtime/modules/acr-pull-rbac.bicep' = {
   name: 'wc027-guidance-publisher-acr-pull'
+  scope: resourceGroup(registrySubscriptionId, registryResourceGroupName)
   params: {
     registryName: registry.name
     identityResourceId: brokerIdentity.id
@@ -409,7 +421,7 @@ var publisherConfiguration = {
     identityResourceId: requestTrustReaderIdentity.id
   }
   bindingSigningKey: {
-    keyId: bindingLogicalKeyId
+    keyId: validatedBindingLogicalKeyId
     keyVaultKeyId: bindingKey.properties.keyUriWithVersion
     keyFingerprint: validatedBindingKeyFingerprint
     identityClientId: bindingSignerIdentity.properties.clientId
@@ -519,7 +531,12 @@ output deployedPublisherConfigurationDigest string = startsWith(publisherConfigu
 output attachedIdentityResourceIds array = validatedAttachedIdentityResourceIds
 output bindingEvidenceDigest string = bindingEvidenceDigest
 output requestQueueName string = requestQueue.name
+output requestQueueResourceId string = requestQueue.id
+output triggerQueueResourceId string = triggerQueue.id
 output authorityContainerName string = authorityContainerName
+output authorityContainerResourceId string = authorityContainerResourceId
 output activationTableName string = activationTableName
-output bindingLogicalKeyId string = bindingLogicalKeyId
+output activationTableResourceId string = activationTableResourceId
+output bindingLogicalKeyId string = validatedBindingLogicalKeyId
+output bindingKeyResourceId string = bindingKey.id
 output bindingKeyVaultKeyId string = bindingKey.properties.keyUriWithVersion

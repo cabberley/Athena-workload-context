@@ -40,7 +40,60 @@ Deploy and review each root independently:
 - `infra/wc024-monitoring-connectivity/main.bicep`
 - `infra/wc024-monitoring-foundation/main.bicep`
 - `infra/wc025-change-ingestion/main.bicep`
+- `infra/wc027-enrichment-feed-runtime/main.bicep`
+- `infra/wc027-guidance-authority-publisher/main.bicep`
 - `infra/wc029-monitoring-prerequisites/main.bicep` (preparation/readiness and explicitly gated guest extensions)
+
+WC-027 is not created by `infra/wc013-live-acceptance/main.bicep`. That root reads existing
+Container Apps Jobs only when its two WC-027 readiness flags are true. The governed deployment
+sequence is therefore:
+
+1. **Foundation**: deploy `infra/wc013-live-acceptance/main.bicep` with
+   `wc027FeedV2ProducerReady=false` and `wc027PublisherReady=false`. Capture the exact managed
+   environment, replay Storage, incident container, presentation identity and URL, private
+   Service Bus namespace/notification queue, and versioned WC-016/WC-027 signing-key outputs.
+2. **Producer**: deploy `infra/wc027-enrichment-feed-runtime/main.bicep` using a reviewed immutable
+   parameter artifact bound to those foundation outputs. Capture its exact Job resource ID,
+   digest-pinned image, generated configuration JSON and SHA-256 digest, attached identities,
+   RBAC evidence, exact queue IDs, and exact storage boundaries. This root also establishes the
+   empty private guidance-authority container so its read-only runtime boundary exists before any
+   publisher receives create permission.
+3. **Publisher**: deploy `infra/wc027-guidance-authority-publisher/main.bicep` with the exact
+   producer configuration JSON, digest, correlation-storage boundary, managed environment,
+   broker, source identities, and guidance-binding key resource from step 2. Capture its exact Job
+   resource ID, image, generated configuration JSON and SHA-256 digest, attached identities, RBAC
+   evidence, exact queue/container/table resource IDs, and versioned binding key.
+4. **Deployment activation gate (`live-acceptance`)**: redeploy
+   `infra/wc013-live-acceptance/main.bicep` with both readiness flags true and only the exact
+   producer and publisher handoffs from steps 2 and 3. The root then reads both deployed Jobs and
+   fails closed on image, command, scaler, registry, configuration, identity, RBAC,
+   embedded-runtime, or key-binding drift. Its
+   `wc016ApprovedConfiguration.wc027DeploymentReadiness` output must read back the exact accepted
+   Job IDs, images, configuration digests, embedded producer digest, and RBAC evidence.
+
+Use `scripts/wc029_deployment_orchestration.py` for these four stages. It creates immutable
+effective-parameter, full-payload what-if, plan, deployment-handoff, and deployment-receipt
+artifacts in an operator-selected evidence directory outside the repository. `plan` performs ARM
+validation and the repository zero-delete/public-exposure preflight. `apply` accepts only the
+unchanged reviewed plan digest, template, effective parameters, freshly repeated identical
+what-if, source commit, orchestrator/preflight implementation, and verified predecessor approval
+chain. It verifies that expected Jobs, identities, exact current key versions, and
+storage/authority resources exist before emitting the next handoff and receipt. Every handoff is
+bound to the exact source commit, subscription, deployment scope, reviewed plan digest, verified
+predecessor receipt hashes, a deliberately narrowed exact stage-output schema, and an exact
+effective-parameter binding. The foundation handoff carries one canonical SHA-256 over every
+non-WC-027 effective parameter rather than an open-ended parameter object. Missing, extra,
+cross-scope, changed, unapproved, or internally inconsistent plans, receipts, handoffs, parameters,
+and deployment outputs fail closed. Never call a later stage without the complete preceding
+handoff and independently reviewed receipt set.
+
+This four-stage tool establishes deployment wiring, not a publisher runtime invocation. The
+merged production publisher can publish `PublishedGuidanceAuthorityBinding.v2` to the producer
+trigger queue, and the orchestrator validates that exact shared queue plus the publisher broker's
+Service Bus Data Sender assignment. It does not construct, sign, or submit
+`GuidanceAuthorityPublicationRequest.v1`. The final deployment handoff therefore records
+`automaticRequestProducerPresent=false` and `runtimeInvocationValidated=false`; do not describe it
+as end-to-end WC-029 completion.
 
 `bootstrap-ampls.bicep` is not a repeatable deployment root. It sets AMPLS access modes to
 `Open/Open` and is resource-group scoped. Verify an existing AMPLS read-only. A missing AMPLS may
@@ -135,6 +188,8 @@ Use scope-correct, reviewed parameters for every root:
 | WC-024 connectivity | Subscription | Reviewed copy of `main.example.bicepparam` |
 | WC-024 foundation | Subscription | Reviewed environment parameter artifact; examples are not deployable approval |
 | WC-025 change ingestion | Subscription | New reviewed parameter artifact containing the exact image, identities, resource allowlist, containers, and versioned signing key |
+| WC-027 enrichment/feed runtime | Resource group | Reviewed immutable producer artifact bound to the WC-013 foundation handoff, including exact identities, source containers, trust metadata, image, and expected generated-configuration digest |
+| WC-027 guidance-authority publisher | Resource group | Reviewed immutable publisher artifact; the orchestration tool injects the exact producer configuration/digest and derives the shared foundation, correlation storage, broker, activation store, source identities, and binding-key/trust handoffs |
 | WC-029 monitoring prerequisites | Subscription | `infra/wc029-monitoring-prerequisites/main.preparation.bicepparam` with both extension gates false; enabling either requires a separately reviewed immutable copy |
 
 The release cannot proceed while any non-WC-013 root lacks its reviewed immutable parameter
@@ -167,14 +222,30 @@ allowlist and rerun the gate.
 
 ## Phase 3: effective RBAC
 
-Record inherited and direct assignments for every managed identity:
+The deployment operator must be able to call Microsoft Graph with `Application.Read.All`.
+For every managed-identity service principal, first enumerate
+`/servicePrincipals/{id}/transitiveMemberOf/microsoft.graph.group` with `$count=true`, follow every
+`@odata.nextLink`, and require the final unique group count to match `@odata.count`. Missing
+permissions, unavailable pages, cycles, untrusted continuation URLs, duplicate groups, or a
+truncated count fail closed.
+
+Record both assignment sets for the service principal and for every resolved transitive group.
+`--all` enumerates assignments at or below the subscription but does not return parent
+management-group grants, so run the scoped inherited query separately and review the
+de-duplicated union by assignment ID:
 
 ```powershell
-az role assignment list `
+$atOrBelowSubscription = az role assignment list `
   --subscription $SubscriptionId `
   --assignee-object-id '<principal-id>' `
-  --include-inherited `
   --all `
+  --output json
+
+$inheritedFromAncestors = az role assignment list `
+  --subscription $SubscriptionId `
+  --assignee-object-id '<principal-id>' `
+  --scope "/subscriptions/$SubscriptionId" `
+  --include-inherited `
   --output json
 ```
 
@@ -188,10 +259,214 @@ Required separation:
 - notification dispatcher: exact v2 queue/table/Logic App rights only; and
 - no generic Contributor assignment for a runtime identity.
 
+Without separate reviewed management-group hierarchy evidence, treat every assignment returned by
+the inherited query at a management-group scope as applying to every governed subscription
+resource and reject it unless that exact assignment is explicitly reviewed.
+
+The orchestrator performs these membership and assignment queries itself. Azure CLI must return a
+fully materialized assignment array for every principal and group; a leaked continuation object,
+malformed response, or unavailable assignment query fails closed rather than being interpreted as
+an empty page.
+
 ## Phase 4: deploy
 
 Deployment is an explicit operator action. The approved command, commit SHA, image digests,
 deployment name, what-if digest, and operator identity must be captured before execution.
+
+Run the four orchestration stages in order. Use a unique deployment name and a new evidence
+directory for each plan. Review the generated `*.what-if.json` and `*.plan.json` before running
+`apply`; the apply command rejects any changed byte.
+
+The plan schema is `athena.wc029DeploymentPlan.v6`. Every reviewed plan, base/effective parameter
+document, what-if, predecessor handoff, and receipt is read exactly once through the secure
+non-reparse artifact reader. Its immutable raw bytes, parsed document, file identity, and SHA-256
+remain attached to that orchestration invocation; later checks never reopen the reviewed path.
+Every Azure deployment validate, what-if, and create command includes `--no-prompt true`, and the
+subprocess receives no stdin. Before Azure validation, the orchestrator compiles the exact Bicep
+template and requires every non-defaulted parameter. It writes the derived effective bytes once to
+a private, identity-pinned temporary file; validate and what-if use that same file. Apply
+rematerializes the captured reviewed bytes privately, and its repeated what-if and create consume
+that same pinned copy. Identity and bytes are checked before and after each Azure command.
+
+For producer, publisher, and live-acceptance stages the plan also records
+`authorityBlobInventory` plus its exact checkpoint SHA-256. Blob service versioning must be enabled.
+Each checkpoint points to the digest of the reviewed predecessor checkpoint. One version-inclusive
+listing supplies every version ID, exact case-sensitive Blob name, ETag, and content length. New
+versions are downloaded by exact version, SHA-256 hashed, and parsed as canonical
+`PublishedGuidanceAuthority.v2` or `PublishedGuidanceAuthorityBinding.v2`; path-bound IDs and each
+binding's exact authority name, version, and digest must match. Previously checkpointed versions
+and digests must remain byte-identical, no content-addressed name may be overwritten or removed,
+and every authority must have a conforming binding. Legitimate publications therefore advance the
+checkpoint append-only instead of being compared circularly with the original deployment-time
+snapshot. Apply requires the pre-create checkpoint to equal the reviewed plan and emits the
+post-deployment successor checkpoint in the handoff and receipt chain. The plan's
+`requiredAuthorityCheckpointSha256s` map records every producer/publisher predecessor and prior
+same-stage checkpoint that the candidate must preserve, so publisher recovery cannot discard a
+newer producer checkpoint.
+
+Producer upgrades and publisher recovery must additionally supply
+`--prior-stage-handoff`, `--prior-stage-receipt`, and
+`--prior-stage-reviewed-receipt-sha256`. The reviewed prior same-stage receipt may come from an
+earlier source commit, but its receipt, plan, handoff, stage scope, and inventory hashes must remain
+internally exact, including deployment name and predecessor-receipt lineage. Every pre-existing
+producer authority container, even an empty one, requires prior producer evidence; an out-of-band
+deployment cannot establish a new baseline. If a reviewed fresh producer create succeeds but
+eventually consistent ARM/RBAC readback prevents the handoff and receipt, rerun the same apply with
+`--resume-succeeded-deployment`. That read-only recovery path is limited to the original fresh
+producer plan: it never runs what-if or create, and it requires the exact succeeded deployment name,
+incremental mode, reviewed parameters, exported compiled template, outputs, enabled versioning, and
+empty container before issuing the recovery receipt. Deployment and readiness readbacks use eight
+bounded attempts with no delete or unreviewed mutation.
+
+Use `--rotation-transition-assignment <exact-role-assignment-id>
+<exact-retired-principal-id>` for retired-principal assignments. Producer upgrades from the earlier
+signer grants use the distinct
+`--legacy-crypto-user-migration-assignment <exact-role-assignment-id>` option because those
+assignments remain bound to the current signer principals while their role profile changes.
+
+```powershell
+$Orchestrator = '.\scripts\wc029_deployment_orchestration.py'
+
+python $Orchestrator plan --stage foundation <reviewed foundation arguments>
+python $Orchestrator apply --plan-manifest <reviewed foundation plan> `
+  --reviewed-plan-sha256 <independently recorded sha256:...>
+
+python $Orchestrator plan --stage producer `
+  --foundation-handoff <foundation handoff> `
+  --foundation-receipt <foundation receipt> `
+  --foundation-reviewed-receipt-sha256 <independently recorded receipt sha256:...> `
+  <reviewed producer arguments>
+python $Orchestrator apply --plan-manifest <reviewed producer plan> `
+  --reviewed-plan-sha256 <independently recorded sha256:...>
+
+# Only after the exact fresh producer deployment succeeded but receipt issuance was
+# blocked by eventually consistent readback:
+python $Orchestrator apply --plan-manifest <same reviewed producer plan> `
+  --reviewed-plan-sha256 <same independently recorded sha256:...> `
+  --resume-succeeded-deployment
+
+python $Orchestrator plan --stage publisher `
+  --foundation-handoff <foundation handoff> `
+  --foundation-receipt <foundation receipt> `
+  --foundation-reviewed-receipt-sha256 <independently recorded receipt sha256:...> `
+  --producer-handoff <producer handoff> `
+  --producer-receipt <producer receipt> `
+  --producer-reviewed-receipt-sha256 <independently recorded receipt sha256:...> `
+  <reviewed publisher arguments>
+python $Orchestrator apply --plan-manifest <reviewed publisher plan> `
+  --reviewed-plan-sha256 <independently recorded sha256:...>
+
+python $Orchestrator plan --stage live-acceptance `
+  --foundation-handoff <foundation handoff> `
+  --foundation-receipt <foundation receipt> `
+  --foundation-reviewed-receipt-sha256 <independently recorded receipt sha256:...> `
+  --producer-handoff <producer handoff> `
+  --producer-receipt <producer receipt> `
+  --producer-reviewed-receipt-sha256 <independently recorded receipt sha256:...> `
+  --publisher-handoff <publisher handoff> `
+  --publisher-receipt <publisher receipt> `
+  --publisher-reviewed-receipt-sha256 <independently recorded receipt sha256:...> `
+  <reviewed WC-013 arguments>
+python $Orchestrator apply --plan-manifest <reviewed live-acceptance plan> `
+  --reviewed-plan-sha256 <independently recorded sha256:...>
+```
+
+Every `plan` command requires the fixed subscription, location, deployment name, reviewed
+parameter artifact, evidence directory, and explicit `--allow-change` entry for each approved
+create or modify. WC-027 resource-group stages additionally require
+`--resource-group rg-athena-wc013-live`. Do not treat these abbreviated placeholders as executable
+approval; record the complete reviewed commands and plan-file SHA-256 values separately in the
+evidence bundle. `apply` writes the immutable `athena.wc029DeploymentHandoff.v3` handoff and a separate
+`athena.wc029DeploymentReceipt.v2`, then prints the receipt path. Independently record the receipt
+SHA-256 before using it in a later stage. Each later `plan` loads the predecessor receipt, its
+referenced plan, effective parameters, what-if, handoff, and earlier receipt chain; a handoff's
+self-computed hashes alone are never approval evidence. The evidence directory must be outside the
+repository. Planning and apply both refuse a dirty working tree, duplicate allowlist entries, the
+wrong stage scope, or any missing or extra predecessor handoff/receipt/approval digest.
+
+The two WC-027 roots derive their configuration JSON from live ARM resource references, which ARM
+what-if cannot fully resolve. Their reviewed digest parameters are therefore recomputed against
+the exact resolved deployment output immediately after create. A mismatch emits no handoff and
+blocks every later stage; reconcile the reviewed digest and repeat validate/what-if rather than
+continuing with the mis-tagged Job. Apply also rejects a non-succeeded deployment, missing required
+root output, mismatched queue/container/table/key output, unexpected Job identity, tag, command,
+scaler, registry, environment, init container, volume, secret, secret reference, or secret-backed
+authentication; any RBAC assignment whose exact assignment ID is not bound to its reviewed
+principal, scope, role definition, condition, and — for a custom role — exact `actions`,
+`notActions`, `dataActions`, and `notDataActions` sets; any effective broad inherited or transitive
+group-derived grant on a governed identity; any unreviewed effective assignment intersecting a
+governed WC-027 scope for any attached, submitter, or reader identity; any unreviewed
+management-group assignment, which is conservatively treated as inherited by every governed
+resource unless separate reviewed hierarchy evidence is introduced; incomplete Microsoft Graph
+membership or Azure assignment evidence; any public/non-RBAC parent Key Vault behind an external
+trust key; any current Key Vault `kid`, RSA type/size, modulus, exponent, SPKI fingerprint, or
+key-operation drift from the same current-version read; any authority Blob service without
+versioning or any missing/conflicting authority
+content/version inventory; any assignment whose resolved role permissions include Blob read without the exact
+canonical condition-version `2.0` no-`Blob.List` ABAC expression; any queue outside its exact
+Active, non-forwarding, non-auto-deleting stage profile; a noncanonical/cross-subscription resource
+ID before validation or what-if; and any final WC-013 readiness readback that differs from the two
+accepted WC-027 handoffs.
+
+The publisher ACR pull module is deployed at the exact subscription and resource group parsed from
+`registryResourceId`; for the fixed topology this is `rg-athena-platform-dev`, not the WC-027
+runtime resource group. Producer verification also models the publisher transition explicitly.
+Before a publisher exists, no extra sender assignment is required. During partial recovery,
+publisher retry, or a later producer upgrade, only the deterministic assignment ID produced by
+`guid(triggerQueue.id, brokerIdentity.id, serviceBusDataSenderRoleDefinitionId)` is accepted, and
+its live principal, queue scope, sender role, principal type, and absent condition are revalidated.
+The complete set of direct assignments at the dedicated trigger queue must contain only the current
+producer assignments, the current deterministic publisher assignment when present, and at most
+four exact retired queue transition pairs. Record each assignment ID and retired principal ID with
+`--rotation-transition-assignment`; do not overload the what-if `--allow-change` list. The reviewed
+plan carries a bounded maximum of 32 transition assignments across all rotated-identity scopes,
+including notification sender, publisher request receiver, exact Key Vault roles, Blob and Table
+assignments, and ACR pull. Planning requires every approved transition ID to be present, bound to
+the independently reviewed retired service-principal ID, and constrained to an approved exact
+scope/role/condition profile.
+After independent plan review, an operator performs separately approved controlled revocation.
+Post-deployment verification requires the retired principal to be absent before emitting a
+handoff. If deletion and recreation of a same-name UAMI causes ARM's deterministic assignment ID to
+be reused, the live assignment is accepted only when its principal is the exact current principal
+and its role, scope, principal type, condition, and custom-role permissions exactly match the
+current expected assignment. The stale reviewed retired principal always fails. The orchestrator
+never deletes RBAC automatically. Any stale or unapproved queue assignment, missing current
+assignment, malformed transition pair or role, or leaked assignment page fails closed.
+
+The five deterministic legacy Key Vault Crypto User assignments are not classified as retired
+identity transitions. Producer planning carries them in the separately bounded
+`legacyCryptoUserMigrationAssignmentIds` plan field, validates their current signer principals and
+exact key scopes, and requires the reviewed set to match the assignments still present. They must
+be manually revoked before create; apply and every later producer dependency check require all
+five IDs to remain absent.
+
+Publisher verification re-queries effective RBAC for the union of publisher principals and every
+producer principal proven by the independently approved producer binding. Separated producer-only
+readers, writers, and signers therefore retain complete direct, group-derived, and inherited
+evidence during publisher apply and recovery; the expected producer assignment set is never
+reduced to the identities attached to the publisher.
+
+### Publisher invocation boundary
+
+No merged production component automatically constructs and submits
+`GuidanceAuthorityPublicationRequest.v1`. After deployment activation, an authorized operator or a
+future separately governed request producer must:
+
+1. construct an already-authoritative canonical signed publication request from the exact current
+   occurrence, approved context, correlation request, requested actions, evaluation time, and
+   expiry;
+2. submit it to `wc027-guidance-authority-requests` with
+   `athena-context wc027-guidance-authority-submit`;
+3. prove one publisher Job execution consumed that request and created the exact immutable
+   authority, signed binding, and current signed activation;
+4. prove the publisher broker sent that binding to the exact
+   `wc027-enrichment-feed-requests` queue and the producer consumed it; and
+5. retain signed producer readback through enrichment, registry admission, feed-v2 commit, and
+   Notification v2 before claiming end-to-end behavior.
+
+This runtime evidence is outside `scripts/wc029_deployment_orchestration.py`. Root deployment,
+successful what-if, and `wc027DeploymentReadiness` prove only the dormant production path and its
+least-privilege wiring.
 
 After deployment:
 

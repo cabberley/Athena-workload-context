@@ -5,25 +5,13 @@ PUBLISHER = ROOT / "infra" / "wc027-guidance-authority-publisher" / "main.bicep"
 RUNTIME = ROOT / "infra" / "wc027-enrichment-feed-runtime" / "main.bicep"
 ROOT_DEPLOYMENT = ROOT / "infra" / "wc013-live-acceptance" / "main.bicep"
 BLOB_CREATOR = (
-    ROOT
-    / "infra"
-    / "wc027-guidance-authority-publisher"
-    / "modules"
-    / "blob-create-rbac.bicep"
+    ROOT / "infra" / "wc027-guidance-authority-publisher" / "modules" / "blob-create-rbac.bicep"
 )
 TABLE_CAS = (
-    ROOT
-    / "infra"
-    / "wc027-guidance-authority-publisher"
-    / "modules"
-    / "table-cas-rbac.bicep"
+    ROOT / "infra" / "wc027-guidance-authority-publisher" / "modules" / "table-cas-rbac.bicep"
 )
 KEY_SIGNER = (
-    ROOT
-    / "infra"
-    / "wc027-guidance-authority-publisher"
-    / "modules"
-    / "key-signer-rbac.bicep"
+    ROOT / "infra" / "wc027-guidance-authority-publisher" / "modules" / "key-signer-rbac.bicep"
 )
 
 
@@ -34,6 +22,7 @@ def test_publisher_is_private_idempotent_and_uses_separated_authorities() -> Non
         "requiresSession: true",
         "requiresDuplicateDetection: true",
         "defaultMessageTimeToLive: 'PT5M'",
+        "autoDeleteOnIdle: 'P10675199DT2H48M5.4775807S'",
         "maxMessageSizeInKilobytes: 12288",
         "maxExecutions: 1",
         "wc027-guidance-authority-requests",
@@ -46,16 +35,21 @@ def test_publisher_is_private_idempotent_and_uses_separated_authorities() -> Non
         "requestTrustReaderIdentityResourceId",
         "bindingTrustReaderIdentityResourceId",
         "keyId: requestLogicalKeyId",
-        "keyId: bindingLogicalKeyId",
+        "keyId: validatedBindingLogicalKeyId",
         "keyVaultKeyId: requestKey.properties.keyUriWithVersion",
         "keyVaultKeyId: bindingKey.properties.keyUriWithVersion",
         "validatedRequestKeyFingerprint",
         "validatedBindingKeyFingerprint",
+        "validatedBindingLogicalKeyId",
         "runtimeTrustDomainFingerprints",
         "public key fingerprints must be distinct",
         "must match runtime guidance trust",
+        "binding logical key ID must match runtime guidance trust",
         "authorityStorageAccountResourceId",
         "activationStorageAccountResourceId",
+        "registrySubscriptionId = split(registryResourceId, '/')[2]",
+        "registryResourceGroupName = split(registryResourceId, '/')[4]",
+        "scope: resourceGroup(registrySubscriptionId, registryResourceGroupName)",
         "runtimeAuthorityAssets.blobEndpoint",
         "runtimeAuthorityAssets.containerName",
         "runtimeActivation.tableEndpoint",
@@ -88,10 +82,7 @@ def test_publisher_data_plane_roles_are_exact_and_non_destructive() -> None:
     table = TABLE_CAS.read_text(encoding="utf-8")
     signer = KEY_SIGNER.read_text(encoding="utf-8")
 
-    assert (
-        "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action"
-        in blob
-    )
+    assert "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action" in blob
     for forbidden in (
         "blobs/read",
         "blobs/write",

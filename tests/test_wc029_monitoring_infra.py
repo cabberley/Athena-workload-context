@@ -16,6 +16,10 @@ NETWORK = (INFRA / "modules" / "network-evidence-validation.bicep").read_text(en
 STORAGE = (INFRA / "modules" / "storage-validation.bicep").read_text(encoding="utf-8")
 PARAMETERS = (INFRA / "main.preparation.bicepparam").read_text(encoding="utf-8")
 READINESS = (INFRA / "Test-MonitoringReadiness.ps1").read_text(encoding="utf-8")
+READINESS_TEST = (
+    ROOT / "tests" / "Test-Wc029MonitoringReadiness.ps1"
+).read_text(encoding="utf-8")
+CI = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
 WC025_PARAMETERS = (
     ROOT / "infra" / "wc025-change-ingestion" / "main.example.bicepparam"
 ).read_text(encoding="utf-8")
@@ -31,6 +35,14 @@ def test_wc029_is_subscription_scoped_and_pinned_to_reviewed_environment() -> No
     assert "validatedSubscriptionId" in MAIN
     assert "athena-hackathon-vnet" in MAIN
     assert MAIN.count("athena-hackathon-") >= 14
+
+
+def test_wc029_readiness_adversarial_wrapper_runs_in_ci() -> None:
+    assert "Test WC-029 monitoring readiness rules" in CI
+    assert "./tests/Test-Wc029MonitoringReadiness.ps1" in CI
+    assert "Parser]::ParseFile" in READINESS_TEST
+    assert "Invoke-AzJson" not in READINESS_TEST
+    assert "& az" not in READINESS_TEST
 
 
 def test_wc029_validates_ama_dcr_dce_and_vm_insights_coverage() -> None:
