@@ -860,7 +860,6 @@ def _wire_guard_execution(
         effective_rbac_max_freshness_seconds=600,
         started_at=NOW,
         exchanges=[],
-        wire_attempts=[],
     )
 
 
@@ -880,14 +879,15 @@ def _multi_resource_activity_request() -> ActivityLogQueryRequest:
     )
 
 
-def test_activity_log_records_and_budgets_each_actual_http_request() -> None:
+def test_activity_log_guards_each_actual_http_request() -> None:
     request = _multi_resource_activity_request()
     transport = _MockTransport(
         _ResponseSpec({"value": []}),
         _ResponseSpec({"value": []}),
     )
+    clock_values = [NOW, NOW, NOW, NOW]
     execution = _wire_guard_execution(
-        [NOW, NOW, NOW, NOW],
+        clock_values,
         expires_at=NOW + timedelta(minutes=1),
     )
     client = AzureActivityLogAcquisitionClient(
@@ -901,11 +901,7 @@ def test_activity_log_records_and_budgets_each_actual_http_request() -> None:
 
     assert result.rows == ()
     assert len(transport.requests) == 2
-    assert [item.attempt for item in execution.wire_attempts] == [1, 2]
-    assert {item.logical_request_digest for item in execution.wire_attempts} == {
-        request.request_digest
-    }
-    assert len({item.wire_request_digest for item in execution.wire_attempts}) == 2
+    assert clock_values == []
 
 
 def test_activity_log_rejects_second_http_request_after_rbac_expiry() -> None:
@@ -932,7 +928,6 @@ def test_activity_log_rejects_second_http_request_after_rbac_expiry() -> None:
         client.query_activity_log(request)
 
     assert len(transport.requests) == 1
-    assert len(execution.wire_attempts) == 1
 
 
 def test_claims_challenge_cannot_trigger_unmetered_source_resend() -> None:
@@ -949,8 +944,9 @@ def test_claims_challenge_cannot_trigger_unmetered_source_resend() -> None:
         ),
         _ResponseSpec({"value": []}),
     )
+    clock_values = [NOW]
     execution = _wire_guard_execution(
-        [NOW],
+        clock_values,
         expires_at=NOW + timedelta(minutes=1),
     )
     client = AzureActivityLogAcquisitionClient(
@@ -964,7 +960,7 @@ def test_claims_challenge_cannot_trigger_unmetered_source_resend() -> None:
         client.query_activity_log(request)
 
     assert len(transport.requests) == 1
-    assert execution.wire_attempts == []
+    assert clock_values == []
 
 
 def test_resource_health_records_one_bounded_graph_wire_request() -> None:
@@ -998,8 +994,9 @@ def test_resource_health_records_one_bounded_graph_wire_request() -> None:
             }
         )
     )
+    clock_values = [NOW, NOW]
     execution = _wire_guard_execution(
-        [NOW, NOW],
+        clock_values,
         expires_at=NOW + timedelta(minutes=1),
     )
     client = AzureResourceHealthAcquisitionClient(
@@ -1013,8 +1010,7 @@ def test_resource_health_records_one_bounded_graph_wire_request() -> None:
 
     assert len(result.rows) == 2
     assert len(transport.requests) == 1
-    assert [item.attempt for item in execution.wire_attempts] == [1]
-    assert execution.wire_attempts[0].logical_request_digest == request.request_digest
+    assert clock_values == []
     body = json.loads(transport.requests[0].body)
     assert PRODUCTION_DB_ID.casefold() in body["query"]
     assert PRODUCTION_WEB_ID.casefold() in body["query"]

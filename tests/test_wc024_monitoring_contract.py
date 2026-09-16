@@ -22,7 +22,6 @@ from athena_context.contracts import (
     MONITORING_IDENTITY_PROOF_TOKEN_VERSION,
     MonitoringAcquisitionExchange,
     MonitoringAcquisitionReceipt,
-    MonitoringAcquisitionWireAttempt,
     MonitoringCollectorContract,
     MonitoringEffectiveRbacInventory,
     MonitoringEvidenceAttestation,
@@ -2346,19 +2345,6 @@ def test_signed_acquisition_receipt_reverifies_deployed_identity_policy() -> Non
         checkedAt=observed_at,
         identityProofDigest=proof.proof_digest,
     )
-    wire_attempt = MonitoringAcquisitionWireAttempt(
-        sequence=1,
-        exchangeSequence=1,
-        attempt=1,
-        source="ipFlowVerify",
-        logicalRequestDigest=exchange.request_digest,
-        wireRequestDigest="sha256:" + "7" * 64,
-        wireResponseDigest="sha256:" + "8" * 64,
-        requestedAt=observed_at,
-        completedAt=observed_at,
-        responseStatus=200,
-        responseBytes=128,
-    )
     selected_incident = _selected_incident()
     payload: dict[str, object] = {
         "schemaVersion": MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION,
@@ -2390,13 +2376,6 @@ def test_signed_acquisition_receipt_reverifies_deployed_identity_policy() -> Non
                 exclude_none=True,
             )
         ],
-        "wireAttempts": [
-            wire_attempt.model_dump(
-                mode="json",
-                by_alias=True,
-                exclude_none=True,
-            )
-        ],
         "identityProof": proof.model_dump(mode="json", by_alias=True),
     }
     receipt_digest = compute_artifact_digest(payload)
@@ -2419,7 +2398,6 @@ def test_signed_acquisition_receipt_reverifies_deployed_identity_policy() -> Non
         **{
             **signed_payload,
             "exchanges": (exchange,),
-            "wireAttempts": (wire_attempt,),
             "identityProof": proof,
             "selectedIncident": selected_incident,
         },
@@ -2446,6 +2424,17 @@ def test_signed_acquisition_receipt_reverifies_deployed_identity_policy() -> Non
         enabled=True,
         activated_at=datetime(2026, 1, 1, tzinfo=UTC),
     )
+    with pytest.raises(ValidationError, match="wireAttempts|Extra inputs"):
+        MonitoringAcquisitionReceipt.model_validate(
+            {
+                **receipt.model_dump(
+                    mode="json",
+                    by_alias=True,
+                    exclude_none=True,
+                ),
+                "wireAttempts": [],
+            }
+        )
 
     verify_monitoring_acquisition_receipt_attestation(
         receipt,
@@ -2479,25 +2468,6 @@ def test_signed_acquisition_receipt_reverifies_deployed_identity_policy() -> Non
                 expected_acquisition_authority_digest=authority_digest,
                 maximum_receipt_age_seconds=600,
             )
-    escaped_wire_attempt = wire_attempt.model_copy(
-        update={
-            "requested_at": effective_rbac_inventory.expires_at,
-            "completed_at": effective_rbac_inventory.expires_at,
-        }
-    )
-    with pytest.raises(
-        ValueError,
-        match="wire-attempt times escape measured effective RBAC lifetime",
-    ):
-        verify_monitoring_acquisition_receipt_attestation(
-            receipt.model_copy(update={"wire_attempts": (escaped_wire_attempt,)}),
-            as_of=observed_at,
-            trusted_key_anchor=anchor,
-            key_resolver=lambda _anchor: record,
-            reviewed_collector_contract=contract,
-            expected_acquisition_authority_digest=authority_digest,
-            maximum_receipt_age_seconds=600,
-        )
     with pytest.raises(
         ValueError,
         match="execution is outside measured effective RBAC lifetime",
@@ -2553,7 +2523,6 @@ def test_signed_acquisition_receipt_reverifies_deployed_identity_policy() -> Non
             "athenaContextPrincipalId",
             "identityProof",
             "selectedIncident",
-            "wireAttempts",
         }
     }
     legacy_payload.update(

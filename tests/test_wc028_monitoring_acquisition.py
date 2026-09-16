@@ -1248,11 +1248,6 @@ def test_acquisition_derives_strict_requests_and_commits_one_batch() -> None:
     assert manifest.normalized_evidence_digest == receipt.normalized_evidence_digest
     assert manifest.exchanges == receipt.exchanges
     assert len(receipt.exchanges) == len(port.requests)
-    assert receipt.wire_attempts is not None
-    assert len(receipt.wire_attempts) == len(port.requests)
-    assert tuple(item.exchange_sequence for item in receipt.wire_attempts) == tuple(
-        item.sequence for item in receipt.exchanges
-    )
     assert all(
         item.identity_proof_digest == receipt.identity_proof.proof_digest
         for item in receipt.exchanges
@@ -1757,7 +1752,6 @@ def test_each_source_call_rechecks_live_effective_rbac_start_time() -> None:
         effective_rbac_max_freshness_seconds=600,
         started_at=NOW,
         exchanges=[],
-        wire_attempts=[],
     )
 
     assert execution._capture_call_start(None) == NOW

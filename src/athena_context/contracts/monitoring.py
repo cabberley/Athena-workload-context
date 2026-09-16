@@ -3729,43 +3729,6 @@ class MonitoringIdentityProof(_StrictMonitoringContract):
         return self
 
 
-class MonitoringAcquisitionWireAttempt(_StrictMonitoringContract):
-    """One exact HTTP request/response interval within a logical acquisition exchange."""
-
-    sequence: int = Field(ge=1, le=256)
-    exchange_sequence: int = Field(alias="exchangeSequence", ge=1, le=32)
-    attempt: int = Field(ge=1, le=64)
-    source: Literal[
-        "activityLog",
-        "ipFlowVerify",
-        "logAnalytics",
-        "resourceGraph",
-        "resourceHealth",
-    ]
-    logical_request_digest: str = Field(
-        alias="logicalRequestDigest",
-        pattern=_DIGEST_PATTERN,
-    )
-    wire_request_digest: str = Field(
-        alias="wireRequestDigest",
-        pattern=_DIGEST_PATTERN,
-    )
-    wire_response_digest: str = Field(
-        alias="wireResponseDigest",
-        pattern=_DIGEST_PATTERN,
-    )
-    requested_at: UtcDateTime = Field(alias="requestedAt")
-    completed_at: UtcDateTime = Field(alias="completedAt")
-    response_status: int = Field(alias="responseStatus", ge=100, le=599)
-    response_bytes: int = Field(alias="responseBytes", ge=0, le=16 * 1024 * 1024)
-
-    @model_validator(mode="after")
-    def validate_attempt(self) -> MonitoringAcquisitionWireAttempt:
-        if self.requested_at > self.completed_at:
-            raise ValueError("acquisition wire-attempt times are reversed")
-        return self
-
-
 class MonitoringAcquisitionExchange(_StrictMonitoringContract):
     """Collector-timed receipt entry for one exact Azure acquisition call."""
 
@@ -4084,11 +4047,6 @@ class MonitoringAcquisitionReceipt(_StrictMonitoringContract):
         min_length=0,
         max_length=32,
     )
-    wire_attempts: tuple[MonitoringAcquisitionWireAttempt, ...] | None = Field(
-        default=None,
-        alias="wireAttempts",
-        max_length=256,
-    )
     receipt_digest: str = Field(alias="receiptDigest", pattern=_DIGEST_PATTERN)
     credential_proofs: tuple[MonitoringCredentialProof, ...] | None = Field(
         default=None,
@@ -4255,50 +4213,6 @@ class MonitoringAcquisitionReceipt(_StrictMonitoringContract):
             for item in self.exchanges
         ):
             raise ValueError("IP Flow checkedAt must use collector-owned execution time")
-        if (
-            self.schema_version != MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION
-            and self.wire_attempts
-        ):
-            raise ValueError("historical acquisition receipts cannot contain wire attempts")
-        if self.wire_attempts:
-            if tuple(item.sequence for item in self.wire_attempts) != tuple(
-                range(1, len(self.wire_attempts) + 1)
-            ):
-                raise ValueError("acquisition wire attempts must use contiguous execution order")
-            wire_request_digests = tuple(item.wire_request_digest for item in self.wire_attempts)
-            if len(wire_request_digests) != len(set(wire_request_digests)):
-                raise ValueError("acquisition wire request digests must be unique")
-            attempts_by_exchange = {
-                exchange.sequence: tuple(
-                    item
-                    for item in self.wire_attempts
-                    if item.exchange_sequence == exchange.sequence
-                )
-                for exchange in self.exchanges
-            }
-            if any(
-                item.exchange_sequence not in attempts_by_exchange for item in self.wire_attempts
-            ):
-                raise ValueError("wire attempt references an unknown acquisition exchange")
-            for exchange in self.exchanges:
-                attempts = attempts_by_exchange[exchange.sequence]
-                if (
-                    not attempts
-                    or tuple(item.attempt for item in attempts)
-                    != tuple(range(1, len(attempts) + 1))
-                    or any(
-                        item.source != exchange.source
-                        or item.logical_request_digest != exchange.request_digest
-                        or not exchange.requested_at
-                        <= item.requested_at
-                        <= item.completed_at
-                        <= exchange.received_at
-                        for item in attempts
-                    )
-                ):
-                    raise ValueError(
-                        "wire attempts do not exactly bind their logical acquisition exchange"
-                    )
         expected = compute_artifact_digest(
             self.model_dump(
                 mode="json",
@@ -4681,39 +4595,6 @@ def verify_monitoring_acquisition_receipt_attestation(
         raise ValueError(
             "acquisition receipt exchange times escape measured effective RBAC lifetime"
         )
-    wire_attempts = receipt.wire_attempts or ()
-    if receipt.exchanges and not wire_attempts:
-        raise ValueError("production acquisition receipt omitted wire-attempt timing")
-    if any(
-        not effective_rbac_inventory.collected_at
-        <= attempt.requested_at
-        <= attempt.completed_at
-        < effective_rbac_inventory.expires_at
-        or (attempt.completed_at - effective_rbac_inventory.collected_at).total_seconds()
-        > maximum_receipt_age_seconds
-        for attempt in wire_attempts
-    ):
-        raise ValueError("acquisition wire-attempt times escape measured effective RBAC lifetime")
-    attempts_by_exchange = {
-        exchange.sequence: tuple(
-            attempt for attempt in wire_attempts if attempt.exchange_sequence == exchange.sequence
-        )
-        for exchange in receipt.exchanges
-    }
-    if any(
-        not attempts_by_exchange[exchange.sequence]
-        or any(
-            attempt.source != exchange.source
-            or attempt.logical_request_digest != exchange.request_digest
-            or not exchange.requested_at
-            <= attempt.requested_at
-            <= attempt.completed_at
-            <= exchange.received_at
-            for attempt in attempts_by_exchange[exchange.sequence]
-        )
-        for exchange in receipt.exchanges
-    ):
-        raise ValueError("acquisition wire attempts do not bind every signed exchange")
     if (
         receipt.acquisition_authority_digest != expected_acquisition_authority_digest
         or receipt.collector_contract_digest != expected_collector_contract_digest
@@ -4795,7 +4676,6 @@ __all__ = [
     "MONITORING_PREVIOUS_PRODUCTION_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION",
     "MonitoringAcquisitionExchange",
     "MonitoringAcquisitionReceipt",
-    "MonitoringAcquisitionWireAttempt",
     "MonitoringCollectorContract",
     "MonitoringCredentialProof",
     "MonitoringEffectiveRbacGrant",

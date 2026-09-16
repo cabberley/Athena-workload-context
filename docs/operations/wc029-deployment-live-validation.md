@@ -220,14 +220,23 @@ template. Perform these steps in order:
    contain every intervening ARM scope, including the Key Vault resource between its resource group
    and the leaf signing key, so broader vault roles and denies cannot escape review.
 
+For each monitoring-intent key read, validate runtime-support RBAC at trusted request start and
+completion. This must occur at the HTTP transport boundary so Key Vault authentication challenges
+and retries are independently guarded, and the resolver's second read must recapture time rather
+than reuse the first read's timestamp. Treat the SystemDefined all-principals deny ID as applying to
+the support principal unless that principal is explicitly excluded; an unsupported condition that
+could affect `AcrPull` or key read blocks execution.
+
 The Job uses `triggerType: Manual` and `replicaRetryLimit: 0`. Never start it on a timer. Create a
 new execution ID, cleanup binding, collector inventory, and replay key for each governed execution.
 The current runtime-support inventory may be refreshed without changing the replay key; recovery
 must use the inventory digest and lifetime already bound by the collector-signed recovery state.
-During a new acquisition, every actual HTTP request and response interval—not only the logical
-source operation—must consume the call budget and remain inside the collector inventory lifetime
-and effective minimum freshness bound. The signed receipt must retain the nested wire-attempt
-digests and timestamps for later verification.
+Historical receipt v5 must remain byte-compatible and contain only its existing logical exchanges.
+Do not add `wireAttempts` or reinterpret authority v5 `maxAcquisitionCalls` locally. The final PR #99
+contract must publish explicit successor receipt and authority versions that bind every physical
+request/response interval and its reviewed call budget; only then may PR #101 restack and consume
+those fields. Until that restack, runtime guards every physical request against current RBAC time but
+the deployment gates remain closed.
 
 ## Phase 3: effective RBAC
 

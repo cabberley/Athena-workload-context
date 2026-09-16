@@ -75,16 +75,23 @@ and approved change scope. It also binds:
   support inventory does not change the stable recovery path; the collector-signed recovery state
   retains the original inventory digest and execution-time validity window.
 
+Every physical monitoring-intent Key Vault request is wrapped at the HTTP transport boundary.
+Trusted time and runtime-support RBAC are revalidated immediately before and after each attempt,
+including authentication challenges and SDK retries. The resolver's second key read receives a new
+guard interval; expiry during the first read prevents construction or execution of that second read.
+The Azure SystemDefined all-principals deny sentinel is applied only when it is the sole deny
+principal. Exclusions are evaluated first, unsupported conditions fail closed only when they could
+affect a required support operation, and nil GUIDs remain invalid everywhere else.
+
 The runtime delegates managed-identity acquisition to the hardened production adapter. That
 adapter verifies the collector identity through the Athena-owned proof audience, carries the
 collector effective-RBAC inventory window into every acquisition execution, and checks live trusted
-time immediately before and after every Azure source call. Receipt verification proves every
-logical exchange, every nested wire-attempt request/completion, and the collector execution
-completion remained inside the signed inventory lifetime and effective minimum freshness bound.
-Each actual HTTP request—including per-resource Activity Log calls, the bounded Resource Graph
-HealthResources query, and ARM polling—consumes the reviewed call budget and contributes exact
-request/response digests to the signed receipt. The adapter creates every Azure source client from
-the same verified
+time immediately before and after every Azure source call and physical HTTP request. Historical
+acquisition receipt v5 remains unchanged: it signs and verifies logical exchanges only and does not
+accept a `wireAttempts` extension or reinterpret `maxAcquisitionCalls` as a physical-request budget.
+The draft remains hard-gated until PR #99 publishes explicit successor receipt and authority schema
+versions for those mandatory wire-attempt and call-budget semantics. The adapter creates every Azure
+source client from the same verified
 `ManagedIdentityCredential`, binds resource-context Log Analytics request v3 and permission evidence
 to the authority-selected VM scope, and persists the selected incident in acquisition receipt v5
 and correlation request v4.

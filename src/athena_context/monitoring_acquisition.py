@@ -35,7 +35,6 @@ from athena_context.contracts import (
     LogQueryMonitoringSignal,
     MonitoringAcquisitionExchange,
     MonitoringAcquisitionReceipt,
-    MonitoringAcquisitionWireAttempt,
     MonitoringCollectorContract,
     MonitoringEvidenceAttestation,
     MonitoringIdentityProof,
@@ -1518,12 +1517,6 @@ class _AzureJsonResponse:
 
 @dataclass(frozen=True, slots=True)
 class _AzureWireRequestToken:
-    sequence: int
-    exchange_sequence: int
-    attempt: int
-    source: AcquisitionSource
-    logical_request_digest: str
-    wire_request_digest: str
     requested_at: datetime
 
 
@@ -3420,7 +3413,6 @@ class _AcquisitionExecution:
     effective_rbac_max_freshness_seconds: int
     started_at: datetime
     exchanges: list[MonitoringAcquisitionExchange]
-    wire_attempts: list[MonitoringAcquisitionWireAttempt]
 
     def _validate_effective_rbac_time(
         self,
@@ -3442,7 +3434,7 @@ class _AcquisitionExecution:
         self,
         requested_at_override: datetime | None,
     ) -> datetime:
-        if len(self.wire_attempts) >= self.max_calls:
+        if len(self.exchanges) >= self.max_calls:
             raise MonitoringAcquisitionError(
                 "monitoring acquisition exceeded its total call budget"
             )
@@ -3482,10 +3474,7 @@ class _AcquisitionExecution:
         headers: Mapping[str, str],
         body: bytes | None,
     ) -> _AzureWireRequestToken:
-        if len(self.wire_attempts) >= self.max_calls:
-            raise MonitoringAcquisitionError(
-                "monitoring acquisition exceeded its total call budget"
-            )
+        del source, logical_request_digest, method, url, headers, body
         requested_at = self.adapter.utc_now()
         if (
             requested_at < self.started_at
@@ -3503,35 +3492,7 @@ class _AcquisitionExecution:
             raise MonitoringAcquisitionError(
                 "collector authorization expired before Azure wire request"
             )
-        exchange_sequence = len(self.exchanges) + 1
-        attempt = (
-            sum(item.exchange_sequence == exchange_sequence for item in self.wire_attempts) + 1
-        )
-        sequence = len(self.wire_attempts) + 1
-        request_payload = {
-            "schemaVersion": "athena.wc028MonitoringWireRequest.v1",
-            "sequence": sequence,
-            "exchangeSequence": exchange_sequence,
-            "attempt": attempt,
-            "source": source,
-            "logicalRequestDigest": logical_request_digest,
-            "method": method,
-            "url": url,
-            "headers": {
-                str(name).casefold(): str(value) for name, value in sorted(headers.items())
-            },
-            "bodyDigest": sha256_hex(body or b""),
-            "bodyBytes": len(body or b""),
-        }
-        return _AzureWireRequestToken(
-            sequence=sequence,
-            exchange_sequence=exchange_sequence,
-            attempt=attempt,
-            source=source,
-            logical_request_digest=logical_request_digest,
-            wire_request_digest=compute_artifact_digest(request_payload),
-            requested_at=requested_at,
-        )
+        return _AzureWireRequestToken(requested_at=requested_at)
 
     def complete_wire_request(
         self,
@@ -3541,6 +3502,7 @@ class _AcquisitionExecution:
         response_headers: Mapping[str, str],
         response_body: bytes,
     ) -> None:
+        del response_status, response_headers, response_body
         completed_at = self.adapter.utc_now()
         if completed_at < token.requested_at or completed_at >= self.identity_proof.expires_at:
             raise MonitoringAcquisitionError(
@@ -3554,31 +3516,6 @@ class _AcquisitionExecution:
             raise MonitoringAcquisitionError(
                 "collector authorization expired during Azure wire request"
             )
-        response_payload = {
-            "schemaVersion": "athena.wc028MonitoringWireResponse.v1",
-            "sequence": token.sequence,
-            "status": response_status,
-            "headers": {
-                str(name).casefold(): str(value) for name, value in sorted(response_headers.items())
-            },
-            "bodyDigest": sha256_hex(response_body),
-            "bodyBytes": len(response_body),
-        }
-        self.wire_attempts.append(
-            MonitoringAcquisitionWireAttempt(
-                sequence=token.sequence,
-                exchangeSequence=token.exchange_sequence,
-                attempt=token.attempt,
-                source=token.source,
-                logicalRequestDigest=token.logical_request_digest,
-                wireRequestDigest=token.wire_request_digest,
-                wireResponseDigest=compute_artifact_digest(response_payload),
-                requestedAt=token.requested_at,
-                completedAt=completed_at,
-                responseStatus=response_status,
-                responseBytes=len(response_body),
-            )
-        )
 
     def _invoke_at[
         RequestT: _AcquisitionRequest,
@@ -3595,7 +3532,6 @@ class _AcquisitionExecution:
             raise MonitoringAcquisitionError(
                 "IP Flow checkedAt must equal the collector-owned call start"
             )
-        wire_attempt_start = len(self.wire_attempts)
         result = operation(request)
         received_at = self.adapter.utc_now()
         if received_at < requested_at:
@@ -3609,36 +3545,6 @@ class _AcquisitionExecution:
                 "collector authorization expired during Azure source I/O"
             )
         source = cast(AcquisitionSource, request.source)
-        if len(self.wire_attempts) == wire_attempt_start:
-            sequence = len(self.wire_attempts) + 1
-            response_bytes = result.canonical_bytes()
-            self.wire_attempts.append(
-                MonitoringAcquisitionWireAttempt(
-                    sequence=sequence,
-                    exchangeSequence=len(self.exchanges) + 1,
-                    attempt=1,
-                    source=source,
-                    logicalRequestDigest=request.request_digest,
-                    wireRequestDigest=compute_artifact_digest(
-                        {
-                            "schemaVersion": ("athena.wc028SyntheticMonitoringWireRequest.v1"),
-                            "sequence": sequence,
-                            "logicalRequestDigest": request.request_digest,
-                        }
-                    ),
-                    wireResponseDigest=compute_artifact_digest(
-                        {
-                            "schemaVersion": ("athena.wc028SyntheticMonitoringWireResponse.v1"),
-                            "sequence": sequence,
-                            "resultDigest": sha256_hex(response_bytes),
-                        }
-                    ),
-                    requestedAt=requested_at,
-                    completedAt=received_at,
-                    responseStatus=200,
-                    responseBytes=len(response_bytes),
-                )
-            )
         self.exchanges.append(
             MonitoringAcquisitionExchange(
                 sequence=len(self.exchanges) + 1,
@@ -4414,7 +4320,6 @@ class MonitoringAcquisitionCoordinator:
             "executionCompletedAt": execution_completed_at,
             "receiptIssuedAt": receipt_issued_at,
             "exchanges": tuple(execution.exchanges),
-            "wireAttempts": tuple(execution.wire_attempts),
             "identityProof": identity_proof,
         }
         receipt_digest = compute_artifact_digest(_json_value(payload))
@@ -4618,7 +4523,6 @@ class MonitoringAcquisitionCoordinator:
             effective_rbac_max_freshness_seconds=(effective_rbac_freshness_seconds),
             started_at=collected_at,
             exchanges=[],
-            wire_attempts=[],
         )
         self._acquisition_adapter.bind_request_guard(execution)
 

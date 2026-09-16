@@ -4,7 +4,7 @@ import base64
 import os
 import re
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from fnmatch import fnmatchcase
@@ -132,9 +132,17 @@ _MONITORING_INTENT_KEY_READER_ROLE_NAME = "Athena WC028 Monitoring Intent Key Re
 _MONITORING_INTENT_KEY_READ_DATA_ACTION = "Microsoft.KeyVault/vaults/keys/read"
 _ZERO_DIGEST = f"sha256:{'0' * 64}"
 _NIL_GUID = "00000000-0000-0000-0000-000000000000"
+_ALL_PRINCIPALS_ID = _NIL_GUID
 _ZERO_EXECUTION_ID = f"wc028-execution-{'0' * 32}"
 _ARM_TEMPLATE_GUID_NAMESPACE = UUID("11fb06fb-712d-4ddd-98c7-e71bbd588830")
 _EXTERNAL_AZURE_FAILURES = (AzureError, ServiceBusError, OSError, TimeoutError)
+_ARM_GUID_PARENT_SEGMENTS = {
+    "subscriptions",
+    "roledefinitions",
+    "roleassignments",
+    "denyassignments",
+    "roleassignmentscheduleinstances",
+}
 
 
 def _configuration_tuple(value: object) -> tuple[object, ...]:
@@ -174,6 +182,14 @@ def _contains_forbidden_startup_sentinel(value: object) -> bool:
     if isinstance(value, list | tuple):
         return any(_contains_forbidden_startup_sentinel(item) for item in value)
     return False
+
+
+def _contains_nil_arm_guid(value: str) -> bool:
+    segments = _canonical_resource_id(value).strip("/").split("/")
+    return any(
+        segment in _ARM_GUID_PARENT_SEGMENTS and segments[index + 1] == _NIL_GUID
+        for index, segment in enumerate(segments[:-1])
+    )
 
 
 def _subscription_id_from_resource_id(value: str) -> str:
@@ -692,7 +708,7 @@ class MonitoringRuntimeSupportEffectiveRbacInventory(_StrictRuntimeModel):
                 for item in self.deny_assignments
                 for value in (
                     item.deny_assignment_id.rsplit("/", maxsplit=1)[-1],
-                    *item.principal_ids,
+                    *(() if item.principal_ids == (_ALL_PRINCIPALS_ID,) else item.principal_ids),
                     *item.excluded_principal_ids,
                 )
             ),
@@ -708,6 +724,31 @@ class MonitoringRuntimeSupportEffectiveRbacInventory(_StrictRuntimeModel):
         )
         if any(value.casefold() == _NIL_GUID for value in nested_guid_values):
             raise ValueError("runtime-support RBAC evidence contains a nil GUID")
+        arm_resource_ids = (
+            *principal_evidence.target_scope_ids,
+            *(
+                value
+                for item in self.support_grants
+                for value in (item.role_definition_id, *item.assignment_scope_ids)
+            ),
+            *(item.role_definition_id for item in self.role_definitions),
+            *(
+                value
+                for item in self.deny_assignments
+                for value in (item.deny_assignment_id, item.scope_id)
+            ),
+            *(
+                value
+                for item in self.active_pim_schedule_instances
+                for value in (
+                    item.schedule_instance_id,
+                    item.role_definition_id,
+                    item.scope_id,
+                )
+            ),
+        )
+        if any(_contains_nil_arm_guid(value) for value in arm_resource_ids):
+            raise ValueError("runtime-support RBAC ARM paths contain a nil GUID")
         digest_values = (
             self.first_raw_snapshot_digest,
             self.second_raw_snapshot_digest,
@@ -1664,11 +1705,9 @@ def _validate_runtime_support_effective_rbac(
         raise ValueError("runtime-support monitoring-intent key-read role is not exact")
     effective_principals = {inventory.support_principal_id}
     for deny in inventory.deny_assignments:
-        if deny.condition is not None:
-            raise ValueError("runtime-support deny conditions are not supported")
         candidate_principals = (
             effective_principals
-            if not deny.principal_ids
+            if not deny.principal_ids or deny.principal_ids == (_ALL_PRINCIPALS_ID,)
             else effective_principals.intersection(deny.principal_ids)
         )
         applicable_principals = candidate_principals.difference(deny.excluded_principal_ids)
@@ -1694,8 +1733,13 @@ def _validate_runtime_support_effective_rbac(
             actions=deny.data_actions,
             not_actions=deny.not_data_actions,
         )
-        if denies_acr_pull or denies_key_read:
-            raise ValueError("runtime-support deny assignment removes an exact required permission")
+        if not denies_acr_pull and not denies_key_read:
+            continue
+        if deny.condition is not None:
+            raise ValueError(
+                "runtime-support deny condition prevents proving an exact required permission"
+            )
+        raise ValueError("runtime-support deny assignment removes an exact required permission")
 
 
 def _revalidate_monitoring_evidence_storage_readiness(
@@ -1800,6 +1844,30 @@ def load_wc028_monitoring_acquisition_job_configuration(
 def _utc_now_milliseconds() -> datetime:
     value = datetime.now(UTC)
     return value.replace(microsecond=(value.microsecond // 1000) * 1000)
+
+
+@contextmanager
+def _guard_runtime_support_key_request(
+    *,
+    configuration: Wc028MonitoringAcquisitionJobConfiguration,
+) -> Iterator[None]:
+    requested_at = _utc_now_milliseconds()
+    _validate_runtime_support_effective_rbac(
+        configuration=configuration,
+        as_of=requested_at,
+    )
+    try:
+        yield
+    finally:
+        completed_at = _utc_now_milliseconds()
+        if completed_at < requested_at:
+            raise MonitoringAcquisitionJobError(
+                "runtime-support Key Vault request interval is non-monotonic"
+            )
+        _validate_runtime_support_effective_rbac(
+            configuration=configuration,
+            as_of=completed_at,
+        )
 
 
 def _validate_monitoring_intent_key_lifecycle(
@@ -2657,7 +2725,8 @@ def _require_pr99_conditioned_blob_contract(
             "WC-028 deployment remains blocked until PR #99 publishes the conditioned "
             "known-name Blob read and add/action collector contract and bootstrap, "
             "reviewed storage-protection contract, signed persistence replay binding, "
-            "and ancestor-complete collector RBAC evidence"
+            "ancestor-complete collector RBAC evidence, and new explicit receipt and "
+            "authority schemas for mandatory wire attempts and their call budget"
         )
 
 
@@ -3771,9 +3840,16 @@ def run_wc028_monitoring_acquisition_job(
             configuration=configuration,
             as_of=startup_as_of,
         )
+
+        def guard_runtime_support_key_request() -> AbstractContextManager[None]:
+            return _guard_runtime_support_key_request(
+                configuration=configuration,
+            )
+
         intent_verifier = KeyVaultRsaPublicKeyVerifier(
             trusted_key_anchor=configuration.monitoring_intent_trusted_key.anchor,
             managed_identity_client_id=configuration.runtime_support_identity_client_id,
+            request_guard=guard_runtime_support_key_request,
         )
         expected_intent_key_record = TrustedKeyRecord(
             anchor=configuration.monitoring_intent_trusted_key.anchor,
@@ -3785,6 +3861,7 @@ def run_wc028_monitoring_acquisition_job(
         intent_key_resolver = KeyVaultTrustedKeyResolver(
             expected_record=expected_intent_key_record,
             managed_identity_client_id=configuration.runtime_support_identity_client_id,
+            request_guard=guard_runtime_support_key_request,
         )
         resolved_intent_key_record = intent_key_resolver(
             configuration.monitoring_intent_trusted_key.anchor

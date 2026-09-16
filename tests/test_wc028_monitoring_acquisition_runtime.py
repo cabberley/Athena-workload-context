@@ -1258,6 +1258,108 @@ def test_runtime_support_rbac_rejects_conditions_pim_and_applicable_denies() -> 
         Wc028MonitoringAcquisitionJobConfiguration.model_validate(denied)
 
 
+def test_runtime_support_rbac_evaluates_system_all_principals_denies_contextually() -> None:
+    def with_all_principals_deny(
+        *,
+        excluded_principal_ids: tuple[str, ...] = (),
+        condition: str | None = None,
+        data_actions: tuple[str, ...] = ("microsoft.keyvault/vaults/keys/read",),
+        deny_assignment_id: str | None = None,
+        scope_id: str | None = None,
+    ) -> dict[str, object]:
+        payload = _configuration_payload()
+        inventory = cast(
+            dict[str, object],
+            payload["runtimeSupportEffectiveRbacInventory"],
+        )
+        deny: dict[str, object] = {
+            "denyAssignmentId": deny_assignment_id
+            or (
+                f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+                "Microsoft.Authorization/denyAssignments/"
+                "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"
+            ).casefold(),
+            "scopeId": scope_id or MONITORING_INTENT_VAULT_RESOURCE_ID.casefold(),
+            "principalIds": (runtime_module._ALL_PRINCIPALS_ID,),
+            "excludedPrincipalIds": excluded_principal_ids,
+            "actions": (),
+            "notActions": (),
+            "dataActions": data_actions,
+            "notDataActions": (),
+            "doNotApplyToChildScopes": False,
+            "rawAssignmentDigest": DIGEST_A,
+        }
+        if condition is not None:
+            deny["condition"] = condition
+        inventory["denyAssignments"] = (deny,)
+        payload["runtimeSupportEffectiveRbacInventory"] = _refresh_support_rbac_inventory(inventory)
+        return payload
+
+    with pytest.raises(ValidationError, match="removes an exact required permission"):
+        Wc028MonitoringAcquisitionJobConfiguration.model_validate(with_all_principals_deny())
+
+    excluded = Wc028MonitoringAcquisitionJobConfiguration.model_validate(
+        with_all_principals_deny(
+            excluded_principal_ids=(SUPPORT_PRINCIPAL_ID.casefold(),),
+        )
+    )
+    assert excluded.runtime_support_effective_rbac_inventory.deny_assignments
+
+    with pytest.raises(
+        ValidationError,
+        match="deny condition prevents proving an exact required permission",
+    ):
+        Wc028MonitoringAcquisitionJobConfiguration.model_validate(
+            with_all_principals_deny(
+                condition="@Resource[synthetic] StringEquals 'unknown'",
+            )
+        )
+
+    unrelated = Wc028MonitoringAcquisitionJobConfiguration.model_validate(
+        with_all_principals_deny(
+            condition="@Resource[synthetic] StringEquals 'unknown'",
+            data_actions=("microsoft.keyvault/vaults/secrets/read",),
+        )
+    )
+    assert unrelated.runtime_support_effective_rbac_inventory.deny_assignments
+
+    nil_grant = _configuration_payload()
+    inventory = cast(
+        dict[str, object],
+        nil_grant["runtimeSupportEffectiveRbacInventory"],
+    )
+    grants = cast(
+        list[dict[str, object]],
+        list(inventory["supportGrants"]),
+    )
+    grants[0]["assignedPrincipalId"] = runtime_module._NIL_GUID
+    inventory["supportGrants"] = tuple(grants)
+    nil_grant["runtimeSupportEffectiveRbacInventory"] = _refresh_support_rbac_inventory(inventory)
+    with pytest.raises(
+        ValidationError,
+        match="contains a nil GUID|direct effective RBAC grant",
+    ):
+        Wc028MonitoringAcquisitionJobConfiguration.model_validate(nil_grant)
+
+    nil_subscription = runtime_module._NIL_GUID
+    for invalid_path in (
+        {
+            "deny_assignment_id": (
+                f"/subscriptions/{nil_subscription}/providers/"
+                "Microsoft.Authorization/denyAssignments/"
+                "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"
+            ).casefold()
+        },
+        {
+            "scope_id": f"/subscriptions/{nil_subscription}".casefold(),
+        },
+    ):
+        with pytest.raises(ValidationError, match="ARM paths contain a nil GUID"):
+            Wc028MonitoringAcquisitionJobConfiguration.model_validate(
+                with_all_principals_deny(**invalid_path)
+            )
+
+
 def test_runtime_support_rbac_must_be_fresh_before_job_execution() -> None:
     configuration = Wc028MonitoringAcquisitionJobConfiguration.model_validate(
         _configuration_payload()
@@ -1413,8 +1515,9 @@ def test_current_published_contract_remains_blocked_on_pr99_bootstrap() -> None:
     with pytest.raises(
         MonitoringAcquisitionJobError,
         match="blocked until PR #99 publishes the conditioned",
-    ):
+    ) as exc_info:
         runtime_module._require_pr99_conditioned_blob_contract(_acquisition_collector_contract())
+    assert "receipt and authority schemas" in str(exc_info.value)
 
 
 def test_authority_scope_digest_and_freshness_fail_before_external_reads(
@@ -1909,6 +2012,10 @@ def test_job_composes_hardened_coordinator_transaction_and_commit_port(
     assert verifier_calls[1]["managed_identity_client_id"] == CLIENT_ID
     assert resolver_calls[0]["managed_identity_client_id"] == SUPPORT_CLIENT_ID
     assert resolver_calls[1]["managed_identity_client_id"] == CLIENT_ID
+    assert callable(verifier_calls[0]["request_guard"])
+    assert resolver_calls[0]["request_guard"] is verifier_calls[0]["request_guard"]
+    assert "request_guard" not in verifier_calls[1]
+    assert "request_guard" not in resolver_calls[1]
     coordinator_arguments = cast(dict[str, object], captured["coordinator"])
     assert coordinator_arguments["collection_transaction"] is transaction
     assert coordinator_arguments["receipt_signer"] is not None
@@ -2138,6 +2245,115 @@ def test_job_wraps_key_client_construction_and_read_failures(
         match="Azure client or transport operation failed",
     ):
         runtime_module.run_wc028_monitoring_acquisition_job(configuration=configuration)
+
+
+def test_slow_first_runtime_support_key_read_expires_before_second_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configuration = Wc028MonitoringAcquisitionJobConfiguration.model_validate(
+        _configuration_payload()
+    )
+    embedded = {
+        "PublishedMonitoringIntent": object(),
+        "PublishedMonitoringIntentAssetReference": object(),
+        "PublishedMonitoringIntentAttestation": object(),
+        "PublishedRuntimeContextBinding": SimpleNamespace(binding_digest=DIGEST_A),
+        "MonitoringCollectorContract": SimpleNamespace(
+            collector_identity_resource_id=COLLECTOR_ID.casefold(),
+            compute_artifact_digest_value=lambda: DIGEST_B,
+        ),
+        "ApprovedChangeScope": object(),
+        "MonitoringAcquisitionAuthority": object(),
+    }
+    monkeypatch.setattr(
+        runtime_module,
+        "_embedded_model",
+        lambda model, _payload: embedded[model.__name__],
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "_validate_acquisition_authority_preflight",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "_require_pr99_conditioned_blob_contract",
+        lambda _contract: None,
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "AzureBlobChangeEvidenceReplayStore",
+        lambda **_kwargs: _MemoryStore(container_name="monitoring-evidence"),
+    )
+    clock_values = [
+        NOW,
+        NOW,
+        configuration.runtime_support_effective_rbac_inventory.expires_at,
+    ]
+
+    def utc_now() -> datetime:
+        if not clock_values:
+            raise AssertionError("runtime-support key guard requested an unexpected timestamp")
+        return clock_values.pop(0)
+
+    monkeypatch.setattr(runtime_module, "_utc_now_milliseconds", utc_now)
+    first_key_reads = 0
+    second_key_reads = 0
+
+    def build_verifier(**kwargs: object) -> object:
+        nonlocal first_key_reads
+        first_key_reads += 1
+        request_guard = cast(Callable[[], Any], kwargs["request_guard"])
+        with request_guard():
+            pass
+        return SimpleNamespace(public_key=object())
+
+    def build_resolver(**_kwargs: object) -> object:
+        nonlocal second_key_reads
+        second_key_reads += 1
+        return object()
+
+    monkeypatch.setattr(runtime_module, "KeyVaultRsaPublicKeyVerifier", build_verifier)
+    monkeypatch.setattr(runtime_module, "KeyVaultTrustedKeyResolver", build_resolver)
+
+    with pytest.raises(
+        MonitoringAcquisitionJobError,
+        match="support effective RBAC evidence is stale",
+    ):
+        runtime_module.run_wc028_monitoring_acquisition_job(configuration=configuration)
+
+    assert first_key_reads == 1
+    assert second_key_reads == 0
+    assert clock_values == []
+
+
+def test_runtime_support_key_guard_rejects_reversed_request_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configuration = Wc028MonitoringAcquisitionJobConfiguration.model_validate(
+        _configuration_payload()
+    )
+    clock_values = [NOW, NOW - timedelta(seconds=1)]
+
+    def utc_now() -> datetime:
+        if not clock_values:
+            raise AssertionError("runtime-support key guard requested an unexpected timestamp")
+        return clock_values.pop(0)
+
+    monkeypatch.setattr(runtime_module, "_utc_now_milliseconds", utc_now)
+
+    with (
+        pytest.raises(
+            MonitoringAcquisitionJobError,
+            match="request interval is non-monotonic",
+        ),
+        runtime_module._guard_runtime_support_key_request(
+            configuration=configuration,
+        ),
+    ):
+        pass
+
+    assert clock_values == []
 
 
 def test_new_acquisition_recaptures_support_freshness_after_slow_probe(
