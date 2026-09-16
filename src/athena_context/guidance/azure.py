@@ -224,6 +224,7 @@ class AzureTableGuidanceAuthorityActivationStore:
             "RowKey": activation.incident_id,
             "activationDigest": activation.activation_digest,
             "payload": activation.canonical_bytes().decode("utf-8"),
+            "triggerDeliveryStatus": "pending",
         }
         try:
             if expected_etag is None:
@@ -243,6 +244,37 @@ class AzureTableGuidanceAuthorityActivationStore:
         return GuidanceAuthorityActivationSnapshot(
             activation=activation,
             etag=etag,
+            trigger_delivery_status="pending",
+        )
+
+    def mark_trigger_submitted(
+        self,
+        activation: PublishedGuidanceAuthorityActivation,
+        *,
+        expected_etag: str,
+    ) -> GuidanceAuthorityActivationSnapshot:
+        entity = {
+            "PartitionKey": self._partition_key,
+            "RowKey": activation.incident_id,
+            "activationDigest": activation.activation_digest,
+            "payload": activation.canonical_bytes().decode("utf-8"),
+            "triggerDeliveryStatus": "submitted",
+        }
+        try:
+            metadata = self._table.update_entity(
+                entity=entity,
+                mode=UpdateMode.REPLACE,
+                etag=expected_etag,
+                match_condition=MatchConditions.IfNotModified,
+            )
+        except (ResourceModifiedError, ResourceNotFoundError) as exc:
+            raise GuidanceAuthorityActivationConflictError(
+                "guidance trigger delivery status CAS conflict"
+            ) from exc
+        return GuidanceAuthorityActivationSnapshot(
+            activation=activation,
+            etag=self._operation_etag(metadata),
+            trigger_delivery_status="submitted",
         )
 
     def _snapshot(
@@ -259,11 +291,14 @@ class AzureTableGuidanceAuthorityActivationStore:
             activation.incident_id != entity.get("RowKey")
             or activation.activation_digest != entity.get("activationDigest")
             or payload.encode("utf-8") != activation.canonical_bytes()
+            or entity.get("triggerDeliveryStatus")
+            not in {"pending", "submitted"}
         ):
             raise ValueError("guidance activation row is not canonical")
         return GuidanceAuthorityActivationSnapshot(
             activation=activation,
             etag=self._entity_etag(entity),
+            trigger_delivery_status=entity["triggerDeliveryStatus"],
         )
 
     @staticmethod
@@ -306,9 +341,10 @@ class AzureServiceBusGuidanceAuthorityTrigger:
                 "GuidancePublicationRequestDeliveryBudget"
             )
         if not (
-            delivery_budget.feed_minimum_remaining_lifetime_seconds
+            delivery_budget.feed_trigger_minimum_time_to_live_seconds
             <= time_to_live_seconds
             <= WC027_GUIDANCE_ACTIVATION_MAX_LIFETIME_SECONDS
+            - delivery_budget.feed_processing_seconds
         ):
             raise ValueError(
                 "guidance trigger TTL does not retain the reviewed feed "

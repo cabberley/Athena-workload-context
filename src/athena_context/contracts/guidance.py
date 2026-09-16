@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
-from datetime import timedelta
+from datetime import datetime, timedelta
+from math import floor
 from typing import Annotated, Literal, cast
 from urllib.parse import urlsplit
 
@@ -141,6 +142,7 @@ WC027_GUIDANCE_PUBLISHER_KEDA_POLLING_INTERVAL_SECONDS = 30
 WC027_GUIDANCE_PUBLISHER_COLD_START_SECONDS = 30
 WC027_GUIDANCE_PUBLISHER_CONNECTION_SETUP_SECONDS = 30
 WC027_GUIDANCE_PUBLISHER_PROCESSING_SECONDS = 60
+WC027_GUIDANCE_PUBLISHER_CAS_MARGIN_SECONDS = 5
 WC027_GUIDANCE_PUBLISHER_MINIMUM_REMAINING_LIFETIME_SECONDS = (
     WC027_GUIDANCE_PUBLISHER_KEDA_POLLING_INTERVAL_SECONDS
     + WC027_GUIDANCE_PUBLISHER_COLD_START_SECONDS
@@ -151,6 +153,8 @@ WC027_GUIDANCE_FEED_KEDA_POLLING_INTERVAL_SECONDS = 30
 WC027_GUIDANCE_FEED_COLD_START_SECONDS = 30
 WC027_GUIDANCE_FEED_CONNECTION_SETUP_SECONDS = 30
 WC027_GUIDANCE_FEED_PROCESSING_SECONDS = 60
+WC027_GUIDANCE_FEED_DELIVERY_JITTER_SECONDS = 30
+WC027_GUIDANCE_FEED_IRREVERSIBLE_WRITE_MARGIN_SECONDS = 15
 WC027_GUIDANCE_FEED_MINIMUM_REMAINING_LIFETIME_SECONDS = (
     WC027_GUIDANCE_FEED_KEDA_POLLING_INTERVAL_SECONDS
     + WC027_GUIDANCE_FEED_COLD_START_SECONDS
@@ -166,6 +170,7 @@ WC027_GUIDANCE_ACTIVATION_MAX_LIFETIME_SECONDS = (
     WC027_GUIDANCE_PUBLICATION_REQUEST_MAX_LIFETIME_SECONDS
     + WC027_GUIDANCE_FEED_TRIGGER_RECOVERY_SECONDS
     + WC027_GUIDANCE_FEED_MINIMUM_REMAINING_LIFETIME_SECONDS
+    + WC027_GUIDANCE_FEED_DELIVERY_JITTER_SECONDS
 )
 
 
@@ -178,6 +183,7 @@ class GuidancePublicationRequestDeliveryBudget(_StrictGuidanceModel):
         alias="publisherConnectionSetupSeconds"
     )
     publisher_processing_seconds: int = Field(alias="publisherProcessingSeconds")
+    publisher_cas_margin_seconds: int = Field(alias="publisherCasMarginSeconds")
     publisher_minimum_remaining_lifetime_seconds: int = Field(
         alias="publisherMinimumRemainingLifetimeSeconds"
     )
@@ -189,6 +195,10 @@ class GuidancePublicationRequestDeliveryBudget(_StrictGuidanceModel):
         alias="feedConnectionSetupSeconds"
     )
     feed_processing_seconds: int = Field(alias="feedProcessingSeconds")
+    feed_delivery_jitter_seconds: int = Field(alias="feedDeliveryJitterSeconds")
+    feed_irreversible_write_margin_seconds: int = Field(
+        alias="feedIrreversibleWriteMarginSeconds"
+    )
     feed_minimum_remaining_lifetime_seconds: int = Field(
         alias="feedMinimumRemainingLifetimeSeconds"
     )
@@ -210,6 +220,7 @@ class GuidancePublicationRequestDeliveryBudget(_StrictGuidanceModel):
                 WC027_GUIDANCE_PUBLISHER_CONNECTION_SETUP_SECONDS
             ),
             publisherProcessingSeconds=WC027_GUIDANCE_PUBLISHER_PROCESSING_SECONDS,
+            publisherCasMarginSeconds=WC027_GUIDANCE_PUBLISHER_CAS_MARGIN_SECONDS,
             publisherMinimumRemainingLifetimeSeconds=(
                 WC027_GUIDANCE_PUBLISHER_MINIMUM_REMAINING_LIFETIME_SECONDS
             ),
@@ -221,6 +232,10 @@ class GuidancePublicationRequestDeliveryBudget(_StrictGuidanceModel):
                 WC027_GUIDANCE_FEED_CONNECTION_SETUP_SECONDS
             ),
             feedProcessingSeconds=WC027_GUIDANCE_FEED_PROCESSING_SECONDS,
+            feedDeliveryJitterSeconds=WC027_GUIDANCE_FEED_DELIVERY_JITTER_SECONDS,
+            feedIrreversibleWriteMarginSeconds=(
+                WC027_GUIDANCE_FEED_IRREVERSIBLE_WRITE_MARGIN_SECONDS
+            ),
             feedMinimumRemainingLifetimeSeconds=(
                 WC027_GUIDANCE_FEED_MINIMUM_REMAINING_LIFETIME_SECONDS
             ),
@@ -245,6 +260,8 @@ class GuidancePublicationRequestDeliveryBudget(_StrictGuidanceModel):
             != WC027_GUIDANCE_PUBLISHER_CONNECTION_SETUP_SECONDS
             or self.publisher_processing_seconds
             != WC027_GUIDANCE_PUBLISHER_PROCESSING_SECONDS
+            or self.publisher_cas_margin_seconds
+            != WC027_GUIDANCE_PUBLISHER_CAS_MARGIN_SECONDS
             or self.publisher_minimum_remaining_lifetime_seconds
             != WC027_GUIDANCE_PUBLISHER_MINIMUM_REMAINING_LIFETIME_SECONDS
             or self.publisher_minimum_remaining_lifetime_seconds
@@ -260,6 +277,10 @@ class GuidancePublicationRequestDeliveryBudget(_StrictGuidanceModel):
             != WC027_GUIDANCE_FEED_CONNECTION_SETUP_SECONDS
             or self.feed_processing_seconds
             != WC027_GUIDANCE_FEED_PROCESSING_SECONDS
+            or self.feed_delivery_jitter_seconds
+            != WC027_GUIDANCE_FEED_DELIVERY_JITTER_SECONDS
+            or self.feed_irreversible_write_margin_seconds
+            != WC027_GUIDANCE_FEED_IRREVERSIBLE_WRITE_MARGIN_SECONDS
             or self.feed_minimum_remaining_lifetime_seconds
             != WC027_GUIDANCE_FEED_MINIMUM_REMAINING_LIFETIME_SECONDS
             or self.feed_minimum_remaining_lifetime_seconds
@@ -295,6 +316,10 @@ class GuidancePublicationRequestDeliveryBudget(_StrictGuidanceModel):
         return timedelta(seconds=self.publisher_processing_seconds)
 
     @property
+    def publisher_cas_margin(self) -> timedelta:
+        return timedelta(seconds=self.publisher_cas_margin_seconds)
+
+    @property
     def feed_minimum_remaining_lifetime(self) -> timedelta:
         return timedelta(seconds=self.feed_minimum_remaining_lifetime_seconds)
 
@@ -303,8 +328,58 @@ class GuidancePublicationRequestDeliveryBudget(_StrictGuidanceModel):
         return timedelta(seconds=self.feed_processing_seconds)
 
     @property
+    def feed_irreversible_write_margin(self) -> timedelta:
+        return timedelta(seconds=self.feed_irreversible_write_margin_seconds)
+
+    @property
     def feed_trigger_recovery(self) -> timedelta:
         return timedelta(seconds=self.feed_trigger_recovery_seconds)
+
+    @property
+    def feed_trigger_minimum_time_to_live_seconds(self) -> int:
+        return (
+            self.feed_keda_polling_interval_seconds
+            + self.feed_cold_start_seconds
+            + self.feed_connection_setup_seconds
+            + self.feed_delivery_jitter_seconds
+        )
+
+    def finish_before(self, request_expires_at: datetime) -> datetime:
+        return (
+            request_expires_at
+            + self.feed_trigger_recovery
+            + self.feed_minimum_remaining_lifetime
+            + timedelta(seconds=self.feed_delivery_jitter_seconds)
+        )
+
+    def publisher_request_time_to_live_seconds(
+        self,
+        *,
+        finish_before: datetime,
+        at: datetime,
+    ) -> int:
+        margin = timedelta(
+            seconds=(
+                self.publisher_processing_seconds
+                + self.feed_minimum_remaining_lifetime_seconds
+                + self.feed_delivery_jitter_seconds
+            )
+        )
+        return floor((finish_before - at - margin).total_seconds())
+
+    def feed_trigger_time_to_live_seconds(
+        self,
+        *,
+        finish_before: datetime,
+        at: datetime,
+    ) -> int:
+        return floor(
+            (
+                finish_before
+                - at
+                - self.feed_processing_budget
+            ).total_seconds()
+        )
 
     def broker_properties(self) -> dict[str, int]:
         return self.model_dump(mode="python", by_alias=True)
@@ -947,6 +1022,7 @@ class GuidanceAuthorityPublicationRequest(_StrictGuidanceModel):
     )
     evaluated_at: UtcDateTime = Field(alias="evaluatedAt")
     expires_at: UtcDateTime = Field(alias="expiresAt")
+    finish_before: UtcDateTime = Field(alias="finishBefore")
     request_attestation: GuidanceAuthorityPublicationRequestAttestation = Field(
         alias="requestAttestation"
     )
@@ -977,6 +1053,10 @@ class GuidanceAuthorityPublicationRequest(_StrictGuidanceModel):
             or self.expires_at - self.evaluated_at
             > timedelta(
                 seconds=WC027_GUIDANCE_PUBLICATION_REQUEST_MAX_LIFETIME_SECONDS
+            )
+            or self.finish_before
+            != GuidancePublicationRequestDeliveryBudget.reviewed().finish_before(
+                self.expires_at
             )
         ):
             raise ValueError(
@@ -1073,6 +1153,9 @@ class PublishedGuidanceAuthorityActivation(_StrictGuidanceModel):
         alias="triggerMessageId",
         pattern=r"^guidance-binding-[a-f0-9]{32}$",
     )
+    trigger_delivery_pending: Literal[True] = Field(
+        alias="triggerDeliveryPending"
+    )
     delivery_budget: GuidancePublicationRequestDeliveryBudget = Field(
         alias="deliveryBudget"
     )
@@ -1080,9 +1163,7 @@ class PublishedGuidanceAuthorityActivation(_StrictGuidanceModel):
     publication_request_expires_at: UtcDateTime = Field(
         alias="publicationRequestExpiresAt"
     )
-    trigger_delivery_deadline: UtcDateTime = Field(
-        alias="triggerDeliveryDeadline"
-    )
+    finish_before: UtcDateTime = Field(alias="finishBefore")
     expires_at: UtcDateTime = Field(alias="expiresAt")
     activation_attestation: PublishedGuidanceAuthorityActivationAttestation = Field(
         alias="activationAttestation"
@@ -1096,12 +1177,11 @@ class PublishedGuidanceAuthorityActivation(_StrictGuidanceModel):
             != f"guidance-bindings/{self.binding_id}/binding.json"
             or self.trigger_message_id != self.binding_id
             or self.activated_at >= self.publication_request_expires_at
-            or self.trigger_delivery_deadline
-            != self.publication_request_expires_at
-            + self.delivery_budget.feed_trigger_recovery
-            or self.expires_at
-            != self.trigger_delivery_deadline
-            + self.delivery_budget.feed_minimum_remaining_lifetime
+            or self.finish_before
+            != self.delivery_budget.finish_before(
+                self.publication_request_expires_at
+            )
+            or self.expires_at != self.finish_before
         ):
             raise ValueError("guidance activation does not bind an eligible binding")
         preimage = self.model_dump(
@@ -2243,6 +2323,8 @@ __all__ = [
     "SelectedRunbookGuidanceSelection",
     "WC027_GUIDANCE_FEED_COLD_START_SECONDS",
     "WC027_GUIDANCE_FEED_CONNECTION_SETUP_SECONDS",
+    "WC027_GUIDANCE_FEED_DELIVERY_JITTER_SECONDS",
+    "WC027_GUIDANCE_FEED_IRREVERSIBLE_WRITE_MARGIN_SECONDS",
     "WC027_GUIDANCE_FEED_KEDA_POLLING_INTERVAL_SECONDS",
     "WC027_GUIDANCE_FEED_MINIMUM_REMAINING_LIFETIME_SECONDS",
     "WC027_GUIDANCE_FEED_PROCESSING_SECONDS",
@@ -2251,6 +2333,7 @@ __all__ = [
     "WC027_GUIDANCE_MINIMUM_REMAINING_LIFETIME_SECONDS",
     "WC027_GUIDANCE_PUBLICATION_REQUEST_MAX_LIFETIME_SECONDS",
     "WC027_GUIDANCE_PUBLISHER_COLD_START_SECONDS",
+    "WC027_GUIDANCE_PUBLISHER_CAS_MARGIN_SECONDS",
     "WC027_GUIDANCE_PUBLISHER_CONNECTION_SETUP_SECONDS",
     "WC027_GUIDANCE_PUBLISHER_KEDA_POLLING_INTERVAL_SECONDS",
     "WC027_GUIDANCE_PUBLISHER_MINIMUM_REMAINING_LIFETIME_SECONDS",

@@ -96,16 +96,18 @@ occurrence-keyed outbox path. If revalidation or producer sender setup consumes 
 persisted request is not sent and the input is abandoned. A request with exactly 150 seconds
 remaining is eligible to persist and send. After persistence, the worker revalidates lifecycle and
 context authority, establishes the managed-identity Service Bus sender, resamples the trusted
-clock, and only then constructs/sends the message. The broker TTL is the remaining signed request
-window plus the separately reviewed 300-second trigger-recovery allowance. Sender creation cannot
-complete the input delivery. The request is sent to the existing
+clock, and only then constructs/sends the message. The signed request carries one absolute
+`finishBefore` deadline, which the activation must copy unchanged. The request hop uses
+`floor(finishBefore - now - downstreamMargin)`, where the downstream margin reserves publisher
+processing, the full feed phase, and delivery jitter. Sender creation cannot complete the input
+delivery. The request is sent to the existing
 `wc027-guidance-authority-requests` queue with a distinct sender identity:
 
 | Field | Value |
 |---|---|
 | Message ID | deterministic `requestId` |
 | Session ID | signed incident ID |
-| TTL | remaining signed request lifetime plus the 300-second trigger-recovery allowance, at most ten minutes |
+| TTL | `floor(finishBefore - now - downstreamMargin)`, bounded by the ten-minute request queue |
 | Body | exact canonical request bytes |
 | Metadata | request, occurrence, incident-state, context-authority, version-pinned outbox, exact 30/30/30/60/150-second publisher and feed phase sets, the 300-second trigger-recovery allowance, the preserved 150-second upstream minimum, and `noAutoRemediation=true` |
 
@@ -115,7 +117,14 @@ prior successful send. Budget exhaustion is retryable without output I/O; once t
 actually stale, the same delivery is rejected rather than completed. Producer completion,
 abandon, and rejection settlement is lock-aware and bounded to one attempt. Message-lock loss,
 already-settled messages, and Service Bus or transport settlement uncertainty return a deterministic
-deferred/uncertain result instead of crashing the Job.
+result (`already-settled`, `message-lock-lost`, `session-lock-lost`, or `unconfirmed`) instead of
+crashing the Job. An uncertain completion is never followed by abandon or dead-letter.
+The authority publisher uses the same one-disposition rule for completion and rejection
+settlement.
+The runtime minimum is `azure-servicebus>=7.14.3`, and the reviewed lock resolves `7.14.3`.
+Regression tests assert both versions and the SDK inheritance contract:
+`MessageAlreadySettled` is a `ValueError`, while message/session lock-loss exceptions are
+`ServiceBusError` subclasses.
 
 ## Deployment and identities
 
@@ -141,16 +150,26 @@ aliases cannot bypass the separation.
 
 The strict producer, publisher, and enrichment/feed configurations carry the same reviewed
 delivery budget. Broker metadata binds every phase. After publisher cold start and Service Bus
-setup, the publisher requires the exact 60-second processing phase before creating authority. The
-signed activation then establishes an independent feed-delivery timeline derived deterministically
-from the signed request: its trigger deadline is request expiry plus 300 seconds, and activation
-expiry is another 150 seconds later. It is the durable trigger outbox and binds the immutable
-binding reference, deterministic trigger `MessageId`, all budget components, and both deadlines.
+setup, the publisher requires the exact 60-second processing phase before creating authority and
+the reviewed CAS margin immediately before commit. The signed activation establishes one
+independent `finishBefore` deadline derived deterministically from request expiry, the 300-second
+recovery allowance, the 150-second feed phase, and a 30-second delivery-jitter margin. It is the
+durable trigger outbox and binds the immutable binding reference, deterministic trigger
+`MessageId`, `triggerDeliveryPending=true`, all budget components, and `finishBefore`.
 After CAS, the publisher submits that exact message to the duplicate-detecting feed queue. A
 definite or uncertain send failure abandons the publisher request; replay may continue after the
 request itself expires, reads the same activation and exact binding version, and resubmits the same
-`MessageId` without another CAS. An uncertain CAS that actually committed is recovered in the same
-way. The publisher completes its input only after trigger submission returns.
+`MessageId` without another CAS. Each trigger TTL is
+`floor(finishBefore - now - feedProcessingMargin)`. An uncertain CAS that actually committed is
+recovered in the same way. The publisher completes its input only after trigger submission
+returns. The feed checks the processing reserve at start and a fresh 15-second margin immediately
+before each irreversible enrichment, feed, or notification write.
+
+The activation Table row separately stores a CAS-protected delivery status. New activations start
+as `pending`; only a confirmed trigger submission updates the same exact activation row to
+`submitted`. Uncertain sends or status updates leave/recover `pending` and resend the identical
+message. A later publisher-input retry that reads `submitted` completes without another trigger
+send.
 
 Deploy the authority publisher first with the dedicated producer sender identity as the only
 value in `requestSubmitterIdentityResourceIds`; the queue-owning publisher module grants that
@@ -190,14 +209,28 @@ are ready.
 Request-producer, authority-publisher, and feed-producer Job IDs must be canonical absolute ARM
 IDs in the root deployment subscription and `foundationResourceGroupName`. Readiness rejects
 prefix/provider/type aliases, missing components, child or suffix IDs, duplicate separators,
-and query/fragment/encoding forms. Existing-resource `.id` values are not represented as
-server-returned evidence; readiness instead uses complete canonical syntactic validation and then
-inspects the referenced Job's exact server-returned configuration surfaces.
+and query/fragment/encoding forms. A guarded nested deployment resolves each ID through
+`reference(expectedId, '2025-01-01', 'Full').id`; readiness requires exact equality with that
+server-returned ID before inspecting the referenced Job's configuration surfaces.
 
 The authority publisher validates `registryResourceId` as one canonical
 `Microsoft.ContainerRegistry/registries` ID. Both the existing registry reference and the
 publisher ACR-pull module use the parsed subscription and resource-group scope, including reviewed
-cross-subscription or cross-resource-group registries.
+cross-subscription or cross-resource-group registries. The module reads the registry's
+`roleAssignmentMode`: `LegacyRegistryPermissions` receives `AcrPull`, while
+`AbacRepositoryPermissions` receives `Container Registry Repository Reader`. The deterministic
+role-assignment GUID is seeded with the registry ID, managed-identity principal object ID, and
+selected role-definition ID, and the assignment declares `principalType: ServicePrincipal`.
+
+Before setting publisher readiness, run
+`infra/wc027-guidance-authority-publisher/Test-AcrDigestPullReadiness.ps1` on an Azure host that can
+use the publisher's user-assigned identity. The script logs in with that identity using the
+registry mode already server-validated by Bicep, performs an actual pull of the exact digest-pinned
+image, verifies the resulting
+`RepoDigest`, and retries only within the reviewed attempt/delay bounds for RBAC propagation.
+Pass its compact JSON output unchanged as `wc027PublisherImagePullEvidenceJson`; the root gate
+matches the registry, image, identity, mode, role, and bounded success evidence to the deployed
+publisher configuration.
 
 The publisher independently exact-reads every referenced outbox Blob version before invoking its
 existing publication/activation service. Broker metadata without matching durable request bytes is

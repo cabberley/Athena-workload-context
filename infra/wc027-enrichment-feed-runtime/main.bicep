@@ -23,6 +23,13 @@ param registryServer string
 @description('Existing Azure Container Registry resource ID.')
 param registryResourceId string
 
+@allowed([
+  'LegacyRegistryPermissions'
+  'AbacRepositoryPermissions'
+])
+@description('Reviewed ACR role assignment mode.')
+param registryRoleAssignmentMode string
+
 @description('Existing private Premium Service Bus namespace name.')
 param serviceBusNamespaceName string
 
@@ -36,6 +43,9 @@ param triggerSubmitterIdentityResourceIds array
 
 @description('Broker identity resource ID attached to the Job and used by the scaler, ACR pull, and queue RBAC.')
 param brokerIdentityResourceId string
+
+@description('Exact broker identity principal object ID used for deterministic ACR role assignment.')
+param brokerIdentityPrincipalId string
 
 @description('Producer identity resource ID that reads v1 incident-assets read-only without list access.')
 param incidentReaderIdentityResourceId string
@@ -221,20 +231,27 @@ var jobNamePrefix = take(namePrefix, 18)
 var triggerQueueName = 'wc027-enrichment-feed-requests'
 var serviceBusDataReceiverRoleDefinitionId = '4f6c0938-94ea-4d52-8e5a-2e02b7ef8e7d'
 var serviceBusDataSenderRoleDefinitionId = '69a216fc-b8fb-44d8-bc22-1f3c2cd27a39'
-var acrPullRoleDefinitionId = '7f951dda-4ed3-4680-a7ca-43fe172d538d'
 var storageBlobDataReaderRoleDefinitionId = '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1'
 var storageTableDataContributorRoleDefinitionId = '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3'
 var storageTableDataReaderRoleDefinitionId = '76199698-9eea-4c19-bc75-cec21354c6b6'
 var keyVaultCryptoUserRoleDefinitionId = '12338af0-0e69-4776-bea7-57ae8d297424'
+var acrPullRoleDefinitionId = '7f951dda-4ed3-4680-a7ca-43fe172d538d'
+var repositoryReaderRoleDefinitionId = 'b93aa761-3e63-49ed-ac28-beffa264f7ac'
+var imagePullRoleDefinitionId = registryRoleAssignmentMode == 'LegacyRegistryPermissions'
+  ? acrPullRoleDefinitionId
+  : repositoryReaderRoleDefinitionId
 var guidancePublisherKedaPollingIntervalSeconds = 30
 var guidancePublisherColdStartSeconds = 30
 var guidancePublisherConnectionSetupSeconds = 30
 var guidancePublisherProcessingSeconds = 60
+var guidancePublisherCasMarginSeconds = 5
 var guidancePublisherMinimumRemainingLifetimeSeconds = guidancePublisherKedaPollingIntervalSeconds + guidancePublisherColdStartSeconds + guidancePublisherConnectionSetupSeconds + guidancePublisherProcessingSeconds
 var guidanceFeedKedaPollingIntervalSeconds = 30
 var guidanceFeedColdStartSeconds = 30
 var guidanceFeedConnectionSetupSeconds = 30
 var guidanceFeedProcessingSeconds = 60
+var guidanceFeedDeliveryJitterSeconds = 30
+var guidanceFeedIrreversibleWriteMarginSeconds = 15
 var guidanceFeedMinimumRemainingLifetimeSeconds = guidanceFeedKedaPollingIntervalSeconds + guidanceFeedColdStartSeconds + guidanceFeedConnectionSetupSeconds + guidanceFeedProcessingSeconds
 var guidanceFeedTriggerRecoverySeconds = 300
 var guidanceMinimumRemainingLifetimeSeconds = guidancePublisherMinimumRemainingLifetimeSeconds
@@ -243,11 +260,14 @@ var guidancePublicationDeliveryBudget = {
   publisherColdStartSeconds: guidancePublisherColdStartSeconds
   publisherConnectionSetupSeconds: guidancePublisherConnectionSetupSeconds
   publisherProcessingSeconds: guidancePublisherProcessingSeconds
+  publisherCasMarginSeconds: guidancePublisherCasMarginSeconds
   publisherMinimumRemainingLifetimeSeconds: guidancePublisherMinimumRemainingLifetimeSeconds
   feedKedaPollingIntervalSeconds: guidanceFeedKedaPollingIntervalSeconds
   feedColdStartSeconds: guidanceFeedColdStartSeconds
   feedConnectionSetupSeconds: guidanceFeedConnectionSetupSeconds
   feedProcessingSeconds: guidanceFeedProcessingSeconds
+  feedDeliveryJitterSeconds: guidanceFeedDeliveryJitterSeconds
+  feedIrreversibleWriteMarginSeconds: guidanceFeedIrreversibleWriteMarginSeconds
   feedMinimumRemainingLifetimeSeconds: guidanceFeedMinimumRemainingLifetimeSeconds
   feedTriggerRecoverySeconds: guidanceFeedTriggerRecoverySeconds
   minimumRemainingLifetimeSeconds: guidanceMinimumRemainingLifetimeSeconds
@@ -273,7 +293,7 @@ var validatedProducerImage = registryServer == expectedRegistryServer && produce
   ? producerImage
   : fail('producerImage must be a real digest-pinned image in the supplied registry')
 
-resource registry 'Microsoft.ContainerRegistry/registries@2025-04-01' existing = {
+resource registry 'Microsoft.ContainerRegistry/registries@2025-11-01' existing = {
   name: last(split(registryResourceId, '/'))
   scope: resourceGroup(split(registryResourceId, '/')[2], split(registryResourceId, '/')[4])
 }
@@ -916,6 +936,8 @@ module producerImagePull 'modules/acr-pull-rbac.bicep' = {
   params: {
     registryName: registry.name
     identityResourceId: brokerIdentity.id
+    identityPrincipalId: brokerIdentityPrincipalId
+    expectedRegistryRoleAssignmentMode: registryRoleAssignmentMode
   }
 }
 
@@ -1091,7 +1113,15 @@ var monitoringCollectorKeyVerifierRoleId = extensionResourceId('/subscriptions/$
 var coreRbacResourceIds = [
   triggerReceiver.id
   notificationSender.id
-  extensionResourceId(registry.id, 'Microsoft.Authorization/roleAssignments', guid(registry.id, brokerIdentity.id, acrPullRoleDefinitionId))
+  extensionResourceId(
+    registry.id,
+    'Microsoft.Authorization/roleAssignments',
+    guid(
+      registry.id,
+      brokerIdentityPrincipalId,
+      imagePullRoleDefinitionId
+    )
+  )
   feedV2WriterRole.id
   feedV2Writer.id
   feedV2ProducerReader.id

@@ -378,6 +378,10 @@ def test_wc027_runtime_is_private_keyless_and_session_ordered() -> None:
     assert "runtimeConfigurationJson" in source
     assert "deliveryBudget: guidancePublicationDeliveryBudget" in source
     assert "pollingInterval: guidanceFeedKedaPollingIntervalSeconds" in source
+    assert "param registryRoleAssignmentMode string" in source
+    assert "param brokerIdentityPrincipalId string" in source
+    assert "identityPrincipalId: brokerIdentityPrincipalId" in source
+    assert "expectedRegistryRoleAssignmentMode: registryRoleAssignmentMode" in source
     assert "triggerSubmitterIdentityResourceIds" in source
     assert "principalId: triggerSubmitterIdentities[index].properties.principalId" in source
     assert "scope: triggerQueue" in source
@@ -394,6 +398,7 @@ def test_wc027_runtime_uses_derived_identities_and_key_scopes() -> None:
     # client-id/principal-id/runtime-identity arrays.
     for param in (
         "param brokerIdentityResourceId string",
+        "param brokerIdentityPrincipalId string",
         "param incidentReaderIdentityResourceId string",
         "param feedV2ProducerReaderIdentityResourceId string",
         "param feedV2WriterIdentityResourceId string",
@@ -410,7 +415,6 @@ def test_wc027_runtime_uses_derived_identities_and_key_scopes() -> None:
 
     for removed in (
         "param brokerIdentityClientId",
-        "param brokerIdentityPrincipalId",
         "param runtimeIdentityResourceIds",
         "param runtimeIdentityClientIds",
         "param incidentReaderPrincipalId",
@@ -654,7 +658,8 @@ def test_wc027_notification_gate_requires_deployed_job_resource_id() -> None:
     assert "wc027ProducerJobResourceIdShapeValid" in source
     assert "wc027ProducerJobResourceIdSegments[6] == 'Microsoft.App'" in source
     assert "wc027ProducerJobResourceIdSegments[7] == 'jobs'" in source
-    assert "wc027ProducerLoadedJobIdMatches" not in source
+    assert "wc027ProducerRuntimeJobIdMatches" in source
+    assert "wc027ProducerRuntimeId!.outputs.runtimeJobResourceId" in source
     assert "exact deployed producer configuration digest" in source
     assert "wc027ProducerImageValid" in source
     assert "wc027ProducerIdentityTypeMatches" in source

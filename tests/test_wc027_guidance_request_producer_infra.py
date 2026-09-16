@@ -27,6 +27,7 @@ KEY_SIGNER = (
 DOCKERFILE = ROOT / "apps" / "guidance-publication-request-producer" / "Dockerfile"
 PUBLISHER = ROOT / "infra" / "wc027-guidance-authority-publisher" / "main.bicep"
 ROOT_ACCEPTANCE = ROOT / "infra" / "wc013-live-acceptance" / "main.bicep"
+JOB_RUNTIME_ID = ROOT / "infra" / "wc013-live-acceptance" / "modules" / "job-runtime-id.bicep"
 
 
 def _evaluate_job_resource_id(
@@ -34,6 +35,7 @@ def _evaluate_job_resource_id(
     *,
     prefix: str,
     resource_id: str,
+    runtime_resource_id: str,
     expected_subscription_id: str,
     expected_resource_group_name: str,
 ) -> tuple[list[str], bool]:
@@ -64,6 +66,7 @@ def _evaluate_job_resource_id(
         and segments[7] == "jobs"
         and bool(segments[8])
         and not any(alias in resource_id for alias in ("//", "?", "#", "%"))
+        and runtime_resource_id.casefold() == resource_id.casefold()
     )
     return segments, valid
 
@@ -222,6 +225,7 @@ def test_delivery_budget_is_bound_across_producer_publisher_and_readiness() -> N
             "guidancePublisherColdStartSeconds = 30",
             "guidancePublisherConnectionSetupSeconds = 30",
             "guidancePublisherProcessingSeconds = 60",
+            "guidancePublisherCasMarginSeconds = 5",
             (
                 "guidancePublisherMinimumRemainingLifetimeSeconds = "
                 "guidancePublisherKedaPollingIntervalSeconds + "
@@ -233,6 +237,8 @@ def test_delivery_budget_is_bound_across_producer_publisher_and_readiness() -> N
             "guidanceFeedColdStartSeconds = 30",
             "guidanceFeedConnectionSetupSeconds = 30",
             "guidanceFeedProcessingSeconds = 60",
+            "guidanceFeedDeliveryJitterSeconds = 30",
+            "guidanceFeedIrreversibleWriteMarginSeconds = 15",
             (
                 "guidanceFeedMinimumRemainingLifetimeSeconds = "
                 "guidanceFeedKedaPollingIntervalSeconds + "
@@ -256,11 +262,14 @@ def test_delivery_budget_is_bound_across_producer_publisher_and_readiness() -> N
         "wc027ReviewedPublisherColdStartSeconds = 30",
         "wc027ReviewedPublisherConnectionSetupSeconds = 30",
         "wc027ReviewedPublisherProcessingSeconds = 60",
+        "wc027ReviewedPublisherCasMarginSeconds = 5",
         "wc027ReviewedPublisherMinimumRemainingLifetimeSeconds",
         "wc027ReviewedFeedKedaPollingIntervalSeconds = 30",
         "wc027ReviewedFeedColdStartSeconds = 30",
         "wc027ReviewedFeedConnectionSetupSeconds = 30",
         "wc027ReviewedFeedProcessingSeconds = 60",
+        "wc027ReviewedFeedDeliveryJitterSeconds = 30",
+        "wc027ReviewedFeedIrreversibleWriteMarginSeconds = 15",
         "wc027ReviewedFeedMinimumRemainingLifetimeSeconds",
         "wc027ReviewedFeedTriggerRecoverySeconds = 300",
         "wc027ReviewedMinimumRemainingLifetimeSeconds",
@@ -309,7 +318,7 @@ def test_request_producer_image_pull_uses_validated_cross_rg_registry_scope() ->
         assert expected in source
 
     registry_block = source.split(
-        "resource registry 'Microsoft.ContainerRegistry/registries@2025-04-01' existing =",
+        "resource registry 'Microsoft.ContainerRegistry/registries@2025-11-01' existing =",
         maxsplit=1,
     )[1].split("var expectedRegistryServer", maxsplit=1)[0]
     image_pull_block = source.split(
@@ -321,6 +330,17 @@ def test_request_producer_image_pull_uses_validated_cross_rg_registry_scope() ->
         assert "validatedRegistryScope.subscriptionId" in block
         assert "validatedRegistryScope.resourceGroupName" in block
         assert "resourceGroup().name" not in block
+    for expected in (
+        "param registryRoleAssignmentMode string",
+        "param receiverIdentityPrincipalId string",
+        "identityPrincipalId: receiverIdentityPrincipalId",
+        "expectedRegistryRoleAssignmentMode: registryRoleAssignmentMode",
+        "guid(",
+        "registry.id",
+        "receiverIdentityPrincipalId",
+        "imagePullRoleDefinitionId",
+    ):
+        assert expected in source
 
 
 def test_request_producer_rejects_every_runtime_identity_intersection() -> None:
@@ -400,16 +420,22 @@ def test_readiness_is_false_by_default_and_closes_the_complete_chain() -> None:
 
 
 @pytest.mark.parametrize(
-    ("prefix", "resource_id_parameter"),
+    ("prefix", "resource_id_parameter", "runtime_module"),
     (
         (
             "wc027RequestProducer",
             "wc027RequestProducerJobResourceId",
+            "wc027RequestProducerRuntimeId",
         ),
-        ("wc027Publisher", "wc027PublisherJobResourceId"),
+        (
+            "wc027Publisher",
+            "wc027PublisherJobResourceId",
+            "wc027PublisherRuntimeId",
+        ),
         (
             "wc027Producer",
             "wc027EnrichmentFeedProducerJobResourceId",
+            "wc027ProducerRuntimeId",
         ),
     ),
 )
@@ -431,11 +457,13 @@ def test_readiness_is_false_by_default_and_closes_the_complete_chain() -> None:
         ("encoded-separator", False),
         ("cross-subscription", False),
         ("cross-resource-group", False),
+        ("runtime-id-mismatch", False),
     ),
 )
 def test_all_wc027_job_resource_ids_are_evaluated_as_canonical_syntax(
     prefix: str,
     resource_id_parameter: str,
+    runtime_module: str,
     resource_id_variant: str,
     expected_valid: bool,
 ) -> None:
@@ -468,13 +496,20 @@ def test_all_wc027_job_resource_ids_are_evaluated_as_canonical_syntax(
             resource_group_name,
             "rg-cross-scope",
         ),
+        "runtime-id-mismatch": canonical,
     }
     selected_resource_id = variants[resource_id_variant]
+    runtime_resource_id = (
+        canonical.replace("wc027-job", "different-job")
+        if resource_id_variant == "runtime-id-mismatch"
+        else selected_resource_id
+    )
 
     segments, valid = _evaluate_job_resource_id(
         source,
         prefix=prefix,
         resource_id=selected_resource_id,
+        runtime_resource_id=runtime_resource_id,
         expected_subscription_id=subscription_id,
         expected_resource_group_name=resource_group_name,
     )
@@ -500,16 +535,42 @@ def test_all_wc027_job_resource_ids_are_evaluated_as_canonical_syntax(
         f"!contains({resource_id_parameter}, '?')",
         f"!contains({resource_id_parameter}, '#')",
         f"!contains({resource_id_parameter}, '%')",
+        (
+            f"toLower({runtime_module}!.outputs.runtimeJobResourceId) == "
+            f"toLower({resource_id_parameter})"
+        ),
     ):
         assert expected in source
-    assert f"var {prefix}LoadedJobIdMatches" not in source
+    assert f"var {prefix}RuntimeJobIdMatches" in source
 
 
-def test_compiled_job_id_validity_uses_only_canonical_shape_predicates() -> None:
+def test_compiled_job_id_validity_uses_guarded_full_runtime_reference() -> None:
     az_cli = shutil.which("az")
     if az_cli is None:
         pytest.fail("az CLI is required to verify the compiled WC-027 root template")
     result = subprocess.run(
+        [
+            az_cli,
+            "bicep",
+            "build",
+            "--file",
+            str(JOB_RUNTIME_ID),
+            "--stdout",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    template = json.loads(result.stdout)
+    assert template["outputs"]["runtimeJobResourceId"]["value"] == (
+        "[reference(parameters('jobResourceId'), '2025-01-01', 'Full').id]"
+    )
+    assert "resourceId(" not in template["outputs"]["runtimeJobResourceId"]["value"]
+    assert "extensionResourceId(" not in template["outputs"]["runtimeJobResourceId"]["value"]
+
+    root_result = subprocess.run(
         [
             az_cli,
             "bicep",
@@ -523,14 +584,23 @@ def test_compiled_job_id_validity_uses_only_canonical_shape_predicates() -> None
         check=False,
         text=True,
     )
-    assert result.returncode == 0, result.stderr
-    variables = json.loads(result.stdout)["variables"]
-
-    for prefix in ("wc027RequestProducer", "wc027Publisher", "wc027Producer"):
-        assert variables[f"{prefix}JobResourceIdValid"] == (
-            f"[variables('{prefix}JobResourceIdShapeValid')]"
+    assert root_result.returncode == 0, root_result.stderr
+    deployments = [
+        resource
+        for resource in json.loads(root_result.stdout)["resources"]
+        if resource.get("type") == "Microsoft.Resources/deployments"
+        and "runtime-id" in str(resource.get("name"))
+    ]
+    assert {deployment["name"] for deployment in deployments} == {
+        "wc027-feed-runtime-id",
+        "wc027-request-producer-runtime-id",
+        "wc027-publisher-runtime-id",
+    }
+    for deployment in deployments:
+        assert deployment["condition"].startswith("[and(")
+        assert deployment["properties"]["template"]["outputs"]["runtimeJobResourceId"]["value"] == (
+            "[reference(parameters('jobResourceId'), '2025-01-01', 'Full').id]"
         )
-        assert f"{prefix}LoadedJobIdMatches" not in variables
 
 
 def test_root_readiness_rejects_identity_overlap_and_unreviewed_job_surfaces() -> None:

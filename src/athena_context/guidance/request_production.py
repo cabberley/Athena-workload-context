@@ -443,7 +443,10 @@ def _utc_now_milliseconds() -> datetime:
 type _RequestProducerSettlementStatus = Literal[
     "settled",
     "deferred",
-    "uncertain",
+    "already-settled",
+    "message-lock-lost",
+    "session-lock-lost",
+    "unconfirmed",
 ]
 
 
@@ -456,24 +459,37 @@ def _settle_request_producer_message(
     reason: str | None = None,
     error_description: str | None = None,
 ) -> _RequestProducerSettlementStatus:
-    from azure.servicebus.exceptions import MessageAlreadySettled, ServiceBusError
-
-    lock_deadlines = tuple(
-        deadline
-        for deadline in (
-            getattr(message, "locked_until_utc", None),
-            getattr(getattr(receiver, "session", None), "locked_until_utc", None),
-        )
-        if deadline is not None
+    from azure.servicebus.exceptions import (
+        MessageAlreadySettled,
+        MessageLockLostError,
+        ServiceBusError,
+        SessionLockLostError,
     )
-    if any(
-        not isinstance(deadline, datetime)
-        or deadline.tzinfo is None
-        or deadline.utcoffset() != UTC.utcoffset(now)
-        or now >= deadline
-        for deadline in lock_deadlines
-    ):
-        return "deferred" if action == "abandon" else "uncertain"
+
+    message_deadline = getattr(message, "locked_until_utc", None)
+    session_deadline = getattr(
+        getattr(receiver, "session", None),
+        "locked_until_utc",
+        None,
+    )
+    if message_deadline is not None:
+        if (
+            not isinstance(message_deadline, datetime)
+            or message_deadline.tzinfo is None
+            or message_deadline.utcoffset() != UTC.utcoffset(now)
+        ):
+            return "unconfirmed"
+        if now >= message_deadline:
+            return "message-lock-lost"
+    if session_deadline is not None:
+        if (
+            not isinstance(session_deadline, datetime)
+            or session_deadline.tzinfo is None
+            or session_deadline.utcoffset() != UTC.utcoffset(now)
+        ):
+            return "unconfirmed"
+        if now >= session_deadline:
+            return "session-lock-lost"
     try:
         if action == "complete":
             receiver.complete_message(message)  # type: ignore[attr-defined]
@@ -487,14 +503,19 @@ def _settle_request_producer_message(
             error_description=error_description,
         )
         return "settled"
+    except MessageAlreadySettled:
+        return "already-settled"
+    except MessageLockLostError:
+        return "message-lock-lost"
+    except SessionLockLostError:
+        return "session-lock-lost"
     except (
-        MessageAlreadySettled,
         ServiceBusError,
         ServiceRequestError,
         ServiceResponseError,
         OSError,
     ):
-        return "uncertain"
+        return "unconfirmed"
 
 
 def build_wc027_guidance_publication_request_producer(

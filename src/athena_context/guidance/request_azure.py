@@ -193,9 +193,11 @@ class AzureServiceBusGuidancePublicationRequestSender:
         if not (
             delivery_budget.minimum_remaining_lifetime_seconds
             + delivery_budget.feed_trigger_recovery_seconds
+            - delivery_budget.publisher_processing_seconds
             <= time_to_live_seconds
             <= WC027_GUIDANCE_PUBLICATION_REQUEST_MAX_LIFETIME_SECONDS
             + WC027_GUIDANCE_FEED_TRIGGER_RECOVERY_SECONDS
+            - delivery_budget.publisher_processing_seconds
         ):
             raise ValueError(
                 "guidance publication request TTL does not retain the reviewed "

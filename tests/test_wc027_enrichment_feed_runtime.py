@@ -115,9 +115,7 @@ class _Activation:
         publication_request_expires_at = (
             binding.incident_bound_request.correlation_request.expires_at
         )
-        trigger_delivery_deadline = (
-            publication_request_expires_at + delivery_budget.feed_trigger_recovery
-        )
+        finish_before = delivery_budget.finish_before(publication_request_expires_at)
         payload = {
             "schemaVersion": ("athena.wc027PublishedGuidanceAuthorityActivation.v1"),
             "incidentId": (binding.incident_bound_request.incident_subject.incident_id),
@@ -135,16 +133,15 @@ class _Activation:
                 contentDigest=sha256_hex(binding.canonical_bytes()),
             ),
             "triggerMessageId": binding.binding_id,
+            "triggerDeliveryPending": True,
             "deliveryBudget": delivery_budget.model_dump(
                 mode="json",
                 by_alias=True,
             ),
             "activatedAt": binding.evaluated_at,
             "publicationRequestExpiresAt": publication_request_expires_at,
-            "triggerDeliveryDeadline": trigger_delivery_deadline,
-            "expiresAt": (
-                trigger_delivery_deadline + delivery_budget.feed_minimum_remaining_lifetime
-            ),
+            "finishBefore": finish_before,
+            "expiresAt": finish_before,
         }
         digest_payload = {
             **payload,
@@ -436,6 +433,30 @@ def _bicep_generated_publisher_configuration() -> dict[str, object]:
             "requestSubmitterIdentityClientId": client_id(7),
             "requestSubmitterIdentityResourceId": identity_resource_id(7),
         },
+        "imagePull": {
+            "registryResourceId": (
+                "/subscriptions/00000000-0000-0000-0000-000000000000/"
+                "resourceGroups/rg-shared-acr/providers/"
+                "Microsoft.ContainerRegistry/registries/athenawc027"
+            ),
+            "registryServer": "athenawc027.azurecr.io",
+            "image": (
+                "athenawc027.azurecr.io/athena/"
+                "wc027-guidance-authority-publisher@sha256:" + "a" * 64
+            ),
+            "roleAssignmentMode": "LegacyRegistryPermissions",
+            "roleDefinitionId": "7f951dda-4ed3-4680-a7ca-43fe172d538d",
+            "roleAssignmentResourceId": (
+                "/subscriptions/00000000-0000-0000-0000-000000000000/"
+                "resourceGroups/rg-shared-acr/providers/"
+                "Microsoft.ContainerRegistry/registries/athenawc027/providers/"
+                "Microsoft.Authorization/roleAssignments/"
+                "30000000-0000-0000-0000-000000000001"
+            ),
+            "identityClientId": client_id(0),
+            "identityResourceId": identity_resource_id(0),
+            "identityPrincipalId": "30000000-0000-0000-0000-000000000002",
+        },
         "requestOutbox": {
             "blobEndpoint": "https://athenawc027.blob.core.windows.net",
             "containerName": "wc027-guidance-request-outbox",
@@ -500,14 +521,19 @@ def test_publisher_configuration_preserves_logical_and_physical_binding_keys() -
     assert configuration.delivery_budget.publisher_cold_start_seconds == 30
     assert configuration.delivery_budget.publisher_connection_setup_seconds == 30
     assert configuration.delivery_budget.publisher_processing_seconds == 60
+    assert configuration.delivery_budget.publisher_cas_margin_seconds == 5
     assert configuration.delivery_budget.publisher_minimum_remaining_lifetime_seconds == 150
     assert configuration.delivery_budget.feed_keda_polling_interval_seconds == 30
     assert configuration.delivery_budget.feed_cold_start_seconds == 30
     assert configuration.delivery_budget.feed_connection_setup_seconds == 30
     assert configuration.delivery_budget.feed_processing_seconds == 60
+    assert configuration.delivery_budget.feed_delivery_jitter_seconds == 30
+    assert configuration.delivery_budget.feed_irreversible_write_margin_seconds == 15
     assert configuration.delivery_budget.feed_minimum_remaining_lifetime_seconds == 150
     assert configuration.delivery_budget.feed_trigger_recovery_seconds == 300
     assert configuration.delivery_budget.minimum_remaining_lifetime_seconds == 150
+    assert configuration.image_pull.role_assignment_mode == ("LegacyRegistryPermissions")
+    assert configuration.image_pull.role_definition_id == "7f951dda-4ed3-4680-a7ca-43fe172d538d"
 
 
 @pytest.mark.parametrize(
@@ -517,11 +543,14 @@ def test_publisher_configuration_preserves_logical_and_physical_binding_keys() -
         ("publisherColdStartSeconds", 29),
         ("publisherConnectionSetupSeconds", 29),
         ("publisherProcessingSeconds", 59),
+        ("publisherCasMarginSeconds", 4),
         ("publisherMinimumRemainingLifetimeSeconds", 149),
         ("feedKedaPollingIntervalSeconds", 31),
         ("feedColdStartSeconds", 29),
         ("feedConnectionSetupSeconds", 29),
         ("feedProcessingSeconds", 59),
+        ("feedDeliveryJitterSeconds", 29),
+        ("feedIrreversibleWriteMarginSeconds", 14),
         ("feedMinimumRemainingLifetimeSeconds", 149),
         ("feedTriggerRecoverySeconds", 299),
         ("minimumRemainingLifetimeSeconds", 149),
@@ -536,6 +565,47 @@ def test_publisher_configuration_rejects_delivery_budget_drift(
 
     with pytest.raises(ValueError, match="delivery budget"):
         Wc027GuidanceAuthorityPublisherConfiguration.model_validate_json(json.dumps(payload))
+
+
+@pytest.mark.parametrize(
+    ("mode", "role_definition_id"),
+    (
+        (
+            "LegacyRegistryPermissions",
+            "b93aa761-3e63-49ed-ac28-beffa264f7ac",
+        ),
+        (
+            "AbacRepositoryPermissions",
+            "7f951dda-4ed3-4680-a7ca-43fe172d538d",
+        ),
+    ),
+)
+def test_publisher_configuration_rejects_image_pull_role_mode_mismatch(
+    mode: str,
+    role_definition_id: str,
+) -> None:
+    payload = _bicep_generated_publisher_configuration()
+    payload["imagePull"]["roleAssignmentMode"] = mode  # type: ignore[index]
+    payload["imagePull"]["roleDefinitionId"] = role_definition_id  # type: ignore[index]
+
+    with pytest.raises(ValueError, match="image pull binding"):
+        Wc027GuidanceAuthorityPublisherConfiguration.model_validate_json(json.dumps(payload))
+
+
+def test_publisher_configuration_accepts_abac_repository_reader() -> None:
+    payload = _bicep_generated_publisher_configuration()
+    payload["imagePull"]["roleAssignmentMode"] = (  # type: ignore[index]
+        "AbacRepositoryPermissions"
+    )
+    payload["imagePull"]["roleDefinitionId"] = (  # type: ignore[index]
+        "b93aa761-3e63-49ed-ac28-beffa264f7ac"
+    )
+
+    configuration = Wc027GuidanceAuthorityPublisherConfiguration.model_validate_json(
+        json.dumps(payload)
+    )
+
+    assert configuration.image_pull.role_assignment_mode == ("AbacRepositoryPermissions")
 
 
 def test_publisher_configuration_rejects_reused_request_authority() -> None:
@@ -614,6 +684,12 @@ def test_publisher_configuration_rejects_owned_identity_reusing_runtime_identity
         "identityClientId"
     ]
     payload["serviceBus"]["brokerIdentityResourceId"] = runtime_identity[  # type: ignore[index]
+        "identityResourceId"
+    ]
+    payload["imagePull"]["identityClientId"] = runtime_identity[  # type: ignore[index]
+        "identityClientId"
+    ]
+    payload["imagePull"]["identityResourceId"] = runtime_identity[  # type: ignore[index]
         "identityResourceId"
     ]
     attached = payload["deploymentBinding"]["attachedIdentityResourceIds"]  # type: ignore[index]
@@ -764,6 +840,7 @@ def test_only_lifecycle_and_guidance_binding_may_use_logical_key_ids() -> None:
 def _runtime(
     *,
     fail_feed_pointer_once: bool = False,
+    clock=None,
 ):
     fixture = _fixture()
     operations: list[str] = []
@@ -809,6 +886,7 @@ def _runtime(
         feed_publication=_Feed(feed, operations),
         notification_publication=notification,
         delivery_budget=_DELIVERY_BUDGET,
+        clock=clock,
     )
     return (
         fixture,
@@ -889,6 +967,54 @@ def test_runtime_enforces_exact_feed_processing_boundary(
                 published_at=published_at,
             )
         assert operations == []
+        assert store.calls == []
+        assert writer.values == {}
+        assert registry.records == {}
+        assert index.calls == 0
+        assert notification.calls == 0
+
+
+@pytest.mark.parametrize(
+    ("remaining_seconds", "should_publish"),
+    ((15, True), (14, False)),
+)
+def test_runtime_rechecks_finish_before_before_irreversible_writes(
+    remaining_seconds: int,
+    should_publish: bool,
+) -> None:
+    clock_values = []
+    (
+        fixture,
+        runtime,
+        store,
+        writer,
+        registry,
+        index,
+        notification,
+        operations,
+        _binding_verifier,
+        _incident_authority,
+    ) = _runtime(clock=lambda: clock_values[0])
+    finish_before = runtime.guidance_activation.snapshot.activation.finish_before
+    clock_values.append(finish_before - timedelta(seconds=remaining_seconds))
+    published_at = finish_before - timedelta(seconds=60)
+
+    if should_publish:
+        runtime.publish(
+            fixture.guidance_binding,
+            published_at=published_at,
+        )
+        assert notification.calls == 1
+    else:
+        with pytest.raises(
+            Wc027EnrichmentSourceNotReadyError,
+            match="irreversible-write margin",
+        ):
+            runtime.publish(
+                fixture.guidance_binding,
+                published_at=published_at,
+            )
+        assert "enrichment.start" not in operations
         assert store.calls == []
         assert writer.values == {}
         assert registry.records == {}

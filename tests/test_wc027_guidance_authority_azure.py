@@ -79,12 +79,21 @@ def test_activation_table_create_read_and_etag_cas_are_exact() -> None:
     created = store.compare_and_swap(activation, expected_etag=None)
     read = store.read_current(incident_id=activation.incident_id)
     updated = store.compare_and_swap(activation, expected_etag=created.etag)
+    activation_update_call = table.update_call
+    submitted = store.mark_trigger_submitted(
+        activation,
+        expected_etag=updated.etag,
+    )
 
     assert read == created
     assert updated.etag == '"etag-2"'
-    assert table.update_call["mode"] is UpdateMode.REPLACE
-    assert table.update_call["etag"] == '"etag-1"'
-    assert table.update_call["match_condition"] is MatchConditions.IfNotModified
+    assert updated.trigger_delivery_status == "pending"
+    assert submitted.trigger_delivery_status == "submitted"
+    assert activation_update_call["mode"] is UpdateMode.REPLACE
+    assert activation_update_call["etag"] == '"etag-1"'
+    assert activation_update_call["match_condition"] is MatchConditions.IfNotModified
+    assert table.update_call["etag"] == '"etag-2"'
+    assert table.entity["triggerDeliveryStatus"] == "submitted"
 
 
 def test_activation_table_create_conflict_fails_closed() -> None:
@@ -104,7 +113,7 @@ def test_binding_trigger_has_deterministic_identity_session_and_ttl() -> None:
 
     trigger.enqueue(
         binding,
-        time_to_live_seconds=150,
+        time_to_live_seconds=120,
         delivery_budget=_DELIVERY_BUDGET,
     )
 
@@ -114,7 +123,7 @@ def test_binding_trigger_has_deterministic_identity_session_and_ttl() -> None:
         binding.incident_bound_request.incident_subject.incident_id
     )
     assert message.content_type == "application/json"
-    assert int(message.time_to_live.total_seconds()) == 150
+    assert int(message.time_to_live.total_seconds()) == 120
     assert message.application_properties["bindingDigest"] == binding.binding_digest
     for key, value in _DELIVERY_BUDGET.broker_properties().items():
         assert message.application_properties[key] == value
@@ -128,13 +137,13 @@ def test_binding_trigger_rejects_out_of_window_ttl_before_send() -> None:
     with pytest.raises(ValueError, match="TTL"):
         trigger.enqueue(
             binding,
-            time_to_live_seconds=149,
+            time_to_live_seconds=119,
             delivery_budget=_DELIVERY_BUDGET,
         )
     with pytest.raises(ValueError, match="TTL"):
         trigger.enqueue(
             binding,
-            time_to_live_seconds=751,
+            time_to_live_seconds=721,
             delivery_budget=_DELIVERY_BUDGET,
         )
 

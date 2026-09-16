@@ -295,6 +295,9 @@ param wc027PublisherConfigurationJson string = ''
 @description('Exact digest-pinned image deployed to the guidance-authority publisher Job.')
 param wc027PublisherImage string = ''
 
+@description('Exact JSON emitted by the bounded managed-identity publisher digest-pull readiness check.')
+param wc027PublisherImagePullEvidenceJson string = ''
+
 @description('Confirms the exact legacy WC-016 resources and RBAC were removed and the cleanup script reported zero residuals.')
 param wc016LegacyCleanupConfirmed bool = false
 
@@ -354,7 +357,10 @@ var wc027RequestProducerJobResourceIdSegments = concat(
   ]
 )
 var wc027RequestProducerJobResourceIdShapeValid = length(wc027RequestProducerJobResourceIdRawSegments) == 9 && empty(wc027RequestProducerJobResourceIdSegments[0]) && wc027RequestProducerJobResourceIdSegments[1] == 'subscriptions' && !empty(wc027RequestProducerJobResourceIdSegments[2]) && toLower(wc027RequestProducerJobResourceIdSegments[2]) == toLower(subscription().subscriptionId) && wc027RequestProducerJobResourceIdSegments[3] == 'resourceGroups' && !empty(wc027RequestProducerJobResourceIdSegments[4]) && toLower(wc027RequestProducerJobResourceIdSegments[4]) == toLower(foundationResourceGroupName) && wc027RequestProducerJobResourceIdSegments[5] == 'providers' && wc027RequestProducerJobResourceIdSegments[6] == 'Microsoft.App' && wc027RequestProducerJobResourceIdSegments[7] == 'jobs' && !empty(wc027RequestProducerJobResourceIdSegments[8]) && !contains(wc027RequestProducerJobResourceId, '//') && !contains(wc027RequestProducerJobResourceId, '?') && !contains(wc027RequestProducerJobResourceId, '#') && !contains(wc027RequestProducerJobResourceId, '%')
-var wc027RequestProducerJobResourceIdValid = wc027RequestProducerJobResourceIdShapeValid
+var wc027RequestProducerRuntimeJobIdMatches = wc027RequestProducerReady && wc027RequestProducerJobResourceIdShapeValid
+  ? toLower(wc027RequestProducerRuntimeId!.outputs.runtimeJobResourceId) == toLower(wc027RequestProducerJobResourceId)
+  : false
+var wc027RequestProducerJobResourceIdValid = wc027RequestProducerJobResourceIdShapeValid && (!wc027RequestProducerReady || wc027RequestProducerRuntimeJobIdMatches)
 var wc027RequestProducerConfigurationDigestHex = replace(
   wc027RequestProducerConfigurationDigest,
   'sha256:',
@@ -391,17 +397,20 @@ var wc027ReviewedPublisherKedaPollingIntervalSeconds = 30
 var wc027ReviewedPublisherColdStartSeconds = 30
 var wc027ReviewedPublisherConnectionSetupSeconds = 30
 var wc027ReviewedPublisherProcessingSeconds = 60
+var wc027ReviewedPublisherCasMarginSeconds = 5
 var wc027ReviewedPublisherMinimumRemainingLifetimeSeconds = wc027ReviewedPublisherKedaPollingIntervalSeconds + wc027ReviewedPublisherColdStartSeconds + wc027ReviewedPublisherConnectionSetupSeconds + wc027ReviewedPublisherProcessingSeconds
 var wc027ReviewedFeedKedaPollingIntervalSeconds = 30
 var wc027ReviewedFeedColdStartSeconds = 30
 var wc027ReviewedFeedConnectionSetupSeconds = 30
 var wc027ReviewedFeedProcessingSeconds = 60
+var wc027ReviewedFeedDeliveryJitterSeconds = 30
+var wc027ReviewedFeedIrreversibleWriteMarginSeconds = 15
 var wc027ReviewedFeedMinimumRemainingLifetimeSeconds = wc027ReviewedFeedKedaPollingIntervalSeconds + wc027ReviewedFeedColdStartSeconds + wc027ReviewedFeedConnectionSetupSeconds + wc027ReviewedFeedProcessingSeconds
 var wc027ReviewedFeedTriggerRecoverySeconds = 300
 var wc027ReviewedMinimumRemainingLifetimeSeconds = wc027ReviewedPublisherMinimumRemainingLifetimeSeconds
 var wc027ParsedRequestProducerConfiguration = json(
   empty(wc027RequestProducerConfigurationJson)
-    ? '{"deliveryBudget":{"feedColdStartSeconds":0,"feedConnectionSetupSeconds":0,"feedKedaPollingIntervalSeconds":0,"feedMinimumRemainingLifetimeSeconds":0,"feedProcessingSeconds":0,"feedTriggerRecoverySeconds":0,"minimumRemainingLifetimeSeconds":0,"publisherColdStartSeconds":0,"publisherConnectionSetupSeconds":0,"publisherKedaPollingIntervalSeconds":0,"publisherMinimumRemainingLifetimeSeconds":0,"publisherProcessingSeconds":0},"deploymentBinding":{"attachedIdentityResourceIds":[],"bindingEvidenceId":"","rbacResourceIds":[]},"requestSigningKey":{"keyFingerprint":"","keyId":"","keyVaultKeyId":""},"serviceBus":{"inputQueueName":"","namespace":"","outputQueueName":"","receiverIdentityResourceId":""}}'
+    ? '{"deliveryBudget":{"feedColdStartSeconds":0,"feedConnectionSetupSeconds":0,"feedDeliveryJitterSeconds":0,"feedIrreversibleWriteMarginSeconds":0,"feedKedaPollingIntervalSeconds":0,"feedMinimumRemainingLifetimeSeconds":0,"feedProcessingSeconds":0,"feedTriggerRecoverySeconds":0,"minimumRemainingLifetimeSeconds":0,"publisherCasMarginSeconds":0,"publisherColdStartSeconds":0,"publisherConnectionSetupSeconds":0,"publisherKedaPollingIntervalSeconds":0,"publisherMinimumRemainingLifetimeSeconds":0,"publisherProcessingSeconds":0},"deploymentBinding":{"attachedIdentityResourceIds":[],"bindingEvidenceId":"","rbacResourceIds":[]},"requestSigningKey":{"keyFingerprint":"","keyId":"","keyVaultKeyId":""},"serviceBus":{"inputQueueName":"","namespace":"","outputQueueName":"","receiverIdentityResourceId":""}}'
     : wc027RequestProducerConfigurationJson
 )
 var wc027RequestProducerDeliveryBudget = wc027ParsedRequestProducerConfiguration.deliveryBudget
@@ -410,11 +419,14 @@ var wc027RequestProducerDeliveryBudgetValid = !contains([
   wc027RequestProducerDeliveryBudget.publisherColdStartSeconds == wc027ReviewedPublisherColdStartSeconds
   wc027RequestProducerDeliveryBudget.publisherConnectionSetupSeconds == wc027ReviewedPublisherConnectionSetupSeconds
   wc027RequestProducerDeliveryBudget.publisherProcessingSeconds == wc027ReviewedPublisherProcessingSeconds
+  wc027RequestProducerDeliveryBudget.publisherCasMarginSeconds == wc027ReviewedPublisherCasMarginSeconds
   wc027RequestProducerDeliveryBudget.publisherMinimumRemainingLifetimeSeconds == wc027ReviewedPublisherMinimumRemainingLifetimeSeconds
   wc027RequestProducerDeliveryBudget.feedKedaPollingIntervalSeconds == wc027ReviewedFeedKedaPollingIntervalSeconds
   wc027RequestProducerDeliveryBudget.feedColdStartSeconds == wc027ReviewedFeedColdStartSeconds
   wc027RequestProducerDeliveryBudget.feedConnectionSetupSeconds == wc027ReviewedFeedConnectionSetupSeconds
   wc027RequestProducerDeliveryBudget.feedProcessingSeconds == wc027ReviewedFeedProcessingSeconds
+  wc027RequestProducerDeliveryBudget.feedDeliveryJitterSeconds == wc027ReviewedFeedDeliveryJitterSeconds
+  wc027RequestProducerDeliveryBudget.feedIrreversibleWriteMarginSeconds == wc027ReviewedFeedIrreversibleWriteMarginSeconds
   wc027RequestProducerDeliveryBudget.feedMinimumRemainingLifetimeSeconds == wc027ReviewedFeedMinimumRemainingLifetimeSeconds
   wc027RequestProducerDeliveryBudget.feedTriggerRecoverySeconds == wc027ReviewedFeedTriggerRecoverySeconds
   wc027RequestProducerDeliveryBudget.minimumRemainingLifetimeSeconds == wc027ReviewedMinimumRemainingLifetimeSeconds
@@ -610,7 +622,10 @@ var wc027PublisherJobResourceIdSegments = concat(
   ]
 )
 var wc027PublisherJobResourceIdShapeValid = length(wc027PublisherJobResourceIdRawSegments) == 9 && empty(wc027PublisherJobResourceIdSegments[0]) && wc027PublisherJobResourceIdSegments[1] == 'subscriptions' && !empty(wc027PublisherJobResourceIdSegments[2]) && toLower(wc027PublisherJobResourceIdSegments[2]) == toLower(subscription().subscriptionId) && wc027PublisherJobResourceIdSegments[3] == 'resourceGroups' && !empty(wc027PublisherJobResourceIdSegments[4]) && toLower(wc027PublisherJobResourceIdSegments[4]) == toLower(foundationResourceGroupName) && wc027PublisherJobResourceIdSegments[5] == 'providers' && wc027PublisherJobResourceIdSegments[6] == 'Microsoft.App' && wc027PublisherJobResourceIdSegments[7] == 'jobs' && !empty(wc027PublisherJobResourceIdSegments[8]) && !contains(wc027PublisherJobResourceId, '//') && !contains(wc027PublisherJobResourceId, '?') && !contains(wc027PublisherJobResourceId, '#') && !contains(wc027PublisherJobResourceId, '%')
-var wc027PublisherJobResourceIdValid = wc027PublisherJobResourceIdShapeValid
+var wc027PublisherRuntimeJobIdMatches = wc027PublisherReady && wc027PublisherJobResourceIdShapeValid
+  ? toLower(wc027PublisherRuntimeId!.outputs.runtimeJobResourceId) == toLower(wc027PublisherJobResourceId)
+  : false
+var wc027PublisherJobResourceIdValid = wc027PublisherJobResourceIdShapeValid && (!wc027PublisherReady || wc027PublisherRuntimeJobIdMatches)
 var wc027PublisherConfigurationDigestHex = replace(wc027PublisherConfigurationDigest, 'sha256:', '')
 var wc027PublisherConfigurationDigestInvalidCharacters = replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(
   wc027PublisherConfigurationDigestHex,
@@ -634,26 +649,49 @@ var wc027PublisherImageInvalidCharacters = replace(replace(replace(replace(repla
 var wc027PublisherImageValid = wc027PublisherImage == toLower(wc027PublisherImage) && length(wc027PublisherImageDigest) == 64 && empty(wc027PublisherImageInvalidCharacters) && wc027PublisherImageDigest != '0000000000000000000000000000000000000000000000000000000000000000'
 var wc027ParsedPublisherConfiguration = json(
   empty(wc027PublisherConfigurationJson)
-    ? '{"deliveryBudget":{"feedColdStartSeconds":0,"feedConnectionSetupSeconds":0,"feedKedaPollingIntervalSeconds":0,"feedMinimumRemainingLifetimeSeconds":0,"feedProcessingSeconds":0,"feedTriggerRecoverySeconds":0,"minimumRemainingLifetimeSeconds":0,"publisherColdStartSeconds":0,"publisherConnectionSetupSeconds":0,"publisherKedaPollingIntervalSeconds":0,"publisherMinimumRemainingLifetimeSeconds":0,"publisherProcessingSeconds":0},"deploymentBinding":{"attachedIdentityResourceIds":[],"bindingEvidenceId":"","rbacResourceIds":[]},"enrichmentRuntimeConfiguration":{},"requestOutbox":{"blobEndpoint":"","containerName":"","identityResourceId":""},"serviceBus":{"brokerIdentityResourceId":"","namespace":"","requestQueueName":"","requestSubmitterIdentityResourceId":""}}'
+    ? '{"deliveryBudget":{"feedColdStartSeconds":0,"feedConnectionSetupSeconds":0,"feedDeliveryJitterSeconds":0,"feedIrreversibleWriteMarginSeconds":0,"feedKedaPollingIntervalSeconds":0,"feedMinimumRemainingLifetimeSeconds":0,"feedProcessingSeconds":0,"feedTriggerRecoverySeconds":0,"minimumRemainingLifetimeSeconds":0,"publisherCasMarginSeconds":0,"publisherColdStartSeconds":0,"publisherConnectionSetupSeconds":0,"publisherKedaPollingIntervalSeconds":0,"publisherMinimumRemainingLifetimeSeconds":0,"publisherProcessingSeconds":0},"deploymentBinding":{"attachedIdentityResourceIds":[],"bindingEvidenceId":"","rbacResourceIds":[]},"enrichmentRuntimeConfiguration":{},"imagePull":{"identityClientId":"","identityPrincipalId":"","identityResourceId":"","image":"","registryResourceId":"","registryServer":"","roleAssignmentMode":"","roleAssignmentResourceId":"","roleDefinitionId":""},"requestOutbox":{"blobEndpoint":"","containerName":"","identityResourceId":""},"serviceBus":{"brokerIdentityResourceId":"","namespace":"","requestQueueName":"","requestSubmitterIdentityResourceId":""}}'
     : wc027PublisherConfigurationJson
+)
+var wc027ParsedPublisherImagePullEvidence = json(
+  empty(wc027PublisherImagePullEvidenceJson)
+    ? '{"attempts":0,"image":"","managedIdentityClientId":"","maxAttempts":0,"registryResourceId":"","registryServer":"","roleAssignmentMode":"","roleDefinitionId":"","schemaVersion":"","success":false,"verifiedAt":""}'
+    : wc027PublisherImagePullEvidenceJson
 )
 var wc027ParsedProducerConfiguration = json(
   empty(wc027EnrichmentFeedProducerConfigurationJson)
-    ? '{"deliveryBudget":{"feedColdStartSeconds":0,"feedConnectionSetupSeconds":0,"feedKedaPollingIntervalSeconds":0,"feedMinimumRemainingLifetimeSeconds":0,"feedProcessingSeconds":0,"feedTriggerRecoverySeconds":0,"minimumRemainingLifetimeSeconds":0,"publisherColdStartSeconds":0,"publisherConnectionSetupSeconds":0,"publisherKedaPollingIntervalSeconds":0,"publisherMinimumRemainingLifetimeSeconds":0,"publisherProcessingSeconds":0}}'
+    ? '{"deliveryBudget":{"feedColdStartSeconds":0,"feedConnectionSetupSeconds":0,"feedDeliveryJitterSeconds":0,"feedIrreversibleWriteMarginSeconds":0,"feedKedaPollingIntervalSeconds":0,"feedMinimumRemainingLifetimeSeconds":0,"feedProcessingSeconds":0,"feedTriggerRecoverySeconds":0,"minimumRemainingLifetimeSeconds":0,"publisherCasMarginSeconds":0,"publisherColdStartSeconds":0,"publisherConnectionSetupSeconds":0,"publisherKedaPollingIntervalSeconds":0,"publisherMinimumRemainingLifetimeSeconds":0,"publisherProcessingSeconds":0}}'
     : wc027EnrichmentFeedProducerConfigurationJson
 )
 var wc027PublisherImageRegistryServer = first(split(wc027PublisherImage, '/'))
+var wc027PublisherImagePullEvidenceValid = !empty(wc027PublisherImagePullEvidenceJson) && !contains([
+  wc027ParsedPublisherImagePullEvidence.schemaVersion == 'athena.wc027AcrDigestPullReadiness.v1'
+  wc027ParsedPublisherImagePullEvidence.success == true
+  wc027ParsedPublisherImagePullEvidence.registryResourceId == wc027ParsedPublisherConfiguration.imagePull.registryResourceId
+  wc027ParsedPublisherImagePullEvidence.registryServer == wc027ParsedPublisherConfiguration.imagePull.registryServer
+  wc027ParsedPublisherImagePullEvidence.image == wc027PublisherImage
+  wc027ParsedPublisherConfiguration.imagePull.image == wc027PublisherImage
+  toLower(wc027ParsedPublisherImagePullEvidence.managedIdentityClientId) == toLower(wc027ParsedPublisherConfiguration.imagePull.identityClientId)
+  wc027ParsedPublisherImagePullEvidence.roleAssignmentMode == wc027ParsedPublisherConfiguration.imagePull.roleAssignmentMode
+  wc027ParsedPublisherImagePullEvidence.roleDefinitionId == wc027ParsedPublisherConfiguration.imagePull.roleDefinitionId
+  wc027ParsedPublisherImagePullEvidence.attempts >= 1
+  wc027ParsedPublisherImagePullEvidence.maxAttempts >= wc027ParsedPublisherImagePullEvidence.attempts
+  wc027ParsedPublisherImagePullEvidence.maxAttempts <= 20
+  !empty(wc027ParsedPublisherImagePullEvidence.verifiedAt)
+], false)
 var wc027PublisherDeliveryBudget = wc027ParsedPublisherConfiguration.deliveryBudget
 var wc027PublisherDeliveryBudgetValid = !contains([
   wc027PublisherDeliveryBudget.publisherKedaPollingIntervalSeconds == wc027ReviewedPublisherKedaPollingIntervalSeconds
   wc027PublisherDeliveryBudget.publisherColdStartSeconds == wc027ReviewedPublisherColdStartSeconds
   wc027PublisherDeliveryBudget.publisherConnectionSetupSeconds == wc027ReviewedPublisherConnectionSetupSeconds
   wc027PublisherDeliveryBudget.publisherProcessingSeconds == wc027ReviewedPublisherProcessingSeconds
+  wc027PublisherDeliveryBudget.publisherCasMarginSeconds == wc027ReviewedPublisherCasMarginSeconds
   wc027PublisherDeliveryBudget.publisherMinimumRemainingLifetimeSeconds == wc027ReviewedPublisherMinimumRemainingLifetimeSeconds
   wc027PublisherDeliveryBudget.feedKedaPollingIntervalSeconds == wc027ReviewedFeedKedaPollingIntervalSeconds
   wc027PublisherDeliveryBudget.feedColdStartSeconds == wc027ReviewedFeedColdStartSeconds
   wc027PublisherDeliveryBudget.feedConnectionSetupSeconds == wc027ReviewedFeedConnectionSetupSeconds
   wc027PublisherDeliveryBudget.feedProcessingSeconds == wc027ReviewedFeedProcessingSeconds
+  wc027PublisherDeliveryBudget.feedDeliveryJitterSeconds == wc027ReviewedFeedDeliveryJitterSeconds
+  wc027PublisherDeliveryBudget.feedIrreversibleWriteMarginSeconds == wc027ReviewedFeedIrreversibleWriteMarginSeconds
   wc027PublisherDeliveryBudget.feedMinimumRemainingLifetimeSeconds == wc027ReviewedFeedMinimumRemainingLifetimeSeconds
   wc027PublisherDeliveryBudget.feedTriggerRecoverySeconds == wc027ReviewedFeedTriggerRecoverySeconds
   wc027PublisherDeliveryBudget.minimumRemainingLifetimeSeconds == wc027ReviewedMinimumRemainingLifetimeSeconds
@@ -667,11 +705,14 @@ var wc027RuntimeDeliveryBudgetValid = !contains([
   wc027RuntimeDeliveryBudget.publisherColdStartSeconds == wc027ReviewedPublisherColdStartSeconds
   wc027RuntimeDeliveryBudget.publisherConnectionSetupSeconds == wc027ReviewedPublisherConnectionSetupSeconds
   wc027RuntimeDeliveryBudget.publisherProcessingSeconds == wc027ReviewedPublisherProcessingSeconds
+  wc027RuntimeDeliveryBudget.publisherCasMarginSeconds == wc027ReviewedPublisherCasMarginSeconds
   wc027RuntimeDeliveryBudget.publisherMinimumRemainingLifetimeSeconds == wc027ReviewedPublisherMinimumRemainingLifetimeSeconds
   wc027RuntimeDeliveryBudget.feedKedaPollingIntervalSeconds == wc027ReviewedFeedKedaPollingIntervalSeconds
   wc027RuntimeDeliveryBudget.feedColdStartSeconds == wc027ReviewedFeedColdStartSeconds
   wc027RuntimeDeliveryBudget.feedConnectionSetupSeconds == wc027ReviewedFeedConnectionSetupSeconds
   wc027RuntimeDeliveryBudget.feedProcessingSeconds == wc027ReviewedFeedProcessingSeconds
+  wc027RuntimeDeliveryBudget.feedDeliveryJitterSeconds == wc027ReviewedFeedDeliveryJitterSeconds
+  wc027RuntimeDeliveryBudget.feedIrreversibleWriteMarginSeconds == wc027ReviewedFeedIrreversibleWriteMarginSeconds
   wc027RuntimeDeliveryBudget.feedMinimumRemainingLifetimeSeconds == wc027ReviewedFeedMinimumRemainingLifetimeSeconds
   wc027RuntimeDeliveryBudget.feedTriggerRecoverySeconds == wc027ReviewedFeedTriggerRecoverySeconds
   wc027RuntimeDeliveryBudget.minimumRemainingLifetimeSeconds == wc027ReviewedMinimumRemainingLifetimeSeconds
@@ -871,10 +912,12 @@ var validatedWc027PublisherReady = wc027PublisherReady && !wc027PublisherJobReso
                                     ? fail('WC-027 publisher request key fingerprint does not match the request producer')
                                     : wc027PublisherReady && !wc027PublisherImageValid
                                       ? fail('WC-027 publisher requires the exact digest-pinned deployed image')
-                                      : wc027PublisherReady && !wc027PublisherIdentityTypeMatches
-                                        ? fail('WC-027 publisher Job must use only user-assigned identities')
-                                        : wc027PublisherReady && !wc027PublisherHasExactContainerCount
-                                          ? fail('WC-027 publisher Job must contain exactly one reviewed container')
+                                      : wc027PublisherReady && !wc027PublisherImagePullEvidenceValid
+                                        ? fail('WC-027 publisher requires successful bounded managed-identity digest-pull evidence')
+                                        : wc027PublisherReady && !wc027PublisherIdentityTypeMatches
+                                          ? fail('WC-027 publisher Job must use only user-assigned identities')
+                                          : wc027PublisherReady && !wc027PublisherHasExactContainerCount
+                                            ? fail('WC-027 publisher Job must contain exactly one reviewed container')
                                           : wc027PublisherReady && !wc027PublisherTemplateMatches
                                             ? fail('WC-027 publisher Job execution template does not exactly match')
                                             : wc027PublisherReady && !wc027PublisherExecutionConfigurationMatches
@@ -915,7 +958,10 @@ var wc027ProducerJobResourceIdSegments = concat(
   ]
 )
 var wc027ProducerJobResourceIdShapeValid = length(wc027ProducerJobResourceIdRawSegments) == 9 && empty(wc027ProducerJobResourceIdSegments[0]) && wc027ProducerJobResourceIdSegments[1] == 'subscriptions' && !empty(wc027ProducerJobResourceIdSegments[2]) && toLower(wc027ProducerJobResourceIdSegments[2]) == toLower(subscription().subscriptionId) && wc027ProducerJobResourceIdSegments[3] == 'resourceGroups' && !empty(wc027ProducerJobResourceIdSegments[4]) && toLower(wc027ProducerJobResourceIdSegments[4]) == toLower(foundationResourceGroupName) && wc027ProducerJobResourceIdSegments[5] == 'providers' && wc027ProducerJobResourceIdSegments[6] == 'Microsoft.App' && wc027ProducerJobResourceIdSegments[7] == 'jobs' && !empty(wc027ProducerJobResourceIdSegments[8]) && !contains(wc027EnrichmentFeedProducerJobResourceId, '//') && !contains(wc027EnrichmentFeedProducerJobResourceId, '?') && !contains(wc027EnrichmentFeedProducerJobResourceId, '#') && !contains(wc027EnrichmentFeedProducerJobResourceId, '%')
-var wc027ProducerJobResourceIdValid = wc027ProducerJobResourceIdShapeValid
+var wc027ProducerRuntimeJobIdMatches = wc027FeedV2ProducerReady && wc027ProducerJobResourceIdShapeValid
+  ? toLower(wc027ProducerRuntimeId!.outputs.runtimeJobResourceId) == toLower(wc027EnrichmentFeedProducerJobResourceId)
+  : false
+var wc027ProducerJobResourceIdValid = wc027ProducerJobResourceIdShapeValid && (!wc027FeedV2ProducerReady || wc027ProducerRuntimeJobIdMatches)
 var wc027ConfigurationDigestHex = replace(
   wc027EnrichmentFeedProducerConfigurationDigest,
   'sha256:',
@@ -1279,6 +1325,27 @@ resource foundationResourceGroup 'Microsoft.Resources/resourceGroups@2025-04-01'
   name: foundationResourceGroupName
   location: location
   tags: resourceTags
+}
+
+module wc027ProducerRuntimeId 'modules/job-runtime-id.bicep' = if (wc027FeedV2ProducerReady && wc027ProducerJobResourceIdShapeValid) {
+  name: 'wc027-feed-runtime-id'
+  params: {
+    jobResourceId: wc027EnrichmentFeedProducerJobResourceId
+  }
+}
+
+module wc027RequestProducerRuntimeId 'modules/job-runtime-id.bicep' = if (wc027RequestProducerReady && wc027RequestProducerJobResourceIdShapeValid) {
+  name: 'wc027-request-producer-runtime-id'
+  params: {
+    jobResourceId: wc027RequestProducerJobResourceId
+  }
+}
+
+module wc027PublisherRuntimeId 'modules/job-runtime-id.bicep' = if (wc027PublisherReady && wc027PublisherJobResourceIdShapeValid) {
+  name: 'wc027-publisher-runtime-id'
+  params: {
+    jobResourceId: wc027PublisherJobResourceId
+  }
 }
 
 resource wc027ProducerJob 'Microsoft.App/jobs@2025-01-01' existing = if (wc027FeedV2ProducerReady && wc027ProducerJobResourceIdShapeValid) {

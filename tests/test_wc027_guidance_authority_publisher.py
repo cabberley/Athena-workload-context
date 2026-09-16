@@ -56,16 +56,18 @@ def _request(
     binding = fixture.guidance_binding
     correlation_request = binding.incident_bound_request.correlation_request
     evaluated_at = evaluated_at or binding.evaluated_at
+    expires_at = min(
+        evaluated_at + lifetime,
+        correlation_request.expires_at,
+    )
     payload = {
         "schemaVersion": "athena.wc027GuidanceAuthorityPublicationRequest.v1",
         "incidentBoundRequest": binding.incident_bound_request,
         "incidentOccurrence": fixture.incident_publication.occurrence,
         "requestedActions": ("investigationCheck",),
         "evaluatedAt": evaluated_at,
-        "expiresAt": min(
-            evaluated_at + lifetime,
-            correlation_request.expires_at,
-        ),
+        "expiresAt": expires_at,
+        "finishBefore": _DELIVERY_BUDGET.finish_before(expires_at),
     }
     attestation = GuidanceAuthorityPublicationRequestAttestation(
         schemaVersion=(
@@ -152,6 +154,7 @@ class _ActivationStore:
     def __init__(self, events: list[str] | None = None) -> None:
         self.snapshot = None
         self.cas_calls = 0
+        self.mark_calls = 0
         self.conflict = False
         self.commit_then_fail_once = False
         self.events = events if events is not None else []
@@ -173,10 +176,22 @@ class _ActivationStore:
         self.snapshot = GuidanceAuthorityActivationSnapshot(
             activation=activation,
             etag=f'"etag-{self.cas_calls}"',
+            trigger_delivery_status="pending",
         )
         if self.commit_then_fail_once:
             self.commit_then_fail_once = False
             raise RuntimeError("synthetic uncertain activation commit")
+        return self.snapshot
+
+    def mark_trigger_submitted(self, activation, *, expected_etag):
+        self.mark_calls += 1
+        assert self.snapshot.activation == activation
+        assert self.snapshot.etag == expected_etag
+        self.snapshot = GuidanceAuthorityActivationSnapshot(
+            activation=activation,
+            etag=f'"etag-submitted-{self.mark_calls}"',
+            trigger_delivery_status="submitted",
+        )
         return self.snapshot
 
 
@@ -254,6 +269,8 @@ def test_publisher_accepts_distinct_logical_and_physical_lifecycle_key_ids() -> 
     assert receipt.binding_reference.name in writer.payloads
     assert activation.cas_calls == 1
     assert len(trigger.calls) == 1
+    assert activation.mark_calls == 1
+    assert activation.snapshot.trigger_delivery_status == "submitted"
 
 
 def test_publisher_creates_signs_activates_and_enqueues_deterministically() -> None:
@@ -277,20 +294,18 @@ def test_publisher_creates_signs_activates_and_enqueues_deterministically() -> N
     assert incident.calls == 20
     assert [call[0].binding_id for call in trigger.calls] == [
         first.activation.binding_id,
-        first.activation.binding_id,
     ]
-    expected_ttl = int(
-        (
-            first.activation.expires_at - request.evaluated_at
-        ).total_seconds()
+    expected_ttl = _DELIVERY_BUDGET.feed_trigger_time_to_live_seconds(
+        finish_before=first.activation.finish_before,
+        at=request.evaluated_at,
     )
-    assert [call[1] for call in trigger.calls] == [expected_ttl, expected_ttl]
-    assert [call[2] for call in trigger.calls] == [
-        _DELIVERY_BUDGET,
-        _DELIVERY_BUDGET,
-    ]
-    assert trigger.events == ["cas", "trigger", "trigger"]
+    assert [call[1] for call in trigger.calls] == [expected_ttl]
+    assert [call[2] for call in trigger.calls] == [_DELIVERY_BUDGET]
+    assert trigger.events == ["cas", "trigger"]
+    assert activation.mark_calls == 1
+    assert activation.snapshot.trigger_delivery_status == "submitted"
     assert first.activation.trigger_message_id == first.activation.binding_id
+    assert first.activation.trigger_delivery_pending is True
     assert first.activation.delivery_budget == _DELIVERY_BUDGET
 
 
@@ -342,16 +357,42 @@ def test_publisher_derives_independent_feed_delivery_window() -> None:
     assert trigger.events == ["cas", "trigger"]
     assert receipt.activation.publication_request_expires_at == request.expires_at
     assert (
-        receipt.activation.trigger_delivery_deadline - request.expires_at
+        receipt.activation.finish_before - request.expires_at
         == _DELIVERY_BUDGET.feed_trigger_recovery
+        + _DELIVERY_BUDGET.feed_minimum_remaining_lifetime
+        + timedelta(seconds=_DELIVERY_BUDGET.feed_delivery_jitter_seconds)
     )
-    assert (
-        receipt.activation.expires_at
-        - receipt.activation.trigger_delivery_deadline
-        == _DELIVERY_BUDGET.feed_minimum_remaining_lifetime
-    )
-    assert trigger.calls[0][1] == 510
+    assert receipt.activation.expires_at == receipt.activation.finish_before
+    assert trigger.calls[0][1] == 480
     assert activation.cas_calls == 1
+
+
+def test_publisher_requires_reviewed_margin_immediately_before_cas() -> None:
+    fixture = _fixture()
+    request = _request(fixture)
+    (
+        _fixture_value,
+        publisher,
+        _writer,
+        activation,
+        trigger,
+        _correlation,
+        _incident,
+    ) = _publisher(
+        clock=lambda: request.expires_at - timedelta(seconds=4)
+    )
+
+    with pytest.raises(
+        GuidanceAuthoritySourceNotReadyError,
+        match="authority CAS",
+    ):
+        publisher.publish(
+            request,
+            now=request.expires_at - timedelta(seconds=60),
+        )
+
+    assert activation.cas_calls == 0
+    assert trigger.calls == []
 
 
 def test_uncertain_trigger_acceptance_recovers_from_committed_activation() -> None:
@@ -375,6 +416,8 @@ def test_uncertain_trigger_acceptance_recovers_from_committed_activation() -> No
     assert recovered is True
     assert activation.cas_calls == 1
     assert len(trigger.calls) == 2
+    assert activation.mark_calls == 1
+    assert activation.snapshot.trigger_delivery_status == "submitted"
     assert writer.read_calls == [activation.snapshot.activation.binding_reference]
     assert trigger.calls[0][0].binding_id == trigger.calls[1][0].binding_id
 
@@ -391,6 +434,7 @@ def test_uncertain_activation_commit_recovers_without_duplicate_trigger() -> Non
 
     assert activation.cas_calls == 1
     assert trigger.calls == []
+    assert activation.snapshot.trigger_delivery_status == "pending"
 
     recovered = publisher.recover_trigger_delivery(
         request,
@@ -400,6 +444,8 @@ def test_uncertain_activation_commit_recovers_without_duplicate_trigger() -> Non
     assert recovered is True
     assert activation.cas_calls == 1
     assert len(trigger.calls) == 1
+    assert activation.mark_calls == 1
+    assert activation.snapshot.trigger_delivery_status == "submitted"
     assert writer.read_calls == [activation.snapshot.activation.binding_reference]
 
 
@@ -409,9 +455,18 @@ def test_committed_trigger_recovery_accepts_exact_deadline() -> None:
     )
     request = _request(fixture)
     publisher.publish(request, now=request.evaluated_at)
+    activation.snapshot = GuidanceAuthorityActivationSnapshot(
+        activation=activation.snapshot.activation,
+        etag=activation.snapshot.etag,
+        trigger_delivery_status="pending",
+    )
     trigger.calls.clear()
     trigger.events.clear()
-    deadline = activation.snapshot.activation.trigger_delivery_deadline
+    deadline = (
+        activation.snapshot.activation.finish_before
+        - _DELIVERY_BUDGET.feed_minimum_remaining_lifetime
+        - timedelta(seconds=_DELIVERY_BUDGET.feed_delivery_jitter_seconds)
+    )
 
     recovered = publisher.recover_trigger_delivery(
         request,
@@ -419,7 +474,7 @@ def test_committed_trigger_recovery_accepts_exact_deadline() -> None:
     )
 
     assert recovered is True
-    assert trigger.calls[0][1] == 150
+    assert trigger.calls[0][1] == 120
 
 
 def test_committed_trigger_recovery_rejects_expired_deadline() -> None:
@@ -428,8 +483,17 @@ def test_committed_trigger_recovery_rejects_expired_deadline() -> None:
     )
     request = _request(fixture)
     publisher.publish(request, now=request.evaluated_at)
+    activation.snapshot = GuidanceAuthorityActivationSnapshot(
+        activation=activation.snapshot.activation,
+        etag=activation.snapshot.etag,
+        trigger_delivery_status="pending",
+    )
     trigger.calls.clear()
-    deadline = activation.snapshot.activation.trigger_delivery_deadline
+    deadline = (
+        activation.snapshot.activation.finish_before
+        - _DELIVERY_BUDGET.feed_minimum_remaining_lifetime
+        - timedelta(seconds=_DELIVERY_BUDGET.feed_delivery_jitter_seconds)
+    )
 
     with pytest.raises(
         GuidanceAuthoritySourceNotReadyError,
@@ -441,6 +505,25 @@ def test_committed_trigger_recovery_rejects_expired_deadline() -> None:
         )
 
     assert trigger.calls == []
+
+
+def test_submitted_trigger_status_settles_without_duplicate_resend() -> None:
+    fixture, publisher, writer, activation, trigger, _correlation, _incident = (
+        _publisher()
+    )
+    request = _request(fixture)
+    publisher.publish(request, now=request.evaluated_at)
+    original_calls = list(trigger.calls)
+
+    recovered = publisher.recover_trigger_delivery(
+        request,
+        now=request.expires_at + timedelta(minutes=1),
+    )
+
+    assert recovered is True
+    assert trigger.calls == original_calls
+    assert writer.read_calls == []
+    assert activation.snapshot.trigger_delivery_status == "submitted"
 
 
 def test_invalid_outer_signature_causes_zero_external_io() -> None:
@@ -593,6 +676,17 @@ def test_request_expiry_cannot_outlive_nested_correlation_authority() -> None:
         )
 
 
+def test_request_finish_before_must_match_reviewed_absolute_deadline() -> None:
+    request = _request(_fixture())
+    payload = request.model_dump(mode="python", by_alias=True)
+    payload["finishBefore"] = payload["finishBefore"] + timedelta(
+        milliseconds=1
+    )
+
+    with pytest.raises(ValidationError, match="bounded validity"):
+        GuidanceAuthorityPublicationRequest.model_validate(payload)
+
+
 def test_activation_model_rejects_non_binding_asset_path() -> None:
     fixture, publisher, _writer, _activation, _trigger, _correlation, _incident = (
         _publisher()
@@ -625,7 +719,7 @@ def test_activation_model_rejects_delivery_budget_drift() -> None:
 
 @pytest.mark.parametrize(
     "field",
-    ("triggerDeliveryDeadline", "expiresAt"),
+    ("finishBefore", "expiresAt"),
 )
 def test_activation_model_rejects_delivery_deadline_drift(field: str) -> None:
     fixture, publisher, _writer, _activation, _trigger, _correlation, _incident = (

@@ -5,6 +5,7 @@ import os
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
 
 from azure.core.exceptions import (
     HttpResponseError,
@@ -83,6 +84,19 @@ class _ActivationWriter:
 
 
 @dataclass(frozen=True, slots=True)
+class _ImagePullBinding:
+    registry_resource_id: str
+    registry_server: str
+    image: str
+    role_assignment_mode: str
+    role_definition_id: str
+    role_assignment_resource_id: str
+    identity_client_id: str
+    identity_resource_id: str
+    identity_principal_id: str
+
+
+@dataclass(frozen=True, slots=True)
 class Wc027GuidanceAuthorityPublisherConfiguration:
     service_bus_namespace: str
     request_queue_name: str
@@ -91,6 +105,7 @@ class Wc027GuidanceAuthorityPublisherConfiguration:
     broker_identity_resource_id: str
     request_submitter_identity_client_id: str
     request_submitter_identity_resource_id: str
+    image_pull: _ImagePullBinding
     request_outbox: _BlobSource
     authority_assets: _WritableBlobSource
     activation: _ActivationWriter
@@ -117,6 +132,7 @@ class Wc027GuidanceAuthorityPublisherConfiguration:
             {
                 "schemaVersion",
                 "serviceBus",
+                "imagePull",
                 "requestOutbox",
                 "authorityAssets",
                 "guidanceActivation",
@@ -143,6 +159,22 @@ class Wc027GuidanceAuthorityPublisherConfiguration:
                 "requestSubmitterIdentityResourceId",
             },
             "serviceBus",
+        )
+        image_pull = _mapping(root["imagePull"], "imagePull")
+        _require_keys(
+            image_pull,
+            {
+                "registryResourceId",
+                "registryServer",
+                "image",
+                "roleAssignmentMode",
+                "roleDefinitionId",
+                "roleAssignmentResourceId",
+                "identityClientId",
+                "identityResourceId",
+                "identityPrincipalId",
+            },
+            "imagePull",
         )
         activation = _mapping(root["guidanceActivation"], "guidanceActivation")
         _require_keys(
@@ -185,6 +217,49 @@ class Wc027GuidanceAuthorityPublisherConfiguration:
             request_submitter_identity_resource_id=_managed_identity_resource_id(
                 service_bus["requestSubmitterIdentityResourceId"],
                 "serviceBus.requestSubmitterIdentityResourceId",
+            ),
+            image_pull=_ImagePullBinding(
+                registry_resource_id=_text(
+                    image_pull["registryResourceId"],
+                    "imagePull.registryResourceId",
+                    maximum=2048,
+                ),
+                registry_server=_text(
+                    image_pull["registryServer"],
+                    "imagePull.registryServer",
+                    maximum=255,
+                ),
+                image=_text(
+                    image_pull["image"],
+                    "imagePull.image",
+                    maximum=2048,
+                ),
+                role_assignment_mode=_text(
+                    image_pull["roleAssignmentMode"],
+                    "imagePull.roleAssignmentMode",
+                    maximum=64,
+                ),
+                role_definition_id=_client_id(
+                    image_pull["roleDefinitionId"],
+                    "imagePull.roleDefinitionId",
+                ),
+                role_assignment_resource_id=_text(
+                    image_pull["roleAssignmentResourceId"],
+                    "imagePull.roleAssignmentResourceId",
+                    maximum=2048,
+                ),
+                identity_client_id=_client_id(
+                    image_pull["identityClientId"],
+                    "imagePull.identityClientId",
+                ),
+                identity_resource_id=_managed_identity_resource_id(
+                    image_pull["identityResourceId"],
+                    "imagePull.identityResourceId",
+                ),
+                identity_principal_id=_client_id(
+                    image_pull["identityPrincipalId"],
+                    "imagePull.identityPrincipalId",
+                ),
             ),
             request_outbox=_blob_source(
                 root["requestOutbox"],
@@ -255,6 +330,29 @@ class Wc027GuidanceAuthorityPublisherConfiguration:
     def _validate_separation(self) -> None:
         runtime = self.enrichment_runtime
         assets = self.authority_assets
+        image_pull = self.image_pull
+        expected_role_definition_id = (
+            "7f951dda-4ed3-4680-a7ca-43fe172d538d"
+            if image_pull.role_assignment_mode == "LegacyRegistryPermissions"
+            else (
+                "b93aa761-3e63-49ed-ac28-beffa264f7ac"
+                if image_pull.role_assignment_mode == "AbacRepositoryPermissions"
+                else ""
+            )
+        )
+        if (
+            image_pull.registry_server != image_pull.image.split("/", maxsplit=1)[0]
+            or image_pull.role_definition_id != expected_role_definition_id
+            or image_pull.identity_client_id != self.broker_identity_client_id
+            or image_pull.identity_resource_id != self.broker_identity_resource_id
+            or not image_pull.role_assignment_resource_id.startswith(
+                f"{image_pull.registry_resource_id}/providers/"
+                "Microsoft.Authorization/roleAssignments/"
+            )
+        ):
+            raise ValueError(
+                "publisher image pull binding does not match its registry mode and broker identity"
+            )
         if self.delivery_budget != runtime.delivery_budget:
             raise ValueError("publisher delivery budget does not match the enrichment runtime")
         if self.request_outbox.container != "wc027-guidance-request-outbox":
@@ -620,28 +718,90 @@ def _abandon_retryable_publisher_message(
     *,
     now: datetime,
 ) -> None:
-    from azure.servicebus.exceptions import ServiceBusError
-
-    lock_deadlines = tuple(
-        deadline
-        for deadline in (
-            getattr(message, "locked_until_utc", None),
-            getattr(getattr(receiver, "session", None), "locked_until_utc", None),
-        )
-        if deadline is not None
+    _settle_publisher_message(
+        receiver,
+        message,
+        action="abandon",
+        now=now,
     )
-    if any(
-        not isinstance(deadline, datetime)
-        or deadline.tzinfo is None
-        or deadline.utcoffset() != UTC.utcoffset(now)
-        or now >= deadline
-        for deadline in lock_deadlines
-    ):
-        return
+
+
+type _PublisherSettlementStatus = Literal[
+    "settled",
+    "deferred",
+    "already-settled",
+    "message-lock-lost",
+    "session-lock-lost",
+    "unconfirmed",
+]
+
+
+def _settle_publisher_message(
+    receiver: object,
+    message: object,
+    *,
+    action: Literal["complete", "abandon", "dead_letter"],
+    now: datetime,
+    reason: str | None = None,
+    error_description: str | None = None,
+) -> _PublisherSettlementStatus:
+    from azure.servicebus.exceptions import (
+        MessageAlreadySettled,
+        MessageLockLostError,
+        ServiceBusError,
+        SessionLockLostError,
+    )
+
+    message_deadline = getattr(message, "locked_until_utc", None)
+    session_deadline = getattr(
+        getattr(receiver, "session", None),
+        "locked_until_utc",
+        None,
+    )
+    if message_deadline is not None:
+        if (
+            not isinstance(message_deadline, datetime)
+            or message_deadline.tzinfo is None
+            or message_deadline.utcoffset() != UTC.utcoffset(now)
+        ):
+            return "unconfirmed"
+        if now >= message_deadline:
+            return "message-lock-lost"
+    if session_deadline is not None:
+        if (
+            not isinstance(session_deadline, datetime)
+            or session_deadline.tzinfo is None
+            or session_deadline.utcoffset() != UTC.utcoffset(now)
+        ):
+            return "unconfirmed"
+        if now >= session_deadline:
+            return "session-lock-lost"
     try:
-        receiver.abandon_message(message)  # type: ignore[attr-defined]
-    except ServiceBusError:
-        return
+        if action == "complete":
+            receiver.complete_message(message)  # type: ignore[attr-defined]
+            return "settled"
+        if action == "abandon":
+            receiver.abandon_message(message)  # type: ignore[attr-defined]
+            return "deferred"
+        receiver.dead_letter_message(  # type: ignore[attr-defined]
+            message,
+            reason=reason,
+            error_description=error_description,
+        )
+        return "settled"
+    except MessageAlreadySettled:
+        return "already-settled"
+    except MessageLockLostError:
+        return "message-lock-lost"
+    except SessionLockLostError:
+        return "session-lock-lost"
+    except (
+        ServiceBusError,
+        ServiceRequestError,
+        ServiceResponseError,
+        OSError,
+    ):
+        return "unconfirmed"
 
 
 def run_wc027_guidance_authority_publisher_worker(
@@ -707,13 +867,27 @@ def run_wc027_guidance_authority_publisher_worker(
             )
             current = _utc_now_milliseconds()
             if publisher.recover_trigger_delivery(request, now=current):
-                receiver.complete_message(message)
-                return True
+                return (
+                    _settle_publisher_message(
+                        receiver,
+                        message,
+                        action="complete",
+                        now=_utc_now_milliseconds(),
+                    )
+                    == "settled"
+                )
             if current < request.evaluated_at or current >= request.expires_at:
                 raise ValueError("guidance publication request is stale")
             publisher.publish(request, now=processing_started_at)
-            receiver.complete_message(message)
-            return True
+            return (
+                _settle_publisher_message(
+                    receiver,
+                    message,
+                    action="complete",
+                    now=_utc_now_milliseconds(),
+                )
+                == "settled"
+            )
         except (
             GuidanceAuthorityActivationConflictError,
             GuidanceAuthoritySourceNotReadyError,
@@ -732,8 +906,11 @@ def run_wc027_guidance_authority_publisher_worker(
             )
             return False
         except ValidationError, ValueError:
-            receiver.dead_letter_message(
+            _settle_publisher_message(
+                receiver,
                 message,
+                action="dead_letter",
+                now=_utc_now_milliseconds(),
                 reason="AthenaWc027GuidanceAuthorityRejected",
                 error_description=(
                     "publication request failed bounded trust, freshness, "

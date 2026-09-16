@@ -13,6 +13,11 @@ param managedEnvironmentResourceId string
 param publisherImage string
 param registryServer string
 param registryResourceId string
+@allowed([
+  'LegacyRegistryPermissions'
+  'AbacRepositoryPermissions'
+])
+param registryRoleAssignmentMode string
 param serviceBusNamespaceName string
 
 @minLength(1)
@@ -20,6 +25,7 @@ param serviceBusNamespaceName string
 param requestSubmitterIdentityResourceIds array
 
 param brokerIdentityResourceId string
+param brokerIdentityPrincipalId string
 param authorityReaderIdentityResourceId string
 param authorityWriterIdentityResourceId string
 param activationWriterIdentityResourceId string
@@ -79,15 +85,23 @@ var triggerQueueName = 'wc027-enrichment-feed-requests'
 var requestOutboxContainerName = 'wc027-guidance-request-outbox'
 var serviceBusDataReceiverRoleDefinitionId = '4f6c0938-94ea-4d52-8e5a-2e02b7ef8e7d'
 var serviceBusDataSenderRoleDefinitionId = '69a216fc-b8fb-44d8-bc22-1f3c2cd27a39'
+var acrPullRoleDefinitionId = '7f951dda-4ed3-4680-a7ca-43fe172d538d'
+var repositoryReaderRoleDefinitionId = 'b93aa761-3e63-49ed-ac28-beffa264f7ac'
+var imagePullRoleDefinitionId = registryRoleAssignmentMode == 'LegacyRegistryPermissions'
+  ? acrPullRoleDefinitionId
+  : repositoryReaderRoleDefinitionId
 var guidancePublisherKedaPollingIntervalSeconds = 30
 var guidancePublisherColdStartSeconds = 30
 var guidancePublisherConnectionSetupSeconds = 30
 var guidancePublisherProcessingSeconds = 60
+var guidancePublisherCasMarginSeconds = 5
 var guidancePublisherMinimumRemainingLifetimeSeconds = guidancePublisherKedaPollingIntervalSeconds + guidancePublisherColdStartSeconds + guidancePublisherConnectionSetupSeconds + guidancePublisherProcessingSeconds
 var guidanceFeedKedaPollingIntervalSeconds = 30
 var guidanceFeedColdStartSeconds = 30
 var guidanceFeedConnectionSetupSeconds = 30
 var guidanceFeedProcessingSeconds = 60
+var guidanceFeedDeliveryJitterSeconds = 30
+var guidanceFeedIrreversibleWriteMarginSeconds = 15
 var guidanceFeedMinimumRemainingLifetimeSeconds = guidanceFeedKedaPollingIntervalSeconds + guidanceFeedColdStartSeconds + guidanceFeedConnectionSetupSeconds + guidanceFeedProcessingSeconds
 var guidanceFeedTriggerRecoverySeconds = 300
 var guidanceMinimumRemainingLifetimeSeconds = guidancePublisherMinimumRemainingLifetimeSeconds
@@ -96,11 +110,14 @@ var guidancePublicationDeliveryBudget = {
   publisherColdStartSeconds: guidancePublisherColdStartSeconds
   publisherConnectionSetupSeconds: guidancePublisherConnectionSetupSeconds
   publisherProcessingSeconds: guidancePublisherProcessingSeconds
+  publisherCasMarginSeconds: guidancePublisherCasMarginSeconds
   publisherMinimumRemainingLifetimeSeconds: guidancePublisherMinimumRemainingLifetimeSeconds
   feedKedaPollingIntervalSeconds: guidanceFeedKedaPollingIntervalSeconds
   feedColdStartSeconds: guidanceFeedColdStartSeconds
   feedConnectionSetupSeconds: guidanceFeedConnectionSetupSeconds
   feedProcessingSeconds: guidanceFeedProcessingSeconds
+  feedDeliveryJitterSeconds: guidanceFeedDeliveryJitterSeconds
+  feedIrreversibleWriteMarginSeconds: guidanceFeedIrreversibleWriteMarginSeconds
   feedMinimumRemainingLifetimeSeconds: guidanceFeedMinimumRemainingLifetimeSeconds
   feedTriggerRecoverySeconds: guidanceFeedTriggerRecoverySeconds
   minimumRemainingLifetimeSeconds: guidanceMinimumRemainingLifetimeSeconds
@@ -239,7 +256,7 @@ var validatedRegistryScope = registryResourceIdValid
     }
   : fail('registryResourceId must identify one canonical Microsoft.ContainerRegistry/registries resource')
 
-resource registry 'Microsoft.ContainerRegistry/registries@2025-04-01' existing = {
+resource registry 'Microsoft.ContainerRegistry/registries@2025-11-01' existing = {
   name: validatedRegistryScope.registryName
   scope: resourceGroup(
     validatedRegistryScope.subscriptionId,
@@ -540,6 +557,8 @@ module publisherImagePull '../wc027-enrichment-feed-runtime/modules/acr-pull-rba
   params: {
     registryName: registry.name
     identityResourceId: brokerIdentity.id
+    identityPrincipalId: brokerIdentityPrincipalId
+    expectedRegistryRoleAssignmentMode: registryRoleAssignmentMode
   }
 }
 
@@ -557,6 +576,15 @@ var activationTableResourceId = '${activationStorageAccountResourceId}/tableServ
 var activationWriterRoleId = extensionResourceId(activationResourceGroupId, 'Microsoft.Authorization/roleDefinitions', guid(activationTableResourceId, 'athena-wc027-table-cas'))
 var activationWriterAssignmentId = extensionResourceId(activationTableResourceId, 'Microsoft.Authorization/roleAssignments', guid(activationTableResourceId, activationWriterIdentity.id, activationWriterRoleId))
 var bindingSignerRoleId = extensionResourceId('/subscriptions/${split(bindingKeyResourceId, '/')[2]}/resourceGroups/${split(bindingKeyResourceId, '/')[4]}', 'Microsoft.Authorization/roleDefinitions', guid(bindingKey.id, 'athena-wc027-key-signer'))
+var publisherImagePullRoleAssignmentResourceId = extensionResourceId(
+  registry.id,
+  'Microsoft.Authorization/roleAssignments',
+  guid(
+    registry.id,
+    brokerIdentityPrincipalId,
+    imagePullRoleDefinitionId
+  )
+)
 var coreRbacResourceIds = [
   requestReceiver.id
   triggerSender.id
@@ -572,7 +600,7 @@ var coreRbacResourceIds = [
   extensionResourceId(bindingKey.id, 'Microsoft.Authorization/roleAssignments', guid(bindingKey.id, bindingTrustReaderIdentity.id, bindingKeyVerifierRoleId))
   bindingSignerRoleId
   extensionResourceId(bindingKey.id, 'Microsoft.Authorization/roleAssignments', guid(bindingKey.id, bindingSignerIdentity.id, bindingSignerRoleId))
-  extensionResourceId(registry.id, 'Microsoft.Authorization/roleAssignments', guid(registry.id, brokerIdentity.id, '7f951dda-4ed3-4680-a7ca-43fe172d538d'))
+  publisherImagePullRoleAssignmentResourceId
 ]
 var submitterRbacResourceIds = map(validatedRequestSubmitterIdentityResourceIds, identityResourceId => extensionResourceId(requestQueue.id, 'Microsoft.Authorization/roleAssignments', guid(requestQueue.id, identityResourceId, serviceBusDataSenderRoleDefinitionId)))
 var rbacResourceIds = concat(coreRbacResourceIds, submitterRbacResourceIds)
@@ -588,6 +616,17 @@ var publisherConfiguration = {
     brokerIdentityResourceId: brokerIdentity.id
     requestSubmitterIdentityClientId: submitterIdentities[0].properties.clientId
     requestSubmitterIdentityResourceId: submitterIdentities[0].id
+  }
+  imagePull: {
+    registryResourceId: registry.id
+    registryServer: registryServer
+    image: validatedPublisherImage
+    roleAssignmentMode: registryRoleAssignmentMode
+    roleDefinitionId: imagePullRoleDefinitionId
+    roleAssignmentResourceId: publisherImagePullRoleAssignmentResourceId
+    identityClientId: brokerIdentity.properties.clientId
+    identityResourceId: brokerIdentity.id
+    identityPrincipalId: brokerIdentityPrincipalId
   }
   requestOutbox: {
     blobEndpoint: requestOutboxBlobEndpoint
@@ -724,6 +763,9 @@ resource publisherJob 'Microsoft.App/jobs@2025-01-01' = {
 
 output publisherJobResourceId string = publisherJob.id
 output publisherImage string = validatedPublisherImage
+output publisherImagePullRoleAssignmentMode string = registryRoleAssignmentMode
+output publisherImagePullRoleDefinitionId string = imagePullRoleDefinitionId
+output publisherImagePullRoleAssignmentResourceId string = publisherImagePullRoleAssignmentResourceId
 output deployedPublisherConfigurationJson string = publisherConfigurationJson
 output deployedPublisherConfigurationDigest string = startsWith(publisherConfigurationDigest, 'sha256:')
   ? publisherConfigurationDigest

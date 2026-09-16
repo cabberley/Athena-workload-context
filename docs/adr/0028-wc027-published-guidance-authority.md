@@ -86,9 +86,10 @@ reviewed 150-second upstream minimum: 30 seconds each for publisher KEDA polling
 Service Bus setup plus 60 seconds for publisher processing. The exact minimum is accepted; anything
 below it fails before the corresponding persistence or send action. After persistence, the
 producer re-reads the signed lifecycle authority and the exact immutable context authority. It
-then establishes the sender, resamples the trusted clock, and calculates a broker TTL from the
-remaining request lifetime plus the bounded 300-second trigger-recovery allowance. Only then does a
-distinct Service Bus sender identity send the canonical request to
+then establishes the sender, resamples the trusted clock, and calculates the request-hop TTL as
+`floor(finishBefore - now - downstreamMargin)`. The request signature binds `finishBefore`, and
+the activation must copy that deadline unchanged. Only then does a distinct Service Bus sender
+identity send the canonical request to
 `wc027-guidance-authority-requests`, using
 `requestId` as `MessageId`, incident ID as `SessionId`, a bounded TTL, and occurrence, incident,
 context-authority, request, outbox, and delivery-budget binding metadata. Service Bus duplicate
@@ -107,14 +108,22 @@ canonical signed request. A correctly signed request without durable outbox evid
 cannot activate guidance authority. The publisher and feed runtime require the same signed and
 configured delivery budget. After publisher KEDA polling, cold start, and Service Bus setup, a new
 publication must retain the exact 60-second processing phase. The signed activation establishes an
-independent feed-delivery timeline derived from the signed request: its trigger deadline is request
-expiry plus 300 seconds, and activation expiry is one complete 150-second feed phase later. The
-activation is the durable trigger outbox and binds the immutable binding reference, deterministic
-trigger message ID, both deadlines, and delivery budget. The publisher submits the trigger after
-CAS and completes its input only after submission returns. Definite or uncertain submission
-failure is retryable; replay exact-reads the same committed activation and immutable binding,
-resubmits the same message identity, and performs no second CAS—even after request expiry. An
-uncertain CAS that actually committed follows the same recovery path.
+independent feed-delivery timeline with one signed absolute `finishBefore` deadline derived from
+request expiry, the 300-second recovery allowance, complete 150-second feed phase, and 30-second
+jitter margin. The activation is the durable trigger outbox and binds the immutable binding
+reference, deterministic trigger message ID, `triggerDeliveryPending=true`, `finishBefore`, and
+delivery budget. The publisher
+requires a fresh CAS margin before commit, submits the trigger after CAS with
+`floor(finishBefore - now - feedProcessingMargin)`, and completes its input only after submission
+returns. Definite or uncertain submission failure is retryable; replay exact-reads the same
+committed activation and immutable binding, resubmits the same message identity, and performs no
+second CAS—even after request expiry. The feed checks the processing reserve at start and a fresh
+irreversible-write margin before each write.
+
+The activation Table row stores a separate ETag-protected trigger-delivery status. CAS creates
+`pending`; a confirmed deterministic send changes only that row to `submitted`. Uncertain send or
+status-update outcomes retain/recover `pending` and resend the same message, while `submitted`
+allows input settlement without another send.
 
 The initial production publisher emits only the deterministic zero-option authority with
 `noMatchingControl`. It first create-or-recovers the immutable authority Blob, then signs and
@@ -125,7 +134,7 @@ match.
 Activation is a separate signed `PublishedGuidanceAuthorityActivation.v1` CAS row keyed by
 incident ID. It binds the exact occurrence, request, binding digest, version-pinned binding
 reference, deterministic trigger message ID, complete delivery budget, activation time, original
-request expiry, trigger recovery deadline, and independently bounded activation expiry. A retry
+request expiry, and independently bounded `finishBefore`. A retry
 may reuse the same activation; a different activation for the same occurrence, an ETag conflict,
 a changed lifecycle authority, changed correlation result, or a superseding activation fails
 closed. The enrichment runtime verifies the current activation, trigger metadata, and exact feed
@@ -148,9 +157,9 @@ binding.
 Root readiness accepts those Jobs only by canonical absolute ARM IDs in the current subscription
 and reviewed foundation resource group. Complete syntactic parsing closes malformed prefixes,
 provider/type aliases, suffixes, duplicate separators, encoded/query/fragment forms, and
-cross-scope substitution. Existing-resource `.id` expressions are not claimed as server-returned
-identity evidence; readiness instead validates the referenced Job's complete configuration and
-identity surfaces.
+cross-scope substitution. A guarded nested deployment resolves each expected ID with ARM
+`reference(..., 'Full').id`; readiness requires exact equality with that server-returned ID before
+validating the referenced Job's complete configuration and identity surfaces.
 
 The publisher configuration is rejected unless its authority Blob endpoint/container and
 activation Table endpoint/name/partition exactly match the embedded feed runtime's read
@@ -158,7 +167,11 @@ locations. The publisher deployment derives those destinations from that runtime
 Its authority writer has only Blob create permission, its activation writer has only Table entity
 read/add/update permission, and its binding signer has only exact-key sign permission.
 The publisher validates the ACR ID canonically and scopes its image-pull module to the exact parsed
-registry subscription and resource group.
+registry subscription and resource group. It detects the registry permission mode and selects
+`AcrPull` only for legacy RBAC registries or `Container Registry Repository Reader` for
+ABAC-repository-permissions registries. Role-assignment identity is seeded by the managed
+identity's principal object ID. Root readiness additionally requires bounded, actual
+managed-identity pull evidence for the exact digest.
 
 ## Consequences
 

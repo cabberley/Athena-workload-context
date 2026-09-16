@@ -972,6 +972,7 @@ def build_wc027_enrichment_feed_runtime(
         feed_publication=feed,
         notification_publication=notification,
         delivery_budget=configuration.delivery_budget,
+        clock=utc_now_millisecond,
     )
 
 

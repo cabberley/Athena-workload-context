@@ -4,7 +4,6 @@ from collections.abc import Callable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from math import ceil
 from typing import Protocol
 from uuid import UUID
 
@@ -253,18 +252,23 @@ class GuidancePublicationRequestProducer:
 
         with self.sender.open() as sender:
             operation_now = self._operation_time(persistence_now)
-            remaining = self._require_remaining_delivery_budget(
+            self._require_remaining_delivery_budget(
                 publication_request,
                 at=operation_now,
                 phase="enqueue",
             )
-            remaining_seconds = ceil(remaining.total_seconds())
+            time_to_live_seconds = self.delivery_budget.publisher_request_time_to_live_seconds(
+                finish_before=publication_request.finish_before,
+                at=operation_now,
+            )
+            if time_to_live_seconds < 1:
+                raise GuidanceAuthoritySourceNotReadyError(
+                    "guidance publication request broker TTL is exhausted"
+                )
             sender.enqueue(
                 publication_request,
                 outbox_reference=outbox_reference,
-                time_to_live_seconds=(
-                    remaining_seconds + self.delivery_budget.feed_trigger_recovery_seconds
-                ),
+                time_to_live_seconds=time_to_live_seconds,
                 delivery_budget=self.delivery_budget,
             )
         return GuidancePublicationRequestReceipt(
@@ -309,6 +313,7 @@ class GuidancePublicationRequestProducer:
             "requestedActions": self.requested_actions,
             "evaluatedAt": evaluated_at,
             "expiresAt": expires_at,
+            "finishBefore": self.delivery_budget.finish_before(expires_at),
         }
         preimage = _canonical_payload(unsigned_payload)
         maximum_attestation = {

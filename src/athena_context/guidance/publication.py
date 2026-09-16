@@ -5,8 +5,7 @@ import binascii
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from math import ceil
-from typing import Protocol
+from typing import Literal, Protocol
 
 from pydantic import BaseModel, ValidationError
 
@@ -69,10 +68,13 @@ class GuidanceAuthorityArtifactWriterPort(Protocol):
 class GuidanceAuthorityActivationSnapshot:
     activation: PublishedGuidanceAuthorityActivation
     etag: str
+    trigger_delivery_status: Literal["pending", "submitted"] = "pending"
 
     def __post_init__(self) -> None:
         if type(self.etag) is not str or not self.etag:
             raise ValueError("activation etag must be a non-empty opaque value")
+        if self.trigger_delivery_status not in {"pending", "submitted"}:
+            raise ValueError("activation trigger delivery status is invalid")
 
 
 class GuidanceAuthorityActivationStorePort(Protocol):
@@ -87,6 +89,13 @@ class GuidanceAuthorityActivationStorePort(Protocol):
         activation: PublishedGuidanceAuthorityActivation,
         *,
         expected_etag: str | None,
+    ) -> GuidanceAuthorityActivationSnapshot: ...
+
+    def mark_trigger_submitted(
+        self,
+        activation: PublishedGuidanceAuthorityActivation,
+        *,
+        expected_etag: str,
     ) -> GuidanceAuthorityActivationSnapshot: ...
 
 
@@ -435,8 +444,12 @@ class GuidanceAuthorityPublisher:
             )
 
         operation_now = self._operation_time(now)
-        if operation_now >= request.expires_at:
-            raise ValueError("guidance publication request expired before activation")
+        self._require_remaining_window(
+            request,
+            at=operation_now,
+            required=self.delivery_budget.publisher_cas_margin,
+            phase="authority CAS",
+        )
         previous = self.activation_store.read_current(
             incident_id=current.state.incident_id
         )
@@ -485,8 +498,8 @@ class GuidanceAuthorityPublisher:
             raise GuidanceAuthorityActivationConflictError(
                 "guidance authority activation changed after commit"
             )
-        self._enqueue_committed_trigger(
-            activation,
+        self._submit_pending_trigger(
+            final_activation,
             binding,
             at=self._operation_time(operation_now),
         )
@@ -529,16 +542,49 @@ class GuidanceAuthorityPublisher:
             request,
         ):
             return False
+        if snapshot.trigger_delivery_status == "submitted":
+            return True
         binding = self._read_committed_binding(
             snapshot.activation,
             request=request,
         )
-        self._enqueue_committed_trigger(
-            snapshot.activation,
+        self._submit_pending_trigger(
+            snapshot,
             binding,
             at=now,
         )
         return True
+
+    def _submit_pending_trigger(
+        self,
+        snapshot: GuidanceAuthorityActivationSnapshot,
+        binding: PublishedGuidanceAuthorityBinding,
+        *,
+        at: datetime,
+    ) -> GuidanceAuthorityActivationSnapshot:
+        if snapshot.trigger_delivery_status == "submitted":
+            return snapshot
+        self._enqueue_committed_trigger(
+            snapshot.activation,
+            binding,
+            at=at,
+        )
+        try:
+            return self.activation_store.mark_trigger_submitted(
+                snapshot.activation,
+                expected_etag=snapshot.etag,
+            )
+        except GuidanceAuthorityActivationConflictError:
+            current = self.activation_store.read_current(
+                incident_id=snapshot.activation.incident_id
+            )
+            if (
+                current is None
+                or current.activation != snapshot.activation
+                or current.trigger_delivery_status != "submitted"
+            ):
+                raise
+            return current
 
     def _read_committed_binding(
         self,
@@ -582,7 +628,12 @@ class GuidanceAuthorityPublisher:
         *,
         at: datetime,
     ) -> None:
-        if at > activation.trigger_delivery_deadline:
+        trigger_send_deadline = (
+            activation.finish_before
+            - self.delivery_budget.feed_minimum_remaining_lifetime
+            - timedelta(seconds=self.delivery_budget.feed_delivery_jitter_seconds)
+        )
+        if at > trigger_send_deadline:
             raise GuidanceAuthoritySourceNotReadyError(
                 "committed guidance trigger recovery deadline expired"
             )
@@ -594,14 +645,29 @@ class GuidanceAuthorityPublisher:
             expected_delivery_budget=self.delivery_budget,
             verified_at=at,
         )
-        remaining = activation.expires_at - at
-        if remaining < self.delivery_budget.feed_minimum_remaining_lifetime:
+        if (
+            activation.finish_before - at
+            < self.delivery_budget.feed_minimum_remaining_lifetime
+            + timedelta(
+                seconds=self.delivery_budget.feed_delivery_jitter_seconds
+            )
+        ):
             raise GuidanceAuthoritySourceNotReadyError(
                 "committed guidance trigger lacks the reviewed feed window"
             )
+        time_to_live_seconds = (
+            self.delivery_budget.feed_trigger_time_to_live_seconds(
+                finish_before=activation.finish_before,
+                at=at,
+            )
+        )
+        if time_to_live_seconds < 1:
+            raise GuidanceAuthoritySourceNotReadyError(
+                "committed guidance trigger TTL is exhausted"
+            )
         self.trigger.enqueue(
             binding,
-            time_to_live_seconds=ceil(remaining.total_seconds()),
+            time_to_live_seconds=time_to_live_seconds,
             delivery_budget=self.delivery_budget,
         )
 
@@ -622,6 +688,7 @@ class GuidanceAuthorityPublisher:
             and activation.activated_at == request.evaluated_at
             and activation.publication_request_expires_at
             == request.expires_at
+            and activation.finish_before == request.finish_before
             and activation.delivery_budget == self.delivery_budget
             and activation.trigger_message_id == activation.binding_id
             and activation.activation_attestation.key_id == self.binding_key_id
@@ -823,17 +890,12 @@ class GuidanceAuthorityPublisher:
             "bindingDigest": binding.binding_digest,
             "bindingReference": binding_reference,
             "triggerMessageId": binding.binding_id,
+            "triggerDeliveryPending": True,
             "deliveryBudget": self.delivery_budget,
             "activatedAt": request.evaluated_at,
             "publicationRequestExpiresAt": request.expires_at,
-            "triggerDeliveryDeadline": (
-                request.expires_at + self.delivery_budget.feed_trigger_recovery
-            ),
-            "expiresAt": (
-                request.expires_at
-                + self.delivery_budget.feed_trigger_recovery
-                + self.delivery_budget.feed_minimum_remaining_lifetime
-            ),
+            "finishBefore": request.finish_before,
+            "expiresAt": request.finish_before,
         }
         preimage = _canonical_payload(unsigned_payload)
         signature = normalize_guidance_detached_signature(

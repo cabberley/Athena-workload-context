@@ -1,3 +1,4 @@
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -27,6 +28,22 @@ KEY_SIGNER = (
     / "modules"
     / "key-signer-rbac.bicep"
 )
+ACR_PULL = (
+    ROOT / "infra" / "wc027-enrichment-feed-runtime" / "modules" / "acr-pull-rbac.bicep"
+)
+ACR_ASSIGNMENT = (
+    ROOT
+    / "infra"
+    / "wc027-enrichment-feed-runtime"
+    / "modules"
+    / "acr-pull-role-assignment.bicep"
+)
+DIGEST_PULL_READINESS = (
+    ROOT
+    / "infra"
+    / "wc027-guidance-authority-publisher"
+    / "Test-AcrDigestPullReadiness.ps1"
+)
 
 
 def _evaluate_registry_resource_id(resource_id: str) -> tuple[list[str], bool]:
@@ -46,6 +63,82 @@ def _evaluate_registry_resource_id(resource_id: str) -> tuple[list[str], bool]:
         and not any(alias in resource_id for alias in ("//", "?", "#", "%"))
     )
     return segments, valid
+
+
+def _publisher_image_pull_evidence() -> tuple[dict[str, object], dict[str, object]]:
+    binding = {
+        "registryResourceId": (
+            "/subscriptions/11111111-1111-1111-1111-111111111111/"
+            "resourceGroups/rg-shared-acr/providers/"
+            "Microsoft.ContainerRegistry/registries/athenashared"
+        ),
+        "registryServer": "athenashared.azurecr.io",
+        "image": (
+            "athenashared.azurecr.io/athena/"
+            "wc027-guidance-authority-publisher@sha256:" + "a" * 64
+        ),
+        "roleAssignmentMode": "AbacRepositoryPermissions",
+        "roleDefinitionId": "b93aa761-3e63-49ed-ac28-beffa264f7ac",
+        "identityClientId": "22222222-2222-2222-2222-222222222222",
+    }
+    evidence = {
+        "schemaVersion": "athena.wc027AcrDigestPullReadiness.v1",
+        "registryResourceId": binding["registryResourceId"],
+        "registryServer": binding["registryServer"],
+        "image": binding["image"],
+        "managedIdentityClientId": binding["identityClientId"],
+        "roleAssignmentMode": binding["roleAssignmentMode"],
+        "roleDefinitionId": binding["roleDefinitionId"],
+        "attempts": 3,
+        "maxAttempts": 10,
+        "verifiedAt": "2026-09-16T02:00:00.000Z",
+        "success": True,
+    }
+    return binding, evidence
+
+
+def _evaluate_publisher_image_pull_evidence(
+    source: str,
+    *,
+    binding: dict[str, object],
+    evidence: dict[str, object],
+) -> bool:
+    required_predicates = (
+        "wc027ParsedPublisherImagePullEvidence.schemaVersion == "
+        "'athena.wc027AcrDigestPullReadiness.v1'",
+        "wc027ParsedPublisherImagePullEvidence.success == true",
+        "wc027ParsedPublisherImagePullEvidence.registryResourceId == "
+        "wc027ParsedPublisherConfiguration.imagePull.registryResourceId",
+        "wc027ParsedPublisherImagePullEvidence.image == wc027PublisherImage",
+        "wc027ParsedPublisherConfiguration.imagePull.image == wc027PublisherImage",
+        "wc027ParsedPublisherImagePullEvidence.roleAssignmentMode == "
+        "wc027ParsedPublisherConfiguration.imagePull.roleAssignmentMode",
+        "wc027ParsedPublisherImagePullEvidence.roleDefinitionId == "
+        "wc027ParsedPublisherConfiguration.imagePull.roleDefinitionId",
+        "wc027ParsedPublisherImagePullEvidence.attempts >= 1",
+        "wc027ParsedPublisherImagePullEvidence.maxAttempts <= 20",
+    )
+    if any(predicate not in source for predicate in required_predicates):
+        return False
+    return (
+        evidence.get("schemaVersion")
+        == "athena.wc027AcrDigestPullReadiness.v1"
+        and evidence.get("success") is True
+        and evidence.get("registryResourceId") == binding["registryResourceId"]
+        and evidence.get("registryServer") == binding["registryServer"]
+        and evidence.get("image") == binding["image"]
+        and str(evidence.get("managedIdentityClientId", "")).casefold()
+        == str(binding["identityClientId"]).casefold()
+        and evidence.get("roleAssignmentMode") == binding["roleAssignmentMode"]
+        and evidence.get("roleDefinitionId") == binding["roleDefinitionId"]
+        and isinstance(evidence.get("attempts"), int)
+        and isinstance(evidence.get("maxAttempts"), int)
+        and 1
+        <= int(evidence["attempts"])
+        <= int(evidence["maxAttempts"])
+        <= 20
+        and bool(evidence.get("verifiedAt"))
+    )
 
 
 def test_publisher_is_private_idempotent_and_uses_separated_authorities() -> None:
@@ -111,6 +204,10 @@ def test_publisher_is_private_idempotent_and_uses_separated_authorities() -> Non
         "athena-context",
         "wc027-guidance-authority-publisher",
         "output publisherImage string = validatedPublisherImage",
+        "param registryRoleAssignmentMode string",
+        "param brokerIdentityPrincipalId string",
+        "imagePull:",
+        "publisherImagePullRoleAssignmentResourceId",
     ):
         assert expected in source
 
@@ -209,7 +306,7 @@ def test_publisher_registry_id_and_image_pull_scope_are_evaluated_canonically(
         assert expected in source
 
     registry_block = source.split(
-        "resource registry 'Microsoft.ContainerRegistry/registries@2025-04-01' existing =",
+        "resource registry 'Microsoft.ContainerRegistry/registries@2025-11-01' existing =",
         maxsplit=1,
     )[1].split("var expectedRegistryServer", maxsplit=1)[0]
     image_pull_block = source.split(
@@ -222,6 +319,136 @@ def test_publisher_registry_id_and_image_pull_scope_are_evaluated_canonically(
         assert "validatedRegistryScope.subscriptionId" in block
         assert "validatedRegistryScope.resourceGroupName" in block
         assert "resourceGroup().name" not in block
+
+
+def test_acr_pull_role_matches_registry_permission_mode_and_object_id_seed() -> None:
+    orchestrator = ACR_PULL.read_text(encoding="utf-8")
+    assignment = ACR_ASSIGNMENT.read_text(encoding="utf-8")
+
+    for expected in (
+        "Microsoft.ContainerRegistry/registries@2025-11-01",
+        "registry.properties.roleAssignmentMode",
+        "'LegacyRegistryPermissions'",
+        "'AbacRepositoryPermissions'",
+        "7f951dda-4ed3-4680-a7ca-43fe172d538d",
+        "b93aa761-3e63-49ed-ac28-beffa264f7ac",
+        "identity.properties.principalId == identityPrincipalId",
+        "expectedRegistryRoleAssignmentMode",
+        "principalObjectId: validatedIdentityPrincipalId",
+    ):
+        assert expected in orchestrator
+
+    assert "guid(registry.id, identity.id" not in orchestrator
+    for expected in (
+        "guid(",
+        "registry.id",
+        "principalObjectId",
+        "roleDefinitionId",
+        "principalId: principalObjectId",
+        "principalType: 'ServicePrincipal'",
+    ):
+        assert expected in assignment
+    assert "identityResourceId" not in assignment
+
+
+def test_publisher_digest_pull_readiness_is_bounded_and_activation_gated() -> None:
+    script = DIGEST_PULL_READINESS.read_text(encoding="utf-8")
+    root = ROOT_DEPLOYMENT.read_text(encoding="utf-8")
+
+    for expected in (
+        "[ValidateRange(1, 20)]",
+        "[int] $MaxAttempts = 10",
+        "[ValidateRange(1, 60)]",
+        "[int] $DelaySeconds = 30",
+        "az login --identity --client-id",
+        "az acr login --name $registryName --expose-token",
+        "docker login",
+        "docker pull $Image",
+        "docker image inspect $Image --format '{{json .RepoDigests}}'",
+        "if ($Image -notin $repoDigests)",
+        "Start-Sleep -Seconds $DelaySeconds",
+        "athena.wc027AcrDigestPullReadiness.v1",
+        "roleAssignmentMode = $RegistryRoleAssignmentMode",
+        "roleDefinitionId = $roleDefinitionId",
+        "success = $true",
+        "docker logout $registryServer",
+    ):
+        assert expected in script
+    assert "Write-Output $token" not in script
+    assert "Write-Host $token" not in script
+
+    for expected in (
+        "param wc027PublisherImagePullEvidenceJson string = ''",
+        "wc027PublisherImagePullEvidenceValid",
+        "athena.wc027AcrDigestPullReadiness.v1",
+        "managedIdentityClientId",
+        "roleAssignmentMode",
+        "roleDefinitionId",
+        "successful bounded managed-identity digest-pull evidence",
+    ):
+        assert expected in root
+
+
+def test_publisher_digest_pull_evidence_evaluates_ready() -> None:
+    source = ROOT_DEPLOYMENT.read_text(encoding="utf-8")
+    binding, evidence = _publisher_image_pull_evidence()
+
+    assert _evaluate_publisher_image_pull_evidence(
+        source,
+        binding=binding,
+        evidence=evidence,
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "schema",
+        "success",
+        "registry",
+        "server",
+        "image",
+        "identity",
+        "mode",
+        "role",
+        "attempts-zero",
+        "attempts-over-max",
+        "max-over-bound",
+        "verified-at",
+    ),
+)
+def test_publisher_digest_pull_evidence_rejects_drift(mutation: str) -> None:
+    source = ROOT_DEPLOYMENT.read_text(encoding="utf-8")
+    binding, evidence = _publisher_image_pull_evidence()
+    selected = deepcopy(evidence)
+    mutations = {
+        "schema": ("schemaVersion", "synthetic.invalid"),
+        "success": ("success", False),
+        "registry": ("registryResourceId", "/synthetic/registry"),
+        "server": ("registryServer", "different.azurecr.io"),
+        "image": ("image", str(binding["image"]).replace("a" * 64, "b" * 64)),
+        "identity": (
+            "managedIdentityClientId",
+            "33333333-3333-3333-3333-333333333333",
+        ),
+        "mode": ("roleAssignmentMode", "LegacyRegistryPermissions"),
+        "role": (
+            "roleDefinitionId",
+            "7f951dda-4ed3-4680-a7ca-43fe172d538d",
+        ),
+        "attempts-zero": ("attempts", 0),
+        "attempts-over-max": ("attempts", 11),
+        "max-over-bound": ("maxAttempts", 21),
+        "verified-at": ("verifiedAt", ""),
+    }
+    key, value = mutations[mutation]
+    selected[key] = value
+
+    assert not _evaluate_publisher_image_pull_evidence(
+        source,
+        binding=binding,
+        evidence=selected,
+    )
 
 
 def test_publisher_data_plane_roles_are_exact_and_non_destructive() -> None:

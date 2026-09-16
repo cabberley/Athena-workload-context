@@ -13,6 +13,11 @@ param managedEnvironmentResourceId string
 param producerImage string
 param registryServer string
 param registryResourceId string
+@allowed([
+  'LegacyRegistryPermissions'
+  'AbacRepositoryPermissions'
+])
+param registryRoleAssignmentMode string
 param serviceBusNamespaceName string
 
 @minLength(1)
@@ -20,6 +25,7 @@ param serviceBusNamespaceName string
 param inputSubmitterIdentityResourceIds array
 
 param receiverIdentityResourceId string
+param receiverIdentityPrincipalId string
 param senderIdentityResourceId string
 param incidentReaderIdentityResourceId string
 param contextAuthorityReaderIdentityResourceId string
@@ -70,15 +76,22 @@ var serviceBusDataReceiverRoleDefinitionId = '4f6c0938-94ea-4d52-8e5a-2e02b7ef8e
 var serviceBusDataSenderRoleDefinitionId = '69a216fc-b8fb-44d8-bc22-1f3c2cd27a39'
 var storageBlobDataReaderRoleDefinitionId = '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1'
 var acrPullRoleDefinitionId = '7f951dda-4ed3-4680-a7ca-43fe172d538d'
+var repositoryReaderRoleDefinitionId = 'b93aa761-3e63-49ed-ac28-beffa264f7ac'
+var imagePullRoleDefinitionId = registryRoleAssignmentMode == 'LegacyRegistryPermissions'
+  ? acrPullRoleDefinitionId
+  : repositoryReaderRoleDefinitionId
 var guidancePublisherKedaPollingIntervalSeconds = 30
 var guidancePublisherColdStartSeconds = 30
 var guidancePublisherConnectionSetupSeconds = 30
 var guidancePublisherProcessingSeconds = 60
+var guidancePublisherCasMarginSeconds = 5
 var guidancePublisherMinimumRemainingLifetimeSeconds = guidancePublisherKedaPollingIntervalSeconds + guidancePublisherColdStartSeconds + guidancePublisherConnectionSetupSeconds + guidancePublisherProcessingSeconds
 var guidanceFeedKedaPollingIntervalSeconds = 30
 var guidanceFeedColdStartSeconds = 30
 var guidanceFeedConnectionSetupSeconds = 30
 var guidanceFeedProcessingSeconds = 60
+var guidanceFeedDeliveryJitterSeconds = 30
+var guidanceFeedIrreversibleWriteMarginSeconds = 15
 var guidanceFeedMinimumRemainingLifetimeSeconds = guidanceFeedKedaPollingIntervalSeconds + guidanceFeedColdStartSeconds + guidanceFeedConnectionSetupSeconds + guidanceFeedProcessingSeconds
 var guidanceFeedTriggerRecoverySeconds = 300
 var guidanceMinimumRemainingLifetimeSeconds = guidancePublisherMinimumRemainingLifetimeSeconds
@@ -87,11 +100,14 @@ var guidancePublicationDeliveryBudget = {
   publisherColdStartSeconds: guidancePublisherColdStartSeconds
   publisherConnectionSetupSeconds: guidancePublisherConnectionSetupSeconds
   publisherProcessingSeconds: guidancePublisherProcessingSeconds
+  publisherCasMarginSeconds: guidancePublisherCasMarginSeconds
   publisherMinimumRemainingLifetimeSeconds: guidancePublisherMinimumRemainingLifetimeSeconds
   feedKedaPollingIntervalSeconds: guidanceFeedKedaPollingIntervalSeconds
   feedColdStartSeconds: guidanceFeedColdStartSeconds
   feedConnectionSetupSeconds: guidanceFeedConnectionSetupSeconds
   feedProcessingSeconds: guidanceFeedProcessingSeconds
+  feedDeliveryJitterSeconds: guidanceFeedDeliveryJitterSeconds
+  feedIrreversibleWriteMarginSeconds: guidanceFeedIrreversibleWriteMarginSeconds
   feedMinimumRemainingLifetimeSeconds: guidanceFeedMinimumRemainingLifetimeSeconds
   feedTriggerRecoverySeconds: guidanceFeedTriggerRecoverySeconds
   minimumRemainingLifetimeSeconds: guidanceMinimumRemainingLifetimeSeconds
@@ -243,7 +259,7 @@ var validatedRegistryScope = registryResourceIdValid
     }
   : fail('registryResourceId must identify one Microsoft.ContainerRegistry/registries resource')
 
-resource registry 'Microsoft.ContainerRegistry/registries@2025-04-01' existing = {
+resource registry 'Microsoft.ContainerRegistry/registries@2025-11-01' existing = {
   name: validatedRegistryScope.registryName
   scope: resourceGroup(
     validatedRegistryScope.subscriptionId,
@@ -556,6 +572,8 @@ module producerImagePull '../wc027-enrichment-feed-runtime/modules/acr-pull-rbac
   params: {
     registryName: registry.name
     identityResourceId: receiverIdentity.id
+    identityPrincipalId: receiverIdentityPrincipalId
+    expectedRegistryRoleAssignmentMode: registryRoleAssignmentMode
   }
 }
 
@@ -583,7 +601,15 @@ var coreRbacResourceIds = [
   extensionResourceId(requestKey.id, 'Microsoft.Authorization/roleAssignments', guid(requestKey.id, requestVerifierIdentity.id, publicRequestKeyReaderRoleId))
   requestSignerRoleId
   extensionResourceId(requestKey.id, 'Microsoft.Authorization/roleAssignments', guid(requestKey.id, requestSignerIdentity.id, requestSignerRoleId))
-  extensionResourceId(registry.id, 'Microsoft.Authorization/roleAssignments', guid(registry.id, receiverIdentity.id, acrPullRoleDefinitionId))
+  extensionResourceId(
+    registry.id,
+    'Microsoft.Authorization/roleAssignments',
+    guid(
+      registry.id,
+      receiverIdentityPrincipalId,
+      imagePullRoleDefinitionId
+    )
+  )
 ]
 var submitterRbacResourceIds = map(validatedInputSubmitterIdentityResourceIds, identityResourceId => extensionResourceId(inputQueue.id, 'Microsoft.Authorization/roleAssignments', guid(inputQueue.id, identityResourceId, serviceBusDataSenderRoleDefinitionId)))
 var rbacResourceIds = concat(coreRbacResourceIds, submitterRbacResourceIds)

@@ -11,6 +11,7 @@ from athena_context.contracts import (
     CorrelationRequest,
     GuidancePublicationRequestDeliveryBudget,
     IncidentNotificationEnvelopeV2,
+    PublishedGuidanceAuthorityActivation,
     PublishedGuidanceAuthorityBinding,
     UtcDateTime,
     canonicalize_json,
@@ -118,6 +119,7 @@ class Wc027EnrichmentFeedRuntime:
     feed_publication: IncidentEnrichmentFeedPublicationPort
     notification_publication: NotificationV2PublicationPort
     delivery_budget: GuidancePublicationRequestDeliveryBudget
+    clock: Callable[[], datetime] | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -199,14 +201,26 @@ class Wc027EnrichmentFeedRuntime:
             occurrence=current.occurrence,
         )
         verified_report = self.correlation.correlate(request.correlation_request)
+        self._require_irreversible_write_window(
+            activation.activation,
+            fallback=published_at,
+        )
         enrichment = self.enrichment_publication.publish(
             incident_publication=incident_publication,
             verified_report=verified_report,
             guidance_binding=binding,
         )
+        self._require_irreversible_write_window(
+            activation.activation,
+            fallback=published_at,
+        )
         feed = self.feed_publication.publish(
             enrichment,
             published_at=published_at,
+        )
+        self._require_irreversible_write_window(
+            activation.activation,
+            fallback=published_at,
         )
         notification = self.notification_publication.publish(
             incident_id=incident_id,
@@ -217,6 +231,22 @@ class Wc027EnrichmentFeedRuntime:
             enrichment_feed_publication=feed,
             notification=notification,
         )
+
+    def _require_irreversible_write_window(
+        self,
+        activation: PublishedGuidanceAuthorityActivation,
+        *,
+        fallback: datetime,
+    ) -> None:
+        current = fallback if self.clock is None else self.clock()
+        _require_canonical_timestamp(current)
+        if (
+            activation.finish_before - current
+            < self.delivery_budget.feed_irreversible_write_margin
+        ):
+            raise Wc027EnrichmentSourceNotReadyError(
+                "guidance activation lacks the reviewed irreversible-write margin"
+            )
 
 
 def parse_wc027_enrichment_trigger(
