@@ -89,11 +89,11 @@ REVIEWED_RSA_KEY_SIZE_BITS = 3072
 REVIEWED_RSA_KEY_OPERATIONS = frozenset({"sign", "verify"})
 PREFLIGHT_PATH = ROOT / "src" / "athena_context" / "wc029_preflight.py"
 PLAN_SCHEMA_VERSION = "athena.wc029DeploymentPlan.v7"
-HANDOFF_SCHEMA_VERSION = "athena.wc029DeploymentHandoff.v6"
+HANDOFF_SCHEMA_VERSION = "athena.wc029DeploymentHandoff.v7"
 RECEIPT_SCHEMA_VERSION = "athena.wc029DeploymentReceipt.v4"
 REVOCATION_PLAN_SCHEMA_VERSION = "athena.wc029RevocationPlan.v1"
 AUTHORITY_BLOB_INVENTORY_SCHEMA_VERSION = "athena.wc029AuthorityBlobInventory.v2"
-IMAGE_PULL_EVIDENCE_SCHEMA_VERSION = "athena.wc029ImagePullEvidence.v2"
+IMAGE_PULL_EVIDENCE_SCHEMA_VERSION = "athena.wc029ImagePullEvidence.v3"
 HANDOFF_FIELDS = frozenset(
     {
         "schemaVersion",
@@ -360,6 +360,7 @@ PRODUCER_OUTPUT_FIELDS = frozenset(
         "notificationQueueResourceId",
         "registryResourceId",
         "registryRoleAssignmentMode",
+        "registryAnonymousPullEnabled",
         "registryRepositoryName",
         "registryPullRoleDefinitionId",
         "registryPullRoleAssignmentResourceId",
@@ -388,6 +389,7 @@ PUBLISHER_OUTPUT_FIELDS = frozenset(
         "bindingKeyVaultKeyId",
         "registryResourceId",
         "registryRoleAssignmentMode",
+        "registryAnonymousPullEnabled",
         "registryRepositoryName",
         "registryPullRoleDefinitionId",
         "registryPullRoleAssignmentResourceId",
@@ -445,6 +447,13 @@ WC027_ACCEPTANCE_PARAMETER_NAMES = frozenset(
 
 class OrchestrationError(ValueError):
     """Raised when deployment evidence or a cross-root handoff fails closed."""
+
+
+class _CommandFailure(OrchestrationError):
+    def __init__(self, returncode: int, detail: str) -> None:
+        self.returncode = returncode
+        self.detail = detail
+        super().__init__(f"command failed with exit code {returncode}: {detail}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -3269,6 +3278,7 @@ def _validated_wc013_acr_pull_assignments(
                     "principalType",
                     "roleDefinitionId",
                     "roleAssignmentMode",
+                    "anonymousPullEnabled",
                     "scope",
                     "image",
                     "repositoryName",
@@ -3299,6 +3309,10 @@ def _validated_wc013_acr_pull_assignments(
             assignment.get("roleAssignmentMode"),
             field=f"WC-013 ACR pull assignment {index} mode",
         )
+        if assignment.get("anonymousPullEnabled") is not False:
+            raise OrchestrationError(
+                "WC-013 ACR pull assignment must prove anonymousPullEnabled is false"
+            )
         expected_role_definition_id = _acr_pull_role_definition_id(
             role_assignment_mode=role_assignment_mode,
             subscription_id=subscription_id,
@@ -3450,6 +3464,13 @@ def _verify_wc013_acr_pull_assignments(
                 ).get("roleAssignmentMode"),
                 field="WC-013 ACR live role-assignment mode",
             )
+            _require_anonymous_pull_disabled(
+                _mapping(
+                    registry.get("properties"),
+                    field="WC-013 ACR properties",
+                ),
+                field="WC-013 ACR",
+            )
         _require_equal(
             assignment["roleAssignmentMode"],
             registry_modes[normalized_scope],
@@ -3496,65 +3517,18 @@ def _verify_wc013_acr_pull_assignments(
             raise OrchestrationError(
                 "WC-013 ACR assignment does not preserve its exact repository condition"
             )
-    role_definitions: dict[str, dict[str, Any]] = {}
-    for principal_id, expected_assignments in expected_by_principal.items():
-        observed = _resolved_effective_role_assignments(
-            principal_id,
-            subscription_id=subscription_id,
-            field=f"effective WC-013 ACR assignments for {principal_id}",
-        )
-        expected_by_id = {
-            str(expected["assignmentResourceId"]).casefold(): expected
-            for expected in expected_assignments
-        }
-        observed_expected_ids: set[str] = set()
-        for observed_index, raw_assignment in enumerate(observed):
-            observed_assignment = _mapping(
-                raw_assignment,
-                field=f"effective WC-013 ACR assignment {observed_index}",
-            )
-            assignment_scope = _string(
-                observed_assignment.get("scope"),
-                field="effective WC-013 ACR assignment scope",
-            )
-            role_definition_id = _string(
-                observed_assignment.get("roleDefinitionId"),
-                field="effective WC-013 ACR role definition ID",
-            )
-            normalized_role_definition_id = role_definition_id.casefold()
-            role_definition = role_definitions.get(normalized_role_definition_id)
-            if role_definition is None:
-                role_definition = _get_role_definition(
-                    role_definition_id,
-                    subscription_id=subscription_id,
-                )
-                role_definitions[normalized_role_definition_id] = role_definition
-            if not _role_definition_grants_acr_pull(role_definition):
-                continue
-            observed_id = _string(
-                observed_assignment.get("id"),
-                field="effective WC-013 ACR assignment ID",
-            ).casefold()
-            observed_principal_id = _canonical_directory_object_id(
-                observed_assignment.get("principalId"),
-                field="effective WC-013 ACR assignment principal ID",
-            )
-            expected = expected_by_id.get(observed_id)
-            if (
-                expected is None
-                or assignment_scope.casefold() != str(expected["scope"]).casefold()
-                or role_definition_id.casefold() != str(expected["roleDefinitionId"]).casefold()
-                or observed_principal_id != principal_id
-            ):
-                raise OrchestrationError(
-                    "WC-013 identity retains a stale, inherited, group-derived, "
-                    "or otherwise unreviewed ACR pull-capable grant"
-                )
-            observed_expected_ids.add(observed_id)
-        if observed_expected_ids != set(expected_by_id):
-            raise OrchestrationError(
-                "WC-013 effective ACR evidence is missing its exact current assignment"
-            )
+    _verify_exact_pull_capable_assignments(
+        set(expected_by_principal),
+        expected_acr_assignments_by_principal={
+            principal_id: {
+                str(expected["assignmentResourceId"]).casefold()
+                for expected in expected_assignments
+            }
+            for principal_id, expected_assignments in expected_by_principal.items()
+        },
+        subscription_id=subscription_id,
+        field="effective WC-013 ACR assignments",
+    )
     _verify_no_applicable_deny_assignments(
         [
             _ExpectedRoleAssignment(
@@ -3930,6 +3904,8 @@ def _producer_outputs(handoff: Mapping[str, object]) -> dict[str, Any]:
         outputs.get("registryRoleAssignmentMode"),
         field="producer registry role-assignment mode",
     )
+    if outputs.get("registryAnonymousPullEnabled") is not False:
+        raise OrchestrationError("producer registry anonymousPullEnabled must be explicitly false")
     repository_name = _acr_repository_name(
         outputs["producerImage"],
         outputs["registryResourceId"],
@@ -4123,6 +4099,8 @@ def _publisher_outputs(handoff: Mapping[str, object]) -> dict[str, Any]:
         outputs.get("registryRoleAssignmentMode"),
         field="publisher registry role-assignment mode",
     )
+    if outputs.get("registryAnonymousPullEnabled") is not False:
+        raise OrchestrationError("publisher registry anonymousPullEnabled must be explicitly false")
     repository_name = _acr_repository_name(
         outputs["publisherImage"],
         outputs["registryResourceId"],
@@ -4668,7 +4646,7 @@ def _run(command: Sequence[str]) -> str:
     )
     if completed.returncode != 0:
         detail = completed.stderr.strip() or completed.stdout.strip()
-        raise OrchestrationError(f"command failed with exit code {completed.returncode}: {detail}")
+        raise _CommandFailure(completed.returncode, detail)
     return completed.stdout
 
 
@@ -4689,7 +4667,7 @@ def _run_bytes(command: Sequence[str]) -> bytes:
     if completed.returncode != 0:
         detail_bytes = completed.stderr.strip() or completed.stdout.strip()
         detail = detail_bytes.decode("utf-8", errors="replace")
-        raise OrchestrationError(f"command failed with exit code {completed.returncode}: {detail}")
+        raise _CommandFailure(completed.returncode, detail)
     return completed.stdout
 
 
@@ -4699,6 +4677,45 @@ def _run_json(command: Sequence[str], *, field: str) -> object:
         return json.loads(output)
     except json.JSONDecodeError as exc:
         raise OrchestrationError(f"{field} did not return valid JSON") from exc
+
+
+def _azure_error_code(detail: str) -> str | None:
+    try:
+        document = json.loads(detail)
+    except json.JSONDecodeError:
+        document = None
+    if isinstance(document, dict):
+        error = document.get("error")
+        candidates = [document, error] if isinstance(error, dict) else [document]
+        for candidate in candidates:
+            code = candidate.get("code")
+            if isinstance(code, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,127}", code):
+                return code
+    for pattern in (
+        r"(?m)^(?:ERROR:\s*)?\(([A-Za-z][A-Za-z0-9_.-]{0,127})\)",
+        r"(?m)^\s*Code:\s*([A-Za-z][A-Za-z0-9_.-]{0,127})\s*$",
+    ):
+        match = re.search(pattern, detail)
+        if match is not None:
+            return match.group(1)
+    return None
+
+
+def _run_json_allowing_absence(
+    command: Sequence[str],
+    *,
+    field: str,
+    absent_error_codes: frozenset[str],
+) -> object | None:
+    try:
+        return _run_json(command, field=field)
+    except _CommandFailure as exc:
+        error_code = _azure_error_code(exc.detail)
+        if error_code is not None and error_code.casefold() in {
+            code.casefold() for code in absent_error_codes
+        }:
+            return None
+        raise
 
 
 def _retry_eventually_consistent[T](
@@ -4750,6 +4767,114 @@ def _deployment_read_command(
         command.extend(["--resource-group", resource_group])
     command.extend(["--only-show-errors", "--output", "json"])
     return command
+
+
+def _optional_resource(
+    resource_id: str,
+    *,
+    subscription_id: str,
+    field: str,
+) -> dict[str, Any] | None:
+    canonical_resource_id = _canonical_subscription_resource_id(
+        resource_id,
+        subscription_id=subscription_id,
+        field=field,
+    )
+    document = _run_json_allowing_absence(
+        [
+            "az",
+            "resource",
+            "show",
+            "--subscription",
+            subscription_id,
+            "--ids",
+            canonical_resource_id,
+            "--only-show-errors",
+            "--output",
+            "json",
+        ],
+        field=field,
+        absent_error_codes=frozenset({"ResourceNotFound"}),
+    )
+    if document is None:
+        return None
+    resource = _mapping(document, field=field)
+    _require_resource_id_equal(
+        resource.get("id"),
+        canonical_resource_id,
+        field=field,
+    )
+    return resource
+
+
+def _publisher_job_resource_id(
+    effective_parameters: Mapping[str, Mapping[str, object]],
+    *,
+    subscription_id: str,
+    resource_group: str,
+) -> str:
+    name_prefix = _string(
+        _parameter_value(effective_parameters, "namePrefix"),
+        field="publisher name prefix",
+    )
+    resource_id = (
+        f"/subscriptions/{subscription_id}/resourceGroups/{resource_group}/"
+        f"providers/Microsoft.App/jobs/{name_prefix[:18]}-w27-guide-auth"
+    )
+    return _canonical_subscription_resource_id(
+        resource_id,
+        subscription_id=subscription_id,
+        field="publisher Job resource ID",
+    )
+
+
+def _verify_initial_publisher_absence(
+    *,
+    effective_parameters: Mapping[str, Mapping[str, object]],
+    deployment_name: str,
+    subscription_id: str,
+    resource_group: str,
+) -> None:
+    publisher_job_id = _publisher_job_resource_id(
+        effective_parameters,
+        subscription_id=subscription_id,
+        resource_group=resource_group,
+    )
+    if (
+        _optional_resource(
+            publisher_job_id,
+            subscription_id=subscription_id,
+            field="initial publisher Job",
+        )
+        is not None
+    ):
+        raise OrchestrationError(
+            "publisher Job already exists; a prior publisher receipt and checkpoint are required"
+        )
+    deployment = _run_json_allowing_absence(
+        _deployment_read_command(
+            operation="show",
+            stage="publisher",
+            deployment_name=deployment_name,
+            subscription_id=subscription_id,
+            resource_group=resource_group,
+        ),
+        field="initial publisher deployment",
+        absent_error_codes=frozenset({"DeploymentNotFound"}),
+    )
+    if deployment is not None:
+        record = _mapping(
+            deployment,
+            field="initial publisher deployment",
+        )
+        if record.get("name") != deployment_name:
+            raise OrchestrationError(
+                "initial publisher deployment readback does not match the requested name"
+            )
+        raise OrchestrationError(
+            "publisher deployment already exists; a prior publisher receipt "
+            "and checkpoint are required"
+        )
 
 
 def _verify_recorded_deployment_parameters(
@@ -5013,6 +5138,42 @@ def _verify_resource(resource_id: str, *, subscription_id: str) -> None:
     )
 
 
+def _verify_live_acr_authentication_required(
+    registry_resource_id: str,
+    *,
+    expected_role_assignment_mode: object,
+    subscription_id: str,
+    field: str,
+) -> str:
+    registry = _get_resource(
+        registry_resource_id,
+        subscription_id=subscription_id,
+    )
+    _require_resource_id_equal(
+        registry.get("id"),
+        registry_resource_id,
+        field=f"{field} registry runtime readback",
+    )
+    properties = _mapping(
+        registry.get("properties"),
+        field=f"{field} registry properties",
+    )
+    _require_anonymous_pull_disabled(
+        properties,
+        field=f"{field} registry",
+    )
+    role_assignment_mode = _acr_role_assignment_mode(
+        properties.get("roleAssignmentMode"),
+        field=f"{field} live registry role-assignment mode",
+    )
+    _require_equal(
+        expected_role_assignment_mode,
+        role_assignment_mode,
+        field=f"{field} registry role-assignment mode",
+    )
+    return role_assignment_mode
+
+
 def _verify_acr_pull_binding(
     outputs: Mapping[str, object],
     *,
@@ -5036,27 +5197,16 @@ def _verify_acr_pull_binding(
         subscription_id=subscription_id,
         field=f"{field} registry resource ID",
     )
-    registry = _get_resource(
+    role_assignment_mode = _verify_live_acr_authentication_required(
         registry_resource_id,
+        expected_role_assignment_mode=outputs.get("registryRoleAssignmentMode"),
         subscription_id=subscription_id,
-    )
-    _require_resource_id_equal(
-        registry.get("id"),
-        registry_resource_id,
-        field=f"{field} registry runtime readback",
-    )
-    properties = _mapping(
-        registry.get("properties"),
-        field=f"{field} registry properties",
-    )
-    role_assignment_mode = _acr_role_assignment_mode(
-        properties.get("roleAssignmentMode"),
-        field=f"{field} live registry role-assignment mode",
+        field=field,
     )
     _require_equal(
-        outputs.get("registryRoleAssignmentMode"),
-        role_assignment_mode,
-        field=f"{field} registry role-assignment mode output",
+        outputs.get("registryAnonymousPullEnabled"),
+        False,
+        field=f"{field} registry anonymous-pull output",
     )
     _require_equal(
         _parameter_value(
@@ -5323,6 +5473,27 @@ def _authority_checkpoint_sha256(value: Mapping[str, object] | None) -> str | No
     return _sha256_bytes(_canonical_json_bytes(value))
 
 
+def _verify_authority_inventory_content_equal(
+    *,
+    expected_inventory: Mapping[str, object],
+    current_inventory: Mapping[str, object],
+    field: str,
+) -> None:
+    for field_name in (
+        "containerResourceId",
+        "containerExists",
+        "currentBlobs",
+        "versions",
+    ):
+        if _canonical_json_bytes(current_inventory.get(field_name)) != _canonical_json_bytes(
+            expected_inventory.get(field_name)
+        ):
+            raise OrchestrationError(
+                f"{field} live authority content does not exactly match the producer "
+                "checkpoint; a prior publisher receipt and checkpoint are required"
+            )
+
+
 def _authority_blob_inventory(
     container_resource_id: str,
     *,
@@ -5429,6 +5600,18 @@ def _authority_blob_inventory(
         raise OrchestrationError(
             "authority Blob content-addressed names cannot have multiple versions"
         )
+    listed_content_bytes = 0
+    for live in live_versions:
+        content_length = int(live["contentLength"])
+        if content_length > MAX_GUIDANCE_AUTHORITY_BINDING_BYTES:
+            raise OrchestrationError(
+                "authority Blob content exceeds the published contract byte bound"
+            )
+        listed_content_bytes += content_length
+        if listed_content_bytes > MAX_AUTHORITY_CHECKPOINT_CONTENT_BYTES:
+            raise OrchestrationError(
+                "authority Blob listed content exceeds the bounded total before download"
+            )
 
     previous_versions = (
         {}
@@ -5443,25 +5626,26 @@ def _authority_blob_inventory(
         raise OrchestrationError(
             "authority Blob inventory removed a version from the reviewed checkpoint"
         )
+    for live in live_versions:
+        key = (str(live["name"]), str(live["versionId"]))
+        previous = previous_versions.get(key)
+        if previous is None:
+            continue
+        for field_name in ("name", "versionId", "etag", "contentLength"):
+            if live[field_name] != previous[field_name]:
+                raise OrchestrationError(
+                    "authority Blob version metadata changed after checkpoint review"
+                )
     checkpoint_versions: list[dict[str, object]] = []
     total_content_bytes = 0
     for live in live_versions:
         key = (str(live["name"]), str(live["versionId"]))
         previous = previous_versions.get(key)
         if previous is not None:
-            for field_name in ("name", "versionId", "etag", "contentLength"):
-                if live[field_name] != previous[field_name]:
-                    raise OrchestrationError(
-                        "authority Blob version metadata changed after checkpoint review"
-                    )
             checkpoint_versions.append(dict(previous))
             total_content_bytes += int(previous["contentLength"])
             continue
         content_length = int(live["contentLength"])
-        if content_length > MAX_GUIDANCE_AUTHORITY_BINDING_BYTES:
-            raise OrchestrationError(
-                "authority Blob content exceeds the published contract byte bound"
-            )
         payload = _download_authority_blob_version(
             container_id,
             blob_name=str(live["name"]),
@@ -6188,6 +6372,15 @@ def _acr_role_assignment_mode(value: object, *, field: str) -> str:
             f"{field} must be {ACR_LEGACY_ROLE_ASSIGNMENT_MODE} or {ACR_ABAC_ROLE_ASSIGNMENT_MODE}"
         )
     return mode
+
+
+def _require_anonymous_pull_disabled(
+    properties: Mapping[str, object],
+    *,
+    field: str,
+) -> None:
+    if properties.get("anonymousPullEnabled") is not False:
+        raise OrchestrationError(f"{field} anonymousPullEnabled must be explicitly false")
 
 
 def _acr_pull_role_definition_id(
@@ -7558,6 +7751,102 @@ def _role_definition_grants_acr_pull(resource: Mapping[str, object]) -> bool:
         for profile in profiles
         for action, is_data_action in required_reads
     )
+
+
+def _acr_assignment_ids_by_principal(
+    assignment_ids_by_principal: Mapping[str, set[str]],
+) -> dict[str, set[str]]:
+    return {
+        principal_id.casefold(): {
+            assignment_id.casefold()
+            for assignment_id in assignment_ids
+            if _resource_type(_role_assignment_scope(assignment_id))
+            == "microsoft.containerregistry/registries"
+        }
+        for principal_id, assignment_ids in assignment_ids_by_principal.items()
+    }
+
+
+def _verify_exact_pull_capable_assignments(
+    principal_ids: set[str],
+    *,
+    expected_acr_assignments_by_principal: Mapping[str, set[str]],
+    subscription_id: str,
+    field: str,
+    effective_assignments_by_principal: Mapping[str, list[dict[str, Any]]] | None = None,
+) -> None:
+    normalized_principal_ids = {
+        _canonical_directory_object_id(
+            principal_id,
+            field=f"{field} principal ID",
+        )
+        for principal_id in principal_ids
+    }
+    expected_by_principal = {
+        principal_id.casefold(): {assignment_id.casefold() for assignment_id in assignment_ids}
+        for principal_id, assignment_ids in expected_acr_assignments_by_principal.items()
+    }
+    if set(expected_by_principal) - normalized_principal_ids:
+        raise OrchestrationError(
+            f"{field} expected ACR assignments contain an ungoverned principal"
+        )
+    role_definitions: dict[str, dict[str, Any]] = {}
+    for principal_id in sorted(normalized_principal_ids):
+        expected_assignment_ids = expected_by_principal.get(principal_id, set())
+        assignments = (
+            _resolved_effective_role_assignments(
+                principal_id,
+                subscription_id=subscription_id,
+                field=f"{field} for {principal_id}",
+            )
+            if effective_assignments_by_principal is None
+            else effective_assignments_by_principal.get(principal_id)
+        )
+        if assignments is None:
+            raise OrchestrationError(
+                f"{field} evidence is missing governed principal {principal_id}"
+            )
+        observed_expected_ids: set[str] = set()
+        for index, raw_assignment in enumerate(assignments):
+            assignment = _mapping(
+                raw_assignment,
+                field=f"{field} assignment {index}",
+            )
+            role_definition_id = _string(
+                assignment.get("roleDefinitionId"),
+                field=f"{field} assignment {index} role definition ID",
+            )
+            normalized_role_definition_id = role_definition_id.casefold()
+            role_definition = role_definitions.get(normalized_role_definition_id)
+            if role_definition is None:
+                role_definition = _get_role_definition(
+                    role_definition_id,
+                    subscription_id=subscription_id,
+                )
+                role_definitions[normalized_role_definition_id] = role_definition
+            if not _role_definition_grants_acr_pull(role_definition):
+                continue
+            assignment_id = _string(
+                assignment.get("id"),
+                field=f"{field} assignment {index} ID",
+            ).casefold()
+            assignment_principal_id = _canonical_directory_object_id(
+                assignment.get("principalId"),
+                field=f"{field} assignment {index} principal ID",
+            )
+            if (
+                assignment_id not in expected_assignment_ids
+                or assignment_principal_id != principal_id
+            ):
+                raise OrchestrationError(
+                    f"{field} contains an unreviewed direct, inherited, group-derived, "
+                    "or sibling-registry pull-capable assignment"
+                )
+            observed_expected_ids.add(assignment_id)
+        if observed_expected_ids != expected_assignment_ids:
+            raise OrchestrationError(
+                f"{field} evidence is missing an exact reviewed ACR assignment"
+            )
 
 
 def _verify_role_profile_condition(
@@ -10147,6 +10436,25 @@ def _verify_publisher_effective_assignments(
         subscription_id=subscription_id,
         effective_assignments_by_principal=effective_assignments_by_principal,
     )
+    reviewed_assignments_by_principal: dict[str, set[str]] = {}
+    for assignments_by_principal in (
+        producer_assignment_ids_by_principal,
+        publisher_assignment_ids_by_principal,
+    ):
+        for principal_id, assignment_ids in assignments_by_principal.items():
+            reviewed_assignments_by_principal.setdefault(
+                principal_id.casefold(),
+                set(),
+            ).update(assignment_id.casefold() for assignment_id in assignment_ids)
+    _verify_exact_pull_capable_assignments(
+        required_principal_ids,
+        expected_acr_assignments_by_principal=(
+            _acr_assignment_ids_by_principal(reviewed_assignments_by_principal)
+        ),
+        subscription_id=subscription_id,
+        field="effective producer/publisher ACR assignments",
+        effective_assignments_by_principal=effective_assignments_by_principal,
+    )
 
 
 def _verify_job_deployment_binding(
@@ -10422,6 +10730,7 @@ def _validated_image_pull_evidence(
                     "registryResourceId",
                     "principalId",
                     "registryRoleAssignmentMode",
+                    "registryAnonymousPullEnabled",
                     "registryRepositoryName",
                     "registryPullRoleDefinitionId",
                     "registryPullRoleAssignmentResourceId",
@@ -10468,6 +10777,10 @@ def _validated_image_pull_evidence(
             execution.get("registryRoleAssignmentMode"),
             field=f"image-pull execution {index} registry mode",
         )
+        if execution.get("registryAnonymousPullEnabled") is not False:
+            raise OrchestrationError(
+                f"image-pull execution {index} must prove anonymous pull is disabled"
+            )
         expected_role_definition_id = _acr_pull_role_definition_id(
             role_assignment_mode=role_assignment_mode,
             subscription_id=subscription_id,
@@ -10556,6 +10869,7 @@ def _verify_digest_pinned_job_image_pull(
     registry_resource_id: str,
     principal_id: str,
     registry_role_assignment_mode: str,
+    registry_anonymous_pull_enabled: object,
     registry_pull_role_definition_id: str,
     registry_pull_role_assignment_resource_id: str,
     subscription_id: str,
@@ -10573,9 +10887,20 @@ def _verify_digest_pinned_job_image_pull(
         role_assignment_mode=registry_role_assignment_mode,
         repository_name=repository_name,
     )
+    if registry_anonymous_pull_enabled is not False:
+        raise OrchestrationError(
+            "digest-pinned image-pull probe requires anonymous pull to be disabled"
+        )
     last_error: OrchestrationError | None = None
     for attempt in range(1, READBACK_MAX_ATTEMPTS + 1):
+        successful_execution_seen = False
         try:
+            _verify_live_acr_authentication_required(
+                registry_resource_id,
+                expected_role_assignment_mode=registry_role_assignment_mode,
+                subscription_id=subscription_id,
+                field="image-pull probe",
+            )
             start = _mapping(
                 _run_json(
                     [
@@ -10648,6 +10973,7 @@ def _verify_digest_pinned_job_image_pull(
                     field="digest-pinned image-pull execution status",
                 )
                 if status == "Succeeded":
+                    successful_execution_seen = True
                     template = _mapping(
                         properties.get("template"),
                         field="digest-pinned image-pull execution template",
@@ -10681,6 +11007,12 @@ def _verify_digest_pinned_job_image_pull(
                         ["-c", "exit 0"],
                         field="image-pull execution arguments",
                     )
+                    _verify_live_acr_authentication_required(
+                        registry_resource_id,
+                        expected_role_assignment_mode=registry_role_assignment_mode,
+                        subscription_id=subscription_id,
+                        field="successful image-pull probe",
+                    )
                     return {
                         "jobResourceId": job_id,
                         "executionName": execution_name,
@@ -10689,6 +11021,7 @@ def _verify_digest_pinned_job_image_pull(
                         "registryResourceId": registry_resource_id,
                         "principalId": principal_id,
                         "registryRoleAssignmentMode": registry_role_assignment_mode,
+                        "registryAnonymousPullEnabled": False,
                         "registryRepositoryName": repository_name,
                         "registryPullRoleDefinitionId": registry_pull_role_definition_id,
                         "registryPullRoleAssignmentResourceId": (
@@ -10706,13 +11039,18 @@ def _verify_digest_pinned_job_image_pull(
                 "digest-pinned image-pull execution did not reach a terminal state"
             )
         except OrchestrationError as exc:
+            if successful_execution_seen:
+                raise OrchestrationError(
+                    "successful digest-pinned image-pull execution failed terminal "
+                    f"evidence validation: {exc}"
+                ) from exc
             last_error = exc
             if attempt < READBACK_MAX_ATTEMPTS:
                 time.sleep(READBACK_RETRY_SECONDS)
     if last_error is None:
         raise OrchestrationError("digest-pinned image-pull probe failed without an error")
     raise OrchestrationError(
-        "digest-pinned image pull did not succeed after bounded RBAC propagation"
+        f"digest-pinned image pull did not succeed after bounded RBAC propagation: {last_error}"
     ) from last_error
 
 
@@ -10742,6 +11080,7 @@ def _image_pull_probe_from_outputs(
                     outputs.get("registryRoleAssignmentMode"),
                     field="producer registry role-assignment mode",
                 ),
+                registry_anonymous_pull_enabled=outputs.get("registryAnonymousPullEnabled"),
                 registry_pull_role_definition_id=_string(
                     outputs.get("registryPullRoleDefinitionId"),
                     field="producer registry pull role definition",
@@ -10772,6 +11111,7 @@ def _image_pull_probe_from_outputs(
                     outputs.get("registryRoleAssignmentMode"),
                     field="publisher registry role-assignment mode",
                 ),
+                registry_anonymous_pull_enabled=outputs.get("registryAnonymousPullEnabled"),
                 registry_pull_role_definition_id=_string(
                     outputs.get("registryPullRoleDefinitionId"),
                     field="publisher registry pull role definition",
@@ -10805,6 +11145,7 @@ def _expected_image_pull_binding(
         "registryResourceId": outputs["registryResourceId"],
         "principalId": principal_id,
         "registryRoleAssignmentMode": outputs["registryRoleAssignmentMode"],
+        "registryAnonymousPullEnabled": outputs["registryAnonymousPullEnabled"],
         "registryRepositoryName": outputs["registryRepositoryName"],
         "registryPullRoleDefinitionId": outputs["registryPullRoleDefinitionId"],
         "registryPullRoleAssignmentResourceId": outputs["registryPullRoleAssignmentResourceId"],
@@ -11463,6 +11804,15 @@ def _verify_producer_resources(
         assignment_ids_by_principal,
         additional_allowed_assignments_by_principal=(prospective_assignment_ids_by_principal),
         subscription_id=subscription_id,
+        effective_assignments_by_principal=effective_assignments_by_principal,
+    )
+    _verify_exact_pull_capable_assignments(
+        allowed_principal_ids,
+        expected_acr_assignments_by_principal=(
+            _acr_assignment_ids_by_principal(assignment_ids_by_principal)
+        ),
+        subscription_id=subscription_id,
+        field="effective producer ACR assignments",
         effective_assignments_by_principal=effective_assignments_by_principal,
     )
     _verify_no_applicable_deny_assignments(
@@ -13298,6 +13648,20 @@ def plan(args: argparse.Namespace) -> Path:
             subscription_id=subscription_id,
             rotation_transitions=predecessor_rotation_transitions,
         )
+    initial_publisher = args.stage == "publisher" and prior_stage_record is None
+    if initial_publisher:
+        _verify_initial_publisher_absence(
+            effective_parameters=effective,
+            deployment_name=_string(
+                args.deployment_name,
+                field="publisher deployment name",
+            ),
+            subscription_id=subscription_id,
+            resource_group=_string(
+                args.resource_group,
+                field="publisher resource group",
+            ),
+        )
     predecessor_authority_inventory = _predecessor_authority_blob_inventory(
         stage=args.stage,
         verified_predecessors=verified_predecessors,
@@ -13339,6 +13703,16 @@ def plan(args: argparse.Namespace) -> Path:
         current_inventory=authority_blob_inventory,
         trusted_inventory=trusted_prior_inventory,
     )
+    if initial_publisher:
+        if predecessor_authority_inventory is None or authority_blob_inventory is None:
+            raise OrchestrationError(
+                "initial publisher planning is missing the producer authority checkpoint"
+            )
+        _verify_authority_inventory_content_equal(
+            expected_inventory=predecessor_authority_inventory,
+            current_inventory=authority_blob_inventory,
+            field="initial publisher planning",
+        )
     if authority_blob_inventory is not None:
         for required_inventory in additional_required_inventories:
             _verify_authority_checkpoint_contains(
@@ -13894,6 +14268,17 @@ def apply(args: argparse.Namespace) -> Path:
         verified_predecessors=verified_predecessors,
         subscription_id=subscription_id,
     )
+    initial_publisher = stage == "publisher" and prior_stage_record is None
+    if initial_publisher:
+        _verify_initial_publisher_absence(
+            effective_parameters=effective_parameters,
+            deployment_name=deployment_name,
+            subscription_id=subscription_id,
+            resource_group=_string(
+                resource_group,
+                field="publisher resource group",
+            ),
+        )
     trusted_prior_inventory = (
         prior_stage_record["inventory"]
         if prior_stage_record is not None
@@ -13959,6 +14344,16 @@ def apply(args: argparse.Namespace) -> Path:
                 subscription_id=subscription_id,
                 previous_inventory=trusted_prior_inventory,
             )
+            if initial_publisher:
+                if predecessor_authority_inventory is None:
+                    raise OrchestrationError(
+                        "initial publisher apply is missing the producer authority checkpoint"
+                    )
+                _verify_authority_inventory_content_equal(
+                    expected_inventory=predecessor_authority_inventory,
+                    current_inventory=current_authority_blob_inventory,
+                    field="initial publisher apply",
+                )
             if _canonical_json_bytes(current_authority_blob_inventory) != (
                 _canonical_json_bytes(reviewed_authority_blob_inventory)
             ):

@@ -1298,6 +1298,9 @@ output registryResourceId string = producerImagePull.outputs.registryResourceId
 @description('Live ACR role-assignment permissions mode used for producer image pull.')
 output registryRoleAssignmentMode string = producerImagePull.outputs.roleAssignmentMode
 
+@description('Live ACR anonymous-pull posture. This must remain explicitly false.')
+output registryAnonymousPullEnabled bool = producerImagePull.outputs.anonymousPullEnabled
+
 @description('Exact ACR repository parsed from the reviewed producer image.')
 output registryRepositoryName string = producerImagePull.outputs.repositoryName
 

@@ -147,6 +147,7 @@ def test_publisher_acr_pull_uses_exact_registry_scope_and_principal_seed() -> No
         "guid(registryScopedResourceId, brokerIdentityPrincipalId, registryPullRoleDefinitionId)",
         "publisherImagePull.outputs.registryResourceId",
         "publisherImagePull.outputs.roleAssignmentMode",
+        "publisherImagePull.outputs.anonymousPullEnabled",
         "publisherImagePull.outputs.roleDefinitionResourceId",
         "publisherImagePull.outputs.roleAssignmentResourceId",
         "publisherImagePull.outputs.repositoryName",
@@ -160,6 +161,8 @@ def test_publisher_acr_pull_uses_exact_registry_scope_and_principal_seed() -> No
         "guid(registry.id, identityPrincipalId, pullRoleDefinitionResourceId, "
         "validatedRepositoryName)" in module
     )
+    assert "registryRuntime.properties.?anonymousPullEnabled == false" in module
+    assert "output anonymousPullEnabled bool = validatedAnonymousPullEnabled" in module
     assert f"var repositoryCondition = '{repository_condition}'" in module
 
 

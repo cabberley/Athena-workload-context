@@ -105,6 +105,8 @@ correlation reader identities/storage domains, and reused producer signing keys 
   `AbacRepositoryPermissions`. The ABAC assignment uses condition version `2.0` and the canonical
   `StringEqualsIgnoreCase` repository-name condition for the exact repository parsed from the
   reviewed digest-pinned producer image; it does not grant registry-wide or prefix-wide access.
+  The live registry must also return `anonymousPullEnabled: false`, otherwise deployment and
+  readiness fail before an image-pull probe can be accepted.
 
 Supply the referenced resource IDs/names (user-assigned identities, replay storage account,
 correlation source storage account, Service Bus namespace, and Key Vault keys); the module derives
@@ -125,7 +127,11 @@ swapped assignment fail closed. Every assignment whose resolved role permissions
 canonical no-`Blob.List` expression; absent, altered, or duplicated condition forms fail closed.
 Effective RBAC includes every transitive Microsoft Entra group membership and each group’s direct,
 descendant, and inherited assignments; incomplete membership or assignment pagination fails
-closed. Readiness separately enumerates every deny assignment at or above each governed scope and
+closed. For every producer and publisher principal, readiness resolves every effective role
+definition and rejects all pull-capable assignments except the exact reviewed producer/publisher
+ACR assignment IDs, including sibling-registry, direct, inherited, and group-derived `AcrPull`,
+`AcrPush`, Repository Reader/Writer/Contributor, and equivalent custom-role grants. Readiness
+separately enumerates every deny assignment at or above each governed scope and
 evaluates direct and transitive-group principals, `All Principals`, exclusions,
 `doNotApplyToChildScopes`, assignment-level and per-permission conditions, and the exact required
 queue, Blob, Table, Key, and ACR actions. An applicable deny or incomplete deny-assignment evidence
@@ -201,12 +207,23 @@ publisher:
   activation writer, request-trust reader, binding-trust reader, and binding-signer identities;
 - publisher image-pull RBAC deployed in the exact registry subscription/resource group derived
   from `registryResourceId` (`rg-athena-platform-dev` in the fixed topology), rather than in the
-  runtime resource group, using the role compatible with the live ACR permission mode;
+  runtime resource group, using the role compatible with the live ACR permission mode and an
+  explicit `anonymousPullEnabled: false` readback;
 - a create-only authority Blob identity plus a separate exact-version readback identity;
 - Table entity read/add/update RBAC for activation CAS with no entity-delete permission;
 - exact-key public-key read/verify RBAC and exact-key sign-only binding RBAC; and
 - generated strict configuration in
   `ATHENA_WC027_GUIDANCE_AUTHORITY_PUBLISHER_CONFIG_JSON`.
+
+The first publisher plan may use the producer authority checkpoint only when Azure proves the
+deterministic publisher Job and requested deployment are absent and the live authority container
+content is byte-for-byte the producer checkpoint. Apply repeats that proof. Any existing
+publisher resource or any added, deleted, or changed authority version requires the independently
+reviewed prior publisher handoff, receipt, and checkpoint.
+
+Authority inventory listing enforces the 4,096-version count, per-artifact byte limit, and 64 MiB
+aggregate listed content limit before downloading a new version. Missing or changed listed content
+lengths fail before download, while downloaded bytes must still equal the listed length.
 
 The request-signing key and binding-signing key are dedicated trust domains. Signed request,
 binding, and activation artifacts contain stable logical key IDs; the generated deployment

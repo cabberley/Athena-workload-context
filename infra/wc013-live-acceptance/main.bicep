@@ -1275,6 +1275,7 @@ var wc013CoreAcrPullAssignments = concat([
     principalType: 'ServicePrincipal'
     roleDefinitionId: acceptanceImagePull.outputs.roleDefinitionResourceId
     roleAssignmentMode: acceptanceImagePull.outputs.roleAssignmentMode
+    anonymousPullEnabled: acceptanceImagePull.outputs.anonymousPullEnabled
     scope: acceptanceImagePull.outputs.registryResourceId
     image: validatedAcceptanceImage
     repositoryName: acceptanceImagePull.outputs.repositoryName
@@ -1288,6 +1289,7 @@ var wc013CoreAcrPullAssignments = concat([
     principalType: 'ServicePrincipal'
     roleDefinitionId: evidenceCollectorImagePull.outputs.roleDefinitionResourceId
     roleAssignmentMode: evidenceCollectorImagePull.outputs.roleAssignmentMode
+    anonymousPullEnabled: evidenceCollectorImagePull.outputs.anonymousPullEnabled
     scope: evidenceCollectorImagePull.outputs.registryResourceId
     image: validatedAcceptanceImage
     repositoryName: evidenceCollectorImagePull.outputs.repositoryName
@@ -1301,6 +1303,7 @@ var wc013CoreAcrPullAssignments = concat([
     principalType: 'ServicePrincipal'
     roleDefinitionId: collectorControllerImagePull.outputs.roleDefinitionResourceId
     roleAssignmentMode: collectorControllerImagePull.outputs.roleAssignmentMode
+    anonymousPullEnabled: collectorControllerImagePull.outputs.anonymousPullEnabled
     scope: collectorControllerImagePull.outputs.registryResourceId
     image: validatedControllerImage
     repositoryName: collectorControllerImagePull.outputs.repositoryName
@@ -1317,6 +1320,7 @@ var wc016AcrPullAssignments = validatedWc016RuntimeEnabled
         principalType: 'ServicePrincipal'
         roleDefinitionId: wc016DetectorImagePull!.outputs.roleDefinitionResourceId
         roleAssignmentMode: wc016DetectorImagePull!.outputs.roleAssignmentMode
+        anonymousPullEnabled: wc016DetectorImagePull!.outputs.anonymousPullEnabled
         scope: wc016DetectorImagePull!.outputs.registryResourceId
         image: validatedWc016DetectorImage
         repositoryName: wc016DetectorImagePull!.outputs.repositoryName
@@ -1330,6 +1334,7 @@ var wc016AcrPullAssignments = validatedWc016RuntimeEnabled
         principalType: 'ServicePrincipal'
         roleDefinitionId: wc016OrchestratorImagePull!.outputs.roleDefinitionResourceId
         roleAssignmentMode: wc016OrchestratorImagePull!.outputs.roleAssignmentMode
+        anonymousPullEnabled: wc016OrchestratorImagePull!.outputs.anonymousPullEnabled
         scope: wc016OrchestratorImagePull!.outputs.registryResourceId
         image: validatedWc016OrchestratorImage
         repositoryName: wc016OrchestratorImagePull!.outputs.repositoryName
@@ -1343,6 +1348,7 @@ var wc016AcrPullAssignments = validatedWc016RuntimeEnabled
         principalType: 'ServicePrincipal'
         roleDefinitionId: wc016NotificationImagePull!.outputs.roleDefinitionResourceId
         roleAssignmentMode: wc016NotificationImagePull!.outputs.roleAssignmentMode
+        anonymousPullEnabled: wc016NotificationImagePull!.outputs.anonymousPullEnabled
         scope: wc016NotificationImagePull!.outputs.registryResourceId
         image: validatedWc016OrchestratorImage
         repositoryName: wc016NotificationImagePull!.outputs.repositoryName

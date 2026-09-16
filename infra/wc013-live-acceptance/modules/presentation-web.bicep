@@ -341,6 +341,7 @@ output acrPullAssignments array = concat([
     principalType: 'ServicePrincipal'
     roleDefinitionId: presentationImagePull.outputs.roleDefinitionResourceId
     roleAssignmentMode: presentationImagePull.outputs.roleAssignmentMode
+    anonymousPullEnabled: presentationImagePull.outputs.anonymousPullEnabled
     scope: presentationImagePull.outputs.registryResourceId
     image: validatedPresentationImage
     repositoryName: presentationImagePull.outputs.repositoryName
@@ -356,6 +357,7 @@ output acrPullAssignments array = concat([
         principalType: 'ServicePrincipal'
         roleDefinitionId: presentationDeliveryImagePull!.outputs.roleDefinitionResourceId
         roleAssignmentMode: presentationDeliveryImagePull!.outputs.roleAssignmentMode
+        anonymousPullEnabled: presentationDeliveryImagePull!.outputs.anonymousPullEnabled
         scope: presentationDeliveryImagePull!.outputs.registryResourceId
         image: validatedDeliveryImage
         repositoryName: presentationDeliveryImagePull!.outputs.repositoryName

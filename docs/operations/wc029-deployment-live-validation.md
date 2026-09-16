@@ -303,7 +303,11 @@ For producer, publisher, and live-acceptance stages the plan also records
 `authorityBlobInventory` plus its exact checkpoint SHA-256. Blob service versioning must be enabled.
 Each checkpoint points to the digest of the reviewed predecessor checkpoint. One version-inclusive
 listing supplies every version ID, exact case-sensitive Blob name, ETag, and content length. New
-versions are downloaded by exact version, SHA-256 hashed, and parsed as canonical
+versions are downloaded only after every listed content length is present, non-negative, within
+the per-artifact bound, consistent with prior checkpoint metadata, and the aggregate listed
+content is no more than 64 MiB. This prevents a maximum-count inventory from amplifying into
+thousands of bounded-but-cumulative downloads. Accepted new versions are then downloaded by exact
+version, SHA-256 hashed, and parsed as canonical
 `PublishedGuidanceAuthority.v2` or `PublishedGuidanceAuthorityBinding.v2`; path-bound IDs and each
 binding's exact authority name, version, and digest must match. Previously checkpointed versions
 and digests must remain byte-identical, no content-addressed name may be overwritten or removed,
@@ -314,6 +318,14 @@ post-deployment successor checkpoint in the handoff and receipt chain. The plan'
 `requiredAuthorityCheckpointSha256s` map records every producer/publisher predecessor and prior
 same-stage checkpoint that the candidate must preserve, so publisher recovery cannot discard a
 newer producer checkpoint.
+
+Initial publisher planning may omit prior publisher evidence only when two independent Azure
+readbacks prove that the exact deterministic publisher Job and the requested publisher deployment
+do not exist, and the live authority container content exactly equals the producer checkpoint.
+Apply repeats both absence reads and the exact content comparison before create. If either
+publisher resource exists, an absence result is not an exact Azure `ResourceNotFound` or
+`DeploymentNotFound`, or the container has any added, deleted, or changed version, the operator
+must supply the prior publisher receipt and checkpoint. Omission is never a recovery shortcut.
 
 Producer upgrades and publisher recovery must additionally supply
 `--prior-stage-handoff`, `--prior-stage-receipt`, and
@@ -422,7 +434,7 @@ parameter artifact, evidence directory, and explicit `--allow-change` entry for 
 create or modify. WC-027 resource-group stages additionally require
 `--resource-group rg-athena-wc013-live`. Do not treat these abbreviated placeholders as executable
 approval; record the complete reviewed commands and plan-file SHA-256 values separately in the
-evidence bundle. `apply` writes the immutable `athena.wc029DeploymentHandoff.v6` handoff and a separate
+evidence bundle. `apply` writes the immutable `athena.wc029DeploymentHandoff.v7` handoff and a separate
 `athena.wc029DeploymentReceipt.v4`, then prints the receipt path. Independently record the receipt
 SHA-256 before using it in a later stage. Each later `plan` loads the predecessor receipt, its
 referenced plan, effective parameters, what-if, handoff, and earlier receipt chain; a handoff's
@@ -455,8 +467,8 @@ resource unless separate reviewed hierarchy evidence is introduced; incomplete M
 membership or Azure assignment evidence; any public/non-RBAC parent Key Vault behind an external
 trust key; any current Key Vault `kid`, RSA type/size, modulus, exponent, SPKI fingerprint, or
 key-operation drift from the same current-version read; any authority Blob service without
-versioning or any missing/conflicting authority
-content/version inventory; any assignment whose resolved role permissions include Blob read without the exact
+versioning or any missing/conflicting/oversized authority content/version inventory; any
+assignment whose resolved role permissions include Blob read without the exact
 canonical condition-version `2.0` no-`Blob.List` ABAC expression; any queue outside its exact
 Active, non-forwarding, non-auto-deleting stage profile; a noncanonical/cross-subscription resource
 ID before validation or what-if; and any final WC-013 readiness readback that differs from the two
@@ -471,7 +483,9 @@ hold distinct per-repository grants. Deleting and recreating a same-name UAMI th
 new legal assignment. Each assignment sets
 `principalType: ServicePrincipal`. The module explicitly calls guarded
 `reference(registry.id, '2025-04-01', 'Full')` and exports that server-returned ID; a constructed
-`existing.id` alone is never treated as runtime evidence.
+`existing.id` alone is never treated as runtime evidence. The same read must return
+`anonymousPullEnabled: false`; missing or enabled anonymous pull blocks role assignment,
+foundation/live-acceptance readiness, producer/publisher readiness, and image-pull evidence.
 
 Foundation and live-acceptance outputs inventory the current WC-013/WC-016/presentation ACR
 assignments with exact label, digest-pinned image, parsed repository, assignment ID, principal,
@@ -486,6 +500,11 @@ the governed subscription, and rejects all extra pull-capable grants even when t
 sibling registry. This includes `AcrPush`, Repository Writer/Contributor, and custom roles whose
 effective actions or data actions grant legacy pull or repository content read.
 
+The same complete pull-capable scan applies to every WC-027 producer and publisher principal,
+including principals with no reviewed ACR assignment. Only the exact reviewed producer and
+publisher image-pull assignment IDs are accepted; all sibling-registry, direct, inherited, and
+group-derived alternatives fail closed.
+
 Readiness compares the reviewed mode with the live ACR `roleAssignmentMode`.
 `LegacyRegistryPermissions` requires `AcrPull`; `AbacRepositoryPermissions` requires
 `Container Registry Repository Reader` with the exact repository condition because an ABAC-enabled
@@ -493,8 +512,11 @@ registry does not honor legacy `AcrPull`. Missing, altered, prefix, multi-reposi
 registry-wide conditions fail closed. After exact RBAC verification, readiness starts a bounded
 no-op Container Apps Job execution with the digest-pinned image, waits for `Succeeded`, validates
 the execution image and command override, and records the execution in digest-bound handoff/receipt
-evidence. The probe
-does not pass `--registry-identity`, create RBAC, or invoke the production job entry point.
+evidence. The probe does not pass `--registry-identity`, create RBAC, or invoke the production Job
+entry point. Because live anonymous pull is explicitly false and the Job registry configuration
+contains only the reviewed managed identity, a successful probe is evidence of identity-authorized
+pull rather than public access. Any anonymous-pull or role-mode failure observed after an execution
+reaches `Succeeded` is terminal and cannot be retried into accepted evidence.
 
 Producer verification also models the publisher transition explicitly.
 Before a publisher exists, no extra sender assignment is required. During partial recovery,

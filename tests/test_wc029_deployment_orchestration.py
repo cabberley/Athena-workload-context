@@ -223,6 +223,7 @@ def _synthetic_image_pull_evidence(
                     else PUBLISHER_BROKER_PRINCIPAL_ID
                 ),
                 "registryRoleAssignmentMode": outputs["registryRoleAssignmentMode"],
+                "registryAnonymousPullEnabled": outputs["registryAnonymousPullEnabled"],
                 "registryRepositoryName": outputs["registryRepositoryName"],
                 "registryPullRoleDefinitionId": outputs["registryPullRoleDefinitionId"],
                 "registryPullRoleAssignmentResourceId": outputs[
@@ -517,6 +518,7 @@ def _wc013_acr_pull_assignments(
                 "principalType": "ServicePrincipal",
                 "roleDefinitionId": role_definition_id,
                 "roleAssignmentMode": role_assignment_mode,
+                "anonymousPullEnabled": False,
                 "scope": REGISTRY_RESOURCE_ID,
                 "image": image,
                 "repositoryName": repository_name,
@@ -903,6 +905,7 @@ def _producer_outputs() -> dict[str, object]:
         "notificationQueueResourceId": (f"{service_bus_id}/queues/incident-notification-outbox"),
         "registryResourceId": REGISTRY_RESOURCE_ID,
         "registryRoleAssignmentMode": REGISTRY_ROLE_ASSIGNMENT_MODE,
+        "registryAnonymousPullEnabled": False,
         "registryRepositoryName": repository_name,
         "registryPullRoleDefinitionId": registry_role_definition_id,
         "registryPullRoleAssignmentResourceId": registry_role_assignment_id,
@@ -1108,6 +1111,7 @@ def _publisher_outputs(producer: dict[str, object]) -> dict[str, object]:
         "bindingKeyVaultKeyId": runtime_binding_key["keyVaultKeyId"],
         "registryResourceId": REGISTRY_RESOURCE_ID,
         "registryRoleAssignmentMode": REGISTRY_ROLE_ASSIGNMENT_MODE,
+        "registryAnonymousPullEnabled": False,
         "registryRepositoryName": repository_name,
         "registryPullRoleDefinitionId": registry_role_definition_id,
         "registryPullRoleAssignmentResourceId": registry_role_assignment_id,
@@ -4876,7 +4880,10 @@ def test_acr_readiness_binds_live_mode_principal_seed_and_server_id(
         "_get_resource",
         lambda resource_id, *, subscription_id: {
             "id": resource_id,
-            "properties": {"roleAssignmentMode": live_mode},
+            "properties": {
+                "roleAssignmentMode": live_mode,
+                "anonymousPullEnabled": False,
+            },
         },
     )
     role_definition_id = orchestration._verify_acr_pull_binding(
@@ -4961,6 +4968,170 @@ def test_acr_readiness_binds_live_mode_principal_seed_and_server_id(
         )
 
 
+@pytest.mark.parametrize("anonymous_pull_enabled", (True, None))
+def test_acr_readiness_rejects_anonymous_or_unproven_pull(
+    monkeypatch: pytest.MonkeyPatch,
+    anonymous_pull_enabled: object,
+) -> None:
+    outputs = _producer_outputs()
+    parameters = {name: {"value": value} for name, value in _producer_parameter_bindings().items()}
+    monkeypatch.setattr(
+        orchestration,
+        "_get_resource",
+        lambda resource_id, *, subscription_id: {
+            "id": resource_id,
+            "properties": {
+                "roleAssignmentMode": REGISTRY_ROLE_ASSIGNMENT_MODE,
+                "anonymousPullEnabled": anonymous_pull_enabled,
+            },
+        },
+    )
+    with pytest.raises(orchestration.OrchestrationError, match="anonymousPullEnabled"):
+        orchestration._verify_acr_pull_binding(
+            outputs,
+            effective_parameters=parameters,
+            principal_id=PRODUCER_BROKER_PRINCIPAL_ID,
+            subscription_id=SUBSCRIPTION_ID,
+            field="producer",
+        )
+
+
+def test_wc013_readiness_rejects_anonymous_registry_pull(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assignments = _wc013_acr_pull_assignments()
+    monkeypatch.setattr(
+        orchestration,
+        "_get_resource",
+        lambda resource_id, *, subscription_id: {
+            "id": resource_id,
+            "properties": {
+                "roleAssignmentMode": REGISTRY_ROLE_ASSIGNMENT_MODE,
+                "anonymousPullEnabled": True,
+            },
+        },
+    )
+    with pytest.raises(orchestration.OrchestrationError, match="anonymousPullEnabled"):
+        orchestration._verify_wc013_acr_pull_assignments(
+            assignments,
+            subscription_id=SUBSCRIPTION_ID,
+        )
+
+
+def test_image_pull_evidence_rejects_anonymous_pull_posture() -> None:
+    outputs = _producer_outputs()
+    evidence = _synthetic_image_pull_evidence((outputs, "producer"))
+    evidence["executions"][0]["registryAnonymousPullEnabled"] = True
+    with pytest.raises(orchestration.OrchestrationError, match="anonymous pull"):
+        orchestration._validated_image_pull_evidence(
+            evidence,
+            stage="producer",
+            subscription_id=SUBSCRIPTION_ID,
+        )
+
+
+def test_image_pull_probe_rejects_anonymous_pull_before_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outputs = _producer_outputs()
+    monkeypatch.setattr(
+        orchestration,
+        "_get_resource",
+        lambda resource_id, *, subscription_id: {
+            "id": resource_id,
+            "properties": {
+                "roleAssignmentMode": outputs["registryRoleAssignmentMode"],
+                "anonymousPullEnabled": True,
+            },
+        },
+    )
+    monkeypatch.setattr(
+        orchestration,
+        "_run_json",
+        lambda *_args, **_kwargs: pytest.fail(
+            "anonymous-pull posture must fail before starting a probe"
+        ),
+    )
+    with pytest.raises(orchestration.OrchestrationError, match="anonymousPullEnabled"):
+        orchestration._verify_digest_pinned_job_image_pull(
+            job_resource_id=str(outputs["producerJobResourceId"]),
+            image=str(outputs["producerImage"]),
+            container_name="wc027-enrichment-feed-producer",
+            registry_resource_id=str(outputs["registryResourceId"]),
+            principal_id=PRODUCER_BROKER_PRINCIPAL_ID,
+            registry_role_assignment_mode=str(outputs["registryRoleAssignmentMode"]),
+            registry_anonymous_pull_enabled=False,
+            registry_pull_role_definition_id=str(outputs["registryPullRoleDefinitionId"]),
+            registry_pull_role_assignment_resource_id=str(
+                outputs["registryPullRoleAssignmentResourceId"]
+            ),
+            subscription_id=SUBSCRIPTION_ID,
+        )
+
+
+def test_image_pull_probe_rechecks_anonymous_pull_after_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outputs = _producer_outputs()
+    registry_reads = 0
+    start_attempts = 0
+    anonymous_pull_states = iter((False, True, False, False))
+
+    def get_resource(resource_id: str, *, subscription_id: str) -> dict[str, object]:
+        nonlocal registry_reads
+        registry_reads += 1
+        return {
+            "id": resource_id,
+            "properties": {
+                "roleAssignmentMode": outputs["registryRoleAssignmentMode"],
+                "anonymousPullEnabled": next(anonymous_pull_states),
+            },
+        }
+
+    def run_json(command: object, *, field: str) -> object:
+        nonlocal start_attempts
+        arguments = list(command)
+        if arguments[:4] == ["az", "containerapp", "job", "start"]:
+            start_attempts += 1
+            return {"name": "synthetic-pull"}
+        return {
+            "properties": {
+                "status": "Succeeded",
+                "template": {
+                    "containers": [
+                        {
+                            "name": "wc027-enrichment-feed-producer",
+                            "image": outputs["producerImage"],
+                            "command": ["/bin/sh"],
+                            "args": ["-c", "exit 0"],
+                        }
+                    ]
+                },
+            }
+        }
+
+    monkeypatch.setattr(orchestration, "_get_resource", get_resource)
+    monkeypatch.setattr(orchestration, "_run_json", run_json)
+    monkeypatch.setattr(orchestration, "READBACK_MAX_ATTEMPTS", 2)
+    with pytest.raises(orchestration.OrchestrationError, match="terminal.*anonymousPullEnabled"):
+        orchestration._verify_digest_pinned_job_image_pull(
+            job_resource_id=str(outputs["producerJobResourceId"]),
+            image=str(outputs["producerImage"]),
+            container_name="wc027-enrichment-feed-producer",
+            registry_resource_id=str(outputs["registryResourceId"]),
+            principal_id=PRODUCER_BROKER_PRINCIPAL_ID,
+            registry_role_assignment_mode=str(outputs["registryRoleAssignmentMode"]),
+            registry_anonymous_pull_enabled=False,
+            registry_pull_role_definition_id=str(outputs["registryPullRoleDefinitionId"]),
+            registry_pull_role_assignment_resource_id=str(
+                outputs["registryPullRoleAssignmentResourceId"]
+            ),
+            subscription_id=SUBSCRIPTION_ID,
+        )
+    assert registry_reads == 2
+    assert start_attempts == 1
+
+
 def test_legacy_acr_assignment_requires_reviewed_manual_revocation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4985,7 +5156,10 @@ def test_legacy_acr_assignment_requires_reviewed_manual_revocation(
         if resource_id.casefold() == REGISTRY_RESOURCE_ID.casefold():
             return {
                 "id": resource_id,
-                "properties": {"roleAssignmentMode": orchestration.ACR_LEGACY_ROLE_ASSIGNMENT_MODE},
+                "properties": {
+                    "roleAssignmentMode": orchestration.ACR_LEGACY_ROLE_ASSIGNMENT_MODE,
+                    "anonymousPullEnabled": False,
+                },
             }
         return {
             "id": resource_id,
@@ -5064,7 +5238,10 @@ def test_exact_head_unconditioned_repository_reader_requires_reviewed_revocation
         if resource_id.casefold() == REGISTRY_RESOURCE_ID.casefold():
             return {
                 "id": resource_id,
-                "properties": {"roleAssignmentMode": orchestration.ACR_ABAC_ROLE_ASSIGNMENT_MODE},
+                "properties": {
+                    "roleAssignmentMode": orchestration.ACR_ABAC_ROLE_ASSIGNMENT_MODE,
+                    "anonymousPullEnabled": False,
+                },
             }
         return {
             "id": resource_id,
@@ -5136,7 +5313,10 @@ def test_current_legacy_acr_pull_assignment_cannot_be_misclassified(
         if resource_id.casefold() == REGISTRY_RESOURCE_ID.casefold():
             return {
                 "id": resource_id,
-                "properties": {"roleAssignmentMode": orchestration.ACR_LEGACY_ROLE_ASSIGNMENT_MODE},
+                "properties": {
+                    "roleAssignmentMode": orchestration.ACR_LEGACY_ROLE_ASSIGNMENT_MODE,
+                    "anonymousPullEnabled": False,
+                },
             }
         return {
             "id": resource_id,
@@ -5204,7 +5384,10 @@ def test_wc013_acr_inventory_rejects_stale_pull_grants(
         if resource_id.casefold() == REGISTRY_RESOURCE_ID.casefold():
             return {
                 "id": resource_id,
-                "properties": {"roleAssignmentMode": REGISTRY_ROLE_ASSIGNMENT_MODE},
+                "properties": {
+                    "roleAssignmentMode": REGISTRY_ROLE_ASSIGNMENT_MODE,
+                    "anonymousPullEnabled": False,
+                },
             }
         if "/roledefinitions/" in resource_id.casefold():
             return {
@@ -5304,7 +5487,7 @@ def test_wc013_acr_inventory_rejects_stale_pull_grants(
     stale_present = True
     with pytest.raises(
         orchestration.OrchestrationError,
-        match="stale, inherited, group-derived",
+        match="pull-capable assignment",
     ):
         orchestration._verify_wc013_acr_pull_assignments(
             assignments,
@@ -5325,7 +5508,10 @@ def test_wc013_abac_effective_set_requires_both_presentation_repositories(
         if resource_id.casefold() == REGISTRY_RESOURCE_ID.casefold():
             return {
                 "id": resource_id,
-                "properties": {"roleAssignmentMode": orchestration.ACR_ABAC_ROLE_ASSIGNMENT_MODE},
+                "properties": {
+                    "roleAssignmentMode": orchestration.ACR_ABAC_ROLE_ASSIGNMENT_MODE,
+                    "anonymousPullEnabled": False,
+                },
             }
         assignment = assignments_by_id[resource_id.casefold()]
         return {
@@ -5401,7 +5587,7 @@ def test_wc013_abac_effective_set_requires_both_presentation_repositories(
             if item["label"] == "presentation-delivery"
         )
     ).casefold()
-    with pytest.raises(orchestration.OrchestrationError, match="missing its exact current"):
+    with pytest.raises(orchestration.OrchestrationError, match="missing an exact reviewed"):
         orchestration._verify_wc013_acr_pull_assignments(
             assignments,
             subscription_id=SUBSCRIPTION_ID,
@@ -5480,7 +5666,10 @@ def test_wc013_rejects_every_extra_pull_capable_role_definition(
         if resource_id.casefold() == REGISTRY_RESOURCE_ID.casefold():
             return {
                 "id": resource_id,
-                "properties": {"roleAssignmentMode": REGISTRY_ROLE_ASSIGNMENT_MODE},
+                "properties": {
+                    "roleAssignmentMode": REGISTRY_ROLE_ASSIGNMENT_MODE,
+                    "anonymousPullEnabled": False,
+                },
             }
         if "/roledefinitions/" in resource_id.casefold():
             role_actions = (
@@ -5618,7 +5807,10 @@ def test_wc013_rejects_group_derived_and_inherited_custom_pull_grants(
         if resource_id.casefold() == REGISTRY_RESOURCE_ID.casefold():
             return {
                 "id": resource_id,
-                "properties": {"roleAssignmentMode": REGISTRY_ROLE_ASSIGNMENT_MODE},
+                "properties": {
+                    "roleAssignmentMode": REGISTRY_ROLE_ASSIGNMENT_MODE,
+                    "anonymousPullEnabled": False,
+                },
             }
         assignment = assignments_by_id[resource_id.casefold()]
         return {
@@ -5712,6 +5904,14 @@ def test_digest_pinned_job_pull_probe_retries_without_implicit_role_creation(
     def run_json(command: object, *, field: str) -> object:
         nonlocal start_attempts, execution_polls
         arguments = list(command)
+        if arguments[:3] == ["az", "resource", "show"]:
+            return {
+                "id": arguments[arguments.index("--ids") + 1],
+                "properties": {
+                    "roleAssignmentMode": outputs["registryRoleAssignmentMode"],
+                    "anonymousPullEnabled": False,
+                },
+            }
         if arguments[:4] == ["az", "containerapp", "job", "start"]:
             start_attempts += 1
             assert "--registry-identity" not in arguments
@@ -5750,6 +5950,7 @@ def test_digest_pinned_job_pull_probe_retries_without_implicit_role_creation(
         registry_resource_id=str(outputs["registryResourceId"]),
         principal_id=PRODUCER_BROKER_PRINCIPAL_ID,
         registry_role_assignment_mode=str(outputs["registryRoleAssignmentMode"]),
+        registry_anonymous_pull_enabled=outputs["registryAnonymousPullEnabled"],
         registry_pull_role_definition_id=str(outputs["registryPullRoleDefinitionId"]),
         registry_pull_role_assignment_resource_id=str(
             outputs["registryPullRoleAssignmentResourceId"]
@@ -6171,6 +6372,131 @@ def test_authority_blob_inventory_rejects_missing_or_conflicting_versions() -> N
         )
 
 
+def test_authority_blob_inventory_rejects_aggregate_length_before_any_download(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    container_id = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
+        "Microsoft.Storage/storageAccounts/athenacorrelation/"
+        "blobServices/default/containers/wc027-guidance-authority"
+    )
+    versioned_blobs = [
+        {
+            "name": f"synthetic/{index:04d}.json",
+            "versionId": f"version-{index:04d}",
+            "isCurrentVersion": True,
+            "properties": {
+                "etag": f'"etag-{index:04d}"',
+                "contentLength": orchestration.MAX_GUIDANCE_AUTHORITY_BINDING_BYTES,
+            },
+        }
+        for index in range(orchestration.MAX_AUTHORITY_CHECKPOINT_VERSIONS)
+    ]
+
+    def run_json(command: object, *, field: str) -> object:
+        arguments = list(command)
+        if arguments[:3] == ["az", "resource", "show"]:
+            return {
+                "id": arguments[arguments.index("--ids") + 1],
+                "properties": {"isVersioningEnabled": True},
+            }
+        if arguments[:3] == ["az", "storage", "container"]:
+            return {"exists": True}
+        return versioned_blobs
+
+    download_attempts = 0
+
+    def download(_command: object) -> bytes:
+        nonlocal download_attempts
+        download_attempts += 1
+        raise AssertionError("aggregate length must fail before a Blob download")
+
+    monkeypatch.setattr(orchestration, "_run_json", run_json)
+    monkeypatch.setattr(orchestration, "_run_bytes", download)
+    with pytest.raises(orchestration.OrchestrationError, match="before download"):
+        orchestration._authority_blob_inventory(
+            container_id,
+            subscription_id=SUBSCRIPTION_ID,
+        )
+    assert download_attempts == 0
+
+
+def test_authority_blob_inventory_rejects_missing_or_inconsistent_lengths_before_download(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    container_id = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
+        "Microsoft.Storage/storageAccounts/athenacorrelation/"
+        "blobServices/default/containers/wc027-guidance-authority"
+    )
+    listed_versions: list[dict[str, object]] = [
+        {
+            "name": "synthetic/missing-length.json",
+            "versionId": "missing-length",
+            "isCurrentVersion": True,
+            "properties": {"etag": '"etag-missing"'},
+        }
+    ]
+
+    def run_json(command: object, *, field: str) -> object:
+        arguments = list(command)
+        if arguments[:3] == ["az", "resource", "show"]:
+            return {
+                "id": arguments[arguments.index("--ids") + 1],
+                "properties": {"isVersioningEnabled": True},
+            }
+        if arguments[:3] == ["az", "storage", "container"]:
+            return {"exists": True}
+        return listed_versions
+
+    monkeypatch.setattr(orchestration, "_run_json", run_json)
+    monkeypatch.setattr(
+        orchestration,
+        "_run_bytes",
+        lambda _command: pytest.fail("invalid listed lengths must prevent downloads"),
+    )
+    with pytest.raises(orchestration.OrchestrationError, match="content length"):
+        orchestration._authority_blob_inventory(
+            container_id,
+            subscription_id=SUBSCRIPTION_ID,
+        )
+
+    previous = _synthetic_authority_checkpoint_with_pair(
+        previous_checkpoint_sha256=f"sha256:{'7' * 64}",
+    )
+    listed_versions = [
+        {
+            "name": "aaa-new.json",
+            "versionId": "new-version",
+            "isCurrentVersion": True,
+            "properties": {
+                "etag": '"etag-new"',
+                "contentLength": 1,
+            },
+        },
+        *[
+            {
+                "name": item["name"],
+                "versionId": item["versionId"],
+                "isCurrentVersion": True,
+                "properties": {
+                    "etag": item["etag"],
+                    "contentLength": (
+                        int(item["contentLength"]) + 1 if index == 0 else item["contentLength"]
+                    ),
+                },
+            }
+            for index, item in enumerate(previous["versions"])
+        ],
+    ]
+    with pytest.raises(orchestration.OrchestrationError, match="metadata changed"):
+        orchestration._authority_blob_inventory(
+            container_id,
+            subscription_id=SUBSCRIPTION_ID,
+            previous_inventory=previous,
+        )
+
+
 def test_authority_blob_inventory_uses_trusted_predecessor_plan_evidence() -> None:
     producer_inventory = _empty_authority_inventory(
         container_exists=True,
@@ -6275,6 +6601,150 @@ def test_publisher_recovery_preserves_newer_producer_checkpoint() -> None:
             required_inventory=newer_producer,
             current_inventory=candidate,
         )
+
+
+def test_initial_publisher_requires_authoritative_job_and_deployment_absence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    effective_parameters = {"namePrefix": {"value": "athena-synthetic"}}
+    expected_job_id = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/{RUNTIME_RESOURCE_GROUP}/"
+        "providers/Microsoft.App/jobs/athena-synthetic-w27-guide-auth"
+    )
+    job_exists = False
+    deployment_exists = False
+    job_absence_detail = "ERROR: (ResourceNotFound) Synthetic publisher Job is absent."
+
+    def run_json(command: object, *, field: str) -> object:
+        arguments = list(command)
+        if arguments[:3] == ["az", "resource", "show"]:
+            assert arguments[arguments.index("--ids") + 1] == expected_job_id
+            if job_exists:
+                return {"id": expected_job_id}
+            raise orchestration._CommandFailure(3, job_absence_detail)
+        assert arguments[:4] == ["az", "deployment", "group", "show"]
+        if deployment_exists:
+            return {"name": "synthetic-publisher"}
+        raise orchestration._CommandFailure(
+            3,
+            "ERROR: (DeploymentNotFound) Synthetic publisher deployment is absent.",
+        )
+
+    monkeypatch.setattr(orchestration, "_run_json", run_json)
+    orchestration._verify_initial_publisher_absence(
+        effective_parameters=effective_parameters,
+        deployment_name="synthetic-publisher",
+        subscription_id=SUBSCRIPTION_ID,
+        resource_group=RUNTIME_RESOURCE_GROUP,
+    )
+
+    job_exists = True
+    with pytest.raises(orchestration.OrchestrationError, match="prior publisher receipt"):
+        orchestration._verify_initial_publisher_absence(
+            effective_parameters=effective_parameters,
+            deployment_name="synthetic-publisher",
+            subscription_id=SUBSCRIPTION_ID,
+            resource_group=RUNTIME_RESOURCE_GROUP,
+        )
+
+    job_exists = False
+    deployment_exists = True
+    with pytest.raises(orchestration.OrchestrationError, match="prior publisher receipt"):
+        orchestration._verify_initial_publisher_absence(
+            effective_parameters=effective_parameters,
+            deployment_name="synthetic-publisher",
+            subscription_id=SUBSCRIPTION_ID,
+            resource_group=RUNTIME_RESOURCE_GROUP,
+        )
+
+    deployment_exists = False
+    job_absence_detail = "synthetic command failed without an Azure error code"
+    with pytest.raises(orchestration._CommandFailure, match="without an Azure error code"):
+        orchestration._verify_initial_publisher_absence(
+            effective_parameters=effective_parameters,
+            deployment_name="synthetic-publisher",
+            subscription_id=SUBSCRIPTION_ID,
+            resource_group=RUNTIME_RESOURCE_GROUP,
+        )
+
+
+def test_initial_publisher_requires_exact_producer_checkpoint_content() -> None:
+    producer_checkpoint = _synthetic_authority_checkpoint_with_pair(
+        previous_checkpoint_sha256=f"sha256:{'8' * 64}",
+    )
+    current = {
+        **producer_checkpoint,
+        "previousCheckpointSha256": (
+            orchestration._authority_checkpoint_sha256(producer_checkpoint)
+        ),
+    }
+    orchestration._verify_authority_inventory_content_equal(
+        expected_inventory=producer_checkpoint,
+        current_inventory=current,
+        field="initial publisher planning",
+    )
+
+    added = json.loads(json.dumps(current))
+    added["versions"].append(
+        {
+            **added["versions"][-1],
+            "name": "guidance-bindings/extra/binding.json",
+            "versionId": "extra-version",
+        }
+    )
+    with pytest.raises(orchestration.OrchestrationError, match="producer checkpoint"):
+        orchestration._verify_authority_inventory_content_equal(
+            expected_inventory=producer_checkpoint,
+            current_inventory=added,
+            field="initial publisher planning",
+        )
+
+    deleted = json.loads(json.dumps(current))
+    deleted["currentBlobs"] = deleted["currentBlobs"][:-1]
+    deleted["versions"] = deleted["versions"][:-1]
+    with pytest.raises(orchestration.OrchestrationError, match="producer checkpoint"):
+        orchestration._verify_authority_inventory_content_equal(
+            expected_inventory=producer_checkpoint,
+            current_inventory=deleted,
+            field="initial publisher planning",
+        )
+
+    changed = json.loads(json.dumps(current))
+    changed["versions"][0]["contentLength"] += 1
+    with pytest.raises(orchestration.OrchestrationError, match="producer checkpoint"):
+        orchestration._verify_authority_inventory_content_equal(
+            expected_inventory=producer_checkpoint,
+            current_inventory=changed,
+            field="initial publisher planning",
+        )
+
+
+def test_initial_publisher_absence_and_content_are_revalidated_before_apply() -> None:
+    source = (ROOT / "scripts" / "wc029_deployment_orchestration.py").read_text(encoding="utf-8")
+    plan_start = source.index("def plan(")
+    apply_start = source.index("def apply(")
+    plan_source = source[plan_start:apply_start]
+    apply_source = source[apply_start:]
+
+    plan_absence = plan_source.index("_verify_initial_publisher_absence(")
+    plan_inventory = plan_source.index("authority_blob_inventory =")
+    plan_content = plan_source.index(
+        "_verify_authority_inventory_content_equal(",
+        plan_inventory,
+    )
+    assert plan_absence < plan_inventory < plan_content
+
+    apply_absence = apply_source.index("_verify_initial_publisher_absence(")
+    apply_inventory = apply_source.index("current_authority_blob_inventory =")
+    apply_content = apply_source.index(
+        "_verify_authority_inventory_content_equal(",
+        apply_inventory,
+    )
+    deployment_execute = apply_source.index("_execute_reviewed_deployment(")
+    assert apply_absence < apply_inventory < apply_content < deployment_execute
+    assert 'initial_publisher = stage == "publisher" and prior_stage_record is None' in (
+        apply_source
+    )
 
 
 def test_service_bus_queue_requires_exact_stage_profile(
@@ -6677,6 +7147,166 @@ def test_exact_effective_assignments_use_global_governed_scope_set() -> None:
         )
 
 
+def test_wc027_pull_capable_assignments_are_exact_for_every_principal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_principal = "89898989-1111-4111-8111-111111111111"
+    second_principal = "89898989-2222-4222-8222-222222222222"
+    group_id = "89898989-3333-4333-8333-333333333333"
+    expected_assignment = (
+        f"{REGISTRY_RESOURCE_ID}/providers/Microsoft.Authorization/roleAssignments/"
+        "89898989-4444-4444-8444-444444444444"
+    )
+    pull_role_definition_id = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+        "Microsoft.Authorization/roleDefinitions/"
+        f"{orchestration.ACR_PULL_ROLE_ID}"
+    )
+    push_role_definition_id = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+        "Microsoft.Authorization/roleDefinitions/"
+        f"{orchestration.ACR_PUSH_ROLE_ID}"
+    )
+    nonpull_role_definition_id = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+        "Microsoft.Authorization/roleDefinitions/"
+        f"{orchestration.TABLE_DATA_READER_ROLE_ID}"
+    )
+    custom_pull_role_definition_id = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
+        "Microsoft.Authorization/roleDefinitions/"
+        "89898989-5555-4555-8555-555555555555"
+    )
+    effective = {
+        first_principal: [
+            {
+                "id": expected_assignment,
+                "principalId": first_principal,
+                "roleDefinitionId": pull_role_definition_id,
+                "scope": REGISTRY_RESOURCE_ID,
+            },
+            {
+                "id": (
+                    f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
+                    "Microsoft.Storage/storageAccounts/athena/tableServices/default/"
+                    "tables/Wc027FeedRegistry/providers/Microsoft.Authorization/"
+                    "roleAssignments/89898989-6666-4666-8666-666666666666"
+                ),
+                "principalId": first_principal,
+                "roleDefinitionId": nonpull_role_definition_id,
+                "scope": (
+                    f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
+                    "Microsoft.Storage/storageAccounts/athena/tableServices/default/"
+                    "tables/Wc027FeedRegistry"
+                ),
+            },
+        ],
+        second_principal: [],
+    }
+
+    def role_definition(
+        role_definition_id: str,
+        *,
+        subscription_id: str,
+    ) -> dict[str, object]:
+        role_id = role_definition_id.casefold().rsplit("/", 1)[-1]
+        if role_id == orchestration.ACR_PULL_ROLE_ID:
+            actions = [orchestration.ACR_LEGACY_PULL_ACTION]
+            data_actions: list[str] = []
+        elif role_id == orchestration.ACR_PUSH_ROLE_ID:
+            actions = [
+                orchestration.ACR_LEGACY_PULL_ACTION,
+                "Microsoft.ContainerRegistry/registries/push/write",
+            ]
+            data_actions = []
+        elif role_id == orchestration.TABLE_DATA_READER_ROLE_ID:
+            actions = []
+            data_actions = [orchestration.TABLE_ENTITY_READ_DATA_ACTION]
+        else:
+            assert role_definition_id == custom_pull_role_definition_id
+            actions = []
+            data_actions = [orchestration.ACR_REPOSITORY_CONTENT_READ_DATA_ACTION]
+        return {
+            "id": role_definition_id,
+            "properties": {
+                "permissions": [
+                    {
+                        "actions": actions,
+                        "notActions": [],
+                        "dataActions": data_actions,
+                        "notDataActions": [],
+                    }
+                ]
+            },
+        }
+
+    monkeypatch.setattr(orchestration, "_get_role_definition", role_definition)
+    orchestration._verify_exact_pull_capable_assignments(
+        {first_principal, second_principal},
+        expected_acr_assignments_by_principal={first_principal: {expected_assignment}},
+        subscription_id=SUBSCRIPTION_ID,
+        field="synthetic WC-027 ACR assignments",
+        effective_assignments_by_principal=effective,
+    )
+
+    sibling_registry = REGISTRY_RESOURCE_ID.replace(
+        "/registries/athena",
+        "/registries/sibling",
+    )
+    effective[first_principal].append(
+        {
+            "id": (
+                f"{sibling_registry}/providers/Microsoft.Authorization/"
+                "roleAssignments/89898989-7777-4777-8777-777777777777"
+            ),
+            "principalId": first_principal,
+            "roleDefinitionId": push_role_definition_id,
+            "scope": sibling_registry,
+        }
+    )
+    with pytest.raises(orchestration.OrchestrationError, match="sibling-registry"):
+        orchestration._verify_exact_pull_capable_assignments(
+            {first_principal, second_principal},
+            expected_acr_assignments_by_principal={first_principal: {expected_assignment}},
+            subscription_id=SUBSCRIPTION_ID,
+            field="synthetic WC-027 ACR assignments",
+            effective_assignments_by_principal=effective,
+        )
+
+    effective[first_principal].pop()
+    effective[second_principal].append(
+        {
+            "id": (
+                f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+                "Microsoft.Authorization/roleAssignments/"
+                "89898989-8888-4888-8888-888888888888"
+            ),
+            "principalId": group_id,
+            "roleDefinitionId": custom_pull_role_definition_id,
+            "scope": f"/subscriptions/{SUBSCRIPTION_ID}",
+        }
+    )
+    with pytest.raises(orchestration.OrchestrationError, match="group-derived"):
+        orchestration._verify_exact_pull_capable_assignments(
+            {first_principal, second_principal},
+            expected_acr_assignments_by_principal={first_principal: {expected_assignment}},
+            subscription_id=SUBSCRIPTION_ID,
+            field="synthetic WC-027 ACR assignments",
+            effective_assignments_by_principal=effective,
+        )
+
+    effective[second_principal].clear()
+    effective[first_principal] = effective[first_principal][1:]
+    with pytest.raises(orchestration.OrchestrationError, match="missing an exact reviewed"):
+        orchestration._verify_exact_pull_capable_assignments(
+            {first_principal, second_principal},
+            expected_acr_assignments_by_principal={first_principal: {expected_assignment}},
+            subscription_id=SUBSCRIPTION_ID,
+            field="synthetic WC-027 ACR assignments",
+            effective_assignments_by_principal=effective,
+        )
+
+
 @pytest.mark.parametrize(
     ("scope", "role_definition_id", "custom_profile", "denied_action", "is_data_action"),
     (
@@ -7073,6 +7703,16 @@ def test_publisher_verification_collects_separated_producer_principal_evidence(
         f"{publisher_scope}/providers/Microsoft.Authorization/roleAssignments/"
         "88818181-4444-4444-8444-444444444444"
     )
+    producer_role_definition_id = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+        "Microsoft.Authorization/roleDefinitions/"
+        f"{orchestration.BLOB_DATA_READER_ROLE_ID}"
+    )
+    publisher_role_definition_id = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+        "Microsoft.Authorization/roleDefinitions/"
+        f"{orchestration.SERVICE_BUS_DATA_RECEIVER_ROLE_ID}"
+    )
     queried_principals: list[set[str]] = []
 
     def verified_evidence(
@@ -7083,14 +7723,45 @@ def test_publisher_verification_collects_separated_producer_principal_evidence(
         assert path in {"publisher-apply", "publisher-recovery"}
         queried_principals.append(set(principal_ids))
         return {
-            producer_principal: [{"id": producer_assignment, "scope": producer_scope}],
-            publisher_principal: [{"id": publisher_assignment, "scope": publisher_scope}],
+            producer_principal: [
+                {
+                    "id": producer_assignment,
+                    "principalId": producer_principal,
+                    "roleDefinitionId": producer_role_definition_id,
+                    "scope": producer_scope,
+                }
+            ],
+            publisher_principal: [
+                {
+                    "id": publisher_assignment,
+                    "principalId": publisher_principal,
+                    "roleDefinitionId": publisher_role_definition_id,
+                    "scope": publisher_scope,
+                }
+            ],
         }
 
     monkeypatch.setattr(
         orchestration,
         "_verify_no_broad_effective_assignments",
         verified_evidence,
+    )
+    monkeypatch.setattr(
+        orchestration,
+        "_get_role_definition",
+        lambda role_definition_id, *, subscription_id: {
+            "id": role_definition_id,
+            "properties": {
+                "permissions": [
+                    {
+                        "actions": [],
+                        "notActions": [],
+                        "dataActions": [],
+                        "notDataActions": [],
+                    }
+                ]
+            },
+        },
     )
     orchestration._verify_publisher_effective_assignments(
         publisher_principal_ids={publisher_principal},
@@ -7474,6 +8145,7 @@ def test_wc027_roots_emit_exact_handoff_outputs() -> None:
         "guidanceAuthoritySourceContainerResourceId",
         "triggerQueueResourceId",
         "notificationQueueResourceId",
+        "registryAnonymousPullEnabled",
         "registryRepositoryName",
         "registryPullConditionVersion",
         "registryPullCondition",
@@ -7486,11 +8158,29 @@ def test_wc027_roots_emit_exact_handoff_outputs() -> None:
         "activationTableResourceId",
         "bindingKeyResourceId",
         "bindingKeyVaultKeyId",
+        "registryAnonymousPullEnabled",
         "registryRepositoryName",
         "registryPullConditionVersion",
         "registryPullCondition",
     ):
         assert f"output {output_name} " in publisher
+
+
+def test_wc027_readiness_scans_pull_capability_for_all_runtime_principals() -> None:
+    source = (ROOT / "scripts" / "wc029_deployment_orchestration.py").read_text(encoding="utf-8")
+    producer_start = source.index("def _verify_producer_resources(")
+    publisher_start = source.index("def _verify_publisher_resources(")
+    producer_source = source[producer_start:publisher_start]
+    publisher_effective_start = source.index("def _verify_publisher_effective_assignments(")
+    publisher_effective_end = source.index(
+        "def _verify_job_deployment_binding(",
+        publisher_effective_start,
+    )
+    publisher_effective_source = source[publisher_effective_start:publisher_effective_end]
+    assert "_verify_exact_pull_capable_assignments(" in producer_source
+    assert "_verify_exact_pull_capable_assignments(" in publisher_effective_source
+    assert "_acr_assignment_ids_by_principal(" in producer_source
+    assert "_acr_assignment_ids_by_principal(" in publisher_effective_source
 
 
 def test_publisher_acr_pull_uses_cross_resource_group_platform_topology() -> None:
@@ -7543,8 +8233,8 @@ def test_apply_is_bound_to_external_digest_and_fresh_what_if() -> None:
     assert '--publisher-reviewed-receipt-sha256"' in source
     assert "athena.wc029DeploymentPlan.v7" in source
     assert "athena.wc029DeploymentReceipt.v4" in source
-    assert "athena.wc029DeploymentHandoff.v6" in source
-    assert "athena.wc029ImagePullEvidence.v2" in source
+    assert "athena.wc029DeploymentHandoff.v7" in source
+    assert "athena.wc029ImagePullEvidence.v3" in source
     assert "athena.wc029RevocationPlan.v1" in source
     assert "predecessorReceiptSha256s" in source
     assert "--rotation-transition-assignment" in source

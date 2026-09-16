@@ -225,7 +225,9 @@ service-principal type, and exact condition. Legacy `AcrPull` records have null 
 mode every `Container Registry Repository Reader` record has condition version `2.0` and the
 canonical exact repository-name condition; the presentation identity has separate assignments for
 the `athena/presentation-web` and `athena/wc013-live` images. WC-029 foundation and live-acceptance
-readiness re-read this inventory, resolve every effective role definition, and reject any extra
+readiness require each ACR module and live registry readback to prove
+`anonymousPullEnabled: false`, re-read this inventory, resolve every effective role definition,
+and reject any extra
 pull-capable direct, inherited, or transitive-group assignment anywhere in the governed
 subscription, including grants on sibling registries.
 

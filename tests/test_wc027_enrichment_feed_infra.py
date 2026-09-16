@@ -122,6 +122,8 @@ def test_wc027_acr_pull_is_mode_aware_principal_seeded_and_cross_scope() -> None
         "param registryRoleAssignmentMode string",
         "reference(registry.id, '2025-04-01', 'Full')",
         "registryRuntime.properties.roleAssignmentMode == registryRoleAssignmentMode",
+        "registryRuntime.properties.?anonymousPullEnabled == false",
+        "ACR anonymousPullEnabled must be explicitly false",
         "guardedPullRoleDefinitionResourceId",
         "roleDefinitionId: guardedPullRoleDefinitionResourceId",
         "b93aa761-3e63-49ed-ac28-beffa264f7ac",
@@ -135,6 +137,7 @@ def test_wc027_acr_pull_is_mode_aware_principal_seeded_and_cross_scope() -> None
         f"var repositoryCondition = '{repository_condition}'",
         "output registryResourceId string = runtimeRegistryResourceId",
         "output roleAssignmentMode string = validatedRoleAssignmentMode",
+        "output anonymousPullEnabled bool = validatedAnonymousPullEnabled",
         "output repositoryName string = validatedRepositoryName",
     ):
         assert expected in module
@@ -150,6 +153,7 @@ def test_wc027_acr_pull_is_mode_aware_principal_seeded_and_cross_scope() -> None
         "registryRoleAssignmentMode: registryRoleAssignmentMode",
         "registryPullRoleAssignmentId",
         "producerImagePull.outputs.registryResourceId",
+        "producerImagePull.outputs.anonymousPullEnabled",
         "producerImagePull.outputs.repositoryName",
         "producerImagePull.outputs.?conditionVersion",
         "producerImagePull.outputs.?condition",

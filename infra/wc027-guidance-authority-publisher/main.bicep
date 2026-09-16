@@ -581,6 +581,7 @@ output bindingKeyResourceId string = bindingKey.id
 output bindingKeyVaultKeyId string = bindingKey.properties.keyUriWithVersion
 output registryResourceId string = publisherImagePull.outputs.registryResourceId
 output registryRoleAssignmentMode string = publisherImagePull.outputs.roleAssignmentMode
+output registryAnonymousPullEnabled bool = publisherImagePull.outputs.anonymousPullEnabled
 output registryRepositoryName string = publisherImagePull.outputs.repositoryName
 output registryPullRoleDefinitionId string = publisherImagePull.outputs.roleDefinitionResourceId
 output registryPullRoleAssignmentResourceId string = publisherImagePull.outputs.roleAssignmentResourceId

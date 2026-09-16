@@ -324,10 +324,12 @@ def test_controller_identity_oidc_and_workflow_are_closed_and_separate() -> None
         "7f951dda-4ed3-4680-a7ca-43fe172d538d",
         "b93aa761-3e63-49ed-ac28-beffa264f7ac",
         "reference(registry.id, '2025-04-01', 'Full')",
+        "registryRuntime.properties.?anonymousPullEnabled == false",
         "guid(registry.id, identityPrincipalId, pullRoleDefinitionResourceId)",
         "principalType: 'ServicePrincipal'",
         "roleDefinitionId: guardedPullRoleDefinitionResourceId",
         "output registryResourceId string = runtimeRegistryResourceId",
+        "output anonymousPullEnabled bool = validatedAnonymousPullEnabled",
     ):
         assert expected in acr_pull
     assert "identityName" not in acr_pull
@@ -341,6 +343,7 @@ def test_controller_identity_oidc_and_workflow_are_closed_and_separate() -> None
         "label: 'wc016-orchestrator'",
         "label: 'wc016-notification'",
         "presentationWeb.outputs.acrPullAssignments",
+        "anonymousPullEnabled: acceptanceImagePull.outputs.anonymousPullEnabled",
     ):
         assert expected in orchestration
     assert "label: 'presentation-delivery'" in _read(
