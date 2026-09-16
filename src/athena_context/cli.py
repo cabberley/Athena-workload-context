@@ -100,6 +100,7 @@ from athena_context.wc013_collector_controller import (
 from athena_context.wc013_evidence_collector import (
     run_wc013_evidence_collector_job,
 )
+from athena_context.wc029_preflight import run_preflight_check
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -466,6 +467,101 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         choices=range(1, 16),
         default=10,
+    )
+    preflight_parser = subparsers.add_parser(
+        "wc029-preflight",
+        help="evaluate saved WC-029 deployment and RBAC evidence offline",
+        description=(
+            "Evaluate one saved WC-029 ARM what-if or RBAC artifact without "
+            "authenticating to Azure or changing resources."
+        ),
+    )
+    preflight_subparsers = preflight_parser.add_subparsers(
+        dest="preflight_kind",
+        required=True,
+    )
+    what_if_parser = preflight_subparsers.add_parser(
+        "what-if",
+        help="evaluate saved ARM what-if JSON",
+    )
+    what_if_parser.add_argument("input", type=Path)
+    what_if_parser.add_argument(
+        "--allow-change",
+        action="append",
+        default=[],
+        metavar="RESOURCE_ID",
+    )
+    what_if_parser.add_argument(
+        "--collection-run-id",
+        required=True,
+    )
+    what_if_parser.add_argument(
+        "--deployment-execution-id",
+        required=True,
+    )
+    what_if_parser.add_argument(
+        "--release-ledger",
+        required=True,
+        type=Path,
+    )
+    what_if_parser.add_argument(
+        "--trusted-release-ledger-root",
+        required=True,
+        type=Path,
+    )
+    what_if_parser.add_argument(
+        "--attestation-manifest-digest",
+        required=True,
+    )
+    what_if_parser.add_argument(
+        "--deployment-digest",
+        required=True,
+    )
+    what_if_parser.add_argument(
+        "--template-digest",
+        required=True,
+    )
+    what_if_parser.add_argument(
+        "--parameters-digest",
+        required=True,
+    )
+    what_if_parser.add_argument(
+        "--format",
+        choices=("json", "text"),
+        default="text",
+    )
+    rbac_parser = preflight_subparsers.add_parser(
+        "rbac",
+        help="evaluate saved role-assignment JSON",
+    )
+    rbac_parser.add_argument("input", type=Path)
+    rbac_parser.add_argument("--policy", required=True, type=Path)
+    rbac_parser.add_argument(
+        "--collection-run-id",
+        required=True,
+    )
+    rbac_parser.add_argument(
+        "--deployment-execution-id",
+        required=True,
+    )
+    rbac_parser.add_argument(
+        "--release-ledger",
+        required=True,
+        type=Path,
+    )
+    rbac_parser.add_argument(
+        "--trusted-release-ledger-root",
+        required=True,
+        type=Path,
+    )
+    rbac_parser.add_argument(
+        "--attestation-manifest-digest",
+        required=True,
+    )
+    rbac_parser.add_argument(
+        "--format",
+        choices=("json", "text"),
+        default="text",
     )
     return parser
 
@@ -860,33 +956,17 @@ def main(
                 incident_key_fingerprint=args.incident_key_fingerprint,
                 incident_public_key_path=args.incident_public_key,
                 incident_feed_v2_key_id=args.incident_feed_v2_key_id,
-                incident_feed_v2_key_fingerprint=(
-                    args.incident_feed_v2_key_fingerprint
-                ),
-                incident_feed_v2_public_key_path=(
-                    args.incident_feed_v2_public_key
-                ),
+                incident_feed_v2_key_fingerprint=(args.incident_feed_v2_key_fingerprint),
+                incident_feed_v2_public_key_path=(args.incident_feed_v2_public_key),
                 incident_report_key_id=args.incident_report_key_id,
-                incident_report_key_fingerprint=(
-                    args.incident_report_key_fingerprint
-                ),
-                incident_report_public_key_path=(
-                    args.incident_report_public_key
-                ),
+                incident_report_key_fingerprint=(args.incident_report_key_fingerprint),
+                incident_report_public_key_path=(args.incident_report_public_key),
                 incident_guidance_key_id=args.incident_guidance_key_id,
-                incident_guidance_key_fingerprint=(
-                    args.incident_guidance_key_fingerprint
-                ),
-                incident_guidance_public_key_path=(
-                    args.incident_guidance_public_key
-                ),
+                incident_guidance_key_fingerprint=(args.incident_guidance_key_fingerprint),
+                incident_guidance_public_key_path=(args.incident_guidance_public_key),
                 incident_enrichment_key_id=args.incident_enrichment_key_id,
-                incident_enrichment_key_fingerprint=(
-                    args.incident_enrichment_key_fingerprint
-                ),
-                incident_enrichment_public_key_path=(
-                    args.incident_enrichment_public_key
-                ),
+                incident_enrichment_key_fingerprint=(args.incident_enrichment_key_fingerprint),
+                incident_enrichment_public_key_path=(args.incident_enrichment_public_key),
                 managed_identity_client_id=args.managed_identity_client_id,
                 port=args.port,
             )
@@ -927,9 +1007,7 @@ def main(
                 signing_key_id=args.signing_key_id,
                 signing_key_fingerprint=args.signing_key_fingerprint,
                 notification_v2_configuration=(
-                    _load_notification_v2_runtime_configuration(
-                        args.notification_v2_config_json
-                    )
+                    _load_notification_v2_runtime_configuration(args.notification_v2_config_json)
                 ),
                 metric_window_minutes=args.metric_window_minutes,
             )
@@ -973,9 +1051,7 @@ def main(
                 incident_asset_blob_endpoint=args.incident_asset_blob_endpoint,
                 presentation_url=args.presentation_url,
                 notification_v2_configuration=(
-                    _load_notification_v2_runtime_configuration(
-                        args.notification_v2_config_json
-                    )
+                    _load_notification_v2_runtime_configuration(args.notification_v2_config_json)
                 ),
             )
             output.write(
@@ -994,11 +1070,8 @@ def main(
             output.write(f"WC-027 enrichment trigger queued: {binding_id}\n")
             return 0
         if args.command == "wc027-enrichment-feed-producer":
-            configuration_json = (
-                args.config_json
-                or os.environ.get(
-                    "ATHENA_WC027_ENRICHMENT_FEED_CONFIG_JSON"
-                )
+            configuration_json = args.config_json or os.environ.get(
+                "ATHENA_WC027_ENRICHMENT_FEED_CONFIG_JSON"
             )
             configuration = load_wc027_enrichment_feed_configuration(
                 path=args.config,
@@ -1072,9 +1145,7 @@ def main(
                 failure_container_name=args.failure_container,
                 maximum_messages_per_subqueue=args.maximum_messages_per_subqueue,
             )
-            output.write(
-                f"WC-025 dead-letter purge removed {purged_count} raw message(s)\n"
-            )
+            output.write(f"WC-025 dead-letter purge removed {purged_count} raw message(s)\n")
             return 0
         if args.command == "wc025-change-history-query":
             history_count = run_resource_graph_change_history_worker(
@@ -1092,6 +1163,34 @@ def main(
                 f"WC-025 change history query processed {history_count} change record(s)\n"
             )
             return 0
+        if args.command == "wc029-preflight":
+            return run_preflight_check(
+                kind=args.preflight_kind,
+                input_path=args.input,
+                allowed_change_ids=frozenset(
+                    args.allow_change if args.preflight_kind == "what-if" else ()
+                ),
+                policy_path=(args.policy if args.preflight_kind == "rbac" else None),
+                require_rbac_policy=args.preflight_kind == "rbac",
+                require_attestation=True,
+                expected_collection_run_id=args.collection_run_id,
+                expected_deployment_execution_id=(args.deployment_execution_id),
+                attestation_manifest_digest=(args.attestation_manifest_digest),
+                deployment_digest=(
+                    args.deployment_digest if args.preflight_kind == "what-if" else None
+                ),
+                template_digest=(
+                    args.template_digest if args.preflight_kind == "what-if" else None
+                ),
+                parameters_digest=(
+                    args.parameters_digest if args.preflight_kind == "what-if" else None
+                ),
+                release_ledger_path=args.release_ledger,
+                trusted_release_ledger_root=(args.trusted_release_ledger_root),
+                output_format=args.format,
+                stdout=output,
+                stderr=errors,
+            )
     except Wc013LiveAcceptanceError as exc:
         errors.write(f"WC-013 live acceptance failed: {exc}\n")
         return 1
