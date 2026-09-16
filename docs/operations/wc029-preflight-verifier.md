@@ -328,10 +328,14 @@ membership, assignment, deny, collection, or page evidence invalidates the artif
 Every typed Graph `transitiveMemberOf` object is registered before non-group objects are excluded
 from the accepted security-group set, so an unfamiliar directory-object type cannot hide a later
 type conflict.
-Every ARM role-assignment row also retains its canonical resource ID and canonical raw-body digest.
-Repeated IDs across pages, ancestor/descendant collections, scopes, or principal artifacts must have
-identical raw bodies. The same group-derived row may map to several effective service principals,
-but changing its principal, role, scope, type, or condition under one ID fails closed.
+Every normalized ARM or guarded Azure CLI role-assignment row also retains `arm_assignment_id` and
+a digest of its canonical identity-bearing body: principal, principal type, role definition, scope,
+condition, and condition version. Guarded CLI output must retain exact `id` and
+`Microsoft.Authorization/roleAssignments` `type`. Repeated IDs across methods, pages,
+ancestor/descendant collections, scopes, or principal artifacts must have the same assignment
+identity. The same group-derived row may map to several effective service principals, and
+non-identity display metadata may vary, but changing its principal, role, scope, type, or condition
+under one ID fails closed.
 
 The verifier derives and deduplicates the union of target/ancestor assignments and the complete
 subscription-descendant inventory, then compares it with separately reviewed

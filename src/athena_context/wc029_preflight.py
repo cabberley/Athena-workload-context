@@ -387,8 +387,8 @@ class RbacAssignment:
     effective_principal_id_supplied: bool = field(compare=False)
     principal_type_supplied: bool = field(compare=False)
     assigned_principal_fields_supplied: bool = field(compare=False)
-    assignment_id: str | None = field(default=None, compare=False)
-    raw_assignment_digest: str | None = field(default=None, compare=False)
+    arm_assignment_id: str | None = field(default=None, compare=False)
+    arm_identity_digest: str | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -438,19 +438,19 @@ class _PrincipalTypeRegistry:
 
 @dataclass(slots=True)
 class _ArmRoleAssignmentRegistry:
-    raw_digests_by_id: dict[str, str] = field(default_factory=dict)
+    identity_digests_by_id: dict[str, str] = field(default_factory=dict)
 
     def register(
         self,
-        assignment_id: str,
-        raw_assignment_digest: str,
+        arm_assignment_id: str,
+        arm_identity_digest: str,
     ) -> None:
-        previous_digest = self.raw_digests_by_id.get(assignment_id)
-        if previous_digest is not None and previous_digest != raw_assignment_digest:
+        previous_digest = self.identity_digests_by_id.get(arm_assignment_id)
+        if previous_digest is not None and previous_digest != arm_identity_digest:
             raise PreflightInputError(
-                "ARM role-assignment ID is associated with conflicting raw assignment bodies"
+                "ARM role-assignment ID is associated with conflicting canonical assignment bodies"
             )
-        self.raw_digests_by_id[assignment_id] = raw_assignment_digest
+        self.identity_digests_by_id[arm_assignment_id] = arm_identity_digest
 
 
 @dataclass(frozen=True, slots=True)
@@ -5132,7 +5132,6 @@ def _paged_values(
     values: list[object] = []
     expected_request_url: str | None = None
     request_urls: list[str] = []
-    seen_request_urls: set[str] = set()
     for index, raw_page in enumerate(pages):
         page = _mapping(raw_page, field_name=f"{field_name} page")
         request_url = _require_exact_url_value(
@@ -5145,9 +5144,6 @@ def _paged_values(
         )
         if parts.scheme.casefold() != "https" or parts.netloc.casefold() != allowed_host:
             raise PreflightInputError(f"{field_name} requestUrl must use https://{allowed_host}")
-        if request_url in seen_request_urls:
-            raise PreflightInputError(f"{field_name} pagination contains a repeated requestUrl")
-        seen_request_urls.add(request_url)
         if index > 0 and expected_request_url != request_url:
             raise PreflightInputError(f"{field_name} pagination has a nextLink gap")
         request_urls.append(request_url)
@@ -6399,6 +6395,55 @@ def _validate_deny_assignments_for_principal(
             )
 
 
+def _canonical_arm_role_assignment_id(
+    value: object,
+    *,
+    field_name: str,
+) -> tuple[str, str]:
+    arm_assignment_id = _canonical_scope(
+        _require_string(
+            value,
+            field_name=f"{field_name} id",
+        )
+    )
+    marker = "/providers/microsoft.authorization/roleassignments/"
+    marker_index = arm_assignment_id.rfind(marker)
+    if marker_index < 0:
+        raise PreflightInputError(f"{field_name} id is malformed")
+    assignment_name = arm_assignment_id[marker_index + len(marker) :]
+    if "/" in assignment_name or _GUID.fullmatch(assignment_name) is None:
+        raise PreflightInputError(f"{field_name} id must end in an assignment GUID")
+    id_scope = arm_assignment_id[:marker_index] if marker_index > 0 else "/"
+    return arm_assignment_id, _canonical_scope(id_scope)
+
+
+def _bind_arm_assignment_identity(
+    assignment: RbacAssignment,
+    *,
+    arm_assignment_id: str,
+    assignment_registry: _ArmRoleAssignmentRegistry,
+) -> RbacAssignment:
+    arm_identity_digest = _canonical_json_digest(
+        {
+            "condition": assignment.condition,
+            "conditionVersion": assignment.condition_version,
+            "principalId": assignment.principal_id,
+            "principalType": assignment.principal_type,
+            "roleDefinitionId": assignment.role_definition_id,
+            "scope": assignment.scope,
+        }
+    )
+    assignment_registry.register(
+        arm_assignment_id,
+        arm_identity_digest,
+    )
+    return replace(
+        assignment,
+        arm_assignment_id=arm_assignment_id,
+        arm_identity_digest=arm_identity_digest,
+    )
+
+
 def _parse_arm_role_assignment(
     value: object,
     *,
@@ -6416,21 +6461,10 @@ def _parse_arm_role_assignment(
     )
     if resource_type != "microsoft.authorization/roleassignments":
         raise PreflightInputError("ARM role-assignment resource has the wrong type")
-    resource_id = _canonical_scope(
-        _require_string(
-            _get_case_insensitive(resource, "id"),
-            field_name="ARM role-assignment id",
-        )
+    arm_assignment_id, id_scope = _canonical_arm_role_assignment_id(
+        _get_case_insensitive(resource, "id"),
+        field_name="ARM role-assignment",
     )
-    marker = "/providers/microsoft.authorization/roleassignments/"
-    marker_index = resource_id.rfind(marker)
-    if marker_index < 0:
-        raise PreflightInputError("ARM role-assignment id is malformed")
-    assignment_name = resource_id[marker_index + len(marker) :]
-    if "/" in assignment_name or _GUID.fullmatch(assignment_name) is None:
-        raise PreflightInputError("ARM role-assignment id must end in an assignment GUID")
-    id_scope = resource_id[:marker_index] if marker_index > 0 else "/"
-    id_scope = _canonical_scope(id_scope)
     properties = _mapping(
         _get_case_insensitive(resource, "properties"),
         field_name="ARM role-assignment properties",
@@ -6470,15 +6504,56 @@ def _parse_arm_role_assignment(
         normalized_assignment,
         field_name="ARM role assignment",
     )
-    raw_assignment_digest = _canonical_json_digest(resource)
-    assignment_registry.register(
-        resource_id,
-        raw_assignment_digest,
-    )
-    return replace(
+    return _bind_arm_assignment_identity(
         parsed_assignment,
-        assignment_id=resource_id,
-        raw_assignment_digest=raw_assignment_digest,
+        arm_assignment_id=arm_assignment_id,
+        assignment_registry=assignment_registry,
+    )
+
+
+def _parse_cli_role_assignment(
+    value: object,
+    *,
+    field_name: str,
+    effective_principal_id: str,
+    assignment_registry: _ArmRoleAssignmentRegistry,
+) -> RbacAssignment:
+    raw_assignment = _mapping(
+        value,
+        field_name=field_name,
+    )
+    resource_type = _require_exact_ascii_token(
+        _get_case_insensitive(raw_assignment, "type"),
+        field_name=f"{field_name} type",
+        maximum_length=128,
+    )
+    if resource_type != "Microsoft.Authorization/roleAssignments":
+        raise PreflightInputError(f"{field_name} resource has the wrong type")
+    arm_assignment_id, id_scope = _canonical_arm_role_assignment_id(
+        _get_case_insensitive(raw_assignment, "id"),
+        field_name=field_name,
+    )
+    assignment = _parse_rbac_assignment(
+        raw_assignment,
+        field_name=field_name,
+    )
+    if assignment.scope != id_scope:
+        raise PreflightInputError(f"{field_name} id and scope disagree")
+    if (
+        assignment.effective_principal_id_supplied
+        and assignment.effective_principal_id != effective_principal_id
+    ):
+        raise PreflightInputError(
+            f"{field_name} effectivePrincipalId disagrees with its collection"
+        )
+    return _bind_arm_assignment_identity(
+        replace(
+            assignment,
+            effective_principal_id=effective_principal_id,
+            effective_principal_id_supplied=True,
+        ),
+        arm_assignment_id=arm_assignment_id,
+        assignment_registry=assignment_registry,
     )
 
 
@@ -6714,22 +6789,12 @@ def _parse_ancestor_role_assignments(
             field_name="Azure CLI role assignments",
             maximum_items=MAX_ASSIGNMENTS,
         ):
-            assignment = _parse_rbac_assignment(
-                raw_assignment,
-                field_name="Azure CLI role assignment",
-            )
-            if (
-                assignment.effective_principal_id_supplied
-                and assignment.effective_principal_id != effective_principal_id
-            ):
-                raise PreflightInputError(
-                    "Azure CLI assignment effectivePrincipalId disagrees with its collection"
-                )
             assignments.append(
-                replace(
-                    assignment,
+                _parse_cli_role_assignment(
+                    raw_assignment,
+                    field_name="Azure CLI role assignment",
                     effective_principal_id=effective_principal_id,
-                    effective_principal_id_supplied=True,
+                    assignment_registry=assignment_registry,
                 )
             )
     else:
@@ -6903,23 +6968,12 @@ def _parse_descendant_role_assignments(
             field_name="Azure CLI descendant role assignments",
             maximum_items=MAX_ASSIGNMENTS,
         ):
-            assignment = _parse_rbac_assignment(
-                raw_assignment,
-                field_name="Azure CLI descendant role assignment",
-            )
-            if (
-                assignment.effective_principal_id_supplied
-                and assignment.effective_principal_id != effective_principal_id
-            ):
-                raise PreflightInputError(
-                    "Azure CLI descendant assignment effectivePrincipalId "
-                    "disagrees with its collection"
-                )
             assignments.append(
-                replace(
-                    assignment,
+                _parse_cli_role_assignment(
+                    raw_assignment,
+                    field_name="Azure CLI descendant role assignment",
                     effective_principal_id=effective_principal_id,
-                    effective_principal_id_supplied=True,
+                    assignment_registry=assignment_registry,
                 )
             )
     else:
@@ -6967,7 +7021,7 @@ def _parse_descendant_role_assignments(
     return assignments
 
 
-def _derive_guarded_role_assignments(
+def _parse_rbac_evidence(
     document: object,
     *,
     policy: RbacPolicy,
@@ -7343,7 +7397,7 @@ def evaluate_role_assignments(
             raise PreflightInputError(
                 "allowedBroadAssignments must be listed in approvedAssignments"
             )
-        observed_assignments, collection = _derive_guarded_role_assignments(
+        observed_assignments, collection = _parse_rbac_evidence(
             document,
             policy=policy,
             policy_document=policy_document,
@@ -7589,7 +7643,11 @@ def _validated_release_ledger_paths(
 
 def _secure_directory_handles_supported() -> bool:
     return (
-        os.open in os.supports_dir_fd and hasattr(os, "O_DIRECTORY") and hasattr(os, "O_NOFOLLOW")
+        os.open in os.supports_dir_fd
+        and os.link in os.supports_dir_fd
+        and os.unlink in os.supports_dir_fd
+        and hasattr(os, "O_DIRECTORY")
+        and hasattr(os, "O_NOFOLLOW")
     )
 
 
@@ -7833,26 +7891,45 @@ class _SecureLedgerDirectory:
         staging_name: str,
         final_name: str,
     ) -> None:
-        if self._directory_fd is None:
+        try:
+            if self._directory_fd is None:
+                os.link(
+                    self._fallback_file_path(
+                        staging_name,
+                        require_existing=True,
+                    ),
+                    self._fallback_file_path(
+                        final_name,
+                        require_existing=False,
+                    ),
+                    follow_symlinks=False,
+                )
+                return
             os.link(
-                self._fallback_file_path(
-                    staging_name,
-                    require_existing=True,
-                ),
-                self._fallback_file_path(
-                    final_name,
-                    require_existing=False,
-                ),
+                staging_name,
+                final_name,
+                src_dir_fd=self._directory_fd,
+                dst_dir_fd=self._directory_fd,
                 follow_symlinks=False,
             )
+        except (AttributeError, NotImplementedError, TypeError) as exc:
+            raise PreflightInputError(
+                "safe no-overwrite ledger publication is unsupported"
+            ) from exc
+
+    def _sync_directory(self) -> None:
+        if self._directory_fd is not None:
+            try:
+                os.fsync(self._directory_fd)
+            except OSError as exc:
+                raise PreflightInputError(
+                    "release ledger directory could not be synchronized"
+                ) from exc
             return
-        os.link(
-            staging_name,
-            final_name,
-            src_dir_fd=self._directory_fd,
-            dst_dir_fd=self._directory_fd,
-            follow_symlinks=False,
-        )
+        if os.name != "nt":
+            raise PreflightInputError(
+                "safe release-ledger directory synchronization is unsupported"
+            )
 
     def _verify_published_record(
         self,
@@ -7945,8 +8022,7 @@ class _SecureLedgerDirectory:
                 name,
                 staging_stat=staging_stat,
             )
-            if self._directory_fd is not None:
-                os.fsync(self._directory_fd)
+            self._sync_directory()
         finally:
             os.close(file_descriptor)
             with suppress(

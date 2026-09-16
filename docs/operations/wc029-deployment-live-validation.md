@@ -585,9 +585,11 @@ principal/exclusion retains its supplied type. Any GUID claimed with different t
 identity, membership, role-assignment, deny, collection, or page evidence requires recollection.
 Retain every typed `transitiveMemberOf` object: the verifier registers its type before excluding
 non-group objects from the accepted security-group set.
-Retain every ARM role-assignment `id` unchanged. The verifier permits the same group-derived ID
-under multiple effective principals only when the complete raw assignment body is canonically
-identical; changing principal, role, scope, type, or condition under one ID invalidates the evidence.
+Retain every ARM and guarded Azure CLI role-assignment `id` and `type` unchanged. The verifier
+permits the same group-derived ID under multiple effective principals only when the canonical
+identity-bearing body is identical across methods and collections. Non-identity display metadata
+may vary, but changing principal, role, scope, type, or condition under one ID invalidates the
+evidence.
 
 The RBAC envelope uses the same `$CollectionRunId`, bounded timestamps, and SHA-256 bindings for the
 reviewed policy, target, hierarchy, membership, both role-assignment collections, and both complete

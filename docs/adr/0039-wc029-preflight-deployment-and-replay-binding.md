@@ -178,10 +178,13 @@ Use the following guarded preflight contract:
     reviewed policy, Graph identities or memberships, ARM/CLI assignments, deny principals,
     exclusions, collections, or pages makes the artifact contradictory. Every typed
     `transitiveMemberOf` directory object enters the registry before non-group objects are filtered.
-25. Every ARM role assignment retains its canonical resource ID and canonical raw-body digest.
-    One assignment ID can map only to one identical raw ARM body across pages, ancestor/descendant
-    collections, and effective-principal artifacts. A group assignment may contribute to multiple
-    effective service principals only when each occurrence is the same canonical raw assignment.
+25. Every normalized ARM or guarded Azure CLI role assignment retains its canonical resource ID as
+    `arm_assignment_id` and a digest of its canonical identity-bearing body: principal, principal
+    type, role definition, scope, condition, and condition version. Guarded CLI rows must retain
+    exact `id` and `type`. One assignment ID can map only to one such body across methods, pages,
+    ancestor/descendant collections, and effective-principal artifacts. A group assignment may
+    contribute to multiple effective service principals only when each occurrence has the same
+    canonical assignment identity; non-identity display metadata is not part of that binding.
 26. Partial protected snapshots register every present protected path, scalar value, and inferred
     object/array kind in the same prefix tree used by deltas. Omitted fields remain unknown rather
     than absent, while present dynamic descendants must reconcile with every delta claim.

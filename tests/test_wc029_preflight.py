@@ -1248,7 +1248,17 @@ def _set_two_page_arm_role_assignments(
 def _cli_assignment(
     assignment: dict[str, str],
 ) -> dict[str, str]:
+    raw_arm_assignment = _raw_arm_assignment(
+        assignment,
+        index=0,
+    )
+    arm_assignment_id = raw_arm_assignment["id"]
+    arm_assignment_type = raw_arm_assignment["type"]
+    assert isinstance(arm_assignment_id, str)
+    assert isinstance(arm_assignment_type, str)
     value = {
+        "id": arm_assignment_id,
+        "type": arm_assignment_type,
         "principalId": _assignment_field(
             assignment,
             "assignedPrincipalId",
@@ -7360,6 +7370,66 @@ def test_release_ledger_publication_failure_does_not_poison_retry(
     assert not list(ledger_path.glob(".wc029-*.tmp"))
 
 
+def test_release_ledger_fails_closed_when_safe_publication_is_unsupported(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trusted_root = tmp_path / "trusted-root"
+    ledger_path = trusted_root / "ledger"
+    ledger_path.mkdir(parents=True)
+
+    def unsupported_link(*_args: object, **_kwargs: object) -> None:
+        raise NotImplementedError
+
+    with _SecureLedgerDirectory(ledger_path, trusted_root) as ledger:
+        monkeypatch.setattr(os, "link", unsupported_link)
+        with pytest.raises(
+            PreflightInputError,
+            match="safe no-overwrite ledger publication is unsupported",
+        ):
+            ledger.create_json("unsupported.json", {"value": "complete"})
+
+    assert not (ledger_path / "unsupported.json").exists()
+    assert not list(ledger_path.glob(".wc029-*.tmp"))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX staging special-file regression")
+@pytest.mark.parametrize("staging_kind", ["fifo", "symlink"])
+def test_posix_release_ledger_does_not_follow_poisoned_staging_path(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    staging_kind: str,
+) -> None:
+    trusted_root = tmp_path / "trusted-root"
+    ledger_path = trusted_root / "ledger"
+    ledger_path.mkdir(parents=True)
+    fixed_uuid = uuid.UUID(int=1)
+    staging_path = ledger_path / f".wc029-{fixed_uuid.hex}.tmp"
+    outside = tmp_path / "outside.json"
+    outside.write_text("unchanged", encoding="utf-8")
+    if staging_kind == "fifo":
+        os.mkfifo(staging_path)
+    else:
+        staging_path.symlink_to(outside)
+    monkeypatch.setattr(
+        wc029_preflight_module.uuid,
+        "uuid4",
+        lambda: fixed_uuid,
+    )
+
+    with (
+        _SecureLedgerDirectory(ledger_path, trusted_root) as ledger,
+        pytest.raises(
+            PreflightInputError,
+            match="staging name could not be allocated",
+        ),
+    ):
+        ledger.create_json("poisoned.json", {"value": "complete"})
+
+    assert not (ledger_path / "poisoned.json").exists()
+    assert outside.read_text(encoding="utf-8") == "unchanged"
+
+
 def test_release_ledger_concurrent_writers_publish_one_complete_record(
     tmp_path,
 ) -> None:
@@ -10890,7 +10960,7 @@ def test_guarded_rbac_rejects_conflicting_raw_body_for_one_assignment_id(
 
     with pytest.raises(
         PreflightInputError,
-        match="conflicting raw assignment bodies|id and properties.scope disagree",
+        match="conflicting canonical assignment bodies|id and properties.scope disagree",
     ):
         _evaluate_guarded_rbac(
             evidence,
@@ -10899,6 +10969,41 @@ def test_guarded_rbac_rejects_conflicting_raw_body_for_one_assignment_id(
                 expected_assignments=[assignment],
             ),
         )
+
+
+def test_guarded_rbac_allows_non_identity_metadata_changes_for_one_assignment_id() -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignment = _guarded_assignment(
+        principal_id=principal_id,
+        role_name="AcrPull",
+        scope=_RG_SCOPE,
+    )
+    evidence = _guarded_evidence([assignment])
+    descendant_pages = _arm_role_assignment_pages(
+        evidence,
+        collection_kind="descendants",
+    )
+    descendant_page = descendant_pages[0]
+    assert isinstance(descendant_page, dict)
+    descendant_values = descendant_page["value"]
+    assert isinstance(descendant_values, list)
+    repeated_assignment = descendant_values[0]
+    assert isinstance(repeated_assignment, dict)
+    repeated_assignment["name"] = "synthetic-display-only"
+    repeated_properties = repeated_assignment["properties"]
+    assert isinstance(repeated_properties, dict)
+    repeated_properties["description"] = "synthetic non-identity metadata"
+
+    assert (
+        _evaluate_guarded_rbac(
+            evidence,
+            _production_policy(
+                principal_id,
+                expected_assignments=[assignment],
+            ),
+        )
+        == ()
+    )
 
 
 def test_guarded_rbac_allows_identical_group_assignment_id_for_multiple_effective_principals() -> (
@@ -11125,20 +11230,12 @@ def test_guarded_rbac_accepts_paged_transitive_security_groups() -> None:
     } == {"identity-separation"}
 
 
-def test_guarded_rbac_cli_equivalent_requires_exact_flags() -> None:
-    principal_id = "11111111-1111-1111-1111-111111111111"
-    assignment = _guarded_assignment(
-        principal_id=principal_id,
-        role_name="AcrPull",
-        scope=_RG_SCOPE,
-    )
-    policy = _production_policy(
-        principal_id,
-        expected_assignments=[assignment],
-    )
-    evidence = _guarded_evidence([assignment])
-    principal = _first_principal_artifact(evidence)
-    principal["roleAssignments"] = {
+def _cli_role_assignment_evidence(
+    assignment: dict[str, str],
+    *,
+    effective_principal_id: str,
+) -> dict[str, object]:
+    return {
         "ancestors": {
             "method": "azure-cli",
             "exitCode": 0,
@@ -11148,7 +11245,7 @@ def test_guarded_rbac_cli_equivalent_requires_exact_flags() -> None:
                 "--scope",
                 _RG_SCOPE,
                 "--assignee-object-id",
-                principal_id,
+                effective_principal_id,
                 "--include-inherited",
                 "--include-groups",
                 "--output",
@@ -11163,7 +11260,7 @@ def test_guarded_rbac_cli_equivalent_requires_exact_flags() -> None:
                 "--subscription",
                 _SUBSCRIPTION_ID,
                 "--assignee-object-id",
-                principal_id,
+                effective_principal_id,
                 "--include-groups",
                 "--all",
                 "--output",
@@ -11172,6 +11269,202 @@ def test_guarded_rbac_cli_equivalent_requires_exact_flags() -> None:
             "value": [_cli_assignment(assignment)],
         },
     }
+
+
+def test_guarded_rbac_rejects_conflicting_cli_assignment_identity_for_one_id() -> None:
+    first_principal_id = "11111111-1111-1111-1111-111111111111"
+    second_principal_id = "22222222-2222-2222-2222-222222222222"
+    group_principal_id = "33333333-3333-3333-3333-333333333333"
+    assignments = [
+        _guarded_assignment(
+            principal_id=group_principal_id,
+            effective_principal_id=first_principal_id,
+            principal_type="Group",
+            role_name="AcrPull",
+            scope=_RG_SCOPE,
+        ),
+        _guarded_assignment(
+            principal_id=group_principal_id,
+            effective_principal_id=second_principal_id,
+            principal_type="Group",
+            role_name="Storage Blob Data Reader",
+            scope=_RG_SCOPE,
+        ),
+    ]
+    evidence = _guarded_evidence(assignments)
+    principals = evidence["principals"]
+    assert isinstance(principals, list)
+    first_principal = principals[0]
+    second_principal = principals[1]
+    assert isinstance(first_principal, dict)
+    assert isinstance(second_principal, dict)
+    first_principal["roleAssignments"] = _cli_role_assignment_evidence(
+        assignments[0],
+        effective_principal_id=first_principal_id,
+    )
+    second_principal["roleAssignments"] = _cli_role_assignment_evidence(
+        assignments[1],
+        effective_principal_id=second_principal_id,
+    )
+    first_cli_assignment = _cli_assignment(assignments[0])
+    shared_assignment_id = first_cli_assignment["id"]
+    second_role_assignments = second_principal["roleAssignments"]
+    assert isinstance(second_role_assignments, dict)
+    for collection_name in ("ancestors", "descendants"):
+        collection = second_role_assignments[collection_name]
+        assert isinstance(collection, dict)
+        values = collection["value"]
+        assert isinstance(values, list)
+        raw_assignment = values[0]
+        assert isinstance(raw_assignment, dict)
+        raw_assignment["id"] = shared_assignment_id
+
+    with pytest.raises(
+        PreflightInputError,
+        match="conflicting canonical assignment bodies",
+    ):
+        _evaluate_guarded_rbac(
+            evidence,
+            _production_policy(
+                first_principal_id,
+                second_principal_id,
+                expected_assignments=assignments,
+            ),
+        )
+
+
+def test_guarded_rbac_rejects_mixed_arm_cli_assignment_identity_conflict() -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignment = _guarded_assignment(
+        principal_id=principal_id,
+        role_name="AcrPull",
+        scope=_RG_SCOPE,
+    )
+    evidence = _guarded_evidence([assignment])
+    principal = _first_principal_artifact(evidence)
+    role_assignments = principal["roleAssignments"]
+    assert isinstance(role_assignments, dict)
+    cli_descendants = _cli_role_assignment_evidence(
+        assignment,
+        effective_principal_id=principal_id,
+    )["descendants"]
+    assert isinstance(cli_descendants, dict)
+    cli_values = cli_descendants["value"]
+    assert isinstance(cli_values, list)
+    cli_assignment = cli_values[0]
+    assert isinstance(cli_assignment, dict)
+    cli_assignment["roleDefinitionName"] = "Reader"
+    cli_assignment["roleDefinitionId"] = _TEST_ROLE_IDS["reader"]
+    role_assignments["descendants"] = cli_descendants
+
+    with pytest.raises(
+        PreflightInputError,
+        match="conflicting canonical assignment bodies",
+    ):
+        _evaluate_guarded_rbac(
+            evidence,
+            _production_policy(
+                principal_id,
+                expected_assignments=[assignment],
+            ),
+        )
+
+
+@pytest.mark.parametrize("missing_field", ["id", "type"])
+def test_guarded_rbac_cli_assignments_require_arm_identity_fields(
+    missing_field: str,
+) -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignment = _guarded_assignment(
+        principal_id=principal_id,
+        role_name="AcrPull",
+        scope=_RG_SCOPE,
+    )
+    evidence = _guarded_evidence([assignment])
+    principal = _first_principal_artifact(evidence)
+    principal["roleAssignments"] = _cli_role_assignment_evidence(
+        assignment,
+        effective_principal_id=principal_id,
+    )
+    role_assignments = principal["roleAssignments"]
+    assert isinstance(role_assignments, dict)
+    ancestors = role_assignments["ancestors"]
+    assert isinstance(ancestors, dict)
+    values = ancestors["value"]
+    assert isinstance(values, list)
+    cli_assignment = values[0]
+    assert isinstance(cli_assignment, dict)
+    cli_assignment.pop(missing_field)
+
+    with pytest.raises(
+        PreflightInputError,
+        match=missing_field,
+    ):
+        _evaluate_guarded_rbac(
+            evidence,
+            _production_policy(
+                principal_id,
+                expected_assignments=[assignment],
+            ),
+        )
+
+
+@pytest.mark.parametrize("collection_name", ["ancestors", "descendants"])
+def test_guarded_rbac_cli_assignments_require_exact_arm_type(
+    collection_name: str,
+) -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignment = _guarded_assignment(
+        principal_id=principal_id,
+        role_name="AcrPull",
+        scope=_RG_SCOPE,
+    )
+    evidence = _guarded_evidence([assignment])
+    principal = _first_principal_artifact(evidence)
+    principal["roleAssignments"] = _cli_role_assignment_evidence(
+        assignment,
+        effective_principal_id=principal_id,
+    )
+    role_assignments = principal["roleAssignments"]
+    assert isinstance(role_assignments, dict)
+    collection = role_assignments[collection_name]
+    assert isinstance(collection, dict)
+    values = collection["value"]
+    assert isinstance(values, list)
+    cli_assignment = values[0]
+    assert isinstance(cli_assignment, dict)
+    cli_assignment["type"] = "microsoft.authorization/roleassignments"
+
+    with pytest.raises(
+        PreflightInputError,
+        match="resource has the wrong type",
+    ):
+        _evaluate_guarded_rbac(
+            evidence,
+            _production_policy(
+                principal_id,
+                expected_assignments=[assignment],
+            ),
+        )
+
+
+def test_guarded_rbac_cli_equivalent_requires_exact_flags() -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignment = _guarded_assignment(
+        principal_id=principal_id,
+        role_name="AcrPull",
+        scope=_RG_SCOPE,
+    )
+    policy = _production_policy(
+        principal_id,
+        expected_assignments=[assignment],
+    )
+    evidence = _guarded_evidence([assignment])
+    principal = _first_principal_artifact(evidence)
+    principal["roleAssignments"] = _cli_role_assignment_evidence(
+        assignment,
+        effective_principal_id=principal_id,
+    )
     assert (
         _evaluate_guarded_rbac(
             evidence,
