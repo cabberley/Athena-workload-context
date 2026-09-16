@@ -189,11 +189,13 @@ registry subscription and resource group. It detects the registry permission mod
 `AcrPull` only for legacy RBAC registries or `Container Registry Repository Reader` for
 ABAC-repository-permissions registries. Every ABAC Repository Reader assignment uses condition
 version `2.0` and the documented request repository-name attribute with
-`StringEqualsIgnoreCase` against the one exact digest-pinned repository. The deterministic
-registry/principal/role assignment seed is intentionally unchanged from the published head so the
-condition updates the existing assignment in place instead of leaving a registry-wide grant.
-Root readiness additionally requires bounded, actual managed-identity pull evidence for the exact
-digest.
+`StringEqualsIgnoreCase` against the one exact repository derived from the digest-pinned image.
+ABAC assignment identity includes that repository; legacy `AcrPull` retains the
+registry/principal/role seed and null condition fields. The module outputs, publisher
+configuration, and readiness evidence carry the same canonical repository and condition bytes as
+PR #102, allowing the required later rebase and its governed legacy-assignment migration to
+reconcile without semantic divergence. Root readiness additionally requires bounded, actual
+managed-identity pull evidence for the exact digest.
 
 ## Consequences
 

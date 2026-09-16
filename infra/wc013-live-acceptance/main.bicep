@@ -649,12 +649,12 @@ var wc027PublisherImageInvalidCharacters = replace(replace(replace(replace(repla
 var wc027PublisherImageValid = wc027PublisherImage == toLower(wc027PublisherImage) && length(wc027PublisherImageDigest) == 64 && empty(wc027PublisherImageInvalidCharacters) && wc027PublisherImageDigest != '0000000000000000000000000000000000000000000000000000000000000000'
 var wc027ParsedPublisherConfiguration = json(
   empty(wc027PublisherConfigurationJson)
-    ? '{"deliveryBudget":{"feedColdStartSeconds":0,"feedConnectionSetupSeconds":0,"feedDeliveryJitterSeconds":0,"feedIrreversibleWriteMarginSeconds":0,"feedKedaPollingIntervalSeconds":0,"feedMinimumRemainingLifetimeSeconds":0,"feedProcessingSeconds":0,"feedTriggerRecoverySeconds":0,"minimumRemainingLifetimeSeconds":0,"publisherCasMarginSeconds":0,"publisherColdStartSeconds":0,"publisherConnectionSetupSeconds":0,"publisherKedaPollingIntervalSeconds":0,"publisherMinimumRemainingLifetimeSeconds":0,"publisherProcessingSeconds":0},"deploymentBinding":{"attachedIdentityResourceIds":[],"bindingEvidenceId":"","rbacResourceIds":[]},"enrichmentRuntimeConfiguration":{},"imagePull":{"identityClientId":"","identityPrincipalId":"","identityResourceId":"","image":"","registryResourceId":"","registryServer":"","roleAssignmentMode":"","roleAssignmentResourceId":"","roleDefinitionId":""},"requestOutbox":{"blobEndpoint":"","containerName":"","identityResourceId":""},"serviceBus":{"brokerIdentityResourceId":"","namespace":"","requestQueueName":"","requestSubmitterIdentityResourceId":""}}'
+    ? '{"deliveryBudget":{"feedColdStartSeconds":0,"feedConnectionSetupSeconds":0,"feedDeliveryJitterSeconds":0,"feedIrreversibleWriteMarginSeconds":0,"feedKedaPollingIntervalSeconds":0,"feedMinimumRemainingLifetimeSeconds":0,"feedProcessingSeconds":0,"feedTriggerRecoverySeconds":0,"minimumRemainingLifetimeSeconds":0,"publisherCasMarginSeconds":0,"publisherColdStartSeconds":0,"publisherConnectionSetupSeconds":0,"publisherKedaPollingIntervalSeconds":0,"publisherMinimumRemainingLifetimeSeconds":0,"publisherProcessingSeconds":0},"deploymentBinding":{"attachedIdentityResourceIds":[],"bindingEvidenceId":"","rbacResourceIds":[]},"enrichmentRuntimeConfiguration":{},"imagePull":{"condition":null,"conditionVersion":null,"identityClientId":"","identityPrincipalId":"","identityResourceId":"","image":"","registryResourceId":"","registryServer":"","repositoryName":"","roleAssignmentMode":"","roleAssignmentResourceId":"","roleDefinitionId":""},"requestOutbox":{"blobEndpoint":"","containerName":"","identityResourceId":""},"serviceBus":{"brokerIdentityResourceId":"","namespace":"","requestQueueName":"","requestSubmitterIdentityResourceId":""}}'
     : wc027PublisherConfigurationJson
 )
 var wc027ParsedPublisherImagePullEvidence = json(
   empty(wc027PublisherImagePullEvidenceJson)
-    ? '{"attempts":0,"image":"","managedIdentityClientId":"","maxAttempts":0,"registryResourceId":"","registryServer":"","roleAssignmentMode":"","roleDefinitionId":"","schemaVersion":"","success":false,"verifiedAt":""}'
+    ? '{"attempts":0,"condition":null,"conditionVersion":null,"image":"","managedIdentityClientId":"","maxAttempts":0,"registryResourceId":"","registryServer":"","repositoryName":"","roleAssignmentMode":"","roleDefinitionId":"","schemaVersion":"","success":false,"verifiedAt":""}'
     : wc027PublisherImagePullEvidenceJson
 )
 var wc027ParsedProducerConfiguration = json(
@@ -663,6 +663,22 @@ var wc027ParsedProducerConfiguration = json(
     : wc027EnrichmentFeedProducerConfigurationJson
 )
 var wc027PublisherImageRegistryServer = first(split(wc027PublisherImage, '/'))
+var wc027PublisherImageRepositoryReference = first(split(wc027PublisherImage, '@sha256:'))
+var wc027PublisherImageRepositoryPrefix = '${wc027PublisherImageRegistryServer}/'
+var wc027PublisherImageRepositoryName = startsWith(
+  wc027PublisherImageRepositoryReference,
+  wc027PublisherImageRepositoryPrefix
+)
+  ? substring(
+      wc027PublisherImageRepositoryReference,
+      length(wc027PublisherImageRepositoryPrefix)
+    )
+  : ''
+var wc027PublisherExpectedRepositoryCondition = '((!(ActionMatches{\'Microsoft.ContainerRegistry/registries/repositories/content/read\'}) AND !(ActionMatches{\'Microsoft.ContainerRegistry/registries/repositories/metadata/read\'})) OR (@Request[Microsoft.ContainerRegistry/registries/repositories:name] StringEqualsIgnoreCase \'${wc027PublisherImageRepositoryName}\'))'
+var wc027PublisherLegacyImagePullConditionValid = wc027ParsedPublisherConfiguration.imagePull.roleAssignmentMode == 'LegacyRegistryPermissions' && wc027ParsedPublisherConfiguration.imagePull.conditionVersion == null && wc027ParsedPublisherConfiguration.imagePull.condition == null
+var wc027PublisherAbacImagePullConditionValid = wc027ParsedPublisherConfiguration.imagePull.roleAssignmentMode == 'AbacRepositoryPermissions' && wc027ParsedPublisherConfiguration.imagePull.conditionVersion == '2.0' && wc027ParsedPublisherConfiguration.imagePull.condition == wc027PublisherExpectedRepositoryCondition
+var wc027PublisherImagePullModeConditionValid = wc027PublisherLegacyImagePullConditionValid || wc027PublisherAbacImagePullConditionValid
+var wc027PublisherImagePullConditionValid = wc027ParsedPublisherConfiguration.imagePull.repositoryName == wc027PublisherImageRepositoryName && wc027PublisherImagePullModeConditionValid
 var wc027PublisherImagePullEvidenceValid = !empty(wc027PublisherImagePullEvidenceJson) && !contains([
   wc027ParsedPublisherImagePullEvidence.schemaVersion == 'athena.wc027AcrDigestPullReadiness.v1'
   wc027ParsedPublisherImagePullEvidence.success == true
@@ -670,9 +686,13 @@ var wc027PublisherImagePullEvidenceValid = !empty(wc027PublisherImagePullEvidenc
   wc027ParsedPublisherImagePullEvidence.registryServer == wc027ParsedPublisherConfiguration.imagePull.registryServer
   wc027ParsedPublisherImagePullEvidence.image == wc027PublisherImage
   wc027ParsedPublisherConfiguration.imagePull.image == wc027PublisherImage
+  wc027ParsedPublisherImagePullEvidence.repositoryName == wc027ParsedPublisherConfiguration.imagePull.repositoryName
   toLower(wc027ParsedPublisherImagePullEvidence.managedIdentityClientId) == toLower(wc027ParsedPublisherConfiguration.imagePull.identityClientId)
   wc027ParsedPublisherImagePullEvidence.roleAssignmentMode == wc027ParsedPublisherConfiguration.imagePull.roleAssignmentMode
   wc027ParsedPublisherImagePullEvidence.roleDefinitionId == wc027ParsedPublisherConfiguration.imagePull.roleDefinitionId
+  wc027ParsedPublisherImagePullEvidence.conditionVersion == wc027ParsedPublisherConfiguration.imagePull.conditionVersion
+  wc027ParsedPublisherImagePullEvidence.condition == wc027ParsedPublisherConfiguration.imagePull.condition
+  wc027PublisherImagePullConditionValid
   wc027ParsedPublisherImagePullEvidence.attempts >= 1
   wc027ParsedPublisherImagePullEvidence.maxAttempts >= wc027ParsedPublisherImagePullEvidence.attempts
   wc027ParsedPublisherImagePullEvidence.maxAttempts <= 20

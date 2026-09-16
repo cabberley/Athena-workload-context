@@ -483,6 +483,7 @@ def _bicep_generated_publisher_configuration() -> dict[str, object]:
                 "athenawc027.azurecr.io/athena/"
                 "wc027-guidance-authority-publisher@sha256:" + "a" * 64
             ),
+            "repositoryName": "athena/wc027-guidance-authority-publisher",
             "roleAssignmentMode": "LegacyRegistryPermissions",
             "roleDefinitionId": "7f951dda-4ed3-4680-a7ca-43fe172d538d",
             "roleAssignmentResourceId": (
@@ -492,6 +493,8 @@ def _bicep_generated_publisher_configuration() -> dict[str, object]:
                 "Microsoft.Authorization/roleAssignments/"
                 "30000000-0000-0000-0000-000000000001"
             ),
+            "conditionVersion": None,
+            "condition": None,
             "identityClientId": client_id(0),
             "identityResourceId": identity_resource_id(0),
             "identityPrincipalId": "30000000-0000-0000-0000-000000000002",
@@ -573,6 +576,9 @@ def test_publisher_configuration_preserves_logical_and_physical_binding_keys() -
     assert configuration.delivery_budget.minimum_remaining_lifetime_seconds == 150
     assert configuration.image_pull.role_assignment_mode == ("LegacyRegistryPermissions")
     assert configuration.image_pull.role_definition_id == "7f951dda-4ed3-4680-a7ca-43fe172d538d"
+    assert configuration.image_pull.repository_name == "athena/wc027-guidance-authority-publisher"
+    assert configuration.image_pull.condition_version is None
+    assert configuration.image_pull.condition is None
 
 
 @pytest.mark.parametrize(
@@ -633,11 +639,21 @@ def test_publisher_configuration_rejects_image_pull_role_mode_mismatch(
 
 def test_publisher_configuration_accepts_abac_repository_reader() -> None:
     payload = _bicep_generated_publisher_configuration()
+    repository_name = payload["imagePull"]["repositoryName"]  # type: ignore[index]
     payload["imagePull"]["roleAssignmentMode"] = (  # type: ignore[index]
         "AbacRepositoryPermissions"
     )
     payload["imagePull"]["roleDefinitionId"] = (  # type: ignore[index]
         "b93aa761-3e63-49ed-ac28-beffa264f7ac"
+    )
+    payload["imagePull"]["conditionVersion"] = "2.0"  # type: ignore[index]
+    payload["imagePull"]["condition"] = (  # type: ignore[index]
+        "((!(ActionMatches{'Microsoft.ContainerRegistry/registries/"
+        "repositories/content/read'}) AND "
+        "!(ActionMatches{'Microsoft.ContainerRegistry/registries/"
+        "repositories/metadata/read'})) OR "
+        "(@Request[Microsoft.ContainerRegistry/registries/repositories:name] "
+        f"StringEqualsIgnoreCase '{repository_name}'))"
     )
 
     configuration = Wc027GuidanceAuthorityPublisherConfiguration.model_validate_json(
@@ -645,6 +661,51 @@ def test_publisher_configuration_accepts_abac_repository_reader() -> None:
     )
 
     assert configuration.image_pull.role_assignment_mode == ("AbacRepositoryPermissions")
+    assert configuration.image_pull.repository_name == repository_name
+    assert configuration.image_pull.condition_version == "2.0"
+    assert configuration.image_pull.condition == payload["imagePull"]["condition"]  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("repositoryName", "athena/other-repository"),
+        ("conditionVersion", "1.0"),
+        ("condition", "registry-wide"),
+    ),
+)
+def test_publisher_configuration_rejects_abac_repository_condition_drift(
+    field: str,
+    value: str,
+) -> None:
+    payload = _bicep_generated_publisher_configuration()
+    repository_name = payload["imagePull"]["repositoryName"]  # type: ignore[index]
+    payload["imagePull"]["roleAssignmentMode"] = "AbacRepositoryPermissions"  # type: ignore[index]
+    payload["imagePull"]["roleDefinitionId"] = (  # type: ignore[index]
+        "b93aa761-3e63-49ed-ac28-beffa264f7ac"
+    )
+    payload["imagePull"]["conditionVersion"] = "2.0"  # type: ignore[index]
+    payload["imagePull"]["condition"] = (  # type: ignore[index]
+        "((!(ActionMatches{'Microsoft.ContainerRegistry/registries/"
+        "repositories/content/read'}) AND "
+        "!(ActionMatches{'Microsoft.ContainerRegistry/registries/"
+        "repositories/metadata/read'})) OR "
+        "(@Request[Microsoft.ContainerRegistry/registries/repositories:name] "
+        f"StringEqualsIgnoreCase '{repository_name}'))"
+    )
+    payload["imagePull"][field] = value  # type: ignore[index]
+
+    with pytest.raises(ValueError, match="exact repository"):
+        Wc027GuidanceAuthorityPublisherConfiguration.model_validate_json(json.dumps(payload))
+
+
+def test_publisher_configuration_rejects_legacy_repository_condition() -> None:
+    payload = _bicep_generated_publisher_configuration()
+    payload["imagePull"]["conditionVersion"] = "2.0"  # type: ignore[index]
+    payload["imagePull"]["condition"] = "registry-wide"  # type: ignore[index]
+
+    with pytest.raises(ValueError, match="exact repository"):
+        Wc027GuidanceAuthorityPublisherConfiguration.model_validate_json(json.dumps(payload))
 
 
 def test_publisher_configuration_rejects_reused_request_authority() -> None:

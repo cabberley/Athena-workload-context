@@ -86,10 +86,10 @@ var requestOutboxContainerName = 'wc027-guidance-request-outbox'
 var serviceBusDataReceiverRoleDefinitionId = '4f6c0938-94ea-4d52-8e5a-2e02b7ef8e7d'
 var serviceBusDataSenderRoleDefinitionId = '69a216fc-b8fb-44d8-bc22-1f3c2cd27a39'
 var acrPullRoleDefinitionId = '7f951dda-4ed3-4680-a7ca-43fe172d538d'
-var repositoryReaderRoleDefinitionId = 'b93aa761-3e63-49ed-ac28-beffa264f7ac'
-var imagePullRoleDefinitionId = registryRoleAssignmentMode == 'LegacyRegistryPermissions'
+var acrRepositoryReaderRoleDefinitionId = 'b93aa761-3e63-49ed-ac28-beffa264f7ac'
+var registryPullRoleDefinitionGuid = registryRoleAssignmentMode == 'LegacyRegistryPermissions'
   ? acrPullRoleDefinitionId
-  : repositoryReaderRoleDefinitionId
+  : acrRepositoryReaderRoleDefinitionId
 var guidancePublisherKedaPollingIntervalSeconds = 30
 var guidancePublisherColdStartSeconds = 30
 var guidancePublisherConnectionSetupSeconds = 30
@@ -264,9 +264,21 @@ resource registry 'Microsoft.ContainerRegistry/registries@2025-11-01' existing =
   )
 }
 
+var registrySubscriptionId = validatedRegistryScope.subscriptionId
+var registryResourceGroupName = validatedRegistryScope.resourceGroupName
+var registryScopedResourceId = resourceId(
+  registrySubscriptionId,
+  registryResourceGroupName,
+  'Microsoft.ContainerRegistry/registries',
+  validatedRegistryScope.registryName
+)
+var registryPullRoleDefinitionId = subscriptionResourceId(
+  registrySubscriptionId,
+  'Microsoft.Authorization/roleDefinitions',
+  registryPullRoleDefinitionGuid
+)
 var expectedRegistryServer = '${toLower(registry.name)}.azurecr.io'
-var imageRepositoryName = 'athena/wc027-guidance-authority-publisher'
-var imagePrefix = '${expectedRegistryServer}/${imageRepositoryName}@sha256:'
+var imagePrefix = '${expectedRegistryServer}/athena/wc027-guidance-authority-publisher@sha256:'
 var imageDigest = replace(publisherImage, imagePrefix, '')
 var imageDigestWithoutDigits = replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(
   imageDigest,
@@ -284,11 +296,31 @@ var validatedPublisherImage = registryServer == expectedRegistryServer && publis
 ) && length(imageDigest) == 64 && empty(imageDigestInvalidCharacters) && imageDigest != '0000000000000000000000000000000000000000000000000000000000000000'
   ? publisherImage
   : fail('publisherImage must be a real digest-pinned image in the supplied registry')
+var publisherImageRepositoryName = replace(
+  first(split(validatedPublisherImage, '@sha256:')),
+  '${expectedRegistryServer}/',
+  ''
+)
+var registryPullRoleAssignmentId = extensionResourceId(
+  registryScopedResourceId,
+  'Microsoft.Authorization/roleAssignments',
+  registryRoleAssignmentMode == 'AbacRepositoryPermissions'
+    ? guid(
+        registryScopedResourceId,
+      brokerIdentityPrincipalId,
+        registryPullRoleDefinitionId,
+        publisherImageRepositoryName
+      )
+    : guid(registryScopedResourceId, brokerIdentityPrincipalId, registryPullRoleDefinitionId)
+)
 
 resource brokerIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2024-11-30' existing = {
   name: last(split(brokerIdentityResourceId, '/'))
   scope: resourceGroup(split(brokerIdentityResourceId, '/')[2], split(brokerIdentityResourceId, '/')[4])
 }
+var validatedBrokerIdentityPrincipalId = brokerIdentity.properties.principalId == brokerIdentityPrincipalId
+  ? brokerIdentityPrincipalId
+  : fail('brokerIdentityPrincipalId must match the server-returned managed identity principal ID')
 
 resource authorityReaderIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2024-11-30' existing = {
   name: last(split(authorityReaderIdentityResourceId, '/'))
@@ -552,15 +584,14 @@ module bindingSigner 'modules/key-signer-rbac.bicep' = {
 module publisherImagePull '../wc027-enrichment-feed-runtime/modules/acr-pull-rbac.bicep' = {
   name: 'wc027-guidance-publisher-acr-pull'
   scope: resourceGroup(
-    validatedRegistryScope.subscriptionId,
-    validatedRegistryScope.resourceGroupName
+    registrySubscriptionId,
+    registryResourceGroupName
   )
   params: {
-    registryName: registry.name
-    identityResourceId: brokerIdentity.id
-    identityPrincipalId: brokerIdentityPrincipalId
-    repositoryName: imageRepositoryName
-    expectedRegistryRoleAssignmentMode: registryRoleAssignmentMode
+    registryResourceId: registryResourceId
+    identityPrincipalId: validatedBrokerIdentityPrincipalId
+    image: validatedPublisherImage
+    registryRoleAssignmentMode: registryRoleAssignmentMode
   }
 }
 
@@ -578,15 +609,6 @@ var activationTableResourceId = '${activationStorageAccountResourceId}/tableServ
 var activationWriterRoleId = extensionResourceId(activationResourceGroupId, 'Microsoft.Authorization/roleDefinitions', guid(activationTableResourceId, 'athena-wc027-table-cas'))
 var activationWriterAssignmentId = extensionResourceId(activationTableResourceId, 'Microsoft.Authorization/roleAssignments', guid(activationTableResourceId, activationWriterIdentity.id, activationWriterRoleId))
 var bindingSignerRoleId = extensionResourceId('/subscriptions/${split(bindingKeyResourceId, '/')[2]}/resourceGroups/${split(bindingKeyResourceId, '/')[4]}', 'Microsoft.Authorization/roleDefinitions', guid(bindingKey.id, 'athena-wc027-key-signer'))
-var publisherImagePullRoleAssignmentResourceId = extensionResourceId(
-  registry.id,
-  'Microsoft.Authorization/roleAssignments',
-  guid(
-    registry.id,
-    brokerIdentityPrincipalId,
-    imagePullRoleDefinitionId
-  )
-)
 var coreRbacResourceIds = [
   requestReceiver.id
   triggerSender.id
@@ -602,7 +624,7 @@ var coreRbacResourceIds = [
   extensionResourceId(bindingKey.id, 'Microsoft.Authorization/roleAssignments', guid(bindingKey.id, bindingTrustReaderIdentity.id, bindingKeyVerifierRoleId))
   bindingSignerRoleId
   extensionResourceId(bindingKey.id, 'Microsoft.Authorization/roleAssignments', guid(bindingKey.id, bindingSignerIdentity.id, bindingSignerRoleId))
-  publisherImagePullRoleAssignmentResourceId
+  registryPullRoleAssignmentId
 ]
 var submitterRbacResourceIds = map(validatedRequestSubmitterIdentityResourceIds, identityResourceId => extensionResourceId(requestQueue.id, 'Microsoft.Authorization/roleAssignments', guid(requestQueue.id, identityResourceId, serviceBusDataSenderRoleDefinitionId)))
 var rbacResourceIds = concat(coreRbacResourceIds, submitterRbacResourceIds)
@@ -620,15 +642,18 @@ var publisherConfiguration = {
     requestSubmitterIdentityResourceId: submitterIdentities[0].id
   }
   imagePull: {
-    registryResourceId: registry.id
+    registryResourceId: publisherImagePull.outputs.registryResourceId
     registryServer: registryServer
     image: validatedPublisherImage
-    roleAssignmentMode: registryRoleAssignmentMode
-    roleDefinitionId: imagePullRoleDefinitionId
-    roleAssignmentResourceId: publisherImagePullRoleAssignmentResourceId
+    repositoryName: publisherImagePull.outputs.repositoryName
+    roleAssignmentMode: publisherImagePull.outputs.roleAssignmentMode
+    roleDefinitionId: registryPullRoleDefinitionGuid
+    roleAssignmentResourceId: publisherImagePull.outputs.roleAssignmentResourceId
+    conditionVersion: publisherImagePull.outputs.?conditionVersion
+    condition: publisherImagePull.outputs.?condition
     identityClientId: brokerIdentity.properties.clientId
     identityResourceId: brokerIdentity.id
-    identityPrincipalId: brokerIdentityPrincipalId
+    identityPrincipalId: validatedBrokerIdentityPrincipalId
   }
   requestOutbox: {
     blobEndpoint: requestOutboxBlobEndpoint
@@ -759,15 +784,21 @@ resource publisherJob 'Microsoft.App/jobs@2025-01-01' = {
   dependsOn: [
     requestSubmitters
     requestOutboxReaderRbac
-    publisherImagePull
   ]
 }
 
 output publisherJobResourceId string = publisherJob.id
 output publisherImage string = validatedPublisherImage
-output publisherImagePullRoleAssignmentMode string = registryRoleAssignmentMode
-output publisherImagePullRoleDefinitionId string = imagePullRoleDefinitionId
-output publisherImagePullRoleAssignmentResourceId string = publisherImagePullRoleAssignmentResourceId
+output publisherImagePullRoleAssignmentMode string = publisherImagePull.outputs.roleAssignmentMode
+output publisherImagePullRoleDefinitionId string = registryPullRoleDefinitionGuid
+output publisherImagePullRoleAssignmentResourceId string = publisherImagePull.outputs.roleAssignmentResourceId
+output registryResourceId string = publisherImagePull.outputs.registryResourceId
+output registryRoleAssignmentMode string = publisherImagePull.outputs.roleAssignmentMode
+output registryRepositoryName string = publisherImagePull.outputs.repositoryName
+output registryPullRoleDefinitionId string = publisherImagePull.outputs.roleDefinitionResourceId
+output registryPullRoleAssignmentResourceId string = publisherImagePull.outputs.roleAssignmentResourceId
+output registryPullConditionVersion string? = publisherImagePull.outputs.?conditionVersion
+output registryPullCondition string? = publisherImagePull.outputs.?condition
 output deployedPublisherConfigurationJson string = publisherConfigurationJson
 output deployedPublisherConfigurationDigest string = startsWith(publisherConfigurationDigest, 'sha256:')
   ? publisherConfigurationDigest

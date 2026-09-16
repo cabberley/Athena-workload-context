@@ -142,9 +142,8 @@ Regression tests assert both versions and the SDK inheritance contract:
 - separate exact-key request signer and request public-key reader identities;
 - ACR pull for the event-trigger identity, deployed at the exact validated subscription and
   resource group parsed from `registryResourceId`; ABAC-mode Repository Reader assignments use
-  condition version `2.0` and an exact case-insensitive repository-name condition, while legacy
-  registries retain `AcrPull`; the existing deterministic assignment ID is preserved so an
-  unconditioned published assignment is updated in place rather than left behind;
+  condition version `2.0` and the shared canonical exact repository-name expression derived from
+  the digest-pinned image, while legacy registries retain unconditioned `AcrPull`;
 - generated non-secret strict configuration and deterministic RBAC evidence; and
 - a publisher handoff containing the existing output queue, sender identity, exact request key
   binding, producer Job resource ID, and configuration digest.
@@ -250,7 +249,12 @@ cross-subscription or cross-resource-group registries. The module reads the regi
 `roleAssignmentMode`: `LegacyRegistryPermissions` receives `AcrPull`, while
 `AbacRepositoryPermissions` receives `Container Registry Repository Reader`. The deterministic
 role-assignment GUID is seeded with the registry ID, managed-identity principal object ID, and
-selected role-definition ID, and the assignment declares `principalType: ServicePrincipal`.
+selected role-definition ID; ABAC mode additionally binds the derived repository name. The
+assignment declares `principalType: ServicePrincipal`. Module outputs, publisher configuration,
+and pull-readiness evidence carry the same repository, condition version, and condition bytes.
+Legacy mode carries null condition fields. The later PR #102 integration rebase owns migration of
+the prior unconditioned Repository Reader assignment and can reconcile this identical shared
+module without semantic divergence.
 
 Before setting publisher readiness, run
 `infra/wc027-guidance-authority-publisher/Test-AcrDigestPullReadiness.ps1` on an Azure host that can

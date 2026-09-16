@@ -387,8 +387,13 @@ def test_wc027_runtime_is_private_keyless_and_session_ordered() -> None:
     assert "pollingInterval: guidanceFeedKedaPollingIntervalSeconds" in source
     assert "param registryRoleAssignmentMode string" in source
     assert "param brokerIdentityPrincipalId string" in source
-    assert "identityPrincipalId: brokerIdentityPrincipalId" in source
-    assert "expectedRegistryRoleAssignmentMode: registryRoleAssignmentMode" in source
+    assert "brokerIdentity.properties.principalId == brokerIdentityPrincipalId" in source
+    assert "identityPrincipalId: validatedBrokerIdentityPrincipalId" in source
+    assert "image: validatedProducerImage" in source
+    assert "registryRoleAssignmentMode: registryRoleAssignmentMode" in source
+    assert "producerImagePull.outputs.repositoryName" in source
+    assert "producerImagePull.outputs.?conditionVersion" in source
+    assert "producerImagePull.outputs.?condition" in source
     assert "triggerSubmitterIdentityResourceIds" in source
     assert "principalId: triggerSubmitterIdentities[index].properties.principalId" in source
     assert "scope: triggerQueue" in source

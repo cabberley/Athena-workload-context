@@ -76,10 +76,10 @@ var serviceBusDataReceiverRoleDefinitionId = '4f6c0938-94ea-4d52-8e5a-2e02b7ef8e
 var serviceBusDataSenderRoleDefinitionId = '69a216fc-b8fb-44d8-bc22-1f3c2cd27a39'
 var storageBlobDataReaderRoleDefinitionId = '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1'
 var acrPullRoleDefinitionId = '7f951dda-4ed3-4680-a7ca-43fe172d538d'
-var repositoryReaderRoleDefinitionId = 'b93aa761-3e63-49ed-ac28-beffa264f7ac'
-var imagePullRoleDefinitionId = registryRoleAssignmentMode == 'LegacyRegistryPermissions'
+var acrRepositoryReaderRoleDefinitionId = 'b93aa761-3e63-49ed-ac28-beffa264f7ac'
+var registryPullRoleDefinitionGuid = registryRoleAssignmentMode == 'LegacyRegistryPermissions'
   ? acrPullRoleDefinitionId
-  : repositoryReaderRoleDefinitionId
+  : acrRepositoryReaderRoleDefinitionId
 var guidancePublisherKedaPollingIntervalSeconds = 30
 var guidancePublisherColdStartSeconds = 30
 var guidancePublisherConnectionSetupSeconds = 30
@@ -267,9 +267,21 @@ resource registry 'Microsoft.ContainerRegistry/registries@2025-11-01' existing =
   )
 }
 
+var registrySubscriptionId = validatedRegistryScope.subscriptionId
+var registryResourceGroupName = validatedRegistryScope.resourceGroupName
+var registryScopedResourceId = resourceId(
+  registrySubscriptionId,
+  registryResourceGroupName,
+  'Microsoft.ContainerRegistry/registries',
+  validatedRegistryScope.registryName
+)
+var registryPullRoleDefinitionId = subscriptionResourceId(
+  registrySubscriptionId,
+  'Microsoft.Authorization/roleDefinitions',
+  registryPullRoleDefinitionGuid
+)
 var expectedRegistryServer = '${toLower(registry.name)}.azurecr.io'
-var imageRepositoryName = 'athena/wc027-guidance-publication-request-producer'
-var imagePrefix = '${expectedRegistryServer}/${imageRepositoryName}@sha256:'
+var imagePrefix = '${expectedRegistryServer}/athena/wc027-guidance-publication-request-producer@sha256:'
 var imageDigest = replace(producerImage, imagePrefix, '')
 var imageDigestWithoutDigits = replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(
   imageDigest,
@@ -287,11 +299,31 @@ var validatedProducerImage = registryServer == expectedRegistryServer && produce
 ) && length(imageDigest) == 64 && empty(imageDigestInvalidCharacters) && imageDigest != '0000000000000000000000000000000000000000000000000000000000000000'
   ? producerImage
   : fail('producerImage must be a real digest-pinned image in the supplied registry')
+var producerImageRepositoryName = replace(
+  first(split(validatedProducerImage, '@sha256:')),
+  '${expectedRegistryServer}/',
+  ''
+)
+var registryPullRoleAssignmentId = extensionResourceId(
+  registryScopedResourceId,
+  'Microsoft.Authorization/roleAssignments',
+  registryRoleAssignmentMode == 'AbacRepositoryPermissions'
+    ? guid(
+        registryScopedResourceId,
+      receiverIdentityPrincipalId,
+        registryPullRoleDefinitionId,
+        producerImageRepositoryName
+      )
+    : guid(registryScopedResourceId, receiverIdentityPrincipalId, registryPullRoleDefinitionId)
+)
 
 resource receiverIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2024-11-30' existing = {
   name: last(split(receiverIdentityResourceId, '/'))
   scope: resourceGroup(split(receiverIdentityResourceId, '/')[2], split(receiverIdentityResourceId, '/')[4])
 }
+var validatedReceiverIdentityPrincipalId = receiverIdentity.properties.principalId == receiverIdentityPrincipalId
+  ? receiverIdentityPrincipalId
+  : fail('receiverIdentityPrincipalId must match the server-returned managed identity principal ID')
 
 resource senderIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2024-11-30' existing = {
   name: last(split(senderIdentityResourceId, '/'))
@@ -567,15 +599,14 @@ module requestKeySigner '../wc027-guidance-authority-publisher/modules/key-signe
 module producerImagePull '../wc027-enrichment-feed-runtime/modules/acr-pull-rbac.bicep' = {
   name: 'wc027-guidance-request-acr-pull'
   scope: resourceGroup(
-    validatedRegistryScope.subscriptionId,
-    validatedRegistryScope.resourceGroupName
+    registrySubscriptionId,
+    registryResourceGroupName
   )
   params: {
-    registryName: registry.name
-    identityResourceId: receiverIdentity.id
-    identityPrincipalId: receiverIdentityPrincipalId
-    repositoryName: imageRepositoryName
-    expectedRegistryRoleAssignmentMode: registryRoleAssignmentMode
+    registryResourceId: registryResourceId
+    identityPrincipalId: validatedReceiverIdentityPrincipalId
+    image: validatedProducerImage
+    registryRoleAssignmentMode: registryRoleAssignmentMode
   }
 }
 
@@ -603,15 +634,7 @@ var coreRbacResourceIds = [
   extensionResourceId(requestKey.id, 'Microsoft.Authorization/roleAssignments', guid(requestKey.id, requestVerifierIdentity.id, publicRequestKeyReaderRoleId))
   requestSignerRoleId
   extensionResourceId(requestKey.id, 'Microsoft.Authorization/roleAssignments', guid(requestKey.id, requestSignerIdentity.id, requestSignerRoleId))
-  extensionResourceId(
-    registry.id,
-    'Microsoft.Authorization/roleAssignments',
-    guid(
-      registry.id,
-      receiverIdentityPrincipalId,
-      imagePullRoleDefinitionId
-    )
-  )
+  registryPullRoleAssignmentId
 ]
 var submitterRbacResourceIds = map(validatedInputSubmitterIdentityResourceIds, identityResourceId => extensionResourceId(inputQueue.id, 'Microsoft.Authorization/roleAssignments', guid(inputQueue.id, identityResourceId, serviceBusDataSenderRoleDefinitionId)))
 var rbacResourceIds = concat(coreRbacResourceIds, submitterRbacResourceIds)
@@ -799,6 +822,13 @@ var publisherHandoff = {
 
 output producerJobResourceId string = producerJob.id
 output producerImage string = validatedProducerImage
+output registryResourceId string = producerImagePull.outputs.registryResourceId
+output registryRoleAssignmentMode string = producerImagePull.outputs.roleAssignmentMode
+output registryRepositoryName string = producerImagePull.outputs.repositoryName
+output registryPullRoleDefinitionId string = producerImagePull.outputs.roleDefinitionResourceId
+output registryPullRoleAssignmentResourceId string = producerImagePull.outputs.roleAssignmentResourceId
+output registryPullConditionVersion string? = producerImagePull.outputs.?conditionVersion
+output registryPullCondition string? = producerImagePull.outputs.?condition
 output deployedProducerConfigurationJson string = producerConfigurationJson
 output deployedProducerConfigurationDigest string = startsWith(producerConfigurationDigest, 'sha256:')
   ? producerConfigurationDigest

@@ -90,9 +90,12 @@ class _ImagePullBinding:
     registry_resource_id: str
     registry_server: str
     image: str
+    repository_name: str
     role_assignment_mode: str
     role_definition_id: str
     role_assignment_resource_id: str
+    condition_version: str | None
+    condition: str | None
     identity_client_id: str
     identity_resource_id: str
     identity_principal_id: str
@@ -169,9 +172,12 @@ class Wc027GuidanceAuthorityPublisherConfiguration:
                 "registryResourceId",
                 "registryServer",
                 "image",
+                "repositoryName",
                 "roleAssignmentMode",
                 "roleDefinitionId",
                 "roleAssignmentResourceId",
+                "conditionVersion",
+                "condition",
                 "identityClientId",
                 "identityResourceId",
                 "identityPrincipalId",
@@ -236,6 +242,11 @@ class Wc027GuidanceAuthorityPublisherConfiguration:
                     "imagePull.image",
                     maximum=2048,
                 ),
+                repository_name=_text(
+                    image_pull["repositoryName"],
+                    "imagePull.repositoryName",
+                    maximum=256,
+                ),
                 role_assignment_mode=_text(
                     image_pull["roleAssignmentMode"],
                     "imagePull.roleAssignmentMode",
@@ -249,6 +260,16 @@ class Wc027GuidanceAuthorityPublisherConfiguration:
                     image_pull["roleAssignmentResourceId"],
                     "imagePull.roleAssignmentResourceId",
                     maximum=2048,
+                ),
+                condition_version=_nullable_text(
+                    image_pull["conditionVersion"],
+                    "imagePull.conditionVersion",
+                    maximum=16,
+                ),
+                condition=_nullable_text(
+                    image_pull["condition"],
+                    "imagePull.condition",
+                    maximum=4096,
                 ),
                 identity_client_id=_client_id(
                     image_pull["identityClientId"],
@@ -342,9 +363,35 @@ class Wc027GuidanceAuthorityPublisherConfiguration:
                 else ""
             )
         )
+        image_parts = image_pull.image.split("@sha256:")
+        repository_prefix = f"{image_pull.registry_server}/"
+        image_reference = image_parts[0] if len(image_parts) == 2 else ""
+        image_digest = image_parts[1] if len(image_parts) == 2 else ""
+        repository_name = (
+            image_reference.removeprefix(repository_prefix)
+            if image_reference.startswith(repository_prefix)
+            else ""
+        )
+        expected_condition_version = (
+            "2.0" if image_pull.role_assignment_mode == "AbacRepositoryPermissions" else None
+        )
+        expected_condition = (
+            _acr_repository_condition(repository_name)
+            if expected_condition_version is not None
+            else None
+        )
         if (
             image_pull.registry_server != image_pull.image.split("/", maxsplit=1)[0]
+            or image_pull.image != image_pull.image.lower()
+            or len(image_parts) != 2
+            or len(image_digest) != 64
+            or any(character not in "0123456789abcdef" for character in image_digest)
+            or image_digest == "0" * 64
+            or not repository_name
+            or image_pull.repository_name != repository_name
             or image_pull.role_definition_id != expected_role_definition_id
+            or image_pull.condition_version != expected_condition_version
+            or image_pull.condition != expected_condition
             or image_pull.identity_client_id != self.broker_identity_client_id
             or image_pull.identity_resource_id != self.broker_identity_resource_id
             or not image_pull.role_assignment_resource_id.startswith(
@@ -353,7 +400,8 @@ class Wc027GuidanceAuthorityPublisherConfiguration:
             )
         ):
             raise ValueError(
-                "publisher image pull binding does not match its registry mode and broker identity"
+                "publisher image pull binding does not match its exact repository, "
+                "registry mode, condition, and broker identity"
             )
         if self.delivery_budget != runtime.delivery_budget:
             raise ValueError("publisher delivery budget does not match the enrichment runtime")
@@ -572,6 +620,38 @@ def _table_endpoint(value: object, name: str) -> str:
     from athena_context.enrichment.production import _https_origin
 
     return _https_origin(value, name, suffix=".table.core.windows.net")
+
+
+def _nullable_text(
+    value: object,
+    name: str,
+    *,
+    maximum: int,
+) -> str | None:
+    if value is None:
+        return None
+    return _text(value, name, maximum=maximum)
+
+
+def _acr_repository_condition(repository_name: str) -> str:
+    if (
+        type(repository_name) is not str
+        or not repository_name
+        or repository_name != repository_name.lower()
+        or repository_name.startswith("/")
+        or repository_name.endswith("/")
+        or any(character in repository_name for character in "@:?#%")
+        or "//" in repository_name
+    ):
+        raise ValueError("ACR repository name must be one exact lowercase repository")
+    return (
+        "((!(ActionMatches{'Microsoft.ContainerRegistry/registries/"
+        "repositories/content/read'}) AND "
+        "!(ActionMatches{'Microsoft.ContainerRegistry/registries/"
+        "repositories/metadata/read'})) OR "
+        "(@Request[Microsoft.ContainerRegistry/registries/repositories:name] "
+        f"StringEqualsIgnoreCase '{repository_name}'))"
+    )
 
 
 def _utc_now_milliseconds() -> datetime:

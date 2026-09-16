@@ -193,11 +193,12 @@ zero-option `noMatchingControl` authority.
 All correlation source readers and upstream authority keys remain separately governed resources.
 For ACR registries in `AbacRepositoryPermissions` mode, each WC-027 Job receives `Container
 Registry Repository Reader` only with condition version `2.0` and an exact
-`StringEqualsIgnoreCase` request-repository condition for that Job's digest-pinned repository.
-Sibling, prefix-alias, and cross-component repositories remain denied. Legacy registries retain
-the existing registry-scoped `AcrPull` assignment. The role-assignment GUID remains the published
-registry/principal/role seed so ABAC deployment updates the prior assignment in place and cannot
-leave a registry-wide Repository Reader grant behind.
+`StringEqualsIgnoreCase` request-repository condition derived from that Job's digest-pinned image.
+Sibling, prefix-alias, and cross-component repositories remain denied. ABAC assignment identity
+also binds the repository name; legacy registries retain the registry/principal/role seed and
+carry unconditioned `AcrPull` with null condition fields. Runtime and publisher outputs expose the
+same repository, condition version, and condition bytes expected by PR #102 deployment evidence,
+so the later rebase can reconcile the shared module without semantic divergence.
 The module grants each configured reader only its exact container with `Blob.List` denied, and
 grants the trust-reader identity only exact-key read/verify data actions on the configured
 verification keys. Publisher authority and activation destinations are derived from the embedded

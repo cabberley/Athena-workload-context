@@ -40,6 +40,33 @@ $registryServer = "$($registryName.ToLowerInvariant()).azurecr.io"
 if (-not $Image.StartsWith("$registryServer/", [System.StringComparison]::Ordinal)) {
     throw 'Image must use the exact registry login server derived from RegistryResourceId.'
 }
+$imageParts = $Image.Split(
+    @('@sha256:'),
+    2,
+    [System.StringSplitOptions]::None
+)
+if ($imageParts.Count -ne 2) {
+    throw 'Image must contain one exact sha256 digest separator.'
+}
+$repositoryPrefix = "$registryServer/"
+$repositoryReference = $imageParts[0]
+if (-not $repositoryReference.StartsWith(
+    $repositoryPrefix,
+    [System.StringComparison]::Ordinal
+)) {
+    throw 'Image repository must use the exact registry login server.'
+}
+$repositoryName = $repositoryReference.Substring($repositoryPrefix.Length)
+if (
+    [string]::IsNullOrWhiteSpace($repositoryName) -or
+    $repositoryName -cne $repositoryName.ToLowerInvariant() -or
+    $repositoryName.StartsWith('/') -or
+    $repositoryName.EndsWith('/') -or
+    $repositoryName.Contains('//') -or
+    $repositoryName.IndexOfAny([char[]] '@:?#%') -ge 0
+) {
+    throw 'Image must identify one exact lowercase ACR repository.'
+}
 
 if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
     throw 'Azure CLI is required for managed-identity ACR readiness verification.'
@@ -62,6 +89,20 @@ $roleDefinitionId = if ($RegistryRoleAssignmentMode -eq 'LegacyRegistryPermissio
 }
 else {
     'b93aa761-3e63-49ed-ac28-beffa264f7ac'
+}
+$conditionVersion = if (
+    $RegistryRoleAssignmentMode -eq 'AbacRepositoryPermissions'
+) {
+    '2.0'
+}
+else {
+    $null
+}
+$condition = if ($RegistryRoleAssignmentMode -eq 'AbacRepositoryPermissions') {
+    "((!(ActionMatches{'Microsoft.ContainerRegistry/registries/repositories/content/read'}) AND !(ActionMatches{'Microsoft.ContainerRegistry/registries/repositories/metadata/read'})) OR (@Request[Microsoft.ContainerRegistry/registries/repositories:name] StringEqualsIgnoreCase '$repositoryName'))"
+}
+else {
+    $null
 }
 
 $nullGuid = '00000000-0000-0000-0000-000000000000'
@@ -97,9 +138,12 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
             registryResourceId = $RegistryResourceId
             registryServer = $registryServer
             image = $Image
+            repositoryName = $repositoryName
             managedIdentityClientId = $ManagedIdentityClientId.ToLowerInvariant()
             roleAssignmentMode = $RegistryRoleAssignmentMode
             roleDefinitionId = $roleDefinitionId
+            conditionVersion = $conditionVersion
+            condition = $condition
             attempts = $attempt
             maxAttempts = $MaxAttempts
             verifiedAt = [DateTimeOffset]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss.fffZ')

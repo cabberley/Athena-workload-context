@@ -325,23 +325,27 @@ def test_request_producer_image_pull_uses_validated_cross_rg_registry_scope() ->
         "module producerImagePull '../wc027-enrichment-feed-runtime/modules/acr-pull-rbac.bicep' =",
         maxsplit=1,
     )[1].split("var incidentContainerResourceId", maxsplit=1)[0]
-    for block in (registry_block, image_pull_block):
-        assert "scope: resourceGroup(" in block
-        assert "validatedRegistryScope.subscriptionId" in block
-        assert "validatedRegistryScope.resourceGroupName" in block
-        assert "resourceGroup().name" not in block
+    assert "scope: resourceGroup(" in registry_block
+    assert "validatedRegistryScope.subscriptionId" in registry_block
+    assert "validatedRegistryScope.resourceGroupName" in registry_block
+    assert "scope: resourceGroup(" in image_pull_block
+    assert "registrySubscriptionId" in image_pull_block
+    assert "registryResourceGroupName" in image_pull_block
+    assert "resourceGroup().name" not in registry_block
+    assert "resourceGroup().name" not in image_pull_block
     for expected in (
         "param registryRoleAssignmentMode string",
         "param receiverIdentityPrincipalId string",
-        "identityPrincipalId: receiverIdentityPrincipalId",
-        "repositoryName: imageRepositoryName",
-        "var imageRepositoryName = 'athena/wc027-guidance-publication-request-producer'",
-        "expectedRegistryRoleAssignmentMode: registryRoleAssignmentMode",
-        "guid(",
-        "registry.id",
-        "receiverIdentityPrincipalId",
-        "imagePullRoleDefinitionId",
-        "imageRepositoryName",
+        "receiverIdentity.properties.principalId == receiverIdentityPrincipalId",
+        "identityPrincipalId: validatedReceiverIdentityPrincipalId",
+        "image: validatedProducerImage",
+        "registryRoleAssignmentMode: registryRoleAssignmentMode",
+        "var producerImageRepositoryName = replace(",
+        "registryPullRoleAssignmentId",
+        "producerImagePull.outputs.registryResourceId",
+        "producerImagePull.outputs.repositoryName",
+        "producerImagePull.outputs.?conditionVersion",
+        "producerImagePull.outputs.?condition",
     ):
         assert expected in source
 
