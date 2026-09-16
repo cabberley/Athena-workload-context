@@ -77,11 +77,16 @@ The transaction exposes the existing `CorrelationRequest`; `CorrelationService` 
 owner of confidence and manual-investigation evidence.
 
 Incident construction preserves the selected adverse health state (`degraded`, `unhealthy`, or
-`unavailable`) and expands the anchor to the complete overlapping evidence interval required by
-the WC-026 verifier. A Resource Health incident anchor must be an active event that explicitly
-transitions from `Available`; a resolved event cannot open an incident. Resource Health event
-intervals must also remain within the control's reviewed `maximumEventAgeSeconds` at both
-collection time and the request's trusted evaluation time.
+`unavailable`). One shared canonical selector chooses the primary healthy-to-adverse transition
+and then expands it to every connected, overlapping, same-state corroborating health component
+across controls. The complete expanded source-record set is signed in `selectedIncident`, used by
+the collection transaction, and reconstructed by production correlation; a caller cannot narrow
+the signed selection while leaving corroborating observations in the anchor. Disconnected
+episodes within one control and overlapping healthy evidence fail closed. A Resource Health
+incident anchor must be an active event that explicitly transitions from `Available`; a resolved
+event cannot open an incident. Resource Health event intervals must also remain within the
+control's reviewed `maximumEventAgeSeconds` at both collection time and the request's trusted
+evaluation time.
 
 The strengthened input contract is `athena.wc028MonitoringCollectionBatch.v2`, and monitoring
 intent is `athena.wc028PublishedMonitoringIntent.v2` because Resource Health controls now carry a

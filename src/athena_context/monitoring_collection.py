@@ -66,8 +66,11 @@ from athena_context.eventing.change_ingestion import (
     normalize_resource_graph_change,
 )
 from athena_context.monitoring_incident import (
+    MonitoringIncidentSample,
+    MonitoringIncidentSelectionError,
     build_selected_incident,
     monitoring_source_record_reference,
+    select_monitoring_incident,
 )
 
 MONITORING_COLLECTION_BATCH_SCHEMA_VERSION = "athena.wc028MonitoringCollectionBatch.v2"
@@ -2041,18 +2044,63 @@ class _MonitoringCollectionTransactionCore:
                 "collection coverage does not match published runtime context"
             )
 
-        incident_resource_id = _canonical_resource_id(batch.incident_resource_id)
-        try:
-            previous = observations_by_source[batch.previous_health_source_record_id]
-            current = tuple(
-                observations_by_source[item] for item in batch.current_health_source_record_ids
+        incident_samples: list[MonitoringIncidentSample] = []
+        for source_record_id, observation in observations_by_source.items():
+            state = _health_state(observation)
+            provenance = observation.control_provenance
+            if (
+                state not in {"healthy", "degraded", "unhealthy", "unavailable"}
+                or provenance is None
+            ):
+                continue
+            incident_samples.append(
+                MonitoringIncidentSample(
+                    resource_id=observation.subject_resource_id,
+                    control_id=provenance.control_id,
+                    payload_id=source_record_id,
+                    selection_key=observation.source_record_reference,
+                    observed_start=observation.observed_start,
+                    observed_end=observation.observed_end,
+                    state=cast(
+                        Literal["healthy", "degraded", "unhealthy", "unavailable"],
+                        state,
+                    ),
+                )
             )
+        try:
+            canonical_selection = select_monitoring_incident(tuple(incident_samples))
+        except MonitoringIncidentSelectionError as exc:
+            raise MonitoringCollectionError(str(exc)) from exc
+        canonical_selected_incident = build_selected_incident(
+            incident_resource_id=canonical_selection.incident_resource_id,
+            previous_record_id=canonical_selection.previous.payload_id,
+            current_record_ids=tuple(item.payload_id for item in canonical_selection.current),
+            current_state=canonical_selection.current_state,
+        )
+        try:
+            observations_by_source[batch.previous_health_source_record_id]
+            tuple(observations_by_source[item] for item in batch.current_health_source_record_ids)
         except KeyError as exc:
             raise MonitoringCollectionError(
                 "incident health selection must reference health observations"
             ) from exc
+        incident_resource_id = _canonical_resource_id(batch.incident_resource_id)
+        if (
+            incident_resource_id != canonical_selected_incident.incident_resource_id
+            or batch.previous_health_source_record_id
+            != canonical_selected_incident.previous_record_id
+            or batch.current_health_source_record_ids
+            != canonical_selected_incident.current_record_ids
+        ):
+            raise MonitoringCollectionError(
+                "incident health selection does not match canonical selection and expansion"
+            )
+        previous = observations_by_source[canonical_selected_incident.previous_record_id]
+        current = tuple(
+            observations_by_source[item] for item in canonical_selected_incident.current_record_ids
+        )
         records_by_source = {item.source_record_id: item for item in batch.records}
-        for source_record_id in batch.current_health_source_record_ids:
+        for source_record_id in canonical_selected_incident.current_record_ids:
             source_record = records_by_source[source_record_id]
             if isinstance(source_record, ResourceHealthRecord) and (
                 source_record.previous_status != "Available"
@@ -2075,35 +2123,21 @@ class _MonitoringCollectionTransactionCore:
             raise MonitoringCollectionError(
                 "incident health selection is not one healthy-to-unhealthy transition"
             )
-        current_health_state = cast(
-            Literal["degraded", "unhealthy", "unavailable"],
-            selected_current_states.pop(),
-        )
-        incident_start = min(item.observed_start for item in current)
-        incident_end = max(item.observed_end for item in current)
-        changed = True
-        expanded_current = set(current)
-        while changed:
-            changed = False
-            for candidate_observation in observations:
-                if (
-                    candidate_observation in expanded_current
-                    or candidate_observation.subject_resource_id != incident_resource_id
-                    or _health_state(candidate_observation) != current_health_state
-                    or candidate_observation.observed_start > incident_end
-                    or candidate_observation.observed_end < incident_start
-                ):
-                    continue
-                expanded_current.add(candidate_observation)
-                incident_start = min(
-                    incident_start,
-                    candidate_observation.observed_start,
+        current_health_state = canonical_selected_incident.current_state
+        if acquisition_receipt is not None:
+            expected_receipt_selection = MonitoringSelectedIncident.model_validate(
+                {
+                    "incidentResourceId": (canonical_selected_incident.incident_resource_id),
+                    "previousRecordId": (canonical_selected_incident.previous_record_id),
+                    "currentRecordIds": (canonical_selected_incident.current_record_ids),
+                    "currentState": canonical_selected_incident.current_state,
+                    "transitionDigest": (canonical_selected_incident.transition_digest),
+                }
+            )
+            if acquisition_receipt.selected_incident != expected_receipt_selection:
+                raise MonitoringCollectionError(
+                    "collection receipt does not bind canonical incident selection"
                 )
-                incident_end = max(
-                    incident_end,
-                    candidate_observation.observed_end,
-                )
-                changed = True
 
         return PreparedMonitoringCollection(
             intent_id=monitoring_intent.intent_id,
@@ -2113,12 +2147,10 @@ class _MonitoringCollectionTransactionCore:
             monitoring_bundle=bundle,
             change_artifacts=artifacts,
             incident_resource_id=incident_resource_id,
-            previous_health_source_record_id=(batch.previous_health_source_record_id),
-            current_health_source_record_ids=(batch.current_health_source_record_ids),
+            previous_health_source_record_id=(canonical_selected_incident.previous_record_id),
+            current_health_source_record_ids=(canonical_selected_incident.current_record_ids),
             previous_health_observation_id=previous.observation_id,
-            current_health_observation_ids=tuple(
-                sorted(item.observation_id for item in expanded_current)
-            ),
+            current_health_observation_ids=tuple(sorted(item.observation_id for item in current)),
             current_health_state=current_health_state,
         )
 

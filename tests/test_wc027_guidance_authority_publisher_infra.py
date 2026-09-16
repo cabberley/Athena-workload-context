@@ -5,25 +5,13 @@ PUBLISHER = ROOT / "infra" / "wc027-guidance-authority-publisher" / "main.bicep"
 RUNTIME = ROOT / "infra" / "wc027-enrichment-feed-runtime" / "main.bicep"
 ROOT_DEPLOYMENT = ROOT / "infra" / "wc013-live-acceptance" / "main.bicep"
 BLOB_CREATOR = (
-    ROOT
-    / "infra"
-    / "wc027-guidance-authority-publisher"
-    / "modules"
-    / "blob-create-rbac.bicep"
+    ROOT / "infra" / "wc027-guidance-authority-publisher" / "modules" / "blob-create-rbac.bicep"
 )
 TABLE_CAS = (
-    ROOT
-    / "infra"
-    / "wc027-guidance-authority-publisher"
-    / "modules"
-    / "table-cas-rbac.bicep"
+    ROOT / "infra" / "wc027-guidance-authority-publisher" / "modules" / "table-cas-rbac.bicep"
 )
 KEY_SIGNER = (
-    ROOT
-    / "infra"
-    / "wc027-guidance-authority-publisher"
-    / "modules"
-    / "key-signer-rbac.bicep"
+    ROOT / "infra" / "wc027-guidance-authority-publisher" / "modules" / "key-signer-rbac.bicep"
 )
 
 
@@ -52,6 +40,18 @@ def test_publisher_is_private_idempotent_and_uses_separated_authorities() -> Non
         "validatedRequestKeyFingerprint",
         "validatedBindingKeyFingerprint",
         "runtimeTrustDomainFingerprints",
+        "athena.wc027GuidanceAuthorityPublisherConfiguration.v2",
+        "athena.wc027EnrichmentFeedRuntimeConfiguration.v2",
+        "athena.wc028MonitoringCollectorContract.v8",
+        "monitoringAcquisitionTrust",
+        (
+            "collectorContractDigest: "
+            "validatedEnrichmentRuntimeConfiguration.monitoringCollectorContractDigest"
+        ),
+        (
+            "acquisitionAuthorityDigest: "
+            "validatedEnrichmentRuntimeConfiguration.monitoringAcquisitionAuthorityDigest"
+        ),
         "public key fingerprints must be distinct",
         "must match runtime guidance trust",
         "authorityStorageAccountResourceId",
@@ -88,10 +88,7 @@ def test_publisher_data_plane_roles_are_exact_and_non_destructive() -> None:
     table = TABLE_CAS.read_text(encoding="utf-8")
     signer = KEY_SIGNER.read_text(encoding="utf-8")
 
-    assert (
-        "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action"
-        in blob
-    )
+    assert "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action" in blob
     for forbidden in (
         "blobs/read",
         "blobs/write",
@@ -144,6 +141,8 @@ def test_runtime_requires_current_activation_and_logical_binding_key() -> None:
     assert "runtimeTrustDomainFingerprints" in source
     assert "validatedTrustDomainMetadata" in source
     assert "trust-domain public key fingerprints must be distinct" in source
+    assert "monitoringCollectorContractDigest" in source
+    assert "monitoringAcquisitionAuthorityDigest" in source
 
 
 def test_readiness_remains_false_until_deployment_is_proven() -> None:

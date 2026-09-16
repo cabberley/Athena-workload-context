@@ -36,8 +36,13 @@ guidance-binding key. An invalid signature is rejected before correlation, lifec
 versioned Blob, or unrelated Key Vault access. It does not trust the queued report as a reusable
 verified result. After that outer verification, it creates one production `CorrelationService`,
 rereads every exact version-pinned correlation input, verifies the configured authorities, and
-recomputes the report synchronously. The same service instance then supplies the process-local
-verification receipt to
+recomputes the report synchronously. Runtime configuration v2 embeds the exact WC-028 v8
+collector contract plus its canonical digest and the exact deployed acquisition-authority
+digest. Production monitoring verification rejects legacy v3 contracts and refuses any handoff or
+receipt whose contract or authority binding differs. The guidance-authority publisher repeats
+those two digests outside its embedded runtime configuration and requires exact equality before
+constructing its own correlation service. The same service instance then supplies the
+process-local verification receipt to
 `IncidentEnrichmentPublicationService`.
 
 Before publication, the worker independently reads the signed v1 current occurrence and active
@@ -67,9 +72,10 @@ endpoint/DNS boundary.
 
 `wc027FeedV2ProducerReady` remains false by default. Setting it true also requires the exact
 deployed `Microsoft.App/jobs` resource ID, the deployed configuration digest, the WC-016 runtime,
-an explicitly ready binding publisher, and matching deployment-derived identity/RBAC evidence.
-Because that publisher is not yet implemented, the current deployment contract constrains its
-readiness input to `false`; activation requires a later reviewed publisher integration.
+an explicitly ready binding publisher, matching deployment-derived identity/RBAC evidence, the
+exact v8 collector-contract digest, and the exact acquisition-authority digest. The root readiness
+gate verifies both digests in the producer and publisher configurations and their deployed Job
+tags before Notification v2 can be enabled.
 
 ## Consequences
 
@@ -78,10 +84,9 @@ readiness input to `false`; activation requires a later reviewed publisher integ
 - Partial enrichment, pointer, registry, or feed-index writes are recoverable without an early
   notification.
 - The producer can be deployed dormant while Notification v2 remains disabled.
-- The repository still has no automatic publisher for
-  `PublishedGuidanceAuthorityBinding.v2`. Until the separately governed guidance-authority
-  publisher submits this exact signed contract, operators may use the bounded submit CLI only with
-  an already-authoritative binding. The runtime does not mint or weaken that authority.
+- The separately governed guidance-authority publisher submits the exact signed
+  `PublishedGuidanceAuthorityBinding.v2`; the enrichment runtime does not mint or weaken that
+  authority.
 
 ## Alternatives considered
 
@@ -100,6 +105,8 @@ readiness input to `false`; activation requires a later reviewed publisher integ
 - Deterministic ordering tests prove correlation, enrichment, feed commit, then notification.
 - Missing and stale authority tests prove zero writes and zero notification.
 - Invalid outer signature tests prove zero correlation, authority, or storage calls.
+- Mismatched, placeholder, or legacy monitoring contract/authority bindings fail during
+  configuration validation or before production receipt verification.
 - Partial feed writes recover on retry.
 - Feed-index failure never reaches notification.
 - Bicep validation asserts sessions, duplicate detection, identity separation, scoped RBAC, and

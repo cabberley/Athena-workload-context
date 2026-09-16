@@ -49,7 +49,11 @@ MONITORING_PREVIOUS_ACQUISITION_RECEIPT_SCHEMA_VERSION = (
 )
 MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION = "athena.wc028MonitoringAcquisitionReceipt.v5"
 MONITORING_ACQUISITION_HANDOFF_SCHEMA_VERSION = "athena.wc028MonitoringEvidenceHandoff.v2"
-MONITORING_IDENTITY_PROOF_AUDIENCE = "api://athena-monitoring-identity-proof"
+_LEGACY_MONITORING_IDENTITY_PROOF_AUDIENCE = "api://athena-monitoring-identity-proof"
+_MONITORING_IDENTITY_PROOF_AUDIENCE_SUFFIX = "/athena-monitoring-identity-proof"
+MONITORING_IDENTITY_PROOF_AUDIENCE = (
+    f"api://00000000-0000-0000-0000-000000000003{_MONITORING_IDENTITY_PROOF_AUDIENCE_SUFFIX}"
+)
 MONITORING_IDENTITY_PROOF_MAXIMUM_LIFETIME_SECONDS = 7200
 MONITORING_IDENTITY_PROOF_REQUIRED_ROLE = "Athena.MonitoringAcquisition.ProveIdentity"
 MONITORING_IDENTITY_PROOF_TOKEN_VERSION = "1.0"  # noqa: S105
@@ -79,6 +83,7 @@ type MonitoringReadOperation = Literal[
     "Microsoft.Network/networkWatchers/ipFlowVerify/read",
     "Microsoft.ResourceHealth/AvailabilityStatuses/read",
     "Microsoft.ResourceHealth/AvailabilityStatuses/current/read",
+    "Microsoft.ResourceGraph/resources/read",
     "Microsoft.Insights/logs/Heartbeat/read",
     "Microsoft.Insights/logs/VMConnection/read",
     "Microsoft.Insights/logs/NWConnectionMonitorTestResult/read",
@@ -96,6 +101,7 @@ type MonitoringIpFlowVerifyOperation = Literal[
 type MonitoringResourceHealthOperation = Literal[
     "Microsoft.ResourceHealth/AvailabilityStatuses/read",
     "Microsoft.ResourceHealth/AvailabilityStatuses/current/read",
+    "Microsoft.ResourceGraph/resources/read",
 ]
 type MonitoringResourceLogOperation = Literal[
     "Microsoft.Insights/logs/Heartbeat/read",
@@ -163,6 +169,7 @@ _RESOURCE_HEALTH_ROLE_NAME = "Athena WC-028 VM Resource Health Reader"
 _RBAC_ATTESTOR_ROLE_NAME = "Athena WC-028 Effective RBAC Attestor"
 _STORAGE_BLOB_DATA_CONTRIBUTOR_ROLE_NAME = "Storage Blob Data Contributor"
 _KEY_VAULT_CRYPTO_USER_ROLE_NAME = "Key Vault Crypto User"
+_ALL_PRINCIPALS_ID = "00000000-0000-0000-0000-000000000000"
 _REVIEWED_WORKLOAD_RESOURCE_GROUP = "rg-athena-demo-workload"
 _REVIEWED_WORKLOAD_VNET_NAME = "athena-hackathon-vnet"
 _REVIEWED_MONITORING_RESOURCE_GROUP = "rg-athena-demo-monitoring"
@@ -246,7 +253,7 @@ _EXPECTED_PREVIOUS_ACQUISITION_READ_OPERATIONS: tuple[MonitoringReadOperation, .
     *_EXPECTED_IP_FLOW_VERIFY_OPERATIONS,
 )
 _EXPECTED_RESOURCE_HEALTH_OPERATIONS: tuple[MonitoringResourceHealthOperation, ...] = (
-    "Microsoft.ResourceHealth/AvailabilityStatuses/current/read",
+    "Microsoft.ResourceGraph/resources/read",
 )
 _EXPECTED_RESOURCE_LOG_OPERATIONS: tuple[MonitoringResourceLogOperation, ...] = (
     "Microsoft.Insights/Logs/Heartbeat/Read",
@@ -762,7 +769,8 @@ class MonitoringEffectiveRbacPrincipalEvidence(_StrictMonitoringContract):
         min_length=1,
         max_length=256,
     )
-    role_assignment_raw_page_digests: tuple[Sha256Digest, ...] = Field(
+    role_assignment_raw_page_digests: tuple[Sha256Digest, ...] | None = Field(
+        default=None,
         alias="roleAssignmentRawPageDigests",
         min_length=1,
         max_length=1024,
@@ -772,8 +780,33 @@ class MonitoringEffectiveRbacPrincipalEvidence(_StrictMonitoringContract):
         alias="transitiveGroupIds",
         max_length=256,
     )
-    transitive_group_raw_page_digests: tuple[Sha256Digest, ...] = Field(
+    transitive_group_raw_page_digests: tuple[Sha256Digest, ...] | None = Field(
+        default=None,
         alias="transitiveGroupRawPageDigests",
+        min_length=1,
+        max_length=1024,
+    )
+    first_role_assignment_raw_page_digests: tuple[Sha256Digest, ...] | None = Field(
+        default=None,
+        alias="firstRoleAssignmentRawPageDigests",
+        min_length=1,
+        max_length=1024,
+    )
+    second_role_assignment_raw_page_digests: tuple[Sha256Digest, ...] | None = Field(
+        default=None,
+        alias="secondRoleAssignmentRawPageDigests",
+        min_length=1,
+        max_length=1024,
+    )
+    first_transitive_group_raw_page_digests: tuple[Sha256Digest, ...] | None = Field(
+        default=None,
+        alias="firstTransitiveGroupRawPageDigests",
+        min_length=1,
+        max_length=1024,
+    )
+    second_transitive_group_raw_page_digests: tuple[Sha256Digest, ...] | None = Field(
+        default=None,
+        alias="secondTransitiveGroupRawPageDigests",
         min_length=1,
         max_length=1024,
     )
@@ -806,23 +839,63 @@ class MonitoringEffectiveRbacPrincipalEvidence(_StrictMonitoringContract):
     @field_validator(
         "role_assignment_raw_page_digests",
         "transitive_group_raw_page_digests",
+        "first_role_assignment_raw_page_digests",
+        "second_role_assignment_raw_page_digests",
+        "first_transitive_group_raw_page_digests",
+        "second_transitive_group_raw_page_digests",
     )
     @classmethod
     def validate_page_digests(
         cls,
-        values: tuple[Sha256Digest, ...],
-    ) -> tuple[Sha256Digest, ...]:
+        values: tuple[Sha256Digest, ...] | None,
+    ) -> tuple[Sha256Digest, ...] | None:
+        if values is None:
+            return None
         if values != tuple(sorted(values)) or len(values) != len(set(values)):
             raise ValueError("raw page digests must be sorted and unique")
         return values
 
     @model_validator(mode="after")
     def validate_principal_evidence(self) -> MonitoringEffectiveRbacPrincipalEvidence:
+        legacy_page_fields = (
+            self.role_assignment_raw_page_digests,
+            self.transitive_group_raw_page_digests,
+        )
+        independent_page_fields = (
+            self.first_role_assignment_raw_page_digests,
+            self.second_role_assignment_raw_page_digests,
+            self.first_transitive_group_raw_page_digests,
+            self.second_transitive_group_raw_page_digests,
+        )
         if (
             len(self.first_read_target_digests) != len(self.target_scope_ids)
             or self.first_read_target_digests != self.second_read_target_digests
+            or (
+                any(item is None for item in legacy_page_fields)
+                and any(item is None for item in independent_page_fields)
+            )
+            or (
+                all(item is not None for item in legacy_page_fields)
+                and any(item is not None for item in independent_page_fields)
+            )
+            or (
+                all(item is not None for item in independent_page_fields)
+                and any(item is not None for item in legacy_page_fields)
+            )
+            or (
+                self.first_role_assignment_raw_page_digests is not None
+                and self.first_role_assignment_raw_page_digests
+                != self.second_role_assignment_raw_page_digests
+            )
+            or (
+                self.first_transitive_group_raw_page_digests is not None
+                and self.first_transitive_group_raw_page_digests
+                != self.second_transitive_group_raw_page_digests
+            )
         ):
-            raise ValueError("RBAC exact-target repeated reads must be complete and stable")
+            raise ValueError(
+                "RBAC exact-target repeated reads must use one complete stable evidence shape"
+            )
         expected = compute_artifact_digest(
             self.model_dump(
                 mode="json",
@@ -917,6 +990,10 @@ class MonitoringEffectiveRbacDenyAssignment(_StrictMonitoringContract):
 
     @model_validator(mode="after")
     def validate_deny_assignment(self) -> MonitoringEffectiveRbacDenyAssignment:
+        if _ALL_PRINCIPALS_ID in self.excluded_principal_ids:
+            raise ValueError("All Principals cannot appear in excludedPrincipalIds")
+        if _ALL_PRINCIPALS_ID in self.principal_ids and self.principal_ids != (_ALL_PRINCIPALS_ID,):
+            raise ValueError("All Principals must be the sole deny-assignment principal")
         expected = compute_artifact_digest(
             self.model_dump(
                 mode="json",
@@ -998,11 +1075,12 @@ class MonitoringEffectiveRbacPimScheduleInstance(_StrictMonitoringContract):
 
 
 class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
-    """Hierarchy-complete measured effective assignments for isolated identities."""
+    """Measured effective assignments from the explicitly collectable RBAC scopes."""
 
     schema_version: Literal[
         "athena.wc028MonitoringEffectiveRbacInventory.v1",
         "athena.wc028MonitoringEffectiveRbacInventory.v2",
+        "athena.wc028MonitoringEffectiveRbacInventory.v3",
     ] = Field(alias="schemaVersion")
     collection_run_id: str = Field(
         alias="collectionRunId",
@@ -1047,14 +1125,23 @@ class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
     )
     collected_at: UtcDateTime = Field(alias="collectedAt")
     expires_at: UtcDateTime = Field(alias="expiresAt")
+    first_read_completed_at: UtcDateTime | None = Field(
+        default=None,
+        alias="firstReadCompletedAt",
+    )
+    second_read_completed_at: UtcDateTime | None = Field(
+        default=None,
+        alias="secondReadCompletedAt",
+    )
+    scope_collection_mode: Literal["subscriptionAndDescendantAtScope"] | None = Field(
+        default=None,
+        alias="scopeCollectionMode",
+    )
     management_group_ancestry: tuple[str, ...] = Field(
         alias="managementGroupAncestry",
-        min_length=1,
         max_length=32,
     )
-    ancestor_scope_collection_complete: Literal[True] = Field(
-        alias="ancestorScopeCollectionComplete"
-    )
+    ancestor_scope_collection_complete: bool = Field(alias="ancestorScopeCollectionComplete")
     subscription_descendant_collection_complete: Literal[True] = Field(
         alias="subscriptionDescendantCollectionComplete"
     )
@@ -1152,6 +1239,42 @@ class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
     pim_schedule_instance_raw_page_digests: tuple[Sha256Digest, ...] | None = Field(
         default=None,
         alias="pimScheduleInstanceRawPageDigests",
+        min_length=1,
+        max_length=1024,
+    )
+    first_role_definition_raw_page_digests: tuple[Sha256Digest, ...] | None = Field(
+        default=None,
+        alias="firstRoleDefinitionRawPageDigests",
+        min_length=1,
+        max_length=1024,
+    )
+    second_role_definition_raw_page_digests: tuple[Sha256Digest, ...] | None = Field(
+        default=None,
+        alias="secondRoleDefinitionRawPageDigests",
+        min_length=1,
+        max_length=1024,
+    )
+    first_deny_assignment_raw_page_digests: tuple[Sha256Digest, ...] | None = Field(
+        default=None,
+        alias="firstDenyAssignmentRawPageDigests",
+        min_length=1,
+        max_length=1024,
+    )
+    second_deny_assignment_raw_page_digests: tuple[Sha256Digest, ...] | None = Field(
+        default=None,
+        alias="secondDenyAssignmentRawPageDigests",
+        min_length=1,
+        max_length=1024,
+    )
+    first_pim_schedule_instance_raw_page_digests: tuple[Sha256Digest, ...] | None = Field(
+        default=None,
+        alias="firstPimScheduleInstanceRawPageDigests",
+        min_length=1,
+        max_length=1024,
+    )
+    second_pim_schedule_instance_raw_page_digests: tuple[Sha256Digest, ...] | None = Field(
+        default=None,
+        alias="secondPimScheduleInstanceRawPageDigests",
         min_length=1,
         max_length=1024,
     )
@@ -1254,7 +1377,9 @@ class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
             not item.startswith("/providers/microsoft.management/managementgroups/")
             for item in normalized
         ):
-            raise ValueError("effective RBAC management-group ancestry must be complete and unique")
+            raise ValueError(
+                "effective RBAC management-group ancestry must be canonical and unique"
+            )
         return normalized
 
     @field_validator("collector_grants", "athena_context_grants")
@@ -1311,6 +1436,12 @@ class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
         "role_definition_raw_page_digests",
         "deny_assignment_raw_page_digests",
         "pim_schedule_instance_raw_page_digests",
+        "first_role_definition_raw_page_digests",
+        "second_role_definition_raw_page_digests",
+        "first_deny_assignment_raw_page_digests",
+        "second_deny_assignment_raw_page_digests",
+        "first_pim_schedule_instance_raw_page_digests",
+        "second_pim_schedule_instance_raw_page_digests",
     )
     @classmethod
     def validate_optional_raw_page_digests(
@@ -1365,7 +1496,7 @@ class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
             raise ValueError(
                 "Athena context effective RBAC grants do not resolve through complete membership"
             )
-        v2_fields = (
+        common_attestor_fields = (
             self.attestor_identity_resource_id,
             self.attestor_client_id,
             self.attestor_principal_id,
@@ -1377,22 +1508,44 @@ class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
             self.role_definitions,
             self.deny_assignments,
             self.active_pim_schedule_instances,
-            self.role_definition_raw_page_digests,
-            self.deny_assignment_raw_page_digests,
-            self.pim_schedule_instance_raw_page_digests,
             self.first_raw_snapshot_digest,
             self.second_raw_snapshot_digest,
             self.repeated_read_stable,
         )
+        legacy_repeated_read_fields = (
+            self.role_definition_raw_page_digests,
+            self.deny_assignment_raw_page_digests,
+            self.pim_schedule_instance_raw_page_digests,
+        )
+        repeated_read_v3_fields = (
+            self.first_read_completed_at,
+            self.second_read_completed_at,
+            self.first_role_definition_raw_page_digests,
+            self.second_role_definition_raw_page_digests,
+            self.first_deny_assignment_raw_page_digests,
+            self.second_deny_assignment_raw_page_digests,
+            self.first_pim_schedule_instance_raw_page_digests,
+            self.second_pim_schedule_instance_raw_page_digests,
+        )
         if self.schema_version == "athena.wc028MonitoringEffectiveRbacInventory.v1":
             if (
-                any(item is not None for item in v2_fields)
+                any(
+                    item is not None
+                    for item in (
+                        *common_attestor_fields,
+                        *legacy_repeated_read_fields,
+                        *repeated_read_v3_fields,
+                    )
+                )
                 or self.ip_flow_verify_role_actions is None
+                or self.scope_collection_mode is not None
+                or not self.management_group_ancestry
+                or self.ancestor_scope_collection_complete is not True
             ):
                 raise ValueError("effective RBAC inventory v1 cannot contain attestor evidence")
         else:
             if (
-                any(item is None for item in v2_fields)
+                any(item is None for item in common_attestor_fields)
                 or self.ip_flow_verify_role_actions is not None
                 or self.attestor_principal_id
                 in {
@@ -1403,7 +1556,7 @@ class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
                 or self.first_raw_snapshot_digest != self.second_raw_snapshot_digest
             ):
                 raise ValueError(
-                    "effective RBAC inventory v2 requires stable separate-attestor evidence"
+                    "effective RBAC inventory requires stable separate-attestor evidence"
                 )
             collector_evidence = cast(
                 MonitoringEffectiveRbacPrincipalEvidence,
@@ -1459,33 +1612,7 @@ class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
                 raise ValueError(
                     "effective RBAC evidence omitted a referenced full role definition"
                 )
-            raw_snapshot_payload = {
-                "collectorPrincipalEvidenceDigest": (collector_evidence.evidence_digest),
-                "athenaContextPrincipalEvidenceDigest": (context_evidence.evidence_digest),
-                "roleDefinitionRawPageDigests": (
-                    list(
-                        cast(
-                            tuple[Sha256Digest, ...],
-                            self.role_definition_raw_page_digests,
-                        )
-                    )
-                ),
-                "denyAssignmentRawPageDigests": (
-                    list(
-                        cast(
-                            tuple[Sha256Digest, ...],
-                            self.deny_assignment_raw_page_digests,
-                        )
-                    )
-                ),
-                "pimScheduleInstanceRawPageDigests": (
-                    list(
-                        cast(
-                            tuple[Sha256Digest, ...],
-                            self.pim_schedule_instance_raw_page_digests,
-                        )
-                    )
-                ),
+            normalized_record_digests = {
                 "roleDefinitionRawDigests": [
                     item.raw_definition_digest for item in role_definitions
                 ],
@@ -1496,12 +1623,222 @@ class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
                     item.raw_instance_digest for item in pim_instances
                 ],
             }
-            expected_raw_snapshot_digest = compute_artifact_digest(raw_snapshot_payload)
-            if (
-                self.first_raw_snapshot_digest != expected_raw_snapshot_digest
-                or self.second_raw_snapshot_digest != expected_raw_snapshot_digest
-            ):
-                raise ValueError("effective RBAC repeated-read snapshot does not bind raw hashes")
+            if self.schema_version == "athena.wc028MonitoringEffectiveRbacInventory.v2":
+                if (
+                    self.scope_collection_mode is not None
+                    or not self.management_group_ancestry
+                    or self.ancestor_scope_collection_complete is not True
+                ):
+                    raise ValueError(
+                        "effective RBAC inventory v2 requires historical ancestor scope evidence"
+                    )
+                if (
+                    any(item is None for item in legacy_repeated_read_fields)
+                    or any(item is not None for item in repeated_read_v3_fields)
+                    or collector_evidence.role_assignment_raw_page_digests is None
+                    or collector_evidence.transitive_group_raw_page_digests is None
+                    or context_evidence.role_assignment_raw_page_digests is None
+                    or context_evidence.transitive_group_raw_page_digests is None
+                ):
+                    raise ValueError(
+                        "effective RBAC inventory v2 cannot contain independent read receipts"
+                    )
+                raw_snapshot_payload = {
+                    "collectorPrincipalEvidenceDigest": (collector_evidence.evidence_digest),
+                    "athenaContextPrincipalEvidenceDigest": (context_evidence.evidence_digest),
+                    "roleDefinitionRawPageDigests": (
+                        list(
+                            cast(
+                                tuple[Sha256Digest, ...],
+                                self.role_definition_raw_page_digests,
+                            )
+                        )
+                    ),
+                    "denyAssignmentRawPageDigests": (
+                        list(
+                            cast(
+                                tuple[Sha256Digest, ...],
+                                self.deny_assignment_raw_page_digests,
+                            )
+                        )
+                    ),
+                    "pimScheduleInstanceRawPageDigests": (
+                        list(
+                            cast(
+                                tuple[Sha256Digest, ...],
+                                self.pim_schedule_instance_raw_page_digests,
+                            )
+                        )
+                    ),
+                    **normalized_record_digests,
+                }
+                expected_raw_snapshot_digest = compute_artifact_digest(raw_snapshot_payload)
+                if (
+                    self.first_raw_snapshot_digest != expected_raw_snapshot_digest
+                    or self.second_raw_snapshot_digest != expected_raw_snapshot_digest
+                ):
+                    raise ValueError(
+                        "effective RBAC repeated-read snapshot does not bind raw hashes"
+                    )
+            else:
+                if (
+                    self.scope_collection_mode != "subscriptionAndDescendantAtScope"
+                    or self.management_group_ancestry
+                    or self.ancestor_scope_collection_complete is not False
+                ):
+                    raise ValueError(
+                        "effective RBAC inventory v3 requires exact collectable scope evidence"
+                    )
+                if (
+                    any(item is not None for item in legacy_repeated_read_fields)
+                    or any(item is None for item in repeated_read_v3_fields)
+                    or collector_evidence.role_assignment_raw_page_digests is not None
+                    or collector_evidence.transitive_group_raw_page_digests is not None
+                    or context_evidence.role_assignment_raw_page_digests is not None
+                    or context_evidence.transitive_group_raw_page_digests is not None
+                    or any(
+                        item is None
+                        for item in (
+                            collector_evidence.first_role_assignment_raw_page_digests,
+                            collector_evidence.second_role_assignment_raw_page_digests,
+                            collector_evidence.first_transitive_group_raw_page_digests,
+                            collector_evidence.second_transitive_group_raw_page_digests,
+                            context_evidence.first_role_assignment_raw_page_digests,
+                            context_evidence.second_role_assignment_raw_page_digests,
+                            context_evidence.first_transitive_group_raw_page_digests,
+                            context_evidence.second_transitive_group_raw_page_digests,
+                        )
+                    )
+                ):
+                    raise ValueError(
+                        "effective RBAC inventory v3 requires independent read receipts"
+                    )
+                first_read_completed_at = cast(
+                    UtcDateTime,
+                    self.first_read_completed_at,
+                )
+                second_read_completed_at = cast(
+                    UtcDateTime,
+                    self.second_read_completed_at,
+                )
+                if not first_read_completed_at < second_read_completed_at <= self.collected_at:
+                    raise ValueError("effective RBAC inventory v3 read receipts are not distinct")
+                first_snapshot_payload = {
+                    "collectorPrincipalId": collector_evidence.principal_id,
+                    "collectorTargetReadDigests": list(
+                        collector_evidence.first_read_target_digests
+                    ),
+                    "athenaContextPrincipalId": context_evidence.principal_id,
+                    "athenaContextTargetReadDigests": list(
+                        context_evidence.first_read_target_digests
+                    ),
+                    "collectorRoleAssignmentRawPageDigests": list(
+                        cast(
+                            tuple[Sha256Digest, ...],
+                            collector_evidence.first_role_assignment_raw_page_digests,
+                        )
+                    ),
+                    "collectorTransitiveGroupRawPageDigests": list(
+                        cast(
+                            tuple[Sha256Digest, ...],
+                            collector_evidence.first_transitive_group_raw_page_digests,
+                        )
+                    ),
+                    "athenaContextRoleAssignmentRawPageDigests": list(
+                        cast(
+                            tuple[Sha256Digest, ...],
+                            context_evidence.first_role_assignment_raw_page_digests,
+                        )
+                    ),
+                    "athenaContextTransitiveGroupRawPageDigests": list(
+                        cast(
+                            tuple[Sha256Digest, ...],
+                            context_evidence.first_transitive_group_raw_page_digests,
+                        )
+                    ),
+                    "roleDefinitionRawPageDigests": list(
+                        cast(
+                            tuple[Sha256Digest, ...],
+                            self.first_role_definition_raw_page_digests,
+                        )
+                    ),
+                    "denyAssignmentRawPageDigests": list(
+                        cast(
+                            tuple[Sha256Digest, ...],
+                            self.first_deny_assignment_raw_page_digests,
+                        )
+                    ),
+                    "pimScheduleInstanceRawPageDigests": list(
+                        cast(
+                            tuple[Sha256Digest, ...],
+                            self.first_pim_schedule_instance_raw_page_digests,
+                        )
+                    ),
+                    **normalized_record_digests,
+                }
+                second_snapshot_payload = {
+                    "collectorPrincipalId": collector_evidence.principal_id,
+                    "collectorTargetReadDigests": list(
+                        collector_evidence.second_read_target_digests
+                    ),
+                    "athenaContextPrincipalId": context_evidence.principal_id,
+                    "athenaContextTargetReadDigests": list(
+                        context_evidence.second_read_target_digests
+                    ),
+                    "collectorRoleAssignmentRawPageDigests": list(
+                        cast(
+                            tuple[Sha256Digest, ...],
+                            collector_evidence.second_role_assignment_raw_page_digests,
+                        )
+                    ),
+                    "collectorTransitiveGroupRawPageDigests": list(
+                        cast(
+                            tuple[Sha256Digest, ...],
+                            collector_evidence.second_transitive_group_raw_page_digests,
+                        )
+                    ),
+                    "athenaContextRoleAssignmentRawPageDigests": list(
+                        cast(
+                            tuple[Sha256Digest, ...],
+                            context_evidence.second_role_assignment_raw_page_digests,
+                        )
+                    ),
+                    "athenaContextTransitiveGroupRawPageDigests": list(
+                        cast(
+                            tuple[Sha256Digest, ...],
+                            context_evidence.second_transitive_group_raw_page_digests,
+                        )
+                    ),
+                    "roleDefinitionRawPageDigests": list(
+                        cast(
+                            tuple[Sha256Digest, ...],
+                            self.second_role_definition_raw_page_digests,
+                        )
+                    ),
+                    "denyAssignmentRawPageDigests": list(
+                        cast(
+                            tuple[Sha256Digest, ...],
+                            self.second_deny_assignment_raw_page_digests,
+                        )
+                    ),
+                    "pimScheduleInstanceRawPageDigests": list(
+                        cast(
+                            tuple[Sha256Digest, ...],
+                            self.second_pim_schedule_instance_raw_page_digests,
+                        )
+                    ),
+                    **normalized_record_digests,
+                }
+                if (
+                    self.first_raw_snapshot_digest
+                    != compute_artifact_digest(first_snapshot_payload)
+                    or self.second_raw_snapshot_digest
+                    != compute_artifact_digest(second_snapshot_payload)
+                    or self.first_raw_snapshot_digest != self.second_raw_snapshot_digest
+                ):
+                    raise ValueError(
+                        "effective RBAC independent snapshots are incomplete or unstable"
+                    )
         expected = compute_artifact_digest(
             self.model_dump(
                 mode="json",
@@ -1749,7 +2086,42 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
     identity_proof_audience: str | None = Field(
         default=None,
         alias="identityProofAudience",
-        pattern=r"^api://[a-z0-9][a-z0-9.-]{2,127}$",
+        pattern=(
+            r"^api://(?:athena-monitoring-identity-proof|"
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-"
+            r"[0-9a-f]{12}/athena-monitoring-identity-proof)$"
+        ),
+    )
+    identity_proof_application_id: str | None = Field(
+        default=None,
+        alias="identityProofApplicationId",
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    )
+    identity_proof_application_object_id: str | None = Field(
+        default=None,
+        alias="identityProofApplicationObjectId",
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    )
+    identity_proof_service_principal_id: str | None = Field(
+        default=None,
+        alias="identityProofServicePrincipalId",
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    )
+    identity_proof_app_role_id: str | None = Field(
+        default=None,
+        alias="identityProofAppRoleId",
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    )
+    identity_proof_app_role_assignment_id: str | None = Field(
+        default=None,
+        alias="identityProofAppRoleAssignmentId",
+        min_length=1,
+        max_length=2048,
+    )
+    identity_proof_assigned_principal_id: str | None = Field(
+        default=None,
+        alias="identityProofAssignedPrincipalId",
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
     )
     identity_proof_token_version: Literal["1.0"] | None = Field(
         default=None,
@@ -1897,11 +2269,30 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
         "rbac_attestor_identity_client_id",
         "rbac_attestor_principal_id",
         "rbac_attestor_tenant_id",
+        "identity_proof_application_id",
+        "identity_proof_application_object_id",
+        "identity_proof_service_principal_id",
+        "identity_proof_app_role_id",
+        "identity_proof_assigned_principal_id",
         mode="before",
     )
     @classmethod
     def canonicalize_identity_guid(cls, value: object) -> object:
         return value.casefold() if type(value) is str else value
+
+    @field_validator("identity_proof_app_role_assignment_id")
+    @classmethod
+    def validate_identity_proof_app_role_assignment_id(
+        cls,
+        value: str | None,
+    ) -> str | None:
+        if value is not None and (
+            not value.isascii()
+            or value != value.strip()
+            or any(character.isspace() for character in value)
+        ):
+            raise ValueError("identity-proof app-role assignment ID must be exact ASCII")
+        return value
 
     @field_validator("rbac_attestor_identity_resource_id")
     @classmethod
@@ -1991,11 +2382,19 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
             self.ip_flow_verify_scope_id,
             self.ip_flow_verify_allowed_operations,
         )
-        identity_proof_fields = (
+        identity_proof_policy_fields = (
             self.identity_proof_audience,
             self.identity_proof_token_version,
             self.identity_proof_required_role,
             self.identity_proof_maximum_lifetime_seconds,
+        )
+        identity_proof_authority_fields = (
+            self.identity_proof_application_id,
+            self.identity_proof_application_object_id,
+            self.identity_proof_service_principal_id,
+            self.identity_proof_app_role_id,
+            self.identity_proof_app_role_assignment_id,
+            self.identity_proof_assigned_principal_id,
         )
         resource_health_fields = (
             self.resource_health_role_definition_id,
@@ -2042,7 +2441,8 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
                     *credential_fields,
                     *ip_flow_policy_fields,
                     self.ip_flow_verify_role_name,
-                    *identity_proof_fields,
+                    *identity_proof_policy_fields,
+                    *identity_proof_authority_fields,
                     *resource_health_fields,
                     *measured_rbac_common_fields,
                     *current_resource_context_fields,
@@ -2073,7 +2473,8 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
                     *credential_fields,
                     *ip_flow_policy_fields,
                     self.ip_flow_verify_role_name,
-                    *identity_proof_fields,
+                    *identity_proof_policy_fields,
+                    *identity_proof_authority_fields,
                     *resource_health_fields,
                     *measured_rbac_common_fields,
                     *current_resource_context_fields,
@@ -2120,7 +2521,8 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
         if (
             self.schema_version == MONITORING_PREVIOUS_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION
             and (
-                any(item is not None for item in identity_proof_fields)
+                any(item is not None for item in identity_proof_policy_fields)
+                or any(item is not None for item in identity_proof_authority_fields)
                 or any(item is not None for item in resource_health_fields)
                 or self.acquisition_receipt_schema_version
                 != "athena.wc028MonitoringAcquisitionReceipt.v3"
@@ -2136,8 +2538,7 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
             MONITORING_PREVIOUS_MEASURED_RBAC_COLLECTOR_CONTRACT_SCHEMA_VERSION,
             MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
         } and (
-            any(item is None for item in identity_proof_fields)
-            or self.identity_proof_audience != MONITORING_IDENTITY_PROOF_AUDIENCE
+            any(item is None for item in identity_proof_policy_fields)
             or self.identity_proof_token_version != MONITORING_IDENTITY_PROOF_TOKEN_VERSION
             or self.identity_proof_required_role != MONITORING_IDENTITY_PROOF_REQUIRED_ROLE
             or self.identity_proof_maximum_lifetime_seconds
@@ -2146,6 +2547,40 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
             raise ValueError(
                 "production collector contract requires the exact Athena identity proof policy"
             )
+        if self.schema_version in {
+            MONITORING_IDENTITY_PROOF_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+            MONITORING_PREVIOUS_PRODUCTION_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+            MONITORING_PREVIOUS_MEASURED_RBAC_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+        }:
+            expected_legacy_audience = (
+                f"api://{cast(str, self.collector_tenant_id)}"
+                f"{_MONITORING_IDENTITY_PROOF_AUDIENCE_SUFFIX}"
+            )
+            if self.identity_proof_audience not in {
+                _LEGACY_MONITORING_IDENTITY_PROOF_AUDIENCE,
+                expected_legacy_audience,
+            } or any(item is not None for item in identity_proof_authority_fields):
+                raise ValueError(
+                    "legacy identity-proof collector contract contains unsupported authority IDs"
+                )
+        if self.schema_version == MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION:
+            expected_current_audience = (
+                f"api://{cast(str, self.collector_tenant_id)}"
+                f"{_MONITORING_IDENTITY_PROOF_AUDIENCE_SUFFIX}"
+            )
+            authority_ids = cast(
+                tuple[str, ...],
+                identity_proof_authority_fields,
+            )
+            if (
+                any(item is None for item in identity_proof_authority_fields)
+                or self.identity_proof_audience != expected_current_audience
+                or self.identity_proof_assigned_principal_id != self.monitoring_reader_principal_id
+                or len(set(authority_ids)) != len(authority_ids)
+            ):
+                raise ValueError(
+                    "current collector contract does not bind the deployed identity-proof authority"
+                )
         if (
             self.schema_version
             in {
@@ -2832,13 +3267,16 @@ def _effective_grant_affects_acquisition_scope(
     grant: MonitoringEffectiveRbacGrant,
     contract: MonitoringCollectorContract,
 ) -> bool:
-    protected_roots = [
+    protected_scopes = {
         contract.workload_resource_group_id.casefold().rstrip("/"),
         contract.monitoring_resource_group_id.casefold().rstrip("/"),
-    ]
+        *(item.casefold().rstrip("/") for item in contract.resource_read_scope_ids),
+        *(item.casefold().rstrip("/") for item in contract.signal_read_scope_ids),
+        *(item.casefold().rstrip("/") for item in contract.resource_log_read_scope_ids or ()),
+        *(item.casefold().rstrip("/") for item in contract.resource_health_scope_ids or ()),
+    }
     if contract.ip_flow_verify_scope_id is not None:
-        watcher_segments = contract.ip_flow_verify_scope_id.split("/")
-        protected_roots.append("/".join(watcher_segments[:5]).casefold().rstrip("/"))
+        protected_scopes.add(contract.ip_flow_verify_scope_id.casefold().rstrip("/"))
     subscription_scope = (
         f"/subscriptions/{_parse_arm_resource_id(contract.workload_resource_group_id)[0]}"
     )
@@ -2848,12 +3286,32 @@ def _effective_grant_affects_acquisition_scope(
             or scope.startswith("/providers/microsoft.management/managementgroups/")
             or scope == subscription_scope
             or any(
-                scope == root or scope.startswith(root + "/") or root.startswith(scope + "/")
-                for root in protected_roots
+                scope == protected
+                or scope.startswith(protected + "/")
+                or protected.startswith(scope + "/")
+                for protected in protected_scopes
             )
         ):
             return True
     return False
+
+
+def _deny_assignment_applies_to_principal(
+    deny: MonitoringEffectiveRbacDenyAssignment,
+    *,
+    principal_id: str,
+    security_group_ids: tuple[str, ...],
+) -> bool:
+    excluded = set(deny.excluded_principal_ids)
+    effective_principal_ids = {
+        principal_id,
+        *security_group_ids,
+    }
+    if effective_principal_ids.intersection(excluded):
+        return False
+    if not deny.principal_ids or _ALL_PRINCIPALS_ID in deny.principal_ids:
+        return True
+    return bool(effective_principal_ids.intersection(deny.principal_ids).difference(excluded))
 
 
 def _rbac_scope_applies(
@@ -2867,10 +3325,12 @@ def _rbac_scope_applies(
     target = target_scope.casefold().rstrip("/")
     if assignment == "/":
         return not do_not_apply_to_child_scopes or target == "/"
-    if assignment in management_group_ancestry:
-        return not do_not_apply_to_child_scopes
     if target == assignment:
         return True
+    if assignment.startswith("/providers/microsoft.management/managementgroups/"):
+        if management_group_ancestry and assignment not in management_group_ancestry:
+            return False
+        return not do_not_apply_to_child_scopes
     return not do_not_apply_to_child_scopes and target.startswith(assignment + "/")
 
 
@@ -2893,12 +3353,51 @@ def _expected_effective_rbac_target_scopes(
     subscription_scope = (
         f"/subscriptions/{_parse_arm_resource_id(contract.workload_resource_group_id)[0]}"
     )
+    evidence_storage_account_scope = (
+        contract.evidence_storage_account_resource_id.casefold().rstrip("/")
+    )
+    signing_key_scope = (
+        cast(
+            str,
+            contract.signing_key_arm_resource_id,
+        )
+        .casefold()
+        .rstrip("/")
+    )
+    signing_key_vault_scope = signing_key_scope.rsplit("/keys/", maxsplit=1)[0]
+    network_watcher_parent_scopes: set[str] = set()
+    for scope in contract.resource_read_scope_ids:
+        normalized = scope.casefold().rstrip("/")
+        if "/providers/microsoft.network/networkwatchers/" not in normalized:
+            continue
+        segments = normalized.strip("/").split("/")
+        network_watcher_index = segments.index("networkwatchers")
+        network_watcher_parent_scopes.add("/" + "/".join(segments[: network_watcher_index + 2]))
+        network_watcher_parent_scopes.add("/" + "/".join(segments[:4]))
     return tuple(
         sorted(
             {
                 subscription_scope.casefold(),
                 contract.workload_resource_group_id.casefold().rstrip("/"),
                 contract.monitoring_resource_group_id.casefold().rstrip("/"),
+                contract.workload_virtual_network_resource_id.casefold().rstrip("/"),
+                contract.workspace_resource_id.casefold().rstrip("/"),
+                *(
+                    f"{contract.workspace_resource_id.casefold().rstrip('/')}/tables/"
+                    f"{table_name.casefold()}"
+                    for table_name in contract.log_analytics_allowed_tables
+                ),
+                evidence_storage_account_scope,
+                f"{evidence_storage_account_scope}/blobservices/default",
+                cast(
+                    str,
+                    contract.evidence_container_resource_id,
+                )
+                .casefold()
+                .rstrip("/"),
+                signing_key_vault_scope,
+                signing_key_scope,
+                *network_watcher_parent_scopes,
                 *inventory.management_group_ancestry,
                 *(
                     scope
@@ -2914,8 +3413,8 @@ def _validate_current_effective_rbac_evidence(
     contract: MonitoringCollectorContract,
     inventory: MonitoringEffectiveRbacInventory,
 ) -> None:
-    if inventory.schema_version != "athena.wc028MonitoringEffectiveRbacInventory.v2":
-        raise ValueError("current collector contract requires effective RBAC inventory v2")
+    if inventory.schema_version != "athena.wc028MonitoringEffectiveRbacInventory.v3":
+        raise ValueError("current collector contract requires effective RBAC inventory v3")
     expected_targets = _expected_effective_rbac_target_scopes(contract, inventory)
     collector_evidence = cast(
         MonitoringEffectiveRbacPrincipalEvidence,
@@ -3037,21 +3536,15 @@ def _validate_current_effective_rbac_evidence(
             "Microsoft.KeyVault/vaults/keys/sign/action",
         ),
     )
-    effective_principal_ids = {
-        inventory.collector_principal_id,
-        *inventory.collector_security_group_ids,
-    }
     for deny in cast(
         tuple[MonitoringEffectiveRbacDenyAssignment, ...],
         inventory.deny_assignments,
     ):
-        candidate_principals = (
-            effective_principal_ids
-            if not deny.principal_ids
-            else effective_principal_ids.intersection(deny.principal_ids)
-        )
-        applicable_principals = candidate_principals.difference(deny.excluded_principal_ids)
-        if not applicable_principals:
+        if not _deny_assignment_applies_to_principal(
+            deny,
+            principal_id=inventory.collector_principal_id,
+            security_group_ids=inventory.collector_security_group_ids,
+        ):
             continue
         if any(
             _rbac_scope_applies(
@@ -3194,7 +3687,11 @@ class MonitoringIdentityProof(_StrictMonitoringContract):
     )
     issuer: str = Field(min_length=1, max_length=256)
     audience: str = Field(
-        pattern=r"^api://[a-z0-9][a-z0-9.-]{2,127}$",
+        pattern=(
+            r"^api://(?:athena-monitoring-identity-proof|"
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-"
+            r"[0-9a-f]{12}/athena-monitoring-identity-proof)$"
+        ),
     )
     identity_type: Literal["app"] = Field(alias="identityType")
     roles: tuple[str, ...] = Field(min_length=1, max_length=8)
@@ -3999,6 +4496,12 @@ def verify_monitoring_acquisition_receipt_attestation(
         or reviewed_collector_contract.athena_context_principal_id is None
         or reviewed_collector_contract.collector_tenant_id is None
         or reviewed_collector_contract.identity_proof_audience is None
+        or reviewed_collector_contract.identity_proof_application_id is None
+        or reviewed_collector_contract.identity_proof_application_object_id is None
+        or reviewed_collector_contract.identity_proof_service_principal_id is None
+        or reviewed_collector_contract.identity_proof_app_role_id is None
+        or reviewed_collector_contract.identity_proof_app_role_assignment_id is None
+        or reviewed_collector_contract.identity_proof_assigned_principal_id is None
         or reviewed_collector_contract.identity_proof_token_version is None
         or reviewed_collector_contract.identity_proof_required_role is None
         or reviewed_collector_contract.identity_proof_maximum_lifetime_seconds is None
@@ -4071,7 +4574,16 @@ def verify_monitoring_acquisition_receipt_attestation(
     if not (
         effective_rbac_inventory.collected_at
         <= receipt.execution_started_at
+        <= receipt.execution_completed_at
+        <= receipt.receipt_issued_at
         < effective_rbac_inventory.expires_at
+        and all(
+            effective_rbac_inventory.collected_at
+            <= exchange.requested_at
+            <= exchange.received_at
+            < effective_rbac_inventory.expires_at
+            for exchange in receipt.exchanges
+        )
     ):
         raise ValueError(
             "acquisition receipt execution is outside measured effective RBAC lifetime"

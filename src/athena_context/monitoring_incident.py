@@ -103,7 +103,7 @@ def build_selected_incident(
             and bool(resource_segments[7])
             and (len(resource_segments) - 6) % 2 == 0
         )
-    except (ValueError, IndexError):
+    except ValueError, IndexError:
         subscription_id_is_valid = False
     if (
         not subscription_id_is_valid
@@ -129,6 +129,125 @@ def build_selected_incident(
         current_record_ids=normalized_current_ids,
         current_state=current_state,
         transition_digest=compute_artifact_digest(payload),
+    )
+
+
+def _expand_monitoring_incident_current(
+    samples: tuple[MonitoringIncidentSample, ...],
+    *,
+    incident_resource_id: str,
+    seed_current: tuple[MonitoringIncidentSample, ...],
+    current_state: Literal["degraded", "unhealthy", "unavailable"],
+) -> tuple[MonitoringIncidentSample, ...]:
+    candidates = tuple(
+        item
+        for item in samples
+        if item.resource_id == incident_resource_id and item.state == current_state
+    )
+    components: list[
+        tuple[
+            str,
+            datetime,
+            datetime,
+            tuple[MonitoringIncidentSample, ...],
+        ]
+    ] = []
+    for control_id in sorted({item.control_id for item in candidates}):
+        ordered = sorted(
+            (item for item in candidates if item.control_id == control_id),
+            key=lambda item: (
+                item.observed_start,
+                item.observed_end,
+                item.selection_key,
+            ),
+        )
+        component_start = ordered[0].observed_start
+        component_end = ordered[0].observed_end
+        component_samples = [ordered[0]]
+        for candidate in ordered[1:]:
+            if candidate.observed_start <= component_end:
+                component_end = max(component_end, candidate.observed_end)
+                component_samples.append(candidate)
+                continue
+            components.append(
+                (
+                    control_id,
+                    component_start,
+                    component_end,
+                    tuple(component_samples),
+                )
+            )
+            component_start = candidate.observed_start
+            component_end = candidate.observed_end
+            component_samples = [candidate]
+        components.append(
+            (
+                control_id,
+                component_start,
+                component_end,
+                tuple(component_samples),
+            )
+        )
+
+    seed_component_indexes = {
+        index
+        for index, (_, _, _, component_samples) in enumerate(components)
+        if any(item in component_samples for item in seed_current)
+    }
+    if len(seed_component_indexes) != 1 or any(
+        not any(item in component_samples for _, _, _, component_samples in components)
+        for item in seed_current
+    ):
+        raise MonitoringIncidentSelectionError(
+            "selected health evidence does not form one connected primary episode"
+        )
+
+    selected_components = set(seed_component_indexes)
+    selected_control_ids = {components[index][0] for index in selected_components}
+    incident_start = min(components[index][1] for index in selected_components)
+    incident_end = max(components[index][2] for index in selected_components)
+    changed = True
+    while changed:
+        changed = False
+        for index, (
+            control_id,
+            component_start,
+            component_end,
+            _,
+        ) in enumerate(components):
+            if index in selected_components:
+                continue
+            if component_start > incident_end or component_end < incident_start:
+                continue
+            if control_id in selected_control_ids:
+                raise MonitoringIncidentSelectionError(
+                    "current health evidence spans disconnected intervals in one control"
+                )
+            selected_components.add(index)
+            selected_control_ids.add(control_id)
+            incident_start = min(incident_start, component_start)
+            incident_end = max(incident_end, component_end)
+            changed = True
+
+    for index in selected_components:
+        control_id, component_start, component_end, _ = components[index]
+        if any(
+            item.resource_id == incident_resource_id
+            and item.control_id == control_id
+            and item.state == "healthy"
+            and item.observed_start < component_end
+            and item.observed_end > component_start
+            for item in samples
+        ):
+            raise MonitoringIncidentSelectionError(
+                "current health episode conflicts with overlapping healthy evidence"
+            )
+
+    return tuple(
+        sorted(
+            (item for index in selected_components for item in components[index][3]),
+            key=lambda item: item.selection_key,
+        )
     )
 
 
@@ -241,14 +360,43 @@ def select_monitoring_incident(
             item[1][0].control_id,
         ),
     )
+    selected_state = cast(
+        Literal["degraded", "unhealthy", "unavailable"],
+        selected_current[0].state,
+    )
+    expanded_current = _expand_monitoring_incident_current(
+        samples,
+        incident_resource_id=incident_resource_id,
+        seed_current=selected_current,
+        current_state=selected_state,
+    )
+    expanded_start = min(item.observed_start for item in expanded_current)
+    expanded_predecessors = tuple(
+        item
+        for item in samples
+        if item.resource_id == incident_resource_id
+        and item.state == "healthy"
+        and item.observed_end <= expanded_start
+    )
+    if not expanded_predecessors:
+        raise MonitoringIncidentSelectionError(
+            "expanded incident evidence has no canonical healthy predecessor"
+        )
+    expanded_control_ids = {item.control_id for item in expanded_current}
+    selected_previous = max(
+        expanded_predecessors,
+        key=lambda item: (
+            item.observed_end,
+            item.control_id in expanded_control_ids,
+            item.observed_start,
+            item.selection_key,
+        ),
+    )
     return MonitoringIncidentSelection(
         incident_resource_id=incident_resource_id,
         previous=selected_previous,
-        current=selected_current,
-        current_state=cast(
-            Literal["degraded", "unhealthy", "unavailable"],
-            selected_current[0].state,
-        ),
+        current=expanded_current,
+        current_state=selected_state,
     )
 
 

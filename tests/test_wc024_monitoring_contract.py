@@ -56,6 +56,12 @@ EFFECTIVE_RBAC_INVENTORY_EXAMPLE = (
     / "wc024-monitoring-foundation"
     / "effective-rbac-inventory.example.json"
 )
+LEGACY_EFFECTIVE_RBAC_INVENTORY_V2_EXAMPLE = (
+    Path(__file__).parents[1]
+    / "infra"
+    / "wc024-monitoring-foundation"
+    / "effective-rbac-inventory.v2.example.json"
+)
 MONITORING_FOUNDATION_MAIN = (
     Path(__file__).parents[1] / "infra" / "wc024-monitoring-foundation" / "main.bicep"
 )
@@ -143,7 +149,7 @@ RESOURCE_HEALTH_ROLE_DEFINITION_ID = (
     "roleDefinitions/0790d6f2-9553-5b63-84ac-56596b7e4072"
 )
 PREVIOUS_RESOURCE_HEALTH_OPERATIONS = ("Microsoft.ResourceHealth/AvailabilityStatuses/read",)
-RESOURCE_HEALTH_OPERATIONS = ("Microsoft.ResourceHealth/AvailabilityStatuses/current/read",)
+RESOURCE_HEALTH_OPERATIONS = ("Microsoft.ResourceGraph/resources/read",)
 PREVIOUS_RESOURCE_LOG_OPERATIONS = (
     "Microsoft.Insights/logs/Heartbeat/read",
     "Microsoft.Insights/logs/NTANetAnalytics/read",
@@ -185,6 +191,12 @@ MEASURED_RBAC_FIELDS = (
     "rbacAttestorScopeId",
     "rbacAttestorAllowedOperations",
     "rbacAttestorIdentitySeparationEnforced",
+    "identityProofApplicationId",
+    "identityProofApplicationObjectId",
+    "identityProofServicePrincipalId",
+    "identityProofAppRoleId",
+    "identityProofAppRoleAssignmentId",
+    "identityProofAssignedPrincipalId",
 )
 V8_ONLY_CONTRACT_FIELDS = (
     "workspaceResourceContextAccessEnabled",
@@ -202,14 +214,23 @@ V8_ONLY_CONTRACT_FIELDS = (
     "rbacAttestorScopeId",
     "rbacAttestorAllowedOperations",
     "rbacAttestorIdentitySeparationEnforced",
+    "identityProofApplicationId",
+    "identityProofApplicationObjectId",
+    "identityProofServicePrincipalId",
+    "identityProofAppRoleId",
+    "identityProofAppRoleAssignmentId",
+    "identityProofAssignedPrincipalId",
 )
 SIGNAL_READER_ROLE_NAME = "Athena WC016 Approved Signal Reader synthetic00000"
 RESOURCE_LOG_READER_ROLE_NAME = "Athena WC-028 VM Resource Log Reader"
 IP_FLOW_VERIFY_ROLE_NAME = "Athena WC-028 Network Watcher IP Flow Verify"
 RESOURCE_HEALTH_ROLE_NAME = "Athena WC-028 VM Resource Health Reader"
-EVIDENCE_CONTAINER_RESOURCE_ID = (
+EVIDENCE_STORAGE_ACCOUNT_RESOURCE_ID = (
     f"{MONITORING_RESOURCE_GROUP_ROOT}/providers/Microsoft.Storage/storageAccounts/"
-    "athenademomonstore/blobServices/default/containers/monitoring-evidence"
+    "athenademomonstore"
+)
+EVIDENCE_CONTAINER_RESOURCE_ID = (
+    f"{EVIDENCE_STORAGE_ACCOUNT_RESOURCE_ID}/blobServices/default/containers/monitoring-evidence"
 )
 EVIDENCE_WRITER_ROLE_DEFINITION_ID = (
     f"/subscriptions/{SUBSCRIPTION_ID}/providers/Microsoft.Authorization/"
@@ -219,6 +240,10 @@ SIGNING_KEY_ARM_RESOURCE_ID = (
     f"{MONITORING_RESOURCE_GROUP_ROOT}/providers/Microsoft.KeyVault/vaults/"
     "athenademomonkv/keys/monitoring-evidence-signing"
 )
+SIGNING_KEY_VAULT_RESOURCE_ID = SIGNING_KEY_ARM_RESOURCE_ID.rsplit(
+    "/keys/",
+    maxsplit=1,
+)[0]
 SIGNING_KEY_CRYPTO_USER_ROLE_DEFINITION_ID = (
     f"/subscriptions/{SUBSCRIPTION_ID}/providers/Microsoft.Authorization/"
     "roleDefinitions/12338af0-0e69-4776-bea7-57ae8d297424"
@@ -241,6 +266,11 @@ RBAC_ATTESTOR_OPERATIONS = (
     "Microsoft.Authorization/roleAssignments/read",
     "Microsoft.Authorization/roleDefinitions/read",
 )
+IDENTITY_PROOF_APPLICATION_ID = "66666666-6666-6666-6666-666666666661"
+IDENTITY_PROOF_APPLICATION_OBJECT_ID = "66666666-6666-6666-6666-666666666662"
+IDENTITY_PROOF_SERVICE_PRINCIPAL_ID = "66666666-6666-6666-6666-666666666663"
+IDENTITY_PROOF_APP_ROLE_ID = "66666666-6666-6666-6666-666666666664"
+IDENTITY_PROOF_APP_ROLE_ASSIGNMENT_ID = "66666666-6666-6666-6666-666666666665"
 
 
 def _json_value(value: object) -> object:
@@ -538,29 +568,49 @@ def _effective_rbac_principal_evidence(
         )
         for target in targets
     )
+    first_role_assignment_pages = (
+        compute_artifact_digest(
+            {
+                "principalId": principal_id.casefold(),
+                "page": "roleAssignments",
+            }
+        ),
+    )
+    second_role_assignment_pages = (
+        compute_artifact_digest(
+            {
+                "principalId": principal_id.casefold(),
+                "page": "roleAssignments",
+            }
+        ),
+    )
+    first_transitive_group_pages = (
+        compute_artifact_digest(
+            {
+                "principalId": principal_id.casefold(),
+                "page": "transitiveGroups",
+            }
+        ),
+    )
+    second_transitive_group_pages = (
+        compute_artifact_digest(
+            {
+                "principalId": principal_id.casefold(),
+                "page": "transitiveGroups",
+            }
+        ),
+    )
     payload: dict[str, object] = {
         "principalId": principal_id.casefold(),
         "queryFilter": "atScope() and assignedTo(principalId)",
         "targetScopeIds": targets,
         "firstReadTargetDigests": target_digests,
         "secondReadTargetDigests": target_digests,
-        "roleAssignmentRawPageDigests": (
-            compute_artifact_digest(
-                {
-                    "principalId": principal_id.casefold(),
-                    "page": "roleAssignments",
-                }
-            ),
-        ),
+        "firstRoleAssignmentRawPageDigests": first_role_assignment_pages,
+        "secondRoleAssignmentRawPageDigests": second_role_assignment_pages,
         "transitiveGroupIds": tuple(sorted(item.casefold() for item in transitive_group_ids)),
-        "transitiveGroupRawPageDigests": (
-            compute_artifact_digest(
-                {
-                    "principalId": principal_id.casefold(),
-                    "page": "transitiveGroups",
-                }
-            ),
-        ),
+        "firstTransitiveGroupRawPageDigests": first_transitive_group_pages,
+        "secondTransitiveGroupRawPageDigests": second_transitive_group_pages,
         "allPagesRetrieved": True,
     }
     return {
@@ -660,13 +710,34 @@ def _effective_rbac_inventory(payload: dict[str, object]) -> dict[str, object]:
             key=lambda item: str(item["roleDefinitionId"]),
         )
     )
+    workspace_id = str(payload["workspaceResourceId"]).casefold().rstrip("/")
+    evidence_storage_account_id = (
+        str(payload["evidenceStorageAccountResourceId"]).casefold().rstrip("/")
+    )
+    signing_key_id = str(payload["signingKeyArmResourceId"]).casefold().rstrip("/")
+    signing_key_vault_id = signing_key_id.rsplit("/keys/", maxsplit=1)[0]
+    network_watcher_resource_group_id = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/resourcegroups/networkwatcherrg"
+    )
     target_scope_ids = tuple(
         sorted(
             {
                 f"/subscriptions/{SUBSCRIPTION_ID}",
                 MONITORING_RESOURCE_GROUP_ROOT.casefold(),
                 WORKLOAD_RESOURCE_GROUP_ROOT.casefold(),
-                "/providers/microsoft.management/managementgroups/synthetic-root",
+                REVIEWED_WORKLOAD_VNET_ID.casefold(),
+                workspace_id,
+                *(
+                    f"{workspace_id}/tables/{table_name.casefold()}"
+                    for table_name in REVIEWED_LOG_TABLES
+                ),
+                evidence_storage_account_id,
+                f"{evidence_storage_account_id}/blobservices/default",
+                EVIDENCE_CONTAINER_RESOURCE_ID.casefold(),
+                signing_key_vault_id,
+                signing_key_id,
+                network_watcher_resource_group_id,
+                NETWORK_WATCHER_RESOURCE_ID.casefold(),
                 *(
                     str(scope).casefold()
                     for grant in ordered_grants
@@ -690,28 +761,73 @@ def _effective_rbac_inventory(payload: dict[str, object]) -> dict[str, object]:
     pim_page_digest = compute_artifact_digest(
         {"page": "roleAssignmentScheduleInstances", "items": []}
     )
-    raw_snapshot_digest = compute_artifact_digest(
+    normalized_record_digests = {
+        "roleDefinitionRawDigests": tuple(item["rawDefinitionDigest"] for item in role_definitions),
+        "denyAssignmentRawDigests": (),
+        "pimScheduleInstanceRawDigests": (),
+    }
+    first_raw_snapshot_digest = compute_artifact_digest(
         _json_value(
             {
-                "collectorPrincipalEvidenceDigest": (
-                    collector_principal_evidence["evidenceDigest"]
+                "collectorPrincipalId": collector_principal_evidence["principalId"],
+                "collectorTargetReadDigests": collector_principal_evidence[
+                    "firstReadTargetDigests"
+                ],
+                "athenaContextPrincipalId": context_principal_evidence["principalId"],
+                "athenaContextTargetReadDigests": context_principal_evidence[
+                    "firstReadTargetDigests"
+                ],
+                "collectorRoleAssignmentRawPageDigests": (
+                    collector_principal_evidence["firstRoleAssignmentRawPageDigests"]
                 ),
-                "athenaContextPrincipalEvidenceDigest": (
-                    context_principal_evidence["evidenceDigest"]
+                "collectorTransitiveGroupRawPageDigests": (
+                    collector_principal_evidence["firstTransitiveGroupRawPageDigests"]
+                ),
+                "athenaContextRoleAssignmentRawPageDigests": (
+                    context_principal_evidence["firstRoleAssignmentRawPageDigests"]
+                ),
+                "athenaContextTransitiveGroupRawPageDigests": (
+                    context_principal_evidence["firstTransitiveGroupRawPageDigests"]
                 ),
                 "roleDefinitionRawPageDigests": (role_definition_page_digest,),
                 "denyAssignmentRawPageDigests": (deny_page_digest,),
                 "pimScheduleInstanceRawPageDigests": (pim_page_digest,),
-                "roleDefinitionRawDigests": tuple(
-                    item["rawDefinitionDigest"] for item in role_definitions
+                **normalized_record_digests,
+            }
+        )
+    )
+    second_raw_snapshot_digest = compute_artifact_digest(
+        _json_value(
+            {
+                "collectorPrincipalId": collector_principal_evidence["principalId"],
+                "collectorTargetReadDigests": collector_principal_evidence[
+                    "secondReadTargetDigests"
+                ],
+                "athenaContextPrincipalId": context_principal_evidence["principalId"],
+                "athenaContextTargetReadDigests": context_principal_evidence[
+                    "secondReadTargetDigests"
+                ],
+                "collectorRoleAssignmentRawPageDigests": (
+                    collector_principal_evidence["secondRoleAssignmentRawPageDigests"]
                 ),
-                "denyAssignmentRawDigests": (),
-                "pimScheduleInstanceRawDigests": (),
+                "collectorTransitiveGroupRawPageDigests": (
+                    collector_principal_evidence["secondTransitiveGroupRawPageDigests"]
+                ),
+                "athenaContextRoleAssignmentRawPageDigests": (
+                    context_principal_evidence["secondRoleAssignmentRawPageDigests"]
+                ),
+                "athenaContextTransitiveGroupRawPageDigests": (
+                    context_principal_evidence["secondTransitiveGroupRawPageDigests"]
+                ),
+                "roleDefinitionRawPageDigests": (role_definition_page_digest,),
+                "denyAssignmentRawPageDigests": (deny_page_digest,),
+                "pimScheduleInstanceRawPageDigests": (pim_page_digest,),
+                **normalized_record_digests,
             }
         )
     )
     inventory_payload: dict[str, object] = {
-        "schemaVersion": "athena.wc028MonitoringEffectiveRbacInventory.v2",
+        "schemaVersion": "athena.wc028MonitoringEffectiveRbacInventory.v3",
         "collectionRunId": "monitoring-rbac-" + "a" * 32,
         "tenantId": COLLECTOR_TENANT_ID,
         "subscriptionId": SUBSCRIPTION_ID,
@@ -723,10 +839,11 @@ def _effective_rbac_inventory(payload: dict[str, object]) -> dict[str, object]:
         "attestorTenantId": COLLECTOR_TENANT_ID,
         "collectedAt": datetime(2026, 9, 10, 1, 55, tzinfo=UTC),
         "expiresAt": datetime(2026, 9, 10, 2, 10, tzinfo=UTC),
-        "managementGroupAncestry": (
-            "/providers/microsoft.management/managementgroups/synthetic-root",
-        ),
-        "ancestorScopeCollectionComplete": True,
+        "firstReadCompletedAt": datetime(2026, 9, 10, 1, 54, tzinfo=UTC),
+        "secondReadCompletedAt": datetime(2026, 9, 10, 1, 55, tzinfo=UTC),
+        "scopeCollectionMode": "subscriptionAndDescendantAtScope",
+        "managementGroupAncestry": (),
+        "ancestorScopeCollectionComplete": False,
         "subscriptionDescendantCollectionComplete": True,
         "groupMembershipCollectionComplete": True,
         "roleDefinitionCollectionComplete": True,
@@ -753,11 +870,14 @@ def _effective_rbac_inventory(payload: dict[str, object]) -> dict[str, object]:
         "roleDefinitions": role_definitions,
         "denyAssignments": (),
         "activePimScheduleInstances": (),
-        "roleDefinitionRawPageDigests": (role_definition_page_digest,),
-        "denyAssignmentRawPageDigests": (deny_page_digest,),
-        "pimScheduleInstanceRawPageDigests": (pim_page_digest,),
-        "firstRawSnapshotDigest": raw_snapshot_digest,
-        "secondRawSnapshotDigest": raw_snapshot_digest,
+        "firstRoleDefinitionRawPageDigests": (role_definition_page_digest,),
+        "secondRoleDefinitionRawPageDigests": (role_definition_page_digest,),
+        "firstDenyAssignmentRawPageDigests": (deny_page_digest,),
+        "secondDenyAssignmentRawPageDigests": (deny_page_digest,),
+        "firstPimScheduleInstanceRawPageDigests": (pim_page_digest,),
+        "secondPimScheduleInstanceRawPageDigests": (pim_page_digest,),
+        "firstRawSnapshotDigest": first_raw_snapshot_digest,
+        "secondRawSnapshotDigest": second_raw_snapshot_digest,
         "repeatedReadStable": True,
         "assignmentCount": sum(len(tuple(item["assignmentScopeIds"])) for item in ordered_grants),
         "sourceReference": VersionPinnedBlobReference(
@@ -783,37 +903,109 @@ def _recompute_effective_rbac_inventory(
         )
     )
     inventory["collectorGrants"] = grants
-    inventory["assignmentCount"] = sum(len(tuple(item["assignmentScopeIds"])) for item in grants)
-    if inventory.get("schemaVersion") == "athena.wc028MonitoringEffectiveRbacInventory.v2":
+    context_grants = tuple(
+        sorted(
+            tuple(inventory["athenaContextGrants"]),
+            key=lambda item: str(item["grantDigest"]),
+        )
+    )
+    inventory["athenaContextGrants"] = context_grants
+    inventory["assignmentCount"] = sum(
+        len(tuple(item["assignmentScopeIds"])) for item in (*grants, *context_grants)
+    )
+    if inventory.get("schemaVersion") in {
+        "athena.wc028MonitoringEffectiveRbacInventory.v2",
+        "athena.wc028MonitoringEffectiveRbacInventory.v3",
+    }:
         collector_evidence = inventory["collectorPrincipalEvidence"]
         context_evidence = inventory["athenaContextPrincipalEvidence"]
         assert isinstance(collector_evidence, dict)
         assert isinstance(context_evidence, dict)
-        raw_snapshot_digest = compute_artifact_digest(
-            _json_value(
-                {
-                    "collectorPrincipalEvidenceDigest": (collector_evidence["evidenceDigest"]),
-                    "athenaContextPrincipalEvidenceDigest": (context_evidence["evidenceDigest"]),
-                    "roleDefinitionRawPageDigests": (inventory["roleDefinitionRawPageDigests"]),
-                    "denyAssignmentRawPageDigests": (inventory["denyAssignmentRawPageDigests"]),
-                    "pimScheduleInstanceRawPageDigests": (
-                        inventory["pimScheduleInstanceRawPageDigests"]
-                    ),
-                    "roleDefinitionRawDigests": tuple(
-                        item["rawDefinitionDigest"] for item in tuple(inventory["roleDefinitions"])
-                    ),
-                    "denyAssignmentRawDigests": tuple(
-                        item["rawAssignmentDigest"] for item in tuple(inventory["denyAssignments"])
-                    ),
-                    "pimScheduleInstanceRawDigests": tuple(
-                        item["rawInstanceDigest"]
-                        for item in tuple(inventory["activePimScheduleInstances"])
-                    ),
-                }
+        normalized_record_digests = {
+            "roleDefinitionRawDigests": tuple(
+                item["rawDefinitionDigest"] for item in tuple(inventory["roleDefinitions"])
+            ),
+            "denyAssignmentRawDigests": tuple(
+                item["rawAssignmentDigest"] for item in tuple(inventory["denyAssignments"])
+            ),
+            "pimScheduleInstanceRawDigests": tuple(
+                item["rawInstanceDigest"] for item in tuple(inventory["activePimScheduleInstances"])
+            ),
+        }
+        if inventory["schemaVersion"] == "athena.wc028MonitoringEffectiveRbacInventory.v2":
+            raw_snapshot_digest = compute_artifact_digest(
+                _json_value(
+                    {
+                        "collectorPrincipalEvidenceDigest": (collector_evidence["evidenceDigest"]),
+                        "athenaContextPrincipalEvidenceDigest": (
+                            context_evidence["evidenceDigest"]
+                        ),
+                        "roleDefinitionRawPageDigests": (inventory["roleDefinitionRawPageDigests"]),
+                        "denyAssignmentRawPageDigests": (inventory["denyAssignmentRawPageDigests"]),
+                        "pimScheduleInstanceRawPageDigests": (
+                            inventory["pimScheduleInstanceRawPageDigests"]
+                        ),
+                        **normalized_record_digests,
+                    }
+                )
             )
-        )
-        inventory["firstRawSnapshotDigest"] = raw_snapshot_digest
-        inventory["secondRawSnapshotDigest"] = raw_snapshot_digest
+            inventory["firstRawSnapshotDigest"] = raw_snapshot_digest
+            inventory["secondRawSnapshotDigest"] = raw_snapshot_digest
+        else:
+            first_snapshot_payload = {
+                "collectorPrincipalId": collector_evidence["principalId"],
+                "collectorTargetReadDigests": collector_evidence["firstReadTargetDigests"],
+                "athenaContextPrincipalId": context_evidence["principalId"],
+                "athenaContextTargetReadDigests": context_evidence["firstReadTargetDigests"],
+                "collectorRoleAssignmentRawPageDigests": collector_evidence[
+                    "firstRoleAssignmentRawPageDigests"
+                ],
+                "collectorTransitiveGroupRawPageDigests": collector_evidence[
+                    "firstTransitiveGroupRawPageDigests"
+                ],
+                "athenaContextRoleAssignmentRawPageDigests": context_evidence[
+                    "firstRoleAssignmentRawPageDigests"
+                ],
+                "athenaContextTransitiveGroupRawPageDigests": context_evidence[
+                    "firstTransitiveGroupRawPageDigests"
+                ],
+                "roleDefinitionRawPageDigests": inventory["firstRoleDefinitionRawPageDigests"],
+                "denyAssignmentRawPageDigests": inventory["firstDenyAssignmentRawPageDigests"],
+                "pimScheduleInstanceRawPageDigests": inventory[
+                    "firstPimScheduleInstanceRawPageDigests"
+                ],
+                **normalized_record_digests,
+            }
+            second_snapshot_payload = {
+                "collectorPrincipalId": collector_evidence["principalId"],
+                "collectorTargetReadDigests": collector_evidence["secondReadTargetDigests"],
+                "athenaContextPrincipalId": context_evidence["principalId"],
+                "athenaContextTargetReadDigests": context_evidence["secondReadTargetDigests"],
+                "collectorRoleAssignmentRawPageDigests": collector_evidence[
+                    "secondRoleAssignmentRawPageDigests"
+                ],
+                "collectorTransitiveGroupRawPageDigests": collector_evidence[
+                    "secondTransitiveGroupRawPageDigests"
+                ],
+                "athenaContextRoleAssignmentRawPageDigests": context_evidence[
+                    "secondRoleAssignmentRawPageDigests"
+                ],
+                "athenaContextTransitiveGroupRawPageDigests": context_evidence[
+                    "secondTransitiveGroupRawPageDigests"
+                ],
+                "roleDefinitionRawPageDigests": inventory["secondRoleDefinitionRawPageDigests"],
+                "denyAssignmentRawPageDigests": inventory["secondDenyAssignmentRawPageDigests"],
+                "pimScheduleInstanceRawPageDigests": inventory[
+                    "secondPimScheduleInstanceRawPageDigests"
+                ],
+                **normalized_record_digests,
+            }
+            inventory["firstRawSnapshotDigest"] = compute_artifact_digest(
+                _json_value(first_snapshot_payload)
+            )
+            inventory["secondRawSnapshotDigest"] = compute_artifact_digest(
+                _json_value(second_snapshot_payload)
+            )
     inventory.pop("inventoryDigest", None)
     inventory["inventoryDigest"] = compute_artifact_digest(_json_value(inventory))
 
@@ -827,6 +1019,8 @@ def _deny_assignment(
     *,
     principal_id: str,
     actions: tuple[str, ...],
+    excluded_principal_ids: tuple[str, ...] = (),
+    scope_id: str | None = None,
 ) -> dict[str, object]:
     payload: dict[str, object] = {
         "denyAssignmentId": (
@@ -834,9 +1028,9 @@ def _deny_assignment(
             "Microsoft.Authorization/denyAssignments/"
             "66666666-6666-6666-6666-666666666666"
         ).casefold(),
-        "scopeId": f"/subscriptions/{SUBSCRIPTION_ID}",
+        "scopeId": scope_id or f"/subscriptions/{SUBSCRIPTION_ID}",
         "principalIds": (principal_id,),
-        "excludedPrincipalIds": (),
+        "excludedPrincipalIds": tuple(sorted(excluded_principal_ids)),
         "actions": tuple(sorted(item.casefold() for item in actions)),
         "notActions": (),
         "dataActions": (),
@@ -886,6 +1080,11 @@ def _previous_effective_rbac_inventory(
         assignment_scope_ids=(NETWORK_WATCHER_RESOURCE_ID,),
     )
     inventory["schemaVersion"] = "athena.wc028MonitoringEffectiveRbacInventory.v1"
+    inventory.pop("scopeCollectionMode")
+    inventory["managementGroupAncestry"] = (
+        "/providers/microsoft.management/managementgroups/synthetic-root",
+    )
+    inventory["ancestorScopeCollectionComplete"] = True
     inventory["resourceLogReaderRoleActions"] = tuple(
         sorted(item.casefold() for item in PREVIOUS_RESOURCE_LOG_OPERATIONS)
     )
@@ -906,6 +1105,8 @@ def _previous_effective_rbac_inventory(
         "attestorClientId",
         "attestorPrincipalId",
         "attestorTenantId",
+        "firstReadCompletedAt",
+        "secondReadCompletedAt",
         "denyAssignmentCollectionComplete",
         "pimScheduleInstanceCollectionComplete",
         "collectorPrincipalEvidence",
@@ -916,11 +1117,17 @@ def _previous_effective_rbac_inventory(
         "roleDefinitionRawPageDigests",
         "denyAssignmentRawPageDigests",
         "pimScheduleInstanceRawPageDigests",
+        "firstRoleDefinitionRawPageDigests",
+        "secondRoleDefinitionRawPageDigests",
+        "firstDenyAssignmentRawPageDigests",
+        "secondDenyAssignmentRawPageDigests",
+        "firstPimScheduleInstanceRawPageDigests",
+        "secondPimScheduleInstanceRawPageDigests",
         "firstRawSnapshotDigest",
         "secondRawSnapshotDigest",
         "repeatedReadStable",
     ):
-        inventory.pop(field)
+        inventory.pop(field, None)
     _recompute_effective_rbac_inventory(inventory)
     return inventory
 
@@ -959,6 +1166,12 @@ def _acquisition_collector_contract() -> MonitoringCollectorContract:
             "rbacAttestorAllowedOperations": RBAC_ATTESTOR_OPERATIONS,
             "rbacAttestorIdentitySeparationEnforced": True,
             "identityProofAudience": MONITORING_IDENTITY_PROOF_AUDIENCE,
+            "identityProofApplicationId": IDENTITY_PROOF_APPLICATION_ID,
+            "identityProofApplicationObjectId": (IDENTITY_PROOF_APPLICATION_OBJECT_ID),
+            "identityProofServicePrincipalId": (IDENTITY_PROOF_SERVICE_PRINCIPAL_ID),
+            "identityProofAppRoleId": IDENTITY_PROOF_APP_ROLE_ID,
+            "identityProofAppRoleAssignmentId": (IDENTITY_PROOF_APP_ROLE_ASSIGNMENT_ID),
+            "identityProofAssignedPrincipalId": ("11111111-1111-1111-1111-111111111111"),
             "identityProofTokenVersion": MONITORING_IDENTITY_PROOF_TOKEN_VERSION,
             "identityProofRequiredRole": MONITORING_IDENTITY_PROOF_REQUIRED_ROLE,
             "identityProofMaximumLifetimeSeconds": (
@@ -1044,6 +1257,12 @@ def test_acquisition_collector_contract_authorizes_receipt_handoff() -> None:
     assert contract.ip_flow_verify_allowed_operations is None
     assert contract.flow_table_acquisition_mode == "unsupportedUnavailable"
     assert contract.identity_proof_audience == MONITORING_IDENTITY_PROOF_AUDIENCE
+    assert contract.identity_proof_application_id == IDENTITY_PROOF_APPLICATION_ID
+    assert contract.identity_proof_application_object_id == IDENTITY_PROOF_APPLICATION_OBJECT_ID
+    assert contract.identity_proof_service_principal_id == IDENTITY_PROOF_SERVICE_PRINCIPAL_ID
+    assert contract.identity_proof_app_role_id == IDENTITY_PROOF_APP_ROLE_ID
+    assert contract.identity_proof_app_role_assignment_id == IDENTITY_PROOF_APP_ROLE_ASSIGNMENT_ID
+    assert contract.identity_proof_assigned_principal_id == contract.monitoring_reader_principal_id
     assert "Microsoft.Network/networkWatchers/read" not in contract.allowed_read_operations
     assert contract.resource_health_scope_ids == SIGNAL_READ_SCOPE_IDS
     assert contract.resource_health_allowed_operations == RESOURCE_HEALTH_OPERATIONS
@@ -1070,6 +1289,40 @@ def test_acquisition_collector_contract_authorizes_receipt_handoff() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    (
+        (
+            "identityProofAudience",
+            "api://00000000-0000-0000-0000-000000000004/athena-monitoring-identity-proof",
+        ),
+        (
+            "identityProofAssignedPrincipalId",
+            "77777777-7777-7777-7777-777777777777",
+        ),
+        (
+            "identityProofServicePrincipalId",
+            IDENTITY_PROOF_APPLICATION_ID,
+        ),
+    ),
+)
+def test_current_collector_contract_rejects_unbound_identity_proof_authority(
+    field_name: str,
+    value: str,
+) -> None:
+    payload = _acquisition_collector_contract().model_dump(
+        mode="python",
+        by_alias=True,
+    )
+    payload[field_name] = value
+
+    with pytest.raises(
+        ValidationError,
+        match="deployed identity-proof authority",
+    ):
+        MonitoringCollectorContract(**payload)
+
+
 def test_effective_rbac_inventory_example_matches_reviewed_contract() -> None:
     inventory = MonitoringEffectiveRbacInventory.model_validate_json(
         EFFECTIVE_RBAC_INVENTORY_EXAMPLE.read_text(encoding="utf-8")
@@ -1078,7 +1331,29 @@ def test_effective_rbac_inventory_example_matches_reviewed_contract() -> None:
     assert inventory == _acquisition_collector_contract().effective_rbac_inventory
 
 
-def test_legacy_v3_acquisition_collector_contract_remains_readable() -> None:
+def test_legacy_v2_effective_rbac_inventory_is_parse_only() -> None:
+    legacy_inventory = MonitoringEffectiveRbacInventory.model_validate_json(
+        LEGACY_EFFECTIVE_RBAC_INVENTORY_V2_EXAMPLE.read_text(encoding="utf-8")
+    )
+    assert legacy_inventory.schema_version == "athena.wc028MonitoringEffectiveRbacInventory.v2"
+
+    payload = _acquisition_collector_contract().model_dump(
+        mode="python",
+        by_alias=True,
+    )
+    payload["effectiveRbacInventory"] = legacy_inventory.model_dump(
+        mode="python",
+        by_alias=True,
+        exclude_none=True,
+    )
+    with pytest.raises(
+        ValidationError,
+        match="current effective RBAC inventory|requires effective RBAC inventory v3",
+    ):
+        MonitoringCollectorContract(**payload)
+
+
+def _legacy_v3_acquisition_collector_contract() -> MonitoringCollectorContract:
     payload = _acquisition_collector_contract().model_dump(
         mode="python",
         by_alias=True,
@@ -1102,8 +1377,11 @@ def test_legacy_v3_acquisition_collector_contract_remains_readable() -> None:
         *MEASURED_RBAC_FIELDS,
     ):
         payload.pop(field, None)
+    return MonitoringCollectorContract(**payload)
 
-    legacy = MonitoringCollectorContract(**payload)
+
+def test_legacy_v3_acquisition_collector_contract_remains_readable() -> None:
+    legacy = _legacy_v3_acquisition_collector_contract()
 
     assert legacy.schema_version == "athena.wc028MonitoringCollectorContract.v3"
     assert legacy.ip_flow_verify_role_definition_id is None
@@ -1388,6 +1666,123 @@ def test_acquisition_contract_rejects_incomplete_effective_rbac_inventory() -> N
         MonitoringCollectorContract(**payload)
 
 
+def test_current_rbac_inventory_rejects_management_group_collection_claims() -> None:
+    payload = _acquisition_collector_contract().model_dump(
+        mode="python",
+        by_alias=True,
+    )
+    inventory = payload["effectiveRbacInventory"]
+    assert isinstance(inventory, dict)
+    inventory["managementGroupAncestry"] = (
+        "/providers/microsoft.management/managementgroups/synthetic-root",
+    )
+    inventory["ancestorScopeCollectionComplete"] = True
+    _recompute_effective_rbac_inventory(inventory)
+
+    with pytest.raises(
+        ValidationError,
+        match="exact collectable scope evidence",
+    ):
+        MonitoringCollectorContract(**payload)
+
+
+def test_context_identity_is_forbidden_on_canonical_flow_log_child_scope() -> None:
+    payload = _acquisition_collector_contract().model_dump(
+        mode="python",
+        by_alias=True,
+    )
+    inventory = payload["effectiveRbacInventory"]
+    assert isinstance(inventory, dict)
+    context_grant = _effective_rbac_grant(
+        principal_id=str(payload["athenaContextPrincipalId"]),
+        role_definition_id=READER_ROLE_DEFINITION_ID,
+        role_definition_name="Reader",
+        assignment_scope_ids=(RESOURCE_READ_SCOPE_IDS[-1],),
+    )
+    inventory["athenaContextGrants"] = (context_grant,)
+    _recompute_effective_rbac_inventory(inventory)
+
+    with pytest.raises(
+        ValidationError,
+        match="effective RBAC inventory does not match exact deployed assignments",
+    ):
+        MonitoringCollectorContract(**payload)
+
+
+@pytest.mark.parametrize(
+    "scope_id",
+    (
+        RESOURCE_READ_SCOPE_IDS[0],
+        SIGNAL_READ_SCOPE_IDS[0],
+        WORKSPACE_ID,
+        f"{WORKSPACE_ID}/tables/{REVIEWED_LOG_TABLES[0]}",
+        REVIEWED_WORKLOAD_VNET_ID,
+        EVIDENCE_STORAGE_ACCOUNT_RESOURCE_ID,
+        f"{EVIDENCE_STORAGE_ACCOUNT_RESOURCE_ID}/blobServices/default",
+        SIGNING_KEY_VAULT_RESOURCE_ID,
+        NETWORK_WATCHER_RESOURCE_ID,
+    ),
+)
+def test_context_identity_is_forbidden_on_each_distinct_acquisition_read_scope(
+    scope_id: str,
+) -> None:
+    payload = _acquisition_collector_contract().model_dump(
+        mode="python",
+        by_alias=True,
+    )
+    inventory = payload["effectiveRbacInventory"]
+    assert isinstance(inventory, dict)
+    inventory["athenaContextGrants"] = (
+        _effective_rbac_grant(
+            principal_id=str(payload["athenaContextPrincipalId"]),
+            role_definition_id=READER_ROLE_DEFINITION_ID,
+            role_definition_name="Reader",
+            assignment_scope_ids=(scope_id,),
+        ),
+    )
+    _recompute_effective_rbac_inventory(inventory)
+
+    with pytest.raises(
+        ValidationError,
+        match="effective RBAC inventory does not match exact deployed assignments",
+    ):
+        MonitoringCollectorContract(**payload)
+
+
+def test_context_group_grant_is_forbidden_on_workspace_table_scope() -> None:
+    payload = _acquisition_collector_contract().model_dump(
+        mode="python",
+        by_alias=True,
+    )
+    inventory = payload["effectiveRbacInventory"]
+    assert isinstance(inventory, dict)
+    group_id = "33333333-3333-3333-3333-333333333333"
+    inventory["athenaContextSecurityGroupIds"] = (group_id,)
+    context_evidence = inventory["athenaContextPrincipalEvidence"]
+    assert isinstance(context_evidence, dict)
+    context_evidence["transitiveGroupIds"] = (group_id,)
+    _recompute_principal_evidence(context_evidence)
+    inventory["athenaContextGrants"] = (
+        _effective_rbac_grant(
+            principal_id=str(payload["athenaContextPrincipalId"]),
+            assigned_principal_id=group_id,
+            assigned_principal_type="Group",
+            role_definition_id=READER_ROLE_DEFINITION_ID,
+            role_definition_name="Reader",
+            assignment_scope_ids=(f"{WORKSPACE_ID}/tables/{REVIEWED_LOG_TABLES[0]}",),
+            inheritance="direct",
+            group_derived=True,
+        ),
+    )
+    _recompute_effective_rbac_inventory(inventory)
+
+    with pytest.raises(
+        ValidationError,
+        match="effective RBAC inventory does not match exact deployed assignments",
+    ):
+        MonitoringCollectorContract(**payload)
+
+
 def test_acquisition_contract_rejects_unbound_effective_rbac_source() -> None:
     payload = _acquisition_collector_contract().model_dump(
         mode="python",
@@ -1443,6 +1838,52 @@ def test_current_rbac_attestation_rejects_unstable_or_incomplete_pages() -> None
 
         with pytest.raises(ValidationError, match=expected):
             MonitoringCollectorContract(**payload)
+
+
+def test_current_rbac_attestation_requires_distinct_read_receipt_times() -> None:
+    payload = _acquisition_collector_contract().model_dump(
+        mode="python",
+        by_alias=True,
+    )
+    inventory = payload["effectiveRbacInventory"]
+    assert isinstance(inventory, dict)
+    inventory["secondReadCompletedAt"] = inventory["firstReadCompletedAt"]
+    inventory.pop("inventoryDigest")
+    inventory["inventoryDigest"] = compute_artifact_digest(_json_value(inventory))
+
+    with pytest.raises(ValidationError, match="read receipts are not distinct"):
+        MonitoringCollectorContract(**payload)
+
+
+def test_current_rbac_attestation_rejects_second_global_read_page_drift() -> None:
+    payload = _acquisition_collector_contract().model_dump(
+        mode="python",
+        by_alias=True,
+    )
+    inventory = payload["effectiveRbacInventory"]
+    assert isinstance(inventory, dict)
+    inventory["secondRoleDefinitionRawPageDigests"] = ("sha256:" + "f" * 64,)
+    _recompute_effective_rbac_inventory(inventory)
+
+    with pytest.raises(ValidationError, match="stable separate-attestor evidence"):
+        MonitoringCollectorContract(**payload)
+
+
+def test_current_rbac_attestation_rejects_second_principal_read_page_drift() -> None:
+    payload = _acquisition_collector_contract().model_dump(
+        mode="python",
+        by_alias=True,
+    )
+    inventory = payload["effectiveRbacInventory"]
+    assert isinstance(inventory, dict)
+    collector_evidence = inventory["collectorPrincipalEvidence"]
+    assert isinstance(collector_evidence, dict)
+    collector_evidence["secondRoleAssignmentRawPageDigests"] = ("sha256:" + "f" * 64,)
+    _recompute_principal_evidence(collector_evidence)
+    _recompute_effective_rbac_inventory(inventory)
+
+    with pytest.raises(ValidationError, match="complete stable evidence shape"):
+        MonitoringCollectorContract(**payload)
 
 
 def test_current_rbac_attestation_rejects_missing_roles_and_conditions() -> None:
@@ -1512,6 +1953,114 @@ def test_current_rbac_attestation_evaluates_wildcard_denies_and_active_pim() -> 
     _recompute_effective_rbac_inventory(pim_inventory)
     with pytest.raises(ValidationError, match="must not depend on active PIM"):
         MonitoringCollectorContract(**pim)
+
+
+def test_current_rbac_attestation_treats_all_zero_principal_as_wildcard() -> None:
+    denied = _acquisition_collector_contract().model_dump(
+        mode="python",
+        by_alias=True,
+    )
+    denied_inventory = denied["effectiveRbacInventory"]
+    assert isinstance(denied_inventory, dict)
+    denied_inventory["denyAssignments"] = (
+        _deny_assignment(
+            principal_id="00000000-0000-0000-0000-000000000000",
+            actions=("*/read",),
+        ),
+    )
+    _recompute_effective_rbac_inventory(denied_inventory)
+
+    with pytest.raises(ValidationError, match="deny assignment removes"):
+        MonitoringCollectorContract(**denied)
+
+
+def test_current_rbac_attestation_honors_all_principals_exclusion() -> None:
+    allowed = _acquisition_collector_contract().model_dump(
+        mode="python",
+        by_alias=True,
+    )
+    allowed_inventory = allowed["effectiveRbacInventory"]
+    assert isinstance(allowed_inventory, dict)
+    allowed_inventory["denyAssignments"] = (
+        _deny_assignment(
+            principal_id="00000000-0000-0000-0000-000000000000",
+            actions=("*/read",),
+            excluded_principal_ids=(str(allowed["monitoringReaderPrincipalId"]),),
+        ),
+    )
+    _recompute_effective_rbac_inventory(allowed_inventory)
+
+    assert MonitoringCollectorContract(**allowed)
+
+
+def test_current_rbac_attestation_honors_all_principals_group_exclusion() -> None:
+    allowed = _acquisition_collector_contract().model_dump(
+        mode="python",
+        by_alias=True,
+    )
+    inventory = allowed["effectiveRbacInventory"]
+    assert isinstance(inventory, dict)
+    group_id = "33333333-3333-3333-3333-333333333333"
+    inventory["collectorSecurityGroupIds"] = (group_id,)
+    collector_evidence = inventory["collectorPrincipalEvidence"]
+    assert isinstance(collector_evidence, dict)
+    collector_evidence["transitiveGroupIds"] = (group_id,)
+    _recompute_principal_evidence(collector_evidence)
+    inventory["denyAssignments"] = (
+        _deny_assignment(
+            principal_id="00000000-0000-0000-0000-000000000000",
+            actions=("*/read",),
+            excluded_principal_ids=(group_id,),
+        ),
+    )
+    _recompute_effective_rbac_inventory(inventory)
+
+    assert MonitoringCollectorContract(**allowed)
+
+
+def test_current_rbac_attestation_rejects_all_principals_as_an_exclusion() -> None:
+    invalid = _acquisition_collector_contract().model_dump(
+        mode="python",
+        by_alias=True,
+    )
+    inventory = invalid["effectiveRbacInventory"]
+    assert isinstance(inventory, dict)
+    inventory["denyAssignments"] = (
+        _deny_assignment(
+            principal_id=str(invalid["monitoringReaderPrincipalId"]),
+            actions=("*/read",),
+            excluded_principal_ids=("00000000-0000-0000-0000-000000000000",),
+        ),
+    )
+    _recompute_effective_rbac_inventory(inventory)
+
+    with pytest.raises(
+        ValidationError,
+        match="All Principals cannot appear in excludedPrincipalIds",
+    ):
+        MonitoringCollectorContract(**invalid)
+
+
+def test_current_rbac_attestation_conservatively_applies_returned_ancestor_deny() -> None:
+    denied = _acquisition_collector_contract().model_dump(
+        mode="python",
+        by_alias=True,
+    )
+    denied_inventory = denied["effectiveRbacInventory"]
+    assert isinstance(denied_inventory, dict)
+    denied_inventory["denyAssignments"] = (
+        _deny_assignment(
+            principal_id=str(denied["monitoringReaderPrincipalId"]),
+            actions=("*/read",),
+            scope_id=(
+                "/providers/microsoft.management/managementgroups/synthetic-returned-ancestor"
+            ),
+        ),
+    )
+    _recompute_effective_rbac_inventory(denied_inventory)
+
+    with pytest.raises(ValidationError, match="deny assignment removes"):
+        MonitoringCollectorContract(**denied)
 
 
 def test_current_rbac_attestation_requires_transitive_group_evidence() -> None:
@@ -1885,6 +2434,24 @@ def test_signed_acquisition_receipt_reverifies_deployed_identity_policy() -> Non
         expected_acquisition_authority_digest=authority_digest,
         maximum_receipt_age_seconds=600,
     )
+    with pytest.raises(
+        ValueError,
+        match="outside measured effective RBAC lifetime",
+    ):
+        verify_monitoring_acquisition_receipt_attestation(
+            receipt.model_copy(
+                update={
+                    "execution_completed_at": effective_rbac_inventory.expires_at,
+                    "receipt_issued_at": effective_rbac_inventory.expires_at,
+                }
+            ),
+            as_of=observed_at,
+            trusted_key_anchor=anchor,
+            key_resolver=lambda _anchor: record,
+            reviewed_collector_contract=contract,
+            expected_acquisition_authority_digest=authority_digest,
+            maximum_receipt_age_seconds=600,
+        )
     with pytest.raises(ValueError, match="does not match deployed acquisition authority"):
         verify_monitoring_acquisition_receipt_attestation(
             receipt.model_copy(update={"authenticated_principal_id": context_principal}),

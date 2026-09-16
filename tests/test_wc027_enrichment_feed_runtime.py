@@ -37,7 +37,10 @@ from athena_context.guidance import GuidanceAuthorityActivationSnapshot
 from athena_context.guidance.production import (
     Wc027GuidanceAuthorityPublisherConfiguration,
 )
-from test_wc024_monitoring_contract import _collector_contract
+from test_wc024_monitoring_contract import (
+    _acquisition_collector_contract,
+    _legacy_v3_acquisition_collector_contract,
+)
 from test_wc026_correlation_contract import NOW
 from test_wc027_enrichment_feed_pipeline import (
     PUBLISHED_AT,
@@ -102,19 +105,13 @@ class _Authority:
 class _Activation:
     def __init__(self, binding, occurrence) -> None:
         payload = {
-            "schemaVersion": (
-                "athena.wc027PublishedGuidanceAuthorityActivation.v1"
-            ),
-            "incidentId": (
-                binding.incident_bound_request.incident_subject.incident_id
-            ),
+            "schemaVersion": ("athena.wc027PublishedGuidanceAuthorityActivation.v1"),
+            "incidentId": (binding.incident_bound_request.incident_subject.incident_id),
             "incidentStateDigest": (
                 binding.incident_bound_request.incident_subject.incident_state_digest
             ),
             "occurrenceDigest": occurrence.occurrence_digest,
-            "publicationRequestId": (
-                "guidance-publication-request-" + "8" * 32
-            ),
+            "publicationRequestId": ("guidance-publication-request-" + "8" * 32),
             "publicationRequestDigest": "sha256:" + "8" * 64,
             "bindingId": binding.binding_id,
             "bindingDigest": binding.binding_digest,
@@ -124,9 +121,7 @@ class _Activation:
                 contentDigest=sha256_hex(binding.canonical_bytes()),
             ),
             "activatedAt": binding.evaluated_at,
-            "expiresAt": (
-                binding.incident_bound_request.correlation_request.expires_at
-            ),
+            "expiresAt": (binding.incident_bound_request.correlation_request.expires_at),
         }
         digest_payload = {
             **payload,
@@ -136,9 +131,7 @@ class _Activation:
             ),
         }
         attestation = PublishedGuidanceAuthorityActivationAttestation(
-            schemaVersion=(
-                "athena.wc027PublishedGuidanceAuthorityActivationAttestation.v1"
-            ),
+            schemaVersion=("athena.wc027PublishedGuidanceAuthorityActivationAttestation.v1"),
             signatureAlgorithm="RS256",
             keyId=binding.binding_attestation.key_id,
             signedPreimageDigest=compute_artifact_digest(digest_payload),
@@ -157,9 +150,7 @@ class _Activation:
         self.snapshot = GuidanceAuthorityActivationSnapshot(
             activation=PublishedGuidanceAuthorityActivation(
                 **complete,
-                activationId=(
-                    f"guidance-activation-{digest.removeprefix('sha256:')[:32]}"
-                ),
+                activationId=(f"guidance-activation-{digest.removeprefix('sha256:')[:32]}"),
                 activationDigest=digest,
             ),
             etag='"synthetic"',
@@ -250,9 +241,7 @@ class _ArtifactReaderProbe:
 
 
 def _bicep_generated_runtime_configuration() -> dict[str, object]:
-    identity_client_ids = [
-        f"00000000-0000-0000-0000-{index:012d}" for index in range(1, 18)
-    ]
+    identity_client_ids = [f"00000000-0000-0000-0000-{index:012d}" for index in range(1, 18)]
 
     def identity_resource_id(index: int) -> str:
         return (
@@ -268,16 +257,14 @@ def _bicep_generated_runtime_configuration() -> dict[str, object]:
             "identityClientId": identity_client_ids[index],
             "identityResourceId": identity_resource_id(index),
         }
+
     def key(
         index: int,
         identity_index: int,
         *,
         logical_key_id: str | None = None,
     ) -> dict[str, str]:
-        key_vault_key_id = (
-            "https://athena-wc027.vault.azure.net/keys/"
-            f"key-{index}/{index:032x}"
-        )
+        key_vault_key_id = f"https://athena-wc027.vault.azure.net/keys/key-{index}/{index:032x}"
         return {
             "keyId": logical_key_id or key_vault_key_id,
             "keyVaultKeyId": key_vault_key_id,
@@ -286,16 +273,15 @@ def _bicep_generated_runtime_configuration() -> dict[str, object]:
             "identityResourceId": identity_resource_id(identity_index),
         }
 
-    attached_identity_resource_ids = [
-        identity_resource_id(index) for index in range(17)
-    ]
+    attached_identity_resource_ids = [identity_resource_id(index) for index in range(17)]
     monitoring_collector_key: dict[str, object] = {
         **key(1, 10),
         "activatedAt": NOW.isoformat().replace("+00:00", "Z"),
         "expiresAt": None,
     }
+    monitoring_collector_contract = _acquisition_collector_contract()
     return {
-        "schemaVersion": "athena.wc027EnrichmentFeedRuntimeConfiguration.v1",
+        "schemaVersion": "athena.wc027EnrichmentFeedRuntimeConfiguration.v2",
         "serviceBus": {
             "namespace": "athena-wc027.servicebus.windows.net",
             "triggerQueueName": "wc027-enrichment-trigger",
@@ -343,19 +329,20 @@ def _bicep_generated_runtime_configuration() -> dict[str, object]:
             "identityClientId": identity_client_ids[16],
             "identityResourceId": identity_resource_id(16),
         },
-        "monitoringCollectorContract": _collector_contract().model_dump(
+        "monitoringCollectorContract": monitoring_collector_contract.model_dump(
             mode="json",
             by_alias=True,
         ),
+        "monitoringCollectorContractDigest": (
+            monitoring_collector_contract.compute_artifact_digest_value()
+        ),
+        "monitoringAcquisitionAuthorityDigest": "sha256:" + "a" * 64,
         "monitoringCollectorKey": monitoring_collector_key,
         "keys": {
             "incident": key(
                 4,
                 10,
-                logical_key_id=(
-                    "synthetic-key://athena-argus-demo/"
-                    "wc016-incidents-rs256-v1"
-                ),
+                logical_key_id=("synthetic-key://athena-argus-demo/wc016-incidents-rs256-v1"),
             ),
             "correlationBinding": key(5, 10),
             "guidanceBinding": key(6, 10),
@@ -419,9 +406,7 @@ def _bicep_generated_publisher_configuration() -> dict[str, object]:
         runtime["keys"]["correlationBinding"]["identityResourceId"],  # type: ignore[index]
     }
     return {
-        "schemaVersion": (
-            "athena.wc027GuidanceAuthorityPublisherConfiguration.v1"
-        ),
+        "schemaVersion": ("athena.wc027GuidanceAuthorityPublisherConfiguration.v2"),
         "serviceBus": {
             "namespace": "athena-wc027.servicebus.windows.net",
             "requestQueueName": "wc027-guidance-authority-requests",
@@ -447,6 +432,10 @@ def _bicep_generated_publisher_configuration() -> dict[str, object]:
         "requestKey": request_key,
         "bindingSigningKey": binding_signing_key,
         "enrichmentRuntimeConfiguration": runtime,
+        "monitoringAcquisitionTrust": {
+            "collectorContractDigest": runtime["monitoringCollectorContractDigest"],
+            "acquisitionAuthorityDigest": runtime["monitoringAcquisitionAuthorityDigest"],
+        },
         "deploymentBinding": {
             "bindingEvidenceId": "10000000-0000-0000-0000-000000000099",
             "attachedIdentityResourceIds": sorted(expected_identities),
@@ -466,15 +455,13 @@ def test_publisher_configuration_preserves_logical_and_physical_binding_keys() -
         json.dumps(payload)
     )
 
-    assert configuration.binding_signing_key.key_id == (
-        payload["enrichmentRuntimeConfiguration"]["keys"]["guidanceBinding"][
-            "keyId"
-        ]
+    assert (
+        configuration.binding_signing_key.key_id
+        == (payload["enrichmentRuntimeConfiguration"]["keys"]["guidanceBinding"]["keyId"])
     )
-    assert configuration.binding_signing_key.key_vault_key_id == (
-        payload["enrichmentRuntimeConfiguration"]["keys"]["guidanceBinding"][
-            "keyVaultKeyId"
-        ]
+    assert (
+        configuration.binding_signing_key.key_vault_key_id
+        == (payload["enrichmentRuntimeConfiguration"]["keys"]["guidanceBinding"]["keyVaultKeyId"])
     )
     assert (
         configuration.binding_signing_key.identity_resource_id
@@ -488,14 +475,12 @@ def test_publisher_configuration_preserves_logical_and_physical_binding_keys() -
 
 def test_publisher_configuration_rejects_reused_request_authority() -> None:
     payload = _bicep_generated_publisher_configuration()
-    payload["requestKey"]["keyId"] = payload["enrichmentRuntimeConfiguration"][
-        "keys"
-    ]["incident"]["keyId"]
+    payload["requestKey"]["keyId"] = payload["enrichmentRuntimeConfiguration"]["keys"]["incident"][
+        "keyId"
+    ]
 
     with pytest.raises(ValueError, match="distinct trust domain"):
-        Wc027GuidanceAuthorityPublisherConfiguration.model_validate_json(
-            json.dumps(payload)
-        )
+        Wc027GuidanceAuthorityPublisherConfiguration.model_validate_json(json.dumps(payload))
 
 
 def test_publisher_configuration_rejects_reused_request_public_key_material() -> None:
@@ -505,9 +490,7 @@ def test_publisher_configuration_rejects_reused_request_public_key_material() ->
     ]["keys"]["incident"]["keyFingerprint"]  # type: ignore[index]
 
     with pytest.raises(ValueError, match="distinct trust domain"):
-        Wc027GuidanceAuthorityPublisherConfiguration.model_validate_json(
-            json.dumps(payload)
-        )
+        Wc027GuidanceAuthorityPublisherConfiguration.model_validate_json(json.dumps(payload))
 
 
 def test_publisher_configuration_rejects_binding_fingerprint_mismatch() -> None:
@@ -515,24 +498,16 @@ def test_publisher_configuration_rejects_binding_fingerprint_mismatch() -> None:
     payload["bindingSigningKey"]["keyFingerprint"] = "sha256:" + "d" * 64  # type: ignore[index]
 
     with pytest.raises(ValueError, match="does not match runtime guidance trust"):
-        Wc027GuidanceAuthorityPublisherConfiguration.model_validate_json(
-            json.dumps(payload)
-        )
+        Wc027GuidanceAuthorityPublisherConfiguration.model_validate_json(json.dumps(payload))
 
 
 def test_publisher_configuration_rejects_reused_managed_identity() -> None:
     payload = _bicep_generated_publisher_configuration()
-    payload["requestKey"]["identityClientId"] = payload["serviceBus"][
-        "brokerIdentityClientId"
-    ]
-    payload["requestKey"]["identityResourceId"] = payload["serviceBus"][
-        "brokerIdentityResourceId"
-    ]
+    payload["requestKey"]["identityClientId"] = payload["serviceBus"]["brokerIdentityClientId"]
+    payload["requestKey"]["identityResourceId"] = payload["serviceBus"]["brokerIdentityResourceId"]
 
     with pytest.raises(ValueError, match="managed identities must be distinct"):
-        Wc027GuidanceAuthorityPublisherConfiguration.model_validate_json(
-            json.dumps(payload)
-        )
+        Wc027GuidanceAuthorityPublisherConfiguration.model_validate_json(json.dumps(payload))
 
 
 @pytest.mark.parametrize(
@@ -580,21 +555,17 @@ def test_publisher_configuration_rejects_runtime_store_drift(
     payload[section][field] = value
 
     with pytest.raises(ValueError, match=message):
-        Wc027GuidanceAuthorityPublisherConfiguration.model_validate_json(
-            json.dumps(payload)
-        )
+        Wc027GuidanceAuthorityPublisherConfiguration.model_validate_json(json.dumps(payload))
 
 
 def test_runtime_rejects_guidance_authority_storage_domain_reuse() -> None:
     payload = _bicep_generated_runtime_configuration()
-    payload["guidanceAuthoritySource"]["containerName"] = payload[
-        "correlationSources"
-    ]["monitoring"]["containerName"]
+    payload["guidanceAuthoritySource"]["containerName"] = payload["correlationSources"][
+        "monitoring"
+    ]["containerName"]
 
     with pytest.raises(ValueError, match="storage domains must be distinct"):
-        Wc027EnrichmentFeedProductionConfiguration.model_validate_json(
-            json.dumps(payload)
-        )
+        Wc027EnrichmentFeedProductionConfiguration.model_validate_json(json.dumps(payload))
 
 
 def test_runtime_rejects_reused_public_key_material_across_trust_domains() -> None:
@@ -604,9 +575,60 @@ def test_runtime_rejects_reused_public_key_material_across_trust_domains() -> No
     ]
 
     with pytest.raises(ValueError, match="public key fingerprints must be distinct"):
-        Wc027EnrichmentFeedProductionConfiguration.model_validate_json(
-            json.dumps(payload)
-        )
+        Wc027EnrichmentFeedProductionConfiguration.model_validate_json(json.dumps(payload))
+
+
+def test_runtime_requires_exact_v8_collector_contract_digest() -> None:
+    payload = _bicep_generated_runtime_configuration()
+    payload["monitoringCollectorContractDigest"] = "sha256:" + "f" * 64
+
+    with pytest.raises(ValueError, match="does not bind the exact v8 contract"):
+        Wc027EnrichmentFeedProductionConfiguration.model_validate_json(json.dumps(payload))
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    (
+        "monitoringCollectorContractDigest",
+        "monitoringAcquisitionAuthorityDigest",
+    ),
+)
+def test_runtime_rejects_placeholder_monitoring_trust_digests(
+    field_name: str,
+) -> None:
+    payload = _bicep_generated_runtime_configuration()
+    payload[field_name] = "sha256:" + "0" * 64
+
+    with pytest.raises(ValueError, match="real lowercase SHA-256 digest"):
+        Wc027EnrichmentFeedProductionConfiguration.model_validate_json(json.dumps(payload))
+
+
+def test_runtime_rejects_legacy_v3_with_explicit_recollection_disposition() -> None:
+    payload = _bicep_generated_runtime_configuration()
+    legacy = _legacy_v3_acquisition_collector_contract()
+    payload["monitoringCollectorContract"] = legacy.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+    )
+    payload["monitoringCollectorContractDigest"] = legacy.compute_artifact_digest_value()
+
+    with pytest.raises(
+        ValueError,
+        match="legacy monitoring collector contract v3 is parse-only.*recollection",
+    ):
+        Wc027EnrichmentFeedProductionConfiguration.model_validate_json(json.dumps(payload))
+
+
+def test_publisher_requires_same_monitoring_acquisition_trust_as_runtime() -> None:
+    payload = _bicep_generated_publisher_configuration()
+    payload["monitoringAcquisitionTrust"]["acquisitionAuthorityDigest"] = "sha256:" + "f" * 64
+
+    with pytest.raises(
+        ValueError,
+        match="monitoring acquisition trust does not match embedded runtime",
+    ):
+        Wc027GuidanceAuthorityPublisherConfiguration.model_validate_json(json.dumps(payload))
 
 
 def test_complete_bicep_generated_configuration_starts_with_bound_key_authorities() -> None:
@@ -622,12 +644,19 @@ def test_complete_bicep_generated_configuration_starts_with_bound_key_authoritie
         == payload["monitoringCollectorKey"]["identityResourceId"]  # type: ignore[index]
     )
     assert (
+        configuration.monitoring_collector_contract_digest
+        == payload["monitoringCollectorContractDigest"]
+    )
+    assert (
+        configuration.monitoring_acquisition_authority_digest
+        == payload["monitoringAcquisitionAuthorityDigest"]
+    )
+    assert (
         configuration.incident_key.key_id
         == "synthetic-key://athena-argus-demo/wc016-incidents-rs256-v1"
     )
     assert (
-        configuration.incident_key.key_vault_key_id
-        == payload["keys"]["incident"]["keyVaultKeyId"]  # type: ignore[index]
+        configuration.incident_key.key_vault_key_id == payload["keys"]["incident"]["keyVaultKeyId"]  # type: ignore[index]
     )
     assert (
         configuration.incident_key.anchor.key_vault_key_id
@@ -658,9 +687,7 @@ def test_only_lifecycle_and_guidance_binding_may_use_logical_key_ids() -> None:
         ValueError,
         match=r"keys\.feed\.keyId must equal the referenced key version",
     ):
-        Wc027EnrichmentFeedProductionConfiguration.model_validate_json(
-            json.dumps(payload)
-        )
+        Wc027EnrichmentFeedProductionConfiguration.model_validate_json(json.dumps(payload))
 
 
 def _runtime(*, fail_feed_pointer_once: bool = False):
@@ -696,9 +723,7 @@ def _runtime(*, fail_feed_pointer_once: bool = False):
     binding_verifier = _SignatureVerifier()
     incident_authority = _Authority(fixture.publication_reader)
     runtime = Wc027EnrichmentFeedRuntime(
-        guidance_binding_key_id=(
-            fixture.guidance_binding.binding_attestation.key_id
-        ),
+        guidance_binding_key_id=(fixture.guidance_binding.binding_attestation.key_id),
         guidance_binding_signature_verifier=binding_verifier,
         correlation=_Correlation(fixture.correlation_service, operations),
         incident_authority=incident_authority,
@@ -869,9 +894,7 @@ def test_runtime_rejects_stale_signed_binding_before_writes() -> None:
         _incident_authority,
     ) = _runtime()
     stale_current = SimpleNamespace(
-        state=fixture.publication_reader.current.state.model_copy(
-            update={"updated_at": NOW}
-        ),
+        state=fixture.publication_reader.current.state.model_copy(update={"updated_at": NOW}),
         occurrence=fixture.publication_reader.current.occurrence,
         pointer_sha256=fixture.publication_reader.current.pointer_sha256,
     )
@@ -916,9 +939,7 @@ def test_runtime_rejects_binding_that_is_not_the_current_activation() -> None:
         binding_verifier,
         incident_authority,
     ) = _runtime()
-    correlation_request = (
-        fixture.guidance_binding.incident_bound_request.correlation_request
-    )
+    correlation_request = fixture.guidance_binding.incident_bound_request.correlation_request
     report = fixture.guidance_binding.correlation_report
     other_binding = _binding(
         request=correlation_request,
@@ -978,9 +999,7 @@ def test_runtime_retry_recovers_partial_feed_without_early_notification() -> Non
         guidance_binding=fixture.guidance_binding,
     )
     pointer_path = (
-        enrichment.enrichment_asset.manifest_reference.name.removesuffix(
-            "/manifest.json"
-        )
+        enrichment.enrichment_asset.manifest_reference.name.removesuffix("/manifest.json")
         + "/feed-pointer.json"
     )
     writer.fail_after_persist.add(pointer_path)
@@ -1094,15 +1113,13 @@ def test_production_configuration_rejects_identity_and_key_reuse() -> None:
     def key(index: int, identity_index: int) -> _KeyAuthority:
         return _KeyAuthority(
             key_id=f"synthetic-key://wc027/{index}",
-            key_vault_key_id=(
-                "https://synthetic.vault.azure.net/keys/"
-                f"key-{index}/{index:032x}"
-            ),
+            key_vault_key_id=(f"https://synthetic.vault.azure.net/keys/key-{index}/{index:032x}"),
             key_fingerprint="sha256:" + f"{index:x}" * 64,
             identity_client_id=identity_ids[identity_index],
             identity_resource_id=resource_id(identity_index),
         )
 
+    monitoring_collector_contract = _acquisition_collector_contract()
     values = {
         "broker_identity_client_id": identity_ids[0],
         "broker_identity_resource_id": resource_id(0),
@@ -1129,6 +1146,11 @@ def test_production_configuration_rejects_identity_and_key_reuse() -> None:
             identity_client_id=identity_ids[16],
             identity_resource_id=resource_id(16),
         ),
+        "monitoring_collector_contract": monitoring_collector_contract,
+        "monitoring_collector_contract_digest": (
+            monitoring_collector_contract.compute_artifact_digest_value()
+        ),
+        "monitoring_acquisition_authority_digest": "sha256:" + "a" * 64,
         "monitoring_collector_key": _MonitoringCollectorKey(
             authority=key(1, 10),
             activated_at=NOW,
@@ -1145,9 +1167,7 @@ def test_production_configuration_rejects_identity_and_key_reuse() -> None:
         "feed_key": key(10, 14),
         "notification_key": key(11, 15),
         "binding_evidence_id": "00000000-0000-0000-0000-000000000099",
-        "attached_identity_resource_ids": tuple(
-            resource_id(index) for index in range(17)
-        ),
+        "attached_identity_resource_ids": tuple(resource_id(index) for index in range(17)),
         "rbac_resource_ids": (
             "/subscriptions/00000000-0000-0000-0000-000000000000/"
             "providers/Microsoft.Authorization/roleDefinitions/"
@@ -1171,9 +1191,7 @@ def test_production_configuration_rejects_identity_and_key_reuse() -> None:
             reader_identity_resource_id=(
                 configuration.enrichment_feed_assets.reader_identity_resource_id
             ),
-            writer_identity_client_id=(
-                configuration.incident_lifecycle_assets.identity_client_id
-            ),
+            writer_identity_client_id=(configuration.incident_lifecycle_assets.identity_client_id),
             writer_identity_resource_id=(
                 configuration.incident_lifecycle_assets.identity_resource_id
             ),

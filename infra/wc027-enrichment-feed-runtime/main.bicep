@@ -203,6 +203,16 @@ var validatedTrustDomainMetadata = length(union(runtimeTrustDomainFingerprints, 
 @description('Reviewed non-secret monitoring collector contract object.')
 param monitoringCollectorContract object
 
+@description('Exact canonical SHA-256 digest of monitoringCollectorContract. The contract must be WC-028 v8.')
+@minLength(71)
+@maxLength(71)
+param monitoringCollectorContractDigest string
+
+@description('Exact deployed WC-028 monitoring acquisition authority digest accepted by correlation.')
+@minLength(71)
+@maxLength(71)
+param monitoringAcquisitionAuthorityDigest string
+
 @description('Monitoring collector key activation timestamp.')
 param monitoringCollectorKeyActivatedAt string
 
@@ -226,6 +236,38 @@ var storageBlobDataReaderRoleDefinitionId = '2a2b9908-6ea1-4ae2-8e65-a410df84e7d
 var storageTableDataContributorRoleDefinitionId = '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3'
 var storageTableDataReaderRoleDefinitionId = '76199698-9eea-4c19-bc75-cec21354c6b6'
 var keyVaultCryptoUserRoleDefinitionId = '12338af0-0e69-4776-bea7-57ae8d297424'
+
+var monitoringCollectorContractDigestHex = replace(monitoringCollectorContractDigest, 'sha256:', '')
+var monitoringCollectorContractDigestWithoutDigits = replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(
+  monitoringCollectorContractDigestHex,
+  '0',
+  ''
+), '1', ''), '2', ''), '3', ''), '4', ''), '5', ''), '6', ''), '7', ''), '8', ''), '9', '')
+var monitoringCollectorContractDigestInvalidCharacters = replace(replace(replace(replace(replace(replace(
+  monitoringCollectorContractDigestWithoutDigits,
+  'a',
+  ''
+), 'b', ''), 'c', ''), 'd', ''), 'e', ''), 'f', '')
+var validatedMonitoringCollectorContractDigest = monitoringCollectorContractDigest == toLower(monitoringCollectorContractDigest) && startsWith(monitoringCollectorContractDigest, 'sha256:') && length(monitoringCollectorContractDigestHex) == 64 && empty(monitoringCollectorContractDigestInvalidCharacters) && monitoringCollectorContractDigestHex != '0000000000000000000000000000000000000000000000000000000000000000'
+  ? monitoringCollectorContractDigest
+  : fail('monitoringCollectorContractDigest must be one real lowercase SHA-256 digest')
+var monitoringAcquisitionAuthorityDigestHex = replace(monitoringAcquisitionAuthorityDigest, 'sha256:', '')
+var monitoringAcquisitionAuthorityDigestWithoutDigits = replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(
+  monitoringAcquisitionAuthorityDigestHex,
+  '0',
+  ''
+), '1', ''), '2', ''), '3', ''), '4', ''), '5', ''), '6', ''), '7', ''), '8', ''), '9', '')
+var monitoringAcquisitionAuthorityDigestInvalidCharacters = replace(replace(replace(replace(replace(replace(
+  monitoringAcquisitionAuthorityDigestWithoutDigits,
+  'a',
+  ''
+), 'b', ''), 'c', ''), 'd', ''), 'e', ''), 'f', '')
+var validatedMonitoringAcquisitionAuthorityDigest = monitoringAcquisitionAuthorityDigest == toLower(monitoringAcquisitionAuthorityDigest) && startsWith(monitoringAcquisitionAuthorityDigest, 'sha256:') && length(monitoringAcquisitionAuthorityDigestHex) == 64 && empty(monitoringAcquisitionAuthorityDigestInvalidCharacters) && monitoringAcquisitionAuthorityDigestHex != '0000000000000000000000000000000000000000000000000000000000000000'
+  ? monitoringAcquisitionAuthorityDigest
+  : fail('monitoringAcquisitionAuthorityDigest must be one real lowercase SHA-256 digest')
+var validatedMonitoringCollectorContract = monitoringCollectorContract.schemaVersion == 'athena.wc028MonitoringCollectorContract.v8' && monitoringCollectorContract.acquisitionReceiptSchemaVersion == 'athena.wc028MonitoringAcquisitionReceipt.v5'
+  ? monitoringCollectorContract
+  : fail('WC-027 production requires the exact WC-028 v8 collector contract; legacy v3 must be recollected and republished')
 
 var expectedRegistryServer = '${toLower(registry.name)}.azurecr.io'
 var imagePrefix = '${expectedRegistryServer}/athena/wc027-enrichment-feed-producer@sha256:'
@@ -895,7 +937,7 @@ module producerImagePull 'modules/acr-pull-rbac.bicep' = {
 
 var correlationSourceBlobEndpoint = correlationSourceStorage.properties.primaryEndpoints.blob
 var runtimeConfiguration = {
-  schemaVersion: 'athena.wc027EnrichmentFeedRuntimeConfiguration.v1'
+  schemaVersion: 'athena.wc027EnrichmentFeedRuntimeConfiguration.v2'
   serviceBus: {
     namespace: serviceBusNamespaceHostName
     triggerQueueName: triggerQueue.name
@@ -969,7 +1011,9 @@ var runtimeConfiguration = {
     identityClientId: guidanceAuthorityReaderIdentity.properties.clientId
     identityResourceId: guidanceAuthorityReaderIdentity.id
   }
-  monitoringCollectorContract: monitoringCollectorContract
+  monitoringCollectorContract: validatedMonitoringCollectorContract
+  monitoringCollectorContractDigest: validatedMonitoringCollectorContractDigest
+  monitoringAcquisitionAuthorityDigest: validatedMonitoringAcquisitionAuthorityDigest
   monitoringCollectorKey: {
     keyId: monitoringCollectorKey.properties.keyUriWithVersion
     keyVaultKeyId: monitoringCollectorKey.properties.keyUriWithVersion
@@ -1108,6 +1152,8 @@ var resourceTags = union(tags, {
   managedBy: 'bicep'
   runtimeConfigurationDigest: runtimeConfigurationDigest
   bindingEvidenceDigest: bindingEvidenceDigest
+  monitoringCollectorContractDigest: validatedMonitoringCollectorContractDigest
+  monitoringAcquisitionAuthorityDigest: validatedMonitoringAcquisitionAuthorityDigest
   attachedIdentityCount: string(length(validatedAttachedIdentityResourceIds))
 })
 
@@ -1218,3 +1264,9 @@ output triggerQueueName string = triggerQueue.name
 
 @description('Private Service Bus namespace host used by the runtime configuration.')
 output namespaceHostName string = serviceBusNamespaceHostName
+
+@description('Exact WC-028 collector contract digest embedded in the deployed runtime configuration.')
+output deployedMonitoringCollectorContractDigest string = validatedMonitoringCollectorContractDigest
+
+@description('Exact WC-028 acquisition authority digest embedded in the deployed runtime configuration.')
+output deployedMonitoringAcquisitionAuthorityDigest string = validatedMonitoringAcquisitionAuthorityDigest

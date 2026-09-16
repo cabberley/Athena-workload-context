@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -34,6 +35,9 @@ from athena_context.contracts import (
     PublishedGuidanceAuthorityBinding,
     TrustedKeyAnchor,
     TrustedKeyRecord,
+)
+from athena_context.contracts.monitoring import (
+    MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
 )
 from athena_context.correlation import (
     AzureBlobCorrelationArtifactReader,
@@ -94,7 +98,7 @@ from athena_context.presentation_assets import (
     PresentationAssetUnavailableError,
 )
 
-_CONFIG_SCHEMA_VERSION = "athena.wc027EnrichmentFeedRuntimeConfiguration.v1"
+_CONFIG_SCHEMA_VERSION = "athena.wc027EnrichmentFeedRuntimeConfiguration.v2"
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,6 +176,8 @@ class Wc027EnrichmentFeedProductionConfiguration:
     guidance_authority_source: _BlobSource
     guidance_activation: _TableSource
     monitoring_collector_contract: MonitoringCollectorContract
+    monitoring_collector_contract_digest: str
+    monitoring_acquisition_authority_digest: str
     monitoring_collector_key: _MonitoringCollectorKey
     incident_key: _KeyAuthority
     correlation_binding_key: _KeyAuthority
@@ -208,6 +214,8 @@ class Wc027EnrichmentFeedProductionConfiguration:
                 "guidanceAuthoritySource",
                 "guidanceActivation",
                 "monitoringCollectorContract",
+                "monitoringCollectorContractDigest",
+                "monitoringAcquisitionAuthorityDigest",
                 "monitoringCollectorKey",
                 "keys",
             },
@@ -320,9 +328,7 @@ class Wc027EnrichmentFeedProductionConfiguration:
         configuration = cls(
             service_bus_namespace=_service_bus_namespace(service_bus["namespace"]),
             trigger_queue_name=_queue_name(service_bus["triggerQueueName"]),
-            notification_queue_name=_queue_name(
-                service_bus["notificationQueueName"]
-            ),
+            notification_queue_name=_queue_name(service_bus["notificationQueueName"]),
             broker_identity_client_id=_client_id(
                 service_bus["brokerIdentityClientId"],
                 "serviceBus.brokerIdentityClientId",
@@ -428,9 +434,15 @@ class Wc027EnrichmentFeedProductionConfiguration:
                     json.dumps(root["monitoringCollectorContract"])
                 )
             ),
-            monitoring_collector_key=_monitoring_collector_key(
-                root["monitoringCollectorKey"]
+            monitoring_collector_contract_digest=_sha256_digest(
+                root["monitoringCollectorContractDigest"],
+                "monitoringCollectorContractDigest",
             ),
+            monitoring_acquisition_authority_digest=_sha256_digest(
+                root["monitoringAcquisitionAuthorityDigest"],
+                "monitoringAcquisitionAuthorityDigest",
+            ),
+            monitoring_collector_key=_monitoring_collector_key(root["monitoringCollectorKey"]),
             incident_key=_key_authority(
                 keys["incident"],
                 "keys.incident",
@@ -466,6 +478,21 @@ class Wc027EnrichmentFeedProductionConfiguration:
         return configuration
 
     def _validate_separation(self) -> None:
+        if (
+            self.monitoring_collector_contract.schema_version
+            != MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION
+        ):
+            raise ValueError(
+                "legacy monitoring collector contract v3 is parse-only; "
+                "WC-027 production requires recollection and republication under v8"
+            )
+        if (
+            self.monitoring_collector_contract.compute_artifact_digest_value()
+            != self.monitoring_collector_contract_digest
+        ):
+            raise ValueError(
+                "monitoringCollectorContractDigest does not bind the exact v8 contract"
+            )
         correlation_sources = (
             self.monitoring_source,
             self.change_source,
@@ -473,12 +500,10 @@ class Wc027EnrichmentFeedProductionConfiguration:
             self.monitoring_intent_source,
             self.guidance_authority_source,
         )
-        if len(
-            {item.identity_client_id.casefold() for item in correlation_sources}
-        ) != len(correlation_sources):
-            raise ValueError(
-                "correlation source reader managed identities must be distinct"
-            )
+        if len({item.identity_client_id.casefold() for item in correlation_sources}) != len(
+            correlation_sources
+        ):
+            raise ValueError("correlation source reader managed identities must be distinct")
         if len(
             {
                 (item.endpoint.casefold().rstrip("/"), item.container.casefold())
@@ -499,22 +524,12 @@ class Wc027EnrichmentFeedProductionConfiguration:
             self.feed_key,
             self.notification_key,
         )
-        if len({item.key_id for item in all_key_authorities}) != len(
-            all_key_authorities
-        ):
+        if len({item.key_id for item in all_key_authorities}) != len(all_key_authorities):
             raise ValueError("WC-027 trust-domain key IDs must be distinct")
-        if len(
-            {item.key_vault_key_id for item in all_key_authorities}
-        ) != len(all_key_authorities):
-            raise ValueError(
-                "WC-027 trust-domain Key Vault key versions must be distinct"
-            )
-        if len({item.key_fingerprint for item in all_key_authorities}) != len(
-            all_key_authorities
-        ):
-            raise ValueError(
-                "WC-027 trust-domain public key fingerprints must be distinct"
-            )
+        if len({item.key_vault_key_id for item in all_key_authorities}) != len(all_key_authorities):
+            raise ValueError("WC-027 trust-domain Key Vault key versions must be distinct")
+        if len({item.key_fingerprint for item in all_key_authorities}) != len(all_key_authorities):
+            raise ValueError("WC-027 trust-domain public key fingerprints must be distinct")
         producer_signing_authorities = (
             self.report_key,
             self.guidance_key,
@@ -522,9 +537,9 @@ class Wc027EnrichmentFeedProductionConfiguration:
             self.feed_key,
             self.notification_key,
         )
-        if len(
-            {item.identity_client_id for item in producer_signing_authorities}
-        ) != len(producer_signing_authorities):
+        if len({item.identity_client_id for item in producer_signing_authorities}) != len(
+            producer_signing_authorities
+        ):
             raise ValueError("WC-027 signing managed identities must be distinct")
         io_identity_pairs = (
             (
@@ -563,9 +578,7 @@ class Wc027EnrichmentFeedProductionConfiguration:
             ),
         )
         io_identities = tuple(client_id for client_id, _ in io_identity_pairs)
-        io_identity_resource_ids = tuple(
-            resource_id for _, resource_id in io_identity_pairs
-        )
+        io_identity_resource_ids = tuple(resource_id for _, resource_id in io_identity_pairs)
         signing_identity_pairs = tuple(
             (
                 item.identity_client_id,
@@ -577,20 +590,18 @@ class Wc027EnrichmentFeedProductionConfiguration:
             {item.casefold() for item in io_identity_resource_ids}
         ) != len(io_identity_resource_ids):
             raise ValueError("WC-027 runtime I/O managed identities must be distinct")
-        if len(
-            {client_id for client_id, _ in signing_identity_pairs}
-        ) != len(signing_identity_pairs) or len(
-            {resource_id.casefold() for _, resource_id in signing_identity_pairs}
-        ) != len(signing_identity_pairs):
+        if len({client_id for client_id, _ in signing_identity_pairs}) != len(
+            signing_identity_pairs
+        ) or len({resource_id.casefold() for _, resource_id in signing_identity_pairs}) != len(
+            signing_identity_pairs
+        ):
             raise ValueError("WC-027 signing managed identities must be distinct")
         if set(io_identities).intersection(
             client_id for client_id, _ in signing_identity_pairs
         ) or {item.casefold() for item in io_identity_resource_ids}.intersection(
             resource_id.casefold() for _, resource_id in signing_identity_pairs
         ):
-            raise ValueError(
-                "WC-027 signing identities must not be reused for runtime I/O"
-            )
+            raise ValueError("WC-027 signing identities must not be reused for runtime I/O")
         verification_identity_pairs = {
             (
                 item.identity_client_id,
@@ -609,24 +620,15 @@ class Wc027EnrichmentFeedProductionConfiguration:
             raise ValueError(
                 "WC-027 verification keys must use one dedicated trust-reader identity"
             )
-        verification_client_id, verification_resource_id = next(
-            iter(verification_identity_pairs)
-        )
+        verification_client_id, verification_resource_id = next(iter(verification_identity_pairs))
         if (
             verification_client_id in io_identities
-            or verification_client_id
-            in {client_id for client_id, _ in signing_identity_pairs}
+            or verification_client_id in {client_id for client_id, _ in signing_identity_pairs}
+            or verification_resource_id in {item.casefold() for item in io_identity_resource_ids}
             or verification_resource_id
-            in {item.casefold() for item in io_identity_resource_ids}
-            or verification_resource_id
-            in {
-                resource_id.casefold()
-                for _, resource_id in signing_identity_pairs
-            }
+            in {resource_id.casefold() for _, resource_id in signing_identity_pairs}
         ):
-            raise ValueError(
-                "WC-027 trust-reader identity must be distinct from I/O and signing"
-            )
+            raise ValueError("WC-027 trust-reader identity must be distinct from I/O and signing")
         expected_attached = {
             *io_identity_resource_ids,
             *(resource_id for _, resource_id in signing_identity_pairs),
@@ -637,12 +639,10 @@ class Wc027EnrichmentFeedProductionConfiguration:
             self.correlation_binding_key.identity_resource_id,
             self.guidance_binding_key.identity_resource_id,
         }
-        if {
-            item.casefold() for item in self.attached_identity_resource_ids
-        } != {item.casefold() for item in expected_attached}:
-            raise ValueError(
-                "deployment binding identities do not match runtime configuration"
-            )
+        if {item.casefold() for item in self.attached_identity_resource_ids} != {
+            item.casefold() for item in expected_attached
+        }:
+            raise ValueError("deployment binding identities do not match runtime configuration")
 
 
 @dataclass(frozen=True, slots=True)
@@ -658,18 +658,16 @@ class _SplitIncidentPresentationReader:
     ) -> PresentationAssetReadResult:
         reader = self._reader_for(blob_name)
         try:
-                result = reader.read_current(
-                    ArtifactCurrentReadRequest(blob_name=blob_name)
-                )
+            result = reader.read_current(ArtifactCurrentReadRequest(blob_name=blob_name))
         except (
-                ArtifactReadError,
-                HttpResponseError,
-                ServiceRequestError,
-                ServiceResponseError,
+            ArtifactReadError,
+            HttpResponseError,
+            ServiceRequestError,
+            ServiceResponseError,
         ) as exc:
-                raise PresentationAssetUnavailableError(
-                    "incident presentation asset is unavailable"
-                ) from exc
+            raise PresentationAssetUnavailableError(
+                "incident presentation asset is unavailable"
+            ) from exc
         return self._bounded_result(result, maximum_bytes=maximum_bytes)
 
     def read_version(
@@ -682,22 +680,22 @@ class _SplitIncidentPresentationReader:
     ) -> PresentationAssetReadResult:
         reader = self._reader_for(blob_name)
         try:
-                result = reader.read(
-                    ArtifactReadRequest(
-                        blob_name=blob_name,
-                        version_id=version_id,
-                        expected_payload_sha256=expected_payload_sha256,
-                    )
+            result = reader.read(
+                ArtifactReadRequest(
+                    blob_name=blob_name,
+                    version_id=version_id,
+                    expected_payload_sha256=expected_payload_sha256,
                 )
+            )
         except (
-                ArtifactReadError,
-                HttpResponseError,
-                ServiceRequestError,
-                ServiceResponseError,
+            ArtifactReadError,
+            HttpResponseError,
+            ServiceRequestError,
+            ServiceResponseError,
         ) as exc:
-                raise PresentationAssetUnavailableError(
-                    "incident presentation asset is unavailable"
-                ) from exc
+            raise PresentationAssetUnavailableError(
+                "incident presentation asset is unavailable"
+            ) from exc
         return self._bounded_result(result, maximum_bytes=maximum_bytes)
 
     def _reader_for(
@@ -705,13 +703,13 @@ class _SplitIncidentPresentationReader:
         blob_name: str,
     ) -> AzureBlobVersionPinnedArtifactReader:
         if (
-                blob_name == "incidents/feed-v2.json"
-                or blob_name.startswith("incidents/feed-v2-index-attestations/")
-                or "/correlation-reports/" in blob_name
-                or "/guidance/" in blob_name
-                or "/enrichments/" in blob_name
+            blob_name == "incidents/feed-v2.json"
+            or blob_name.startswith("incidents/feed-v2-index-attestations/")
+            or "/correlation-reports/" in blob_name
+            or "/guidance/" in blob_name
+            or "/enrichments/" in blob_name
         ):
-                return self.enrichment_feed_reader
+            return self.enrichment_feed_reader
         return self.lifecycle_reader
 
     @staticmethod
@@ -721,13 +719,13 @@ class _SplitIncidentPresentationReader:
         maximum_bytes: int,
     ) -> PresentationAssetReadResult:
         if result.size_bytes > maximum_bytes:
-                raise PresentationAssetUnavailableError(
-                    "incident presentation asset exceeds its caller bound"
-                )
+            raise PresentationAssetUnavailableError(
+                "incident presentation asset exceeds its caller bound"
+            )
         return PresentationAssetReadResult(
-                blob_name=result.blob_name,
-                payload=result.payload,
-                payload_sha256=result.payload_sha256,
+            blob_name=result.blob_name,
+            payload=result.payload,
+            payload_sha256=result.payload_sha256,
         )
 
 
@@ -745,18 +743,14 @@ def build_wc027_enrichment_feed_runtime(
     )
 
     lifecycle_verifier = _verifier(configuration.incident_key)
-    correlation_binding_verifier = _verifier(
-        configuration.correlation_binding_key
-    )
+    correlation_binding_verifier = _verifier(configuration.correlation_binding_key)
     report_signer = _signer(configuration.report_key)
     guidance_signer = _signer(configuration.guidance_key)
     enrichment_signer = _signer(configuration.enrichment_key)
     feed_signer = _signer(configuration.feed_key)
     notification_signer = _signer(configuration.notification_key)
 
-    monitoring_key_verifier = _verifier(
-        configuration.monitoring_collector_key.authority
-    )
+    monitoring_key_verifier = _verifier(configuration.monitoring_collector_key.authority)
     monitoring_record = TrustedKeyRecord(
         anchor=configuration.monitoring_collector_key.authority.anchor,
         public_key=monitoring_key_verifier.public_key,
@@ -789,17 +783,17 @@ def build_wc027_enrichment_feed_runtime(
         ),
         monitoring_verifier=TrustedMonitoringHandoffVerifier(
             reviewed_contract=configuration.monitoring_collector_contract,
-            trusted_key_anchor=(
-                configuration.monitoring_collector_key.authority.anchor
-            ),
+            trusted_key_anchor=(configuration.monitoring_collector_key.authority.anchor),
             key_resolver=monitoring_resolver,
+            expected_collector_contract_digest=(configuration.monitoring_collector_contract_digest),
+            expected_acquisition_authority_digest=(
+                configuration.monitoring_acquisition_authority_digest
+            ),
         ),
         change_verifier=TrustedChangeArtifactVerifier(
             signer=KeyVaultChangeEvidenceSigner(
                 key_vault_key_id=configuration.change_key.key_vault_key_id,
-                managed_identity_client_id=(
-                    configuration.change_key.identity_client_id
-                ),
+                managed_identity_client_id=(configuration.change_key.identity_client_id),
             )
         ),
         monitoring_intent_verifier=TrustedMonitoringIntentAssetVerifier(
@@ -810,9 +804,7 @@ def build_wc027_enrichment_feed_runtime(
     incident_reader = AzureBlobIncidentAssetPublisher(
         blob_endpoint=configuration.incident_lifecycle_assets.endpoint,
         container_name=configuration.incident_lifecycle_assets.container,
-        managed_identity_client_id=(
-            configuration.incident_lifecycle_assets.identity_client_id
-        ),
+        managed_identity_client_id=(configuration.incident_lifecycle_assets.identity_client_id),
         signing_key_id=configuration.incident_key.key_id,
         signing_key_vault_key_id=configuration.incident_key.key_vault_key_id,
         signing_key_fingerprint=configuration.incident_key.key_fingerprint,
@@ -821,33 +813,25 @@ def build_wc027_enrichment_feed_runtime(
     incident_exact_reader = AzureBlobVersionPinnedArtifactReader(
         blob_endpoint=configuration.incident_lifecycle_assets.endpoint,
         container_name=configuration.incident_lifecycle_assets.container,
-        managed_identity_client_id=(
-            configuration.incident_lifecycle_assets.identity_client_id
-        ),
+        managed_identity_client_id=(configuration.incident_lifecycle_assets.identity_client_id),
         max_payload_bytes=MAX_ARTIFACT_TRANSFER_BYTES,
     )
     enrichment_feed_exact_reader = AzureBlobVersionPinnedArtifactReader(
         blob_endpoint=configuration.enrichment_feed_assets.endpoint,
         container_name=configuration.enrichment_feed_assets.container,
-        managed_identity_client_id=(
-            configuration.enrichment_feed_assets.reader_identity_client_id
-        ),
+        managed_identity_client_id=(configuration.enrichment_feed_assets.reader_identity_client_id),
         max_payload_bytes=MAX_ARTIFACT_TRANSFER_BYTES,
     )
     guidance_authority_reader = AzureBlobVersionPinnedArtifactReader(
         blob_endpoint=configuration.guidance_authority_source.endpoint,
         container_name=configuration.guidance_authority_source.container,
-        managed_identity_client_id=(
-            configuration.guidance_authority_source.identity_client_id
-        ),
+        managed_identity_client_id=(configuration.guidance_authority_source.identity_client_id),
         max_payload_bytes=MAX_ARTIFACT_TRANSFER_BYTES,
     )
     artifact_writer = AzureBlobIncidentEnrichmentArtifactWriter(
         blob_endpoint=configuration.enrichment_feed_assets.endpoint,
         container_name=configuration.enrichment_feed_assets.container,
-        managed_identity_client_id=(
-            configuration.enrichment_feed_assets.writer_identity_client_id
-        ),
+        managed_identity_client_id=(configuration.enrichment_feed_assets.writer_identity_client_id),
     )
     enrichment = IncidentEnrichmentPublicationService(
         correlation_service=correlation,
@@ -859,16 +843,10 @@ def build_wc027_enrichment_feed_runtime(
         incident_key_vault_key_id=configuration.incident_key.key_vault_key_id,
         incident_key_fingerprint=configuration.incident_key.key_fingerprint,
         incident_signature_verifier=lifecycle_verifier.verify_preimage,
-        correlation_binding_key_id=(
-            configuration.correlation_binding_key.key_vault_key_id
-        ),
-        correlation_binding_signature_verifier=(
-            correlation_binding_verifier.verify_preimage
-        ),
+        correlation_binding_key_id=(configuration.correlation_binding_key.key_vault_key_id),
+        correlation_binding_signature_verifier=(correlation_binding_verifier.verify_preimage),
         guidance_binding_key_id=configuration.guidance_binding_key.key_id,
-        guidance_binding_signature_verifier=(
-            guidance_binding_verifier.verify_preimage
-        ),
+        guidance_binding_signature_verifier=(guidance_binding_verifier.verify_preimage),
         report_key_id=configuration.report_key.key_id,
         report_signer=report_signer,
         report_signature_verifier=report_signer.verify_preimage,
@@ -889,9 +867,7 @@ def build_wc027_enrichment_feed_runtime(
     index_publisher = AzureBlobIncidentFeedIndexPublisher(
         blob_endpoint=configuration.enrichment_feed_assets.endpoint,
         container_name=configuration.enrichment_feed_assets.container,
-        managed_identity_client_id=(
-            configuration.enrichment_feed_assets.writer_identity_client_id
-        ),
+        managed_identity_client_id=(configuration.enrichment_feed_assets.writer_identity_client_id),
         feed_key_id=configuration.feed_key.key_id,
         feed_key_fingerprint=configuration.feed_key.key_fingerprint,
         signature_verifier=feed_signer.verify_preimage,
@@ -942,25 +918,19 @@ def build_wc027_enrichment_feed_runtime(
         presentation_base_url=configuration.presentation_url,
         notification_key_id=configuration.notification_key.key_id,
         notification_signer=notification_signer,
-        notification_signature_verifier=(
-            notification_signer.verify_preimage
-        ),
+        notification_signature_verifier=(notification_signer.verify_preimage),
         outbox=notification_outbox,
     )
     return Wc027EnrichmentFeedRuntime(
         guidance_binding_key_id=configuration.guidance_binding_key.key_id,
-        guidance_binding_signature_verifier=(
-            guidance_binding_verifier.verify_preimage
-        ),
+        guidance_binding_signature_verifier=(guidance_binding_verifier.verify_preimage),
         correlation=correlation,
         incident_authority=incident_reader,
         guidance_activation=AzureTableGuidanceAuthorityActivationStore(
             endpoint=configuration.guidance_activation.endpoint,
             table_name=configuration.guidance_activation.table,
             partition_key=configuration.guidance_activation.partition_key,
-            managed_identity_client_id=(
-                configuration.guidance_activation.identity_client_id
-            ),
+            managed_identity_client_id=(configuration.guidance_activation.identity_client_id),
         ),
         enrichment_publication=enrichment,
         feed_publication=feed,
@@ -1000,9 +970,7 @@ def submit_wc027_enrichment_feed_trigger(
                 binding.canonical_bytes(),
                 content_type="application/json",
                 message_id=binding.binding_id,
-                session_id=(
-                    binding.incident_bound_request.incident_subject.incident_id
-                ),
+                session_id=(binding.incident_bound_request.incident_subject.incident_id),
                 application_properties={
                     "schemaVersion": WC027_ENRICHMENT_TRIGGER_SCHEMA_VERSION,
                     "bindingDigest": binding.binding_digest,
@@ -1026,9 +994,7 @@ def run_wc027_enrichment_feed_worker(
 
     if not 1 <= max_wait_time_seconds <= 300:
         raise ValueError("max_wait_time_seconds must be between 1 and 300")
-    credential = ManagedIdentityCredential(
-        client_id=configuration.broker_identity_client_id
-    )
+    credential = ManagedIdentityCredential(client_id=configuration.broker_identity_client_id)
     with (
         AutoLockRenewer(max_workers=1) as lock_renewer,
         ServiceBusClient(
@@ -1066,9 +1032,7 @@ def run_wc027_enrichment_feed_worker(
             runtime = build_wc027_enrichment_feed_runtime(
                 configuration,
                 binding=binding,
-                notification_outbox=AzureServiceBusNotificationOutbox(
-                    notification_sender
-                ),
+                notification_outbox=AzureServiceBusNotificationOutbox(notification_sender),
             )
             runtime.publish(
                 binding,
@@ -1091,13 +1055,12 @@ def run_wc027_enrichment_feed_worker(
         ):
             receiver.abandon_message(message)
             return False
-        except (ValidationError, ValueError):
+        except ValidationError, ValueError:
             receiver.dead_letter_message(
                 message,
                 reason="AthenaWc027EnrichmentRejected",
                 error_description=(
-                    "signed binding failed bounded validation, freshness, "
-                    "or trust verification"
+                    "signed binding failed bounded validation, freshness, or trust verification"
                 ),
             )
             return False
@@ -1119,9 +1082,7 @@ def load_wc027_enrichment_feed_configuration(
         payload = environment_json
     else:
         raise ValueError("WC-027 runtime configuration is required")
-    return Wc027EnrichmentFeedProductionConfiguration.model_validate_json(
-        payload
-    )
+    return Wc027EnrichmentFeedProductionConfiguration.model_validate_json(payload)
 
 
 def _correlation_reader(
@@ -1345,6 +1306,13 @@ def _text(value: object, label: str, *, maximum: int) -> str:
     return value
 
 
+def _sha256_digest(value: object, label: str) -> str:
+    text = _text(value, label, maximum=71)
+    if re.fullmatch(r"sha256:[a-f0-9]{64}", text) is None or text == "sha256:" + "0" * 64:
+        raise ValueError(f"{label} must be a real lowercase SHA-256 digest")
+    return text
+
+
 def _client_id(value: object, label: str) -> str:
     text = _text(value, label, maximum=36)
     try:
@@ -1380,8 +1348,7 @@ def _identity_resource_ids(value: object, label: str) -> tuple[str, ...]:
     if type(value) is not list or not 1 <= len(value) <= 32:
         raise ValueError(f"{label} must be a bounded array")
     result = tuple(
-        _managed_identity_resource_id(item, f"{label}[{index}]")
-        for index, item in enumerate(value)
+        _managed_identity_resource_id(item, f"{label}[{index}]") for index, item in enumerate(value)
     )
     if len({item.casefold() for item in result}) != len(result):
         raise ValueError(f"{label} must contain distinct identities")
@@ -1392,16 +1359,13 @@ def _rbac_resource_ids(value: object, label: str) -> tuple[str, ...]:
     if type(value) is not list or not 1 <= len(value) <= 64:
         raise ValueError(f"{label} must be a bounded array")
     result = tuple(
-        _text(item, f"{label}[{index}]", maximum=4096)
-        for index, item in enumerate(value)
+        _text(item, f"{label}[{index}]", maximum=4096) for index, item in enumerate(value)
     )
     if any(
         not item.startswith("/")
         or (
-            "/providers/Microsoft.Authorization/roleAssignments/"
-            not in item
-            and "/providers/Microsoft.Authorization/roleDefinitions/"
-            not in item
+            "/providers/Microsoft.Authorization/roleAssignments/" not in item
+            and "/providers/Microsoft.Authorization/roleDefinitions/" not in item
         )
         for item in result
     ) or len({item.casefold() for item in result}) != len(result):
@@ -1418,11 +1382,7 @@ def _queue_name(value: object) -> str:
 
 def _service_bus_namespace(value: object) -> str:
     text = _text(value, "service bus namespace", maximum=255)
-    if (
-        text != text.casefold()
-        or not text.endswith(".servicebus.windows.net")
-        or "/" in text
-    ):
+    if text != text.casefold() or not text.endswith(".servicebus.windows.net") or "/" in text:
         raise ValueError("service bus namespace is invalid")
     return text
 

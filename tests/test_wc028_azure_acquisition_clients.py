@@ -295,6 +295,7 @@ def _resource_graph_request(
 def _resource_health_request(
     *,
     resource_id: str = PRODUCTION_WEB_ID,
+    reason_types: tuple[str, ...] = ("PlatformInitiated",),
 ) -> ResourceHealthQueryRequest:
     resource_id = resource_id.casefold()
     return monitoring_acquisition_module._build_request(
@@ -305,7 +306,7 @@ def _resource_health_request(
             "eventStatuses": ("Active", "Resolved"),
             "currentStatuses": ("Available", "Unavailable"),
             "previousStatuses": ("Available", "Unavailable"),
-            "reasonTypes": ("PlatformInitiated",),
+            "reasonTypes": reason_types,
             "expectedColumns": (
                 "resourceId",
                 "eventStatus",
@@ -663,22 +664,21 @@ def test_resource_graph_client_uses_generated_bounded_change_query() -> None:
     assert "| take 501" in body["query"]
 
 
-def test_resource_health_client_reads_exact_current_availability_status() -> None:
+def test_resource_health_client_reads_documented_healthresources_transition() -> None:
     request = _resource_health_request()
     transport = _MockTransport(
         _ResponseSpec(
             {
-                "id": (
-                    f"{PRODUCTION_WEB_ID}/providers/"
-                    "Microsoft.ResourceHealth/availabilityStatuses/current"
-                ),
-                "properties": {
-                    "targetResourceId": PRODUCTION_WEB_ID.upper(),
-                    "occurredTime": (NOW - timedelta(minutes=2)).isoformat(),
-                    "previousAvailabilityState": "Available",
-                    "availabilityState": "Unavailable",
-                    "reasonType": "PlatformInitiated",
-                },
+                "data": [
+                    {
+                        "resourceId": PRODUCTION_WEB_ID.upper(),
+                        "occurredAt": (NOW - timedelta(minutes=2)).isoformat(),
+                        "previousStatus": "Available",
+                        "currentStatus": "Unavailable",
+                        "reasonType": "PlatformInitiated",
+                    }
+                ],
+                "resultTruncated": False,
             }
         )
     )
@@ -695,29 +695,61 @@ def test_resource_health_client_reads_exact_current_availability_status() -> Non
     assert len(result.rows) == 1
     assert result.rows[0].event_status == "Active"
     assert result.rows[0].current_status == "Unavailable"
-    assert transport.requests[0].url == (
-        f"https://management.azure.com{PRODUCTION_WEB_ID.casefold()}/providers/"
-        "Microsoft.ResourceHealth/availabilityStatuses/current?api-version=2025-05-01"
+    sent = transport.requests[0]
+    assert sent.url.endswith("/providers/Microsoft.ResourceGraph/resources?api-version=2022-10-01")
+    body = json.loads(sent.body)
+    assert body["subscriptions"] == ["00000000-0000-0000-0000-000000000000"]
+    assert body["options"] == {"$top": 501, "resultFormat": "ObjectArray"}
+    assert "HealthResources" in body["query"]
+    assert "previousAvailabilityState" in body["query"]
+    assert PRODUCTION_WEB_ID.casefold() in body["query"]
+
+
+def test_resource_health_missing_reason_normalizes_to_unknown() -> None:
+    request = _resource_health_request(reason_types=("Unknown",))
+    transport = _MockTransport(
+        _ResponseSpec(
+            {
+                "data": [
+                    {
+                        "resourceId": PRODUCTION_WEB_ID,
+                        "occurredAt": (NOW - timedelta(minutes=2)).isoformat(),
+                        "previousStatus": "Available",
+                        "currentStatus": "Unavailable",
+                        "reasonType": "",
+                    }
+                ],
+                "resultTruncated": False,
+            }
+        )
+    )
+    client = AzureResourceHealthAcquisitionClient(
+        credential=_Credential(),
+        reviewed_contract=_acquisition_collector_contract(),
+        _transport=transport,
     )
 
+    result = client.query_resource_health(request)
 
-def test_resource_health_current_endpoint_retains_recently_resolved_transition() -> None:
+    assert len(result.rows) == 1
+    assert result.rows[0].reason_type == "Unknown"
+
+
+def test_resource_health_graph_retains_resolved_transition() -> None:
     request = _resource_health_request()
     transport = _MockTransport(
         _ResponseSpec(
             {
-                "id": (
-                    f"{PRODUCTION_WEB_ID}/providers/"
-                    "Microsoft.ResourceHealth/availabilityStatuses/current"
-                ),
-                "properties": {
-                    "targetResourceId": PRODUCTION_WEB_ID,
-                    "availabilityState": "Available",
-                    "reasonType": "PlatformInitiated",
-                    "recentlyResolved": {
-                        "resolvedTime": (NOW - timedelta(minutes=2)).isoformat(),
-                    },
-                },
+                "data": [
+                    {
+                        "resourceId": PRODUCTION_WEB_ID,
+                        "occurredAt": (NOW - timedelta(minutes=2)).isoformat(),
+                        "previousStatus": "Unavailable",
+                        "currentStatus": "Available",
+                        "reasonType": "PlatformInitiated",
+                    }
+                ],
+                "resultTruncated": False,
             }
         )
     )

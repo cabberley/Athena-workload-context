@@ -25,7 +25,6 @@ from pydantic import ConfigDict, Field, field_validator, model_validator
 from athena_context.contracts import (
     MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
     MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION,
-    MONITORING_IDENTITY_PROOF_AUDIENCE,
     MONITORING_IDENTITY_PROOF_MAXIMUM_LIFETIME_SECONDS,
     MONITORING_IDENTITY_PROOF_REQUIRED_ROLE,
     MONITORING_IDENTITY_PROOF_TOKEN_VERSION,
@@ -101,7 +100,6 @@ _AZURE_LOGS_SCOPE = "https://api.loganalytics.io/.default"
 _LOG_ANALYTICS_API_VERSION = "v1"
 _ACTIVITY_LOG_API_VERSION = "2015-04-01"
 _RESOURCE_GRAPH_API_VERSION = "2022-10-01"
-_RESOURCE_HEALTH_API_VERSION = "2025-05-01"
 _NETWORK_API_VERSION = "2025-09-01"
 _MAX_ARM_POLL_SECONDS = 75
 _MAX_ARM_POLL_ATTEMPTS = 16
@@ -330,7 +328,11 @@ class MonitoringAcquisitionAuthority(_StrictAcquisitionModel):
     identity_proof_audience: str | None = Field(
         default=None,
         alias="identityProofAudience",
-        pattern=r"^api://[a-z0-9][a-z0-9.-]{2,127}$",
+        pattern=(
+            r"^api://(?:athena-monitoring-identity-proof|"
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-"
+            r"[0-9a-f]{12}/athena-monitoring-identity-proof)$"
+        ),
     )
     identity_proof_token_version: Literal["1.0"] | None = Field(
         default=None,
@@ -593,14 +595,27 @@ class MonitoringAcquisitionAuthority(_StrictAcquisitionModel):
         if self.schema_version in {
             "athena.wc028MonitoringAcquisitionAuthority.v4",
             "athena.wc028MonitoringAcquisitionAuthority.v5",
-        } and (
-            self.identity_proof_audience != MONITORING_IDENTITY_PROOF_AUDIENCE
-            or self.identity_proof_token_version != MONITORING_IDENTITY_PROOF_TOKEN_VERSION
-            or self.identity_proof_required_role != MONITORING_IDENTITY_PROOF_REQUIRED_ROLE
-            or self.identity_proof_maximum_lifetime_seconds
-            != MONITORING_IDENTITY_PROOF_MAXIMUM_LIFETIME_SECONDS
-        ):
-            raise ValueError("authority does not bind the exact Athena identity proof policy")
+        }:
+            expected_identity_proof_audience = (
+                f"api://{cast(str, self.monitoring_reader_tenant_id)}"
+                "/athena-monitoring-identity-proof"
+            )
+            accepted_identity_proof_audiences = (
+                {
+                    "api://athena-monitoring-identity-proof",
+                    expected_identity_proof_audience,
+                }
+                if self.schema_version == "athena.wc028MonitoringAcquisitionAuthority.v4"
+                else {expected_identity_proof_audience}
+            )
+            if (
+                self.identity_proof_audience not in accepted_identity_proof_audiences
+                or self.identity_proof_token_version != MONITORING_IDENTITY_PROOF_TOKEN_VERSION
+                or self.identity_proof_required_role != MONITORING_IDENTITY_PROOF_REQUIRED_ROLE
+                or self.identity_proof_maximum_lifetime_seconds
+                != MONITORING_IDENTITY_PROOF_MAXIMUM_LIFETIME_SECONDS
+            ):
+                raise ValueError("authority does not bind the exact Athena identity proof policy")
         if self.schema_version != "athena.wc028MonitoringAcquisitionAuthority.v1":
             deployment_payload: dict[str, object] = {
                 "monitoringReaderIdentityId": self.monitoring_reader_identity_id,
@@ -1759,7 +1774,7 @@ def _azure_health_status(
 def _azure_reason_type(
     value: object | None,
 ) -> Literal["PlatformInitiated", "UserInitiated", "Unknown"]:
-    if value is None:
+    if value is None or (isinstance(value, str) and not value.strip()):
         return "Unknown"
     normalized = _azure_text(value, "Azure Resource Health reason", maximum=64).casefold()
     if normalized in {
@@ -2563,76 +2578,29 @@ class AzureResourceGraphAcquisitionClient(_AzureAcquisitionClientBase):
 def _normalize_resource_health_row(
     value: object,
     *,
-    requested_resource_id: str,
     request: ResourceHealthQueryRequest,
 ) -> ResourceHealthRow | None:
     row = _azure_mapping(value, "Resource Health row")
-    properties = _azure_mapping(
-        row.get("properties"),
-        "Resource Health properties",
-    )
-    expected_status_id = (
-        f"{requested_resource_id}/providers/microsoft.resourcehealth/availabilitystatuses/current"
-    )
-    status_id = (
+    resource_id = _canonical_resource_id(
         _azure_text(
-            row.get("id"),
-            "Resource Health status id",
-        )
-        .casefold()
-        .rstrip("/")
-    )
-    if status_id != expected_status_id:
-        raise MonitoringAcquisitionError(
-            "Resource Health response did not identify the exact current endpoint"
-        )
-    response_resource_id = properties.get("targetResourceId")
-    resource_id = (
-        requested_resource_id
-        if response_resource_id is None
-        else _canonical_resource_id(
-            _azure_text(
-                response_resource_id,
-                "Resource Health targetResourceId",
-            )
+            row.get("resourceId"),
+            "Resource Health resourceId",
         )
     )
-    if resource_id != requested_resource_id:
+    if resource_id not in request.resource_ids:
         raise MonitoringAcquisitionError(
             "Resource Health response escaped its exact resource scope"
         )
-    if properties.get("availabilityState") is None:
-        return None
     current_status = _azure_health_status(
-        properties.get("availabilityState"),
-        "Resource Health availabilityState",
+        row.get("currentStatus"),
+        "Resource Health currentStatus",
     )
-    previous_value = properties.get("previousAvailabilityState")
-    previous_status: Literal[
-        "Available",
-        "Degraded",
-        "Unavailable",
-        "Unknown",
-    ]
-    recently_resolved_properties: Mapping[str, object] | None = None
-    if previous_value is None:
-        recently_resolved = properties.get("recentlyResolved")
-        if current_status != "Available" or recently_resolved is None:
-            return None
-        recently_resolved_properties = _azure_mapping(
-            recently_resolved,
-            "Resource Health recentlyResolved",
-        )
-        previous_status = "Unavailable"
-    else:
-        previous_status = _azure_health_status(
-            previous_value,
-            "Resource Health previousAvailabilityState",
-        )
+    previous_status = _azure_health_status(
+        row.get("previousStatus"),
+        "Resource Health previousStatus",
+    )
     event_status = _resource_health_event_status(current_status, previous_status)
-    reason_type = _azure_reason_type(
-        properties.get("healthEventCause", properties.get("reasonType"))
-    )
+    reason_type = _azure_reason_type(row.get("reasonType"))
     if (
         _selected_value(event_status, request.event_statuses) is None
         or _selected_value(current_status, request.current_statuses) is None
@@ -2641,17 +2609,7 @@ def _normalize_resource_health_row(
     ):
         return None
     occurred_at = _azure_datetime(
-        properties.get(
-            "occurredTime",
-            properties.get(
-                "occuredTime",
-                (
-                    recently_resolved_properties.get("resolvedTime")
-                    if recently_resolved_properties is not None
-                    else None
-                ),
-            ),
-        ),
+        row.get("occurredAt"),
         "Resource Health occurredTime",
     )
     if not request.window_start <= occurred_at <= request.window_end:
@@ -2667,8 +2625,37 @@ def _normalize_resource_health_row(
     )
 
 
+def _resource_health_query(request: ResourceHealthQueryRequest) -> str:
+    resource_ids = ", ".join(
+        f"'{resource_id.replace("'", "''")}'" for resource_id in request.resource_ids
+    )
+    return "\n".join(
+        (
+            "HealthResources",
+            "| where type =~ 'microsoft.resourcehealth/availabilitystatuses'",
+            (
+                "| extend resourceId=tolower(tostring(properties.targetResourceId)), "
+                "occurredAt=todatetime(properties.occurredTime), "
+                "previousStatus=tostring(properties.previousAvailabilityState), "
+                "currentStatus=tostring(properties.availabilityState), "
+                "reasonType=tostring(properties.reasonType)"
+            ),
+            f"| where resourceId in~ ({resource_ids})",
+            (
+                "| where occurredAt between "
+                f"(datetime({_azure_datetime_text(request.window_start)}) .. "
+                f"datetime({_azure_datetime_text(request.window_end)}))"
+            ),
+            "| summarize arg_max(occurredAt, *) by resourceId",
+            ("| project resourceId, occurredAt, previousStatus, currentStatus, reasonType"),
+            "| order by occurredAt asc, resourceId asc",
+            f"| take {request.max_rows + 1}",
+        )
+    )
+
+
 class AzureResourceHealthAcquisitionClient(_AzureAcquisitionClientBase):
-    """Credential-bound Resource Health availability-history client."""
+    """Credential-bound Resource Graph HealthResources transition client."""
 
     def __init__(
         self,
@@ -2703,30 +2690,50 @@ class AzureResourceHealthAcquisitionClient(_AzureAcquisitionClientBase):
             raise MonitoringAcquisitionError(
                 "Resource Health request escaped the exact reviewed VM scopes"
             )
-        rows: list[ResourceHealthRow] = []
-        response_bytes = 0
-        truncated = False
-        for resource_id in request.resource_ids:
-            response = self._http.request_json(
-                method="GET",
-                path=(
-                    f"{quote(resource_id, safe='/')}/providers/"
-                    "Microsoft.ResourceHealth/availabilityStatuses/current"
-                    f"?api-version={_RESOURCE_HEALTH_API_VERSION}"
-                ),
-                max_bytes=_remaining_response_bytes(request.max_bytes, response_bytes),
+        subscription_id = _arm_subscription_id(self._reviewed_contract.workload_resource_group_id)
+        query_text = _resource_health_query(request)
+        if len(query_text.encode("utf-8")) > 32 * 1024:
+            raise MonitoringAcquisitionError(
+                "Resource Health generated query exceeded its reviewed byte bound"
             )
-            response_bytes += response.response_bytes
-            payload = _azure_mapping(response.payload, "Resource Health response")
-            normalized = _normalize_resource_health_row(
-                payload,
-                requested_resource_id=resource_id,
-                request=request,
+        response = self._http.request_json(
+            method="POST",
+            path=(
+                "/providers/Microsoft.ResourceGraph/resources"
+                f"?api-version={_RESOURCE_GRAPH_API_VERSION}"
+            ),
+            body={
+                "subscriptions": [subscription_id],
+                "query": query_text,
+                "options": {
+                    "$top": request.max_rows + 1,
+                    "resultFormat": "ObjectArray",
+                },
+            },
+            max_bytes=request.max_bytes,
+        )
+        payload = _azure_mapping(response.payload, "Resource Health response")
+        marker = payload.get("resultTruncated")
+        if marker is False or marker == "false":
+            truncated = False
+        elif marker is True or marker == "true":
+            truncated = True
+        else:
+            raise MonitoringAcquisitionError(
+                "Resource Health response truncation marker was invalid"
             )
-            if normalized is not None:
-                rows.append(normalized)
+        if payload.get("$skipToken") is not None or payload.get("skipToken") is not None:
+            truncated = True
+        raw_rows = _azure_list(payload.get("data"), "Resource Health data")
+        rows = [
+            normalized
+            for normalized in (
+                _normalize_resource_health_row(item, request=request) for item in raw_rows
+            )
+            if normalized is not None
+        ]
         normalized_rows = _sorted_rows(rows)
-        if len(normalized_rows) > request.max_rows:
+        if len(raw_rows) > request.max_rows:
             truncated = True
         return ResourceHealthQueryResult(
             schemaVersion="athena.wc028ResourceHealthQueryResult.v1",
@@ -2736,7 +2743,7 @@ class AzureResourceHealthAcquisitionClient(_AzureAcquisitionClientBase):
             collectedAt=request.window_end,
             columns=request.expected_columns,
             truncated=truncated,
-            responseBytes=response_bytes,
+            responseBytes=response.response_bytes,
             rows=normalized_rows[: request.max_rows],
         )
 
@@ -3284,6 +3291,7 @@ class MonitoringAcquisitionReceiptSigner(Protocol):
 class _AcquisitionExecution:
     adapter: AzureMonitoringAdapter
     identity_proof: MonitoringIdentityProof
+    authorization_expires_at: datetime
     max_calls: int
     max_freshness_seconds: int
     started_at: datetime
@@ -3301,6 +3309,7 @@ class _AcquisitionExecution:
         if (
             requested_at < self.started_at
             or requested_at >= self.identity_proof.expires_at
+            or requested_at >= self.authorization_expires_at
             or (requested_at - self.started_at).total_seconds() > self.max_freshness_seconds
         ):
             raise MonitoringAcquisitionError(
@@ -3332,7 +3341,11 @@ class _AcquisitionExecution:
             )
         result = operation(request)
         received_at = self.adapter.utc_now()
-        if received_at < requested_at:
+        if received_at < requested_at or received_at >= self.authorization_expires_at:
+            if received_at >= self.authorization_expires_at:
+                raise MonitoringAcquisitionError(
+                    "effective RBAC inventory expired during Azure source I/O"
+                )
             raise MonitoringAcquisitionError("collector runtime returned non-monotonic time")
         source = cast(AcquisitionSource, request.source)
         self.exchanges.append(
@@ -4050,8 +4063,12 @@ class MonitoringAcquisitionCoordinator:
         if (
             execution_completed_at < execution.started_at
             or receipt_issued_at < execution_completed_at
+            or execution_completed_at >= execution.authorization_expires_at
+            or receipt_issued_at >= execution.authorization_expires_at
         ):
-            raise MonitoringAcquisitionError("collector runtime returned non-monotonic time")
+            raise MonitoringAcquisitionError(
+                "collector execution or receipt issuance exceeded its authorization lifetime"
+            )
         identity_proof = execution.identity_proof
         payload: dict[str, object] = {
             "schemaVersion": MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION,
@@ -4098,6 +4115,14 @@ class MonitoringAcquisitionCoordinator:
             cast(dict[str, object], _json_value(signed_payload))
         )
         signature = self._receipt_signer.sign_preimage(canonicalize_json(preimage).encode("utf-8"))
+        signing_completed_at = execution.adapter.utc_now()
+        if (
+            signing_completed_at < receipt_issued_at
+            or signing_completed_at >= execution.authorization_expires_at
+        ):
+            raise MonitoringAcquisitionError(
+                "receipt signing exceeded its effective RBAC authorization lifetime"
+            )
         return MonitoringAcquisitionReceipt.model_validate(
             {
                 **signed_payload,
@@ -4255,6 +4280,7 @@ class MonitoringAcquisitionCoordinator:
         execution = _AcquisitionExecution(
             adapter=self._acquisition_adapter,
             identity_proof=identity_proof,
+            authorization_expires_at=effective_rbac_inventory.expires_at,
             max_calls=cast(int, self._acquisition_authority.max_acquisition_calls),
             max_freshness_seconds=self._acquisition_authority.max_freshness_seconds,
             started_at=collected_at,

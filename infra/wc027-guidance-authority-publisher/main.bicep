@@ -75,20 +75,23 @@ var triggerQueueName = 'wc027-enrichment-feed-requests'
 var serviceBusDataReceiverRoleDefinitionId = '4f6c0938-94ea-4d52-8e5a-2e02b7ef8e7d'
 var serviceBusDataSenderRoleDefinitionId = '69a216fc-b8fb-44d8-bc22-1f3c2cd27a39'
 var parsedEnrichmentRuntimeConfiguration = json(enrichmentRuntimeConfigurationJson)
-var runtimeAuthorityAssets = parsedEnrichmentRuntimeConfiguration.guidanceAuthoritySource
-var runtimeActivation = parsedEnrichmentRuntimeConfiguration.guidanceActivation
+var validatedEnrichmentRuntimeConfiguration = parsedEnrichmentRuntimeConfiguration.schemaVersion == 'athena.wc027EnrichmentFeedRuntimeConfiguration.v2' && parsedEnrichmentRuntimeConfiguration.monitoringCollectorContract.schemaVersion == 'athena.wc028MonitoringCollectorContract.v8' && parsedEnrichmentRuntimeConfiguration.monitoringCollectorContract.acquisitionReceiptSchemaVersion == 'athena.wc028MonitoringAcquisitionReceipt.v5'
+  ? parsedEnrichmentRuntimeConfiguration
+  : fail('guidance publication requires the exact WC-027 v2 runtime and WC-028 v8 collector contract; legacy v3 must be recollected and republished')
+var runtimeAuthorityAssets = validatedEnrichmentRuntimeConfiguration.guidanceAuthoritySource
+var runtimeActivation = validatedEnrichmentRuntimeConfiguration.guidanceActivation
 var runtimeTrustDomainFingerprints = [
-  parsedEnrichmentRuntimeConfiguration.monitoringCollectorKey.keyFingerprint
-  parsedEnrichmentRuntimeConfiguration.keys.change.keyFingerprint
-  parsedEnrichmentRuntimeConfiguration.keys.monitoringIntent.keyFingerprint
-  parsedEnrichmentRuntimeConfiguration.keys.incident.keyFingerprint
-  parsedEnrichmentRuntimeConfiguration.keys.correlationBinding.keyFingerprint
-  parsedEnrichmentRuntimeConfiguration.keys.guidanceBinding.keyFingerprint
-  parsedEnrichmentRuntimeConfiguration.keys.report.keyFingerprint
-  parsedEnrichmentRuntimeConfiguration.keys.guidance.keyFingerprint
-  parsedEnrichmentRuntimeConfiguration.keys.enrichment.keyFingerprint
-  parsedEnrichmentRuntimeConfiguration.keys.feed.keyFingerprint
-  parsedEnrichmentRuntimeConfiguration.keys.notification.keyFingerprint
+  validatedEnrichmentRuntimeConfiguration.monitoringCollectorKey.keyFingerprint
+  validatedEnrichmentRuntimeConfiguration.keys.change.keyFingerprint
+  validatedEnrichmentRuntimeConfiguration.keys.monitoringIntent.keyFingerprint
+  validatedEnrichmentRuntimeConfiguration.keys.incident.keyFingerprint
+  validatedEnrichmentRuntimeConfiguration.keys.correlationBinding.keyFingerprint
+  validatedEnrichmentRuntimeConfiguration.keys.guidanceBinding.keyFingerprint
+  validatedEnrichmentRuntimeConfiguration.keys.report.keyFingerprint
+  validatedEnrichmentRuntimeConfiguration.keys.guidance.keyFingerprint
+  validatedEnrichmentRuntimeConfiguration.keys.enrichment.keyFingerprint
+  validatedEnrichmentRuntimeConfiguration.keys.feed.keyFingerprint
+  validatedEnrichmentRuntimeConfiguration.keys.notification.keyFingerprint
 ]
 var validatedRuntimeTrustDomainFingerprints = length(union(runtimeTrustDomainFingerprints, runtimeTrustDomainFingerprints)) == length(runtimeTrustDomainFingerprints)
   ? runtimeTrustDomainFingerprints
@@ -96,7 +99,7 @@ var validatedRuntimeTrustDomainFingerprints = length(union(runtimeTrustDomainFin
 var validatedRequestKeyFingerprint = !contains(validatedRuntimeTrustDomainFingerprints, requestKeyFingerprint)
   ? requestKeyFingerprint
   : fail('guidance publication request public key fingerprint must use a distinct trust domain')
-var validatedBindingKeyFingerprint = bindingKeyFingerprint == parsedEnrichmentRuntimeConfiguration.keys.guidanceBinding.keyFingerprint
+var validatedBindingKeyFingerprint = bindingKeyFingerprint == validatedEnrichmentRuntimeConfiguration.keys.guidanceBinding.keyFingerprint
   ? bindingKeyFingerprint
   : fail('publisher binding signer fingerprint must match runtime guidance trust')
 var authorityStorageAccountName = last(split(authorityStorageAccountResourceId, '/'))
@@ -378,7 +381,7 @@ var rbacResourceIds = concat(coreRbacResourceIds, submitterRbacResourceIds)
 var bindingEvidenceDigest = guid(join(rbacResourceIds, '|'))
 
 var publisherConfiguration = {
-  schemaVersion: 'athena.wc027GuidanceAuthorityPublisherConfiguration.v1'
+  schemaVersion: 'athena.wc027GuidanceAuthorityPublisherConfiguration.v2'
   serviceBus: {
     namespace: '${serviceBus.name}.servicebus.windows.net'
     requestQueueName: requestQueue.name
@@ -415,7 +418,11 @@ var publisherConfiguration = {
     identityClientId: bindingSignerIdentity.properties.clientId
     identityResourceId: bindingSignerIdentity.id
   }
-  enrichmentRuntimeConfiguration: parsedEnrichmentRuntimeConfiguration
+  enrichmentRuntimeConfiguration: validatedEnrichmentRuntimeConfiguration
+  monitoringAcquisitionTrust: {
+    collectorContractDigest: validatedEnrichmentRuntimeConfiguration.monitoringCollectorContractDigest
+    acquisitionAuthorityDigest: validatedEnrichmentRuntimeConfiguration.monitoringAcquisitionAuthorityDigest
+  }
   deploymentBinding: {
     bindingEvidenceId: bindingEvidenceDigest
     attachedIdentityResourceIds: validatedAttachedIdentityResourceIds
@@ -434,6 +441,8 @@ resource publisherJob 'Microsoft.App/jobs@2025-01-01' = {
     runtimeConfigurationDigest: publisherConfigurationDigest
     enrichmentRuntimeConfigurationDigest: enrichmentRuntimeConfigurationDigest
     bindingEvidenceDigest: bindingEvidenceDigest
+    monitoringCollectorContractDigest: validatedEnrichmentRuntimeConfiguration.monitoringCollectorContractDigest
+    monitoringAcquisitionAuthorityDigest: validatedEnrichmentRuntimeConfiguration.monitoringAcquisitionAuthorityDigest
   })
   identity: {
     type: 'UserAssigned'

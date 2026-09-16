@@ -360,14 +360,40 @@ var wc027PublisherImageInvalidCharacters = replace(replace(replace(replace(repla
 var wc027PublisherImageValid = wc027PublisherImage == toLower(wc027PublisherImage) && length(wc027PublisherImageDigest) == 64 && empty(wc027PublisherImageInvalidCharacters) && wc027PublisherImageDigest != '0000000000000000000000000000000000000000000000000000000000000000'
 var wc027ParsedPublisherConfiguration = json(
   empty(wc027PublisherConfigurationJson)
-    ? '{"deploymentBinding":{"attachedIdentityResourceIds":[],"bindingEvidenceId":"","rbacResourceIds":[]},"enrichmentRuntimeConfiguration":{},"serviceBus":{"brokerIdentityResourceId":"","namespace":"","requestQueueName":""}}'
+    ? '{"schemaVersion":"","deploymentBinding":{"attachedIdentityResourceIds":[],"bindingEvidenceId":"","rbacResourceIds":[]},"enrichmentRuntimeConfiguration":{"schemaVersion":"","monitoringCollectorContract":{"schemaVersion":"","acquisitionReceiptSchemaVersion":""},"monitoringCollectorContractDigest":"","monitoringAcquisitionAuthorityDigest":""},"monitoringAcquisitionTrust":{"collectorContractDigest":"","acquisitionAuthorityDigest":""},"serviceBus":{"brokerIdentityResourceId":"","namespace":"","requestQueueName":""}}'
     : wc027PublisherConfigurationJson
 )
 var wc027ParsedProducerConfiguration = json(
   empty(wc027EnrichmentFeedProducerConfigurationJson)
-    ? '{}'
+    ? '{"schemaVersion":"","monitoringCollectorContract":{"schemaVersion":"","acquisitionReceiptSchemaVersion":""},"monitoringCollectorContractDigest":"","monitoringAcquisitionAuthorityDigest":""}'
     : wc027EnrichmentFeedProducerConfigurationJson
 )
+var wc027MonitoringCollectorContractDigestHex = replace(wc027ParsedProducerConfiguration.monitoringCollectorContractDigest, 'sha256:', '')
+var wc027MonitoringCollectorContractDigestWithoutDigits = replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(
+  wc027MonitoringCollectorContractDigestHex,
+  '0',
+  ''
+), '1', ''), '2', ''), '3', ''), '4', ''), '5', ''), '6', ''), '7', ''), '8', ''), '9', '')
+var wc027MonitoringCollectorContractDigestInvalidCharacters = replace(replace(replace(replace(replace(replace(
+  wc027MonitoringCollectorContractDigestWithoutDigits,
+  'a',
+  ''
+), 'b', ''), 'c', ''), 'd', ''), 'e', ''), 'f', '')
+var wc027MonitoringCollectorContractDigestValid = wc027ParsedProducerConfiguration.monitoringCollectorContractDigest == toLower(wc027ParsedProducerConfiguration.monitoringCollectorContractDigest) && startsWith(wc027ParsedProducerConfiguration.monitoringCollectorContractDigest, 'sha256:') && length(wc027MonitoringCollectorContractDigestHex) == 64 && empty(wc027MonitoringCollectorContractDigestInvalidCharacters) && wc027MonitoringCollectorContractDigestHex != '0000000000000000000000000000000000000000000000000000000000000000'
+var wc027MonitoringAcquisitionAuthorityDigestHex = replace(wc027ParsedProducerConfiguration.monitoringAcquisitionAuthorityDigest, 'sha256:', '')
+var wc027MonitoringAcquisitionAuthorityDigestWithoutDigits = replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(
+  wc027MonitoringAcquisitionAuthorityDigestHex,
+  '0',
+  ''
+), '1', ''), '2', ''), '3', ''), '4', ''), '5', ''), '6', ''), '7', ''), '8', ''), '9', '')
+var wc027MonitoringAcquisitionAuthorityDigestInvalidCharacters = replace(replace(replace(replace(replace(replace(
+  wc027MonitoringAcquisitionAuthorityDigestWithoutDigits,
+  'a',
+  ''
+), 'b', ''), 'c', ''), 'd', ''), 'e', ''), 'f', '')
+var wc027MonitoringAcquisitionAuthorityDigestValid = wc027ParsedProducerConfiguration.monitoringAcquisitionAuthorityDigest == toLower(wc027ParsedProducerConfiguration.monitoringAcquisitionAuthorityDigest) && startsWith(wc027ParsedProducerConfiguration.monitoringAcquisitionAuthorityDigest, 'sha256:') && length(wc027MonitoringAcquisitionAuthorityDigestHex) == 64 && empty(wc027MonitoringAcquisitionAuthorityDigestInvalidCharacters) && wc027MonitoringAcquisitionAuthorityDigestHex != '0000000000000000000000000000000000000000000000000000000000000000'
+var wc027ProducerMonitoringTrustIsCurrent = wc027ParsedProducerConfiguration.schemaVersion == 'athena.wc027EnrichmentFeedRuntimeConfiguration.v2' && wc027ParsedProducerConfiguration.monitoringCollectorContract.schemaVersion == 'athena.wc028MonitoringCollectorContract.v8' && wc027ParsedProducerConfiguration.monitoringCollectorContract.acquisitionReceiptSchemaVersion == 'athena.wc028MonitoringAcquisitionReceipt.v5' && wc027MonitoringCollectorContractDigestValid && wc027MonitoringAcquisitionAuthorityDigestValid
+var wc027PublisherMonitoringTrustMatches = wc027ParsedPublisherConfiguration.schemaVersion == 'athena.wc027GuidanceAuthorityPublisherConfiguration.v2' && wc027ParsedPublisherConfiguration.monitoringAcquisitionTrust.collectorContractDigest == wc027ParsedProducerConfiguration.monitoringCollectorContractDigest && wc027ParsedPublisherConfiguration.monitoringAcquisitionTrust.acquisitionAuthorityDigest == wc027ParsedProducerConfiguration.monitoringAcquisitionAuthorityDigest
 var wc027PublisherImageRegistryServer = first(split(wc027PublisherImage, '/'))
 var wc027PublisherExpectedIdentityResourceIds = map(
   wc027ParsedPublisherConfiguration.deploymentBinding.attachedIdentityResourceIds,
@@ -428,6 +454,14 @@ var validatedWc027PublisherReady = wc027PublisherReady && !wc027PublisherJobReso
                         ? fail('WC-027 publisher embedded runtime configuration does not match the producer')
                       : wc027PublisherReady && string(wc027ParsedPublisherConfiguration.enrichmentRuntimeConfiguration) != string(wc027ParsedProducerConfiguration)
                         ? fail('WC-027 publisher embedded runtime configuration JSON does not match the producer')
+                      : wc027PublisherReady && !wc027ProducerMonitoringTrustIsCurrent
+                        ? fail('WC-027 publisher requires the exact v8 monitoring collector contract and acquisition authority binding')
+                      : wc027PublisherReady && !wc027PublisherMonitoringTrustMatches
+                        ? fail('WC-027 publisher monitoring acquisition trust does not match the producer')
+                      : wc027PublisherReady && wc027PublisherJob!.tags.monitoringCollectorContractDigest != wc027ParsedProducerConfiguration.monitoringCollectorContractDigest
+                        ? fail('WC-027 publisher collector contract digest tag does not match')
+                      : wc027PublisherReady && wc027PublisherJob!.tags.monitoringAcquisitionAuthorityDigest != wc027ParsedProducerConfiguration.monitoringAcquisitionAuthorityDigest
+                        ? fail('WC-027 publisher acquisition authority digest tag does not match')
       : wc027PublisherReady && wc027PublisherJob!.tags.runtimeConfigurationDigest != wc027PublisherConfigurationDigest
         ? fail('WC-027 publisher Job configuration digest tag does not match')
         : wc027PublisherReady && wc027PublisherJob!.properties.template.containers[0].env[1].name != 'ATHENA_WC027_GUIDANCE_AUTHORITY_PUBLISHER_CONFIG_JSON'
@@ -474,7 +508,7 @@ var wc027ConfigurationDigestValid = length(wc027EnrichmentFeedProducerConfigurat
 ) && empty(wc027ConfigurationDigestInvalidCharacters)
 var wc027ParsedConfiguration = json(
   empty(wc027EnrichmentFeedProducerConfigurationJson)
-    ? '{"deploymentBinding":{"attachedIdentityResourceIds":[],"bindingEvidenceId":"","rbacResourceIds":[]}}'
+    ? '{"schemaVersion":"","deploymentBinding":{"attachedIdentityResourceIds":[],"bindingEvidenceId":"","rbacResourceIds":[]},"monitoringCollectorContract":{"schemaVersion":"","acquisitionReceiptSchemaVersion":""},"monitoringCollectorContractDigest":"","monitoringAcquisitionAuthorityDigest":""}'
     : wc027EnrichmentFeedProducerConfigurationJson
 )
 var wc027AttachedIdentityResourceIds = wc027FeedV2ProducerReady && wc027ProducerJobResourceIdValid
@@ -541,7 +575,13 @@ var validatedWc027FeedV2ProducerReady = wc027FeedV2ProducerReady && !startsWith(
             ? fail('WC-027 producer Job does not contain the exact activation configuration')
             : wc027FeedV2ProducerReady && wc027ProducerJob!.properties.template.containers[0].env[1].value != wc027EnrichmentFeedProducerConfigurationJson
               ? fail('WC-027 producer Job configuration does not match the activation input')
-              : wc027FeedV2ProducerReady && !validatedWc027PublisherReady
+            : wc027FeedV2ProducerReady && !wc027ProducerMonitoringTrustIsCurrent
+              ? fail('WC-027 Notification v2 requires the exact v8 monitoring collector contract and acquisition authority binding')
+            : wc027FeedV2ProducerReady && wc027ProducerJob!.tags.monitoringCollectorContractDigest != wc027ParsedConfiguration.monitoringCollectorContractDigest
+              ? fail('WC-027 producer collector contract digest tag does not match its deployed configuration')
+            : wc027FeedV2ProducerReady && wc027ProducerJob!.tags.monitoringAcquisitionAuthorityDigest != wc027ParsedConfiguration.monitoringAcquisitionAuthorityDigest
+              ? fail('WC-027 producer acquisition authority digest tag does not match its deployed configuration')
+            : wc027FeedV2ProducerReady && !validatedWc027PublisherReady
                 ? fail('WC-027 Notification v2 requires an explicitly ready PublishedGuidanceAuthorityBinding.v2 publisher (wc027PublisherReady)')
                 : wc027FeedV2ProducerReady && empty(wc027ParsedConfiguration.deploymentBinding.bindingEvidenceId)
                   ? fail('WC-027 Notification v2 requires deployment-derived RBAC binding evidence')
