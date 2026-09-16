@@ -236,12 +236,13 @@ def test_upgrade_cleanup_targets_only_exact_legacy_collector_bindings() -> None:
     cleanup = (INFRA / "remove-obsolete-collector-rbac.ps1").read_text(encoding="utf-8")
 
     for expected in (
-        "Athena WC028 Bounded Acquisition Reader",
-        "Athena WC028 Change Evidence Create-Only Writer",
-        "Athena WC028 Monitoring Intent Key Reader",
-        "Athena WC028 IP Flow Verifier",
+        "athena-wc028-bounded-acquisition-reader",
+        "athena-wc028-change-evidence-create-only",
+        "athena-wc028-monitoring-intent-key-reader",
+        "athena-wc028-ip-flow-verify",
         "Microsoft.Network/networkWatchers/ipFlowVerify/action",
         "NetworkWatcherResourceId",
+        "NetworkWatcherRG/NetworkWatcher_australiaeast",
         "historicalIpFlowRoleDefinitionId",
         "historicalIpFlowRoleAssignmentId",
         "New-ArmTemplateGuid",
@@ -255,7 +256,13 @@ def test_upgrade_cleanup_targets_only_exact_legacy_collector_bindings() -> None:
         "verifiedAbsentBindings",
         "Assert-ResourceSubscription",
         "Assert-RoleDefinitionAbsent",
-        "Assert-ReviewedIpFlowRoleDefinition",
+        "Assert-ReviewedRoleDefinition",
+        "Get-ResourceGroupScope",
+        "Get-HistoricalNetworkWatcherResourceId",
+        "$boundedReaderRoleDefinitionGuid",
+        "$changeWriterRoleDefinitionGuid",
+        "$intentKeyReaderRoleDefinitionGuid",
+        "$historicalRoleDefinitions",
         "$roleDefinitionGuid",
         "reviewedRoleAssignmentIds",
         "reviewedRoleDefinitionIds",
@@ -267,12 +274,41 @@ def test_upgrade_cleanup_targets_only_exact_legacy_collector_bindings() -> None:
         "Remove-AzRoleAssignment",
         "--scope', '/subscriptions/",
         "Microsoft.Authorization/roleAssignments/delete",
+        "Find-RoleDefinitionId",
+        "-RoleName",
+        "roleName -ne",
     ):
         assert forbidden not in cleanup
 
     assert "athena.wc028LegacyCollectorRbacCleanup.v3" in cleanup
     assert "ExpectedAssignmentId = $ipFlowAssignmentId" in cleanup
-    assert "$networkWatcherId/providers/Microsoft.Authorization/roleAssignments/" in cleanup
+    assert (
+        "$historicalNetworkWatcherId/providers/Microsoft.Authorization/roleAssignments/" in cleanup
+    )
+    assert cleanup.count("ExpectedAssignmentId = $null") == 5
+    assert "$boundedReaderRoleDefinitionGuid = New-ArmTemplateGuid -Values @(" in cleanup
+    assert (
+        "'athena-wc028-bounded-acquisition-reader',\n    $historicalWorkloadResourceGroupId"
+    ) in cleanup
+    assert (
+        """$changeWriterRoleDefinitionGuid = New-ArmTemplateGuid -Values @(
+    $subscriptionScope,
+    'athena-wc028-change-evidence-create-only',
+    (Normalize-ResourceId -ResourceId $ChangeEvidenceContainerResourceId)
+)"""
+        in cleanup
+    )
+    assert (
+        """$intentKeyReaderRoleDefinitionGuid = New-ArmTemplateGuid -Values @(
+    $subscriptionScope,
+    'athena-wc028-monitoring-intent-key-reader',
+    (Normalize-ResourceId -ResourceId $MonitoringIntentSigningKeyResourceId)
+)"""
+        in cleanup
+    )
+    assert "if ($null -ne $boundedReaderRoleDefinitionId)" not in cleanup
+    assert "if ($null -ne $changeWriterRoleDefinitionId)" not in cleanup
+    assert "if ($null -ne $intentKeyReaderRoleDefinitionId)" not in cleanup
 
 
 def test_upgrade_cleanup_exact_role_helpers_are_script_scoped() -> None:
@@ -323,4 +359,271 @@ if ($errors.Count -ne 0) {{
     parents = {item["name"]: item["parent"] for item in functions}
 
     assert parents["Get-ExactRoleDefinition"] == "<script>"
-    assert parents["Assert-ReviewedIpFlowRoleDefinition"] == "<script>"
+    assert parents["Assert-ReviewedRoleDefinition"] == "<script>"
+    assert parents["Assert-RoleDefinitionAbsent"] == "<script>"
+
+
+def test_upgrade_cleanup_role_helpers_execute_for_absent_deleted_and_renamed_roles() -> None:
+    shell = shutil.which("pwsh") or shutil.which("powershell")
+    if shell is None:
+        pytest.skip("PowerShell is required for executable cleanup tests")
+    cleanup_path = str(INFRA / "remove-obsolete-collector-rbac.ps1").replace("'", "''")
+    command = f"""
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+$tokens = $null
+$errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile(
+    '{cleanup_path}',
+    [ref]$tokens,
+    [ref]$errors
+)
+if ($errors.Count -ne 0) {{
+    throw ($errors -join [Environment]::NewLine)
+}}
+foreach ($functionName in @(
+    'Normalize-ResourceId',
+    'Get-ExactRoleDefinition',
+    'Assert-ReviewedRoleDefinition',
+    'Assert-RoleDefinitionAbsent'
+)) {{
+    $functionAst = $ast.Find(
+        {{
+            param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -eq $functionName
+        }},
+        $true
+    )
+    if ($null -eq $functionAst) {{
+        throw "Missing cleanup function $functionName"
+    }}
+    Invoke-Expression $functionAst.Extent.Text
+}}
+
+$SubscriptionId = '00000000-0000-0000-0000-000000000000'
+$roleDefinitionId = (
+    '/subscriptions/00000000-0000-0000-0000-000000000000/providers/' +
+    'Microsoft.Authorization/roleDefinitions/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+)
+$otherRoleDefinitionId = $roleDefinitionId.Replace(
+    'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+    'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'
+)
+$assignableScope = (
+    '/subscriptions/00000000-0000-0000-0000-000000000000/' +
+    'resourceGroups/rg-synthetic'
+)
+$script:mockRoleDefinitions = @(
+    [pscustomobject]@{{ id = $otherRoleDefinitionId }}
+)
+function Invoke-AzJson {{
+    param([Parameter(Mandatory)][string[]]$AzArguments)
+    return $script:mockRoleDefinitions
+}}
+
+$initiallyAbsent = Get-ExactRoleDefinition -RoleDefinitionId $roleDefinitionId
+if ($null -ne $initiallyAbsent) {{
+    throw 'An unrelated role ID must filter to no exact role definition.'
+}}
+Assert-RoleDefinitionAbsent -RoleDefinitionId $roleDefinitionId
+
+$renamedRole = [pscustomobject]@{{
+    id = $roleDefinitionId
+    roleName = 'Renamed Legacy Role'
+    roleType = 'CustomRole'
+    permissions = @(
+        [pscustomobject]@{{
+            actions = @('Microsoft.Test/widgets/read')
+            notActions = @()
+            dataActions = @()
+            notDataActions = @()
+        }}
+    )
+    assignableScopes = @($assignableScope)
+}}
+$script:mockRoleDefinitions = @($renamedRole)
+$resolved = Get-ExactRoleDefinition -RoleDefinitionId $roleDefinitionId
+if ($null -eq $resolved) {{
+    throw 'The exact deterministic role ID was not resolved.'
+}}
+Assert-ReviewedRoleDefinition `
+    -RoleDefinition $resolved `
+    -ExpectedRoleDefinitionId $roleDefinitionId `
+    -ExpectedAssignableScope $assignableScope `
+    -ExpectedActions @('Microsoft.Test/widgets/read') `
+    -ExpectedDataActions @()
+
+$mismatchedRole = $renamedRole.PSObject.Copy()
+$mismatchedRole.permissions = @(
+    [pscustomobject]@{{
+        actions = @('Microsoft.Test/widgets/write')
+        notActions = @()
+        dataActions = @()
+        notDataActions = @()
+    }}
+)
+$mismatchRejected = $false
+try {{
+    Assert-ReviewedRoleDefinition `
+        -RoleDefinition $mismatchedRole `
+        -ExpectedRoleDefinitionId $roleDefinitionId `
+        -ExpectedAssignableScope $assignableScope `
+        -ExpectedActions @('Microsoft.Test/widgets/read') `
+        -ExpectedDataActions @()
+}} catch {{
+    $mismatchRejected = $true
+}}
+if (-not $mismatchRejected) {{
+    throw 'A mismatched historical role body was accepted.'
+}}
+
+$scopeMismatchRejected = $false
+try {{
+    Assert-ReviewedRoleDefinition `
+        -RoleDefinition $renamedRole `
+        -ExpectedRoleDefinitionId $roleDefinitionId `
+        -ExpectedAssignableScope "$assignableScope-other" `
+        -ExpectedActions @('Microsoft.Test/widgets/read') `
+        -ExpectedDataActions @()
+}} catch {{
+    $scopeMismatchRejected = $true
+}}
+if (-not $scopeMismatchRejected) {{
+    throw 'A mismatched historical role assignable scope was accepted.'
+}}
+
+$script:mockRoleDefinitions = @()
+Assert-RoleDefinitionAbsent -RoleDefinitionId $roleDefinitionId
+
+[ordered]@{{
+    initiallyAbsent = $true
+    renamedRoleAccepted = $true
+    mismatchedRoleRejected = $mismatchRejected
+    mismatchedScopeRejected = $scopeMismatchRejected
+    successfullyDeletedAbsent = $true
+}} | ConvertTo-Json -Compress
+"""
+    completed = subprocess.run(
+        [shell, "-NoProfile", "-NonInteractive", "-Command", command],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert json.loads(completed.stdout) == {
+        "initiallyAbsent": True,
+        "renamedRoleAccepted": True,
+        "mismatchedRoleRejected": True,
+        "mismatchedScopeRejected": True,
+        "successfullyDeletedAbsent": True,
+    }
+
+
+def test_upgrade_cleanup_reconstructs_historical_network_watcher_guid_preimages() -> None:
+    shell = shutil.which("pwsh") or shutil.which("powershell")
+    if shell is None:
+        pytest.skip("PowerShell is required for executable cleanup tests")
+    cleanup_path = str(INFRA / "remove-obsolete-collector-rbac.ps1").replace("'", "''")
+    command = f"""
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+$tokens = $null
+$errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile(
+    '{cleanup_path}',
+    [ref]$tokens,
+    [ref]$errors
+)
+if ($errors.Count -ne 0) {{
+    throw ($errors -join [Environment]::NewLine)
+}}
+foreach ($functionName in @(
+    'Convert-GuidToNetworkBytes',
+    'Convert-NetworkBytesToGuid',
+    'New-ArmTemplateGuid',
+    'Get-HistoricalNetworkWatcherResourceId'
+)) {{
+    $functionAst = $ast.Find(
+        {{
+            param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -eq $functionName
+        }},
+        $true
+    )
+    Invoke-Expression $functionAst.Extent.Text
+}}
+
+$SubscriptionId = '00000000-0000-0000-0000-000000000000'
+$subscriptionScope = '/subscriptions/00000000-0000-0000-0000-000000000000'
+$liveNetworkWatcherId = (
+    "$subscriptionScope/resourceGroups/NetworkWatcherRG/providers/" +
+    'Microsoft.Network/networkWatchers/NetworkWatcher_australiaeast'
+)
+$historicalNetworkWatcherId = Get-HistoricalNetworkWatcherResourceId `
+    -ResourceId $liveNetworkWatcherId
+$expectedHistoricalNetworkWatcherId = (
+    "$subscriptionScope/resourceGroups/networkwatcherrg/providers/" +
+    'Microsoft.Network/networkWatchers/networkwatcher_australiaeast'
+)
+if ($historicalNetworkWatcherId -cne $expectedHistoricalNetworkWatcherId) {{
+    throw 'Historical Network Watcher resource ID casing was not reconstructed exactly.'
+}}
+$roleGuid = New-ArmTemplateGuid -Values @(
+    $subscriptionScope,
+    'athena-wc028-ip-flow-verify',
+    $historicalNetworkWatcherId
+)
+if ($roleGuid -ne 'b5e78872-6f8f-5156-ad98-4c5b4704d15e') {{
+    throw 'Historical IP Flow role-definition GUID does not match the original ARM preimage.'
+}}
+$roleDefinitionId = (
+    "$subscriptionScope/providers/Microsoft.Authorization/roleDefinitions/$roleGuid"
+)
+$assignmentGuid = New-ArmTemplateGuid -Values @(
+    $historicalNetworkWatcherId,
+    '44444444-4444-4444-4444-444444444444',
+    $roleDefinitionId
+)
+if ($assignmentGuid -ne '3b53fb0b-abc4-5ad5-b7f8-54199918a930') {{
+    throw 'Historical IP Flow assignment GUID does not match the original ARM preimage.'
+}}
+
+$wrongWatcherRejected = $false
+try {{
+    Get-HistoricalNetworkWatcherResourceId -ResourceId (
+        "$subscriptionScope/resourceGroups/rg-other/providers/" +
+        'Microsoft.Network/networkWatchers/NetworkWatcher_other'
+    ) | Out-Null
+}} catch {{
+    $wrongWatcherRejected = $true
+}}
+if (-not $wrongWatcherRejected) {{
+    throw 'A caller-selected non-historical Network Watcher was accepted.'
+}}
+
+[ordered]@{{
+    historicalNetworkWatcherId = $historicalNetworkWatcherId
+    roleGuid = $roleGuid
+    assignmentGuid = $assignmentGuid
+    wrongWatcherRejected = $wrongWatcherRejected
+}} | ConvertTo-Json -Compress
+"""
+    completed = subprocess.run(
+        [shell, "-NoProfile", "-NonInteractive", "-Command", command],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert json.loads(completed.stdout) == {
+        "historicalNetworkWatcherId": (
+            "/subscriptions/00000000-0000-0000-0000-000000000000/"
+            "resourceGroups/networkwatcherrg/providers/Microsoft.Network/"
+            "networkWatchers/networkwatcher_australiaeast"
+        ),
+        "roleGuid": "b5e78872-6f8f-5156-ad98-4c5b4704d15e",
+        "assignmentGuid": "3b53fb0b-abc4-5ad5-b7f8-54199918a930",
+        "wrongWatcherRejected": True,
+    }

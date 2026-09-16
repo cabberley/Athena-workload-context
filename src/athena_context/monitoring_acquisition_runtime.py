@@ -191,10 +191,32 @@ def _subscription_id_from_resource_id(value: str) -> str:
 def _resource_scope_ancestry(value: str) -> tuple[str, ...]:
     normalized = _canonical_resource_id(value)
     segments = normalized.strip("/").split("/")
+    _subscription_id_from_resource_id(normalized)
     subscription_scope = f"/subscriptions/{segments[1]}"
-    scopes = {subscription_scope, normalized}
-    if len(segments) >= 4 and segments[2] == "resourcegroups":
-        scopes.add(f"{subscription_scope}/resourcegroups/{segments[3]}")
+    scopes = {subscription_scope}
+    index = 2
+    if index < len(segments) and segments[index] == "resourcegroups":
+        if index + 1 >= len(segments) or not segments[index + 1]:
+            raise ValueError("runtime resource ID has an invalid resource-group scope")
+        index += 2
+        scopes.add("/" + "/".join(segments[:index]))
+    if index == len(segments):
+        return tuple(sorted(scopes))
+    while index < len(segments):
+        if segments[index] != "providers" or index + 1 >= len(segments) or not segments[index + 1]:
+            raise ValueError("runtime resource ID has an invalid provider scope")
+        index += 2
+        resource_count = 0
+        while index < len(segments) and segments[index] != "providers":
+            if index + 1 >= len(segments) or not segments[index] or not segments[index + 1]:
+                raise ValueError("runtime resource ID has an incomplete nested resource scope")
+            index += 2
+            resource_count += 1
+            scopes.add("/" + "/".join(segments[:index]))
+        if resource_count == 0:
+            raise ValueError("runtime resource ID provider has no resource scope")
+    if normalized not in scopes:
+        raise ValueError("runtime resource ID ancestry did not reach the exact target")
     return tuple(sorted(scopes))
 
 

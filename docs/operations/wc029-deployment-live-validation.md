@@ -180,8 +180,10 @@ template. Perform these steps in order:
 2. Save the full cleanup JSON outside the repository and retain its `cleanupEvidenceDigest`.
 3. Re-query the collector's hierarchy-complete effective assignments, role definitions, deny
    assignments, transitive groups, and active PIM schedules. Stop unless all six legacy bindings
-   and all three obsolete custom role definitions, including the deterministic Network Watcher IP
-   Flow assignment and role, are absent.
+   and all four deterministic obsolete custom role definitions, including the Network Watcher IP
+   Flow assignment and role, are absent. Discover each historical role only by its exact
+   original-ARM-`guid()` ID; a renamed role must still be validated and removed, while any changed
+   permission body or assignable scope blocks cleanup.
 4. Produce a fresh collector contract and authority from the PR #99 revision that recognizes the
    conditioned known-name-read/add-only writer, binds the reviewed storage-protection contract and
    signed persistence replay preimage, and proves all management-group or tenant-root ancestor
@@ -211,7 +213,9 @@ template. Perform these steps in order:
    module and the Job. After the required PR #99 restack, replace that hard gate, deploy the manual
    Job, remeasure both identities, and verify the collector inventory matches the new contract and
    the runtime-support identity has only direct `AcrPull` on the reviewed registry plus the exact
-   monitoring-intent key-read role before any new acquisition.
+   monitoring-intent key-read role before any new acquisition. The runtime-support inventory must
+   contain every intervening ARM scope, including the Key Vault resource between its resource group
+   and the leaf signing key, so broader vault roles and denies cannot escape review.
 
 The Job uses `triggerType: Manual` and `replicaRetryLimit: 0`. Never start it on a timer. Create a
 new execution ID, cleanup binding, collector inventory, and replay key for each governed execution.

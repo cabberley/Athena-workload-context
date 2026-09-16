@@ -52,7 +52,6 @@ from athena_context.monitoring_acquisition_runtime import (
 from athena_context.monitoring_collection import build_collected_correlation_request
 from test_wc024_monitoring_contract import _acquisition_collector_contract
 from test_wc028_monitoring_acquisition import (
-    _acquisition_authority,
     _AcquisitionPort,
     _authority,
     _execute,
@@ -98,6 +97,10 @@ MONITORING_INTENT_KEY_RESOURCE_ID = (
     "providers/Microsoft.KeyVault/vaults/synthetic-context-kv/"
     "keys/monitoring-intent-signing"
 )
+MONITORING_INTENT_VAULT_RESOURCE_ID = MONITORING_INTENT_KEY_RESOURCE_ID.rsplit(
+    "/keys/",
+    maxsplit=1,
+)[0]
 ACR_PULL_ROLE_ID = (
     f"/subscriptions/{SUBSCRIPTION_ID}/providers/Microsoft.Authorization/roleDefinitions/"
     "7f951dda-4ed3-4680-a7ca-43fe172d538d"
@@ -274,21 +277,12 @@ def _runtime_support_rbac_inventory(
         "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
     )
     support_principal_id = SUPPORT_PRINCIPAL_ID.casefold()
-    registry_resource_group_name = registry_id.split("/resourcegroups/", maxsplit=1)[1].split(
-        "/", maxsplit=1
-    )[0]
-    key_resource_group_name = key_id.split("/resourcegroups/", maxsplit=1)[1].split(
-        "/", maxsplit=1
-    )[0]
     target_scopes = tuple(
         sorted(
             {
                 MANAGEMENT_GROUP_SCOPE.casefold(),
-                f"/subscriptions/{subscription_id}",
-                (f"/subscriptions/{subscription_id}/resourcegroups/{registry_resource_group_name}"),
-                registry_id,
-                (f"/subscriptions/{subscription_id}/resourcegroups/{key_resource_group_name}"),
-                key_id,
+                *runtime_module._resource_scope_ancestry(registry_id),
+                *runtime_module._resource_scope_ancestry(key_id),
             }
         )
     )
@@ -1022,6 +1016,120 @@ def test_configuration_rejects_rehashed_zero_principal_evidence_digests(
         Wc028MonitoringAcquisitionJobConfiguration.model_validate(payload)
 
 
+def test_resource_scope_ancestry_includes_every_nested_arm_parent() -> None:
+    assert runtime_module._resource_scope_ancestry(MONITORING_INTENT_KEY_RESOURCE_ID) == tuple(
+        sorted(
+            {
+                f"/subscriptions/{SUBSCRIPTION_ID}".casefold(),
+                (
+                    f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg-athena-demo-context"
+                ).casefold(),
+                MONITORING_INTENT_VAULT_RESOURCE_ID.casefold(),
+                MONITORING_INTENT_KEY_RESOURCE_ID.casefold(),
+            }
+        )
+    )
+
+
+def test_runtime_support_rbac_requires_key_vault_and_key_target_evidence() -> None:
+    payload = _configuration_payload()
+    inventory = cast(
+        dict[str, object],
+        payload["runtimeSupportEffectiveRbacInventory"],
+    )
+    principal_evidence = cast(
+        dict[str, object],
+        inventory["supportPrincipalEvidence"],
+    )
+    target_scopes = tuple(
+        scope
+        for scope in cast(tuple[str, ...], principal_evidence["targetScopeIds"])
+        if scope != MONITORING_INTENT_VAULT_RESOURCE_ID.casefold()
+    )
+    principal_evidence["targetScopeIds"] = target_scopes
+    principal_evidence["firstReadTargetDigests"] = tuple(DIGEST_A for _ in target_scopes)
+    principal_evidence["secondReadTargetDigests"] = tuple(DIGEST_A for _ in target_scopes)
+    payload["runtimeSupportEffectiveRbacInventory"] = _refresh_support_rbac_inventory(inventory)
+
+    with pytest.raises(ValidationError, match="hierarchy-complete dedicated"):
+        Wc028MonitoringAcquisitionJobConfiguration.model_validate(payload)
+
+
+def test_runtime_support_rbac_rejects_vault_level_key_roles() -> None:
+    broader_expected_role = _configuration_payload()
+    broader_inventory = cast(
+        dict[str, object],
+        broader_expected_role["runtimeSupportEffectiveRbacInventory"],
+    )
+    broader_grants = cast(
+        list[dict[str, object]],
+        list(broader_inventory["supportGrants"]),
+    )
+    key_grant = next(
+        item
+        for item in broader_grants
+        if item["roleDefinitionId"] == SUPPORT_KEY_READER_ROLE_ID.casefold()
+    )
+    key_grant["assignmentScopeIds"] = (MONITORING_INTENT_VAULT_RESOURCE_ID.casefold(),)
+    broader_inventory["supportGrants"] = tuple(broader_grants)
+    broader_expected_role["runtimeSupportEffectiveRbacInventory"] = _refresh_support_rbac_inventory(
+        broader_inventory
+    )
+    with pytest.raises(ValidationError, match="exact direct governed"):
+        Wc028MonitoringAcquisitionJobConfiguration.model_validate(broader_expected_role)
+
+    unexpected_role = _configuration_payload()
+    unexpected_inventory = cast(
+        dict[str, object],
+        unexpected_role["runtimeSupportEffectiveRbacInventory"],
+    )
+    unexpected_role_id = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+        "microsoft.authorization/roledefinitions/"
+        "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    ).casefold()
+    unexpected_grants = cast(
+        list[dict[str, object]],
+        list(unexpected_inventory["supportGrants"]),
+    )
+    unexpected_key_grant = next(
+        item
+        for item in unexpected_grants
+        if item["roleDefinitionId"] == SUPPORT_KEY_READER_ROLE_ID.casefold()
+    )
+    unexpected_key_grant.update(
+        {
+            "roleDefinitionId": unexpected_role_id,
+            "roleDefinitionName": "Synthetic Broad Vault Reader",
+            "assignmentScopeIds": (MONITORING_INTENT_VAULT_RESOURCE_ID.casefold(),),
+        }
+    )
+    unexpected_inventory["supportGrants"] = tuple(unexpected_grants)
+    unexpected_roles = cast(
+        list[dict[str, object]],
+        list(unexpected_inventory["roleDefinitions"]),
+    )
+    unexpected_key_role = next(
+        item
+        for item in unexpected_roles
+        if item["roleDefinitionId"] == SUPPORT_KEY_READER_ROLE_ID.casefold()
+    )
+    unexpected_key_role.update(
+        {
+            "roleDefinitionId": unexpected_role_id,
+            "roleDefinitionName": "Synthetic Broad Vault Reader",
+            "actions": ("microsoft.keyvault/vaults/read",),
+            "dataActions": (),
+        }
+    )
+    unexpected_inventory["roleDefinitions"] = tuple(unexpected_roles)
+    unexpected_role["runtimeSupportEffectiveRbacInventory"] = _refresh_support_rbac_inventory(
+        unexpected_inventory
+    )
+    with pytest.raises(ValidationError, match="arbitrary effective Azure privileges"):
+        Wc028MonitoringAcquisitionJobConfiguration.model_validate(unexpected_role)
+
+
 def test_runtime_support_rbac_rejects_inherited_and_group_privileges() -> None:
     inherited = _configuration_payload()
     inherited_inventory = cast(
@@ -1131,7 +1239,7 @@ def test_runtime_support_rbac_rejects_conditions_pim_and_applicable_denies() -> 
                 "Microsoft.Authorization/denyAssignments/"
                 "dddddddd-dddd-dddd-dddd-dddddddddddd"
             ).casefold(),
-            "scopeId": f"/subscriptions/{SUBSCRIPTION_ID}".casefold(),
+            "scopeId": MONITORING_INTENT_VAULT_RESOURCE_ID.casefold(),
             "principalIds": (SUPPORT_PRINCIPAL_ID.casefold(),),
             "excludedPrincipalIds": (),
             "actions": (),
@@ -1293,98 +1401,12 @@ def test_configuration_loader_is_bounded_and_unambiguous(tmp_path: Path) -> None
 
 
 def test_current_nil_subscription_contract_is_rejected_at_startup() -> None:
-    context_binding, monitoring_intent, controls = _authority(required_control_names={"heartbeat"})
     collector_contract = _acquisition_collector_contract()
-    acquisition_authority = _acquisition_authority(
-        context_binding=context_binding,
-        controls=controls,
-        collector_contract=collector_contract,
-    )
-    payload = _configuration_payload()
     subscription_id = collector_contract.collector_identity_resource_id.strip("/").split("/")[1]
-    support_identity_id = SUPPORT_ID.replace(SUBSCRIPTION_ID, subscription_id)
     registry_id = REGISTRY_ID.replace(SUBSCRIPTION_ID, subscription_id)
-    monitoring_intent_key_resource_id = MONITORING_INTENT_KEY_RESOURCE_ID.replace(
-        SUBSCRIPTION_ID,
-        subscription_id,
-    )
-    support_rbac_inventory = _runtime_support_rbac_inventory(
-        subscription_id=subscription_id,
-        tenant_id=cast(str, collector_contract.collector_tenant_id),
-        support_identity_resource_id=support_identity_id,
-        registry_resource_id=registry_id,
-        monitoring_intent_key_resource_id=monitoring_intent_key_resource_id,
-    )
-    evidence_storage_id = collector_contract.evidence_storage_account_resource_id
-    evidence_storage_name = evidence_storage_id.rsplit("/", maxsplit=1)[-1]
-    payload.update(
-        {
-            "managedIdentityClientId": collector_contract.collector_identity_client_id,
-            "collectorIdentityResourceId": collector_contract.collector_identity_resource_id,
-            "athenaContextIdentityResourceId": collector_contract.athena_context_identity_id,
-            "runtimeSupportIdentityResourceId": support_identity_id,
-            "registryResourceId": registry_id,
-            "runtimeSupportAcrPullRoleDefinitionId": (
-                ACR_PULL_ROLE_ID.replace(SUBSCRIPTION_ID, subscription_id)
-            ),
-            "monitoringIntentSigningKeyResourceId": monitoring_intent_key_resource_id,
-            "runtimeSupportMonitoringIntentKeyReaderRoleDefinitionId": (
-                SUPPORT_KEY_READER_ROLE_ID.replace(SUBSCRIPTION_ID, subscription_id)
-            ),
-            "runtimeSupportEffectiveRbacInventory": support_rbac_inventory,
-            "sourceStorageAccountResourceId": SOURCE_STORAGE_ID.replace(
-                SUBSCRIPTION_ID,
-                subscription_id,
-            ),
-            "evidenceStorageAccountResourceId": evidence_storage_id,
-            "evidenceBlobEndpoint": (f"https://{evidence_storage_name}.blob.core.windows.net"),
-            "monitoringIntent": monitoring_intent.model_dump(
-                mode="json",
-                by_alias=True,
-                exclude_none=True,
-            ),
-            "contextBinding": context_binding.model_dump(
-                mode="json",
-                by_alias=True,
-                exclude_none=True,
-            ),
-            "acquisitionAuthority": acquisition_authority.model_dump(
-                mode="json",
-                by_alias=True,
-                exclude_none=True,
-            ),
-            "monitoringCollectorContract": collector_contract.model_dump(
-                mode="json",
-                by_alias=True,
-                exclude_none=True,
-            ),
-            "expectedActiveContextAuthorityDigest": (
-                context_binding.publication_authority.authority_digest
-            ),
-            "expectedAcquisitionAuthorityDigest": acquisition_authority.authority_digest,
-        }
-    )
-    signing_key = cast(dict[str, object], payload["collectorSigningKey"])
-    signing_key["keyVaultKeyId"] = collector_contract.signing_key_resource_id
-    payload["persistenceReplayKey"] = compute_artifact_digest(
-        {
-            "schemaVersion": "athena.wc028MonitoringPersistenceReplay.v3",
-            "executionId": EXECUTION_ID,
-            "acquisitionAuthorityDigest": acquisition_authority.authority_digest,
-            "monitoringIntentDigest": monitoring_intent.intent_digest,
-            "monitoringIntentReferenceDigest": cast(
-                dict[str, object],
-                payload["monitoringIntentReference"],
-            )["referenceDigest"],
-            "contextBindingDigest": context_binding.binding_digest,
-            "incidentRevision": 1,
-            "legacyCollectorRbacCleanupDigest": CLEANUP_DIGEST,
-            "trustDelaySeconds": payload["trustDelaySeconds"],
-            "requestLifetimeSeconds": payload["requestLifetimeSeconds"],
-        }
-    )
-    with pytest.raises(ValidationError, match="non-nil GUID"):
-        Wc028MonitoringAcquisitionJobConfiguration.model_validate(payload)
+
+    with pytest.raises(ValueError, match="Azure subscription"):
+        runtime_module._resource_scope_ancestry(registry_id)
 
 
 def test_current_published_contract_remains_blocked_on_pr99_bootstrap() -> None:

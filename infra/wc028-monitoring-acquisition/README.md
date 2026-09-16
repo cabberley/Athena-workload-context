@@ -61,8 +61,9 @@ and approved change scope. It also binds:
 - the WC-024 collector resource, client, and principal identities;
 - the separate runtime-support resource, client, and principal identities;
 - the exact registry and monitoring-intent key scopes, the two permitted role IDs, and fresh
-  hierarchy-complete runtime-support effective-RBAC evidence covering direct and inherited
-  assignments, transitive groups, active PIM schedules, conditions, and deny assignments;
+  hierarchy-complete runtime-support effective-RBAC evidence covering every intervening ARM scope
+  (including the containing Key Vault and leaf key), direct and inherited assignments, transitive
+  groups, active PIM schedules, conditions, and deny assignments;
 - the separate Athena context resource and principal identities;
 - the monitoring-evidence storage endpoint and container;
 - the non-zero storage-readiness digest and exact versioning/immutability readback;
@@ -113,8 +114,10 @@ Before deploying this version over an existing WC-028 runtime, run
 change-evidence container, monitoring-evidence container, monitoring-intent key, exact historical
 Network Watcher, and exact collector resource/principal pair. The script deletes only the six exact
 legacy collector assignments, including the deterministic Network Watcher IP Flow assignment and
-the broad monitoring-evidence contributor assignment. It removes the three obsolete custom role
-definitions, verifies every reviewed binding and definition is absent, and emits
+the broad monitoring-evidence contributor assignment. It recomputes all four historical custom
+role-definition IDs from their original ARM `guid()` preimages, validates any existing definition's
+exact permissions and assignable scope without trusting its mutable display name, removes it by
+exact ID, verifies every reviewed assignment and definition is absent, and emits
 `cleanupEvidenceDigest`.
 
 Pass that digest as both `legacyCollectorRbacCleanupDigest` and the matching field in runtime

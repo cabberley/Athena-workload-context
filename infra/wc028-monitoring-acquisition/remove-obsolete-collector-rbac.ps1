@@ -126,13 +126,67 @@ function Assert-ResourceSubscription {
     ) {
         throw "Resource ID '$ResourceId' is outside SubscriptionId."
     }
+}
+
+function Get-ResourceGroupScope {
+    param([Parameter(Mandatory)][string]$ResourceId)
+
+    $normalized = Normalize-ResourceId -ResourceId $ResourceId
+    $providerIndex = $normalized.IndexOf(
+        '/providers/',
+        [StringComparison]::OrdinalIgnoreCase
+    )
+    $resourceGroupScope = if ($providerIndex -lt 0) {
+        $normalized
+    } else {
+        $normalized.Substring(0, $providerIndex)
     }
+    $segments = $resourceGroupScope.Trim('/').Split('/')
+    if (
+        $segments.Count -ne 4 -or
+        $segments[0] -ne 'subscriptions' -or
+        $segments[1] -ne $SubscriptionId.ToLowerInvariant() -or
+        $segments[2] -ne 'resourcegroups' -or
+        [string]::IsNullOrEmpty($segments[3])
+    ) {
+        throw "Resource ID '$ResourceId' does not have one exact resource-group scope."
+    }
+    return $resourceGroupScope
+}
 
-    function Get-ExactRoleDefinition {
-        param([Parameter(Mandatory)][string]$RoleDefinitionId)
+function Get-HistoricalNetworkWatcherResourceId {
+    param([Parameter(Mandatory)][string]$ResourceId)
 
-        $roleDefinitionGuid = $RoleDefinitionId.TrimEnd('/').Split('/')[-1]
-        $matches = @(
+    $segments = $ResourceId.Trim('/').Split('/')
+    if (
+        $segments.Count -ne 8 -or
+        $segments[0].ToLowerInvariant() -ne 'subscriptions' -or
+        $segments[1].ToLowerInvariant() -ne $SubscriptionId.ToLowerInvariant() -or
+        $segments[2].ToLowerInvariant() -ne 'resourcegroups' -or
+        $segments[3].ToLowerInvariant() -ne 'networkwatcherrg' -or
+        $segments[4].ToLowerInvariant() -ne 'providers' -or
+        $segments[5].ToLowerInvariant() -ne 'microsoft.network' -or
+        $segments[6].ToLowerInvariant() -ne 'networkwatchers' -or
+        $segments[7].ToLowerInvariant() -ne 'networkwatcher_australiaeast'
+    ) {
+        throw (
+            "Resource ID '$ResourceId' is not the reviewed historical " +
+            'NetworkWatcherRG/NetworkWatcher_australiaeast resource.'
+        )
+    }
+    return (
+        "/subscriptions/$($SubscriptionId.ToLowerInvariant())/resourceGroups/" +
+        "$($segments[3].ToLowerInvariant())/providers/Microsoft.Network/networkWatchers/" +
+        $segments[7].ToLowerInvariant()
+    )
+}
+
+function Get-ExactRoleDefinition {
+    param([Parameter(Mandatory)][string]$RoleDefinitionId)
+
+    $roleDefinitionGuid = $RoleDefinitionId.TrimEnd('/').Split('/')[-1]
+    $matches = @(
+        @(
             Invoke-AzJson -AzArguments @(
                 'role', 'definition', 'list',
                 '--name', $roleDefinitionGuid,
@@ -143,67 +197,71 @@ function Assert-ResourceSubscription {
                 Normalize-ResourceId -ResourceId $RoleDefinitionId
             )
         }
-        if ($matches.Count -gt 1) {
-            throw "Role definition '$RoleDefinitionId' resolved ambiguously."
-        }
-        if ($matches.Count -eq 0) {
-            return $null
-        }
-        return $matches[0]
-    }
-
-    function Assert-ReviewedIpFlowRoleDefinition {
-        param(
-            [Parameter(Mandatory)][object]$RoleDefinition,
-            [Parameter(Mandatory)][string]$ExpectedRoleDefinitionId,
-            [Parameter(Mandatory)][string]$ExpectedAssignableScope
-        )
-
-        $permissions = @($RoleDefinition.permissions)
-        $assignableScopes = @(
-            $RoleDefinition.assignableScopes |
-                ForEach-Object { Normalize-ResourceId -ResourceId ([string]$_) }
-        )
-        if (
-            (Normalize-ResourceId -ResourceId ([string]$RoleDefinition.id)) -ne (
-                Normalize-ResourceId -ResourceId $ExpectedRoleDefinitionId
-            ) -or
-            [string]$RoleDefinition.roleName -ne 'Athena WC028 IP Flow Verifier' -or
-            [string]$RoleDefinition.roleType -ne 'CustomRole' -or
-            $permissions.Count -ne 1 -or
-            @($permissions[0].actions).Count -ne 1 -or
-            [string]$permissions[0].actions[0] -ne (
-                'Microsoft.Network/networkWatchers/ipFlowVerify/action'
-            ) -or
-            @($permissions[0].notActions).Count -ne 0 -or
-            @($permissions[0].dataActions).Count -ne 0 -or
-            @($permissions[0].notDataActions).Count -ne 0 -or
-            $assignableScopes.Count -ne 1 -or
-            $assignableScopes[0] -ne (
-                Normalize-ResourceId -ResourceId $ExpectedAssignableScope
-            )
-        ) {
-            throw 'Historical IP Flow role definition does not match the reviewed deterministic role.'
-        }
-    }
-
-    function Find-RoleDefinitionId {
-    param([Parameter(Mandatory)][string]$RoleName)
-
-    $matches = @(
-        Invoke-AzJson -AzArguments @(
-            'role', 'definition', 'list',
-            '--name', $RoleName,
-            '--subscription', $SubscriptionId
-        )
     )
     if ($matches.Count -gt 1) {
-        throw "Role name '$RoleName' resolved ambiguously."
+        throw "Role definition '$RoleDefinitionId' resolved ambiguously."
     }
     if ($matches.Count -eq 0) {
         return $null
     }
-    return [string]$matches[0].id
+    return $matches[0]
+}
+
+function Assert-ReviewedRoleDefinition {
+    param(
+        [Parameter(Mandatory)][object]$RoleDefinition,
+        [Parameter(Mandatory)][string]$ExpectedRoleDefinitionId,
+        [Parameter(Mandatory)][string]$ExpectedAssignableScope,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$ExpectedActions,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$ExpectedDataActions
+    )
+
+    $permissions = @($RoleDefinition.permissions)
+    $assignableScopes = @(
+        @($RoleDefinition.assignableScopes) |
+            ForEach-Object { Normalize-ResourceId -ResourceId ([string]$_) } |
+            Sort-Object
+    )
+    $actualActions = @(
+        @($permissions[0].actions) |
+            ForEach-Object { ([string]$_).ToLowerInvariant() } |
+            Sort-Object
+    )
+    $actualDataActions = @(
+        @($permissions[0].dataActions) |
+            ForEach-Object { ([string]$_).ToLowerInvariant() } |
+            Sort-Object
+    )
+    $expectedActionsNormalized = @(
+        $ExpectedActions |
+            ForEach-Object { $_.ToLowerInvariant() } |
+            Sort-Object
+    )
+    $expectedDataActionsNormalized = @(
+        $ExpectedDataActions |
+            ForEach-Object { $_.ToLowerInvariant() } |
+            Sort-Object
+    )
+    if (
+        (Normalize-ResourceId -ResourceId ([string]$RoleDefinition.id)) -ne (
+            Normalize-ResourceId -ResourceId $ExpectedRoleDefinitionId
+        ) -or
+        [string]$RoleDefinition.roleType -ne 'CustomRole' -or
+        $permissions.Count -ne 1 -or
+        ($actualActions -join "`n") -ne ($expectedActionsNormalized -join "`n") -or
+        @($permissions[0].notActions).Count -ne 0 -or
+        ($actualDataActions -join "`n") -ne ($expectedDataActionsNormalized -join "`n") -or
+        @($permissions[0].notDataActions).Count -ne 0 -or
+        $assignableScopes.Count -ne 1 -or
+        $assignableScopes[0] -ne (
+            Normalize-ResourceId -ResourceId $ExpectedAssignableScope
+        )
+    ) {
+        throw (
+            "Historical role definition '$ExpectedRoleDefinitionId' does not match " +
+            'the reviewed deterministic body and assignable scope.'
+        )
+    }
 }
 
 function Assert-RoleDefinitionAbsent {
@@ -211,16 +269,18 @@ function Assert-RoleDefinitionAbsent {
 
     $roleDefinitionGuid = $RoleDefinitionId.TrimEnd('/').Split('/')[-1]
     $matches = @(
-        Invoke-AzJson -AzArguments @(
-            'role', 'definition', 'list',
-            '--name', $roleDefinitionGuid,
-            '--subscription', $SubscriptionId
-        )
-    ) | Where-Object {
-        (Normalize-ResourceId -ResourceId ([string]$_.id)) -eq (
-            Normalize-ResourceId -ResourceId $RoleDefinitionId
-        )
-    }
+        @(
+            Invoke-AzJson -AzArguments @(
+                'role', 'definition', 'list',
+                '--name', $roleDefinitionGuid,
+                '--subscription', $SubscriptionId
+            )
+        ) | Where-Object {
+            (Normalize-ResourceId -ResourceId ([string]$_.id)) -eq (
+                Normalize-ResourceId -ResourceId $RoleDefinitionId
+            )
+        }
+    )
     if ($matches.Count -ne 0) {
         throw "Role definition '$RoleDefinitionId' remains after exact cleanup."
     }
@@ -269,35 +329,132 @@ if (
     throw 'NetworkWatcherResourceId does not resolve to the exact reviewed Network Watcher.'
 }
 $networkWatcherId = [string]$networkWatcher.id
-$networkWatcherResourceGroupId = $networkWatcherId.Substring(
-    0,
-    $networkWatcherId.IndexOf('/providers/', [StringComparison]::OrdinalIgnoreCase)
+$workloadResourceGroup = Invoke-AzJson -AzArguments @(
+    'group', 'show',
+    '--ids', $WorkloadResourceGroupResourceId,
+    '--subscription', $SubscriptionId
 )
+if (
+    (Normalize-ResourceId -ResourceId ([string]$workloadResourceGroup.id)) -ne (
+        Normalize-ResourceId -ResourceId $WorkloadResourceGroupResourceId
+    )
+) {
+    throw 'WorkloadResourceGroupResourceId does not resolve to the exact reviewed resource group.'
+}
+$workloadResourceGroupId = [string]$workloadResourceGroup.id
+$workloadResourceGroupSegments = (
+    Normalize-ResourceId -ResourceId $workloadResourceGroupId
+).Trim('/').Split('/')
+$historicalWorkloadResourceGroupId = (
+    "/subscriptions/$($SubscriptionId.ToLowerInvariant())/resourceGroups/" +
+    $workloadResourceGroupSegments[3]
+)
+$historicalNetworkWatcherId = Get-HistoricalNetworkWatcherResourceId `
+    -ResourceId $networkWatcherId
+$networkWatcherResourceGroupId = Get-ResourceGroupScope -ResourceId $networkWatcherId
+$changeEvidenceResourceGroupId = Get-ResourceGroupScope `
+    -ResourceId $ChangeEvidenceContainerResourceId
+$monitoringIntentKeyResourceGroupId = Get-ResourceGroupScope `
+    -ResourceId $MonitoringIntentSigningKeyResourceId
 $subscriptionScope = "/subscriptions/$($SubscriptionId.ToLowerInvariant())"
+$boundedReaderRoleDefinitionGuid = New-ArmTemplateGuid -Values @(
+    $subscriptionScope,
+    'athena-wc028-bounded-acquisition-reader',
+    $historicalWorkloadResourceGroupId
+)
+$boundedReaderRoleDefinitionId = (
+    "$subscriptionScope/providers/Microsoft.Authorization/roleDefinitions/" +
+    $boundedReaderRoleDefinitionGuid
+)
+$changeWriterRoleDefinitionGuid = New-ArmTemplateGuid -Values @(
+    $subscriptionScope,
+    'athena-wc028-change-evidence-create-only',
+    (Normalize-ResourceId -ResourceId $ChangeEvidenceContainerResourceId)
+)
+$changeWriterRoleDefinitionId = (
+    "$subscriptionScope/providers/Microsoft.Authorization/roleDefinitions/" +
+    $changeWriterRoleDefinitionGuid
+)
+$intentKeyReaderRoleDefinitionGuid = New-ArmTemplateGuid -Values @(
+    $subscriptionScope,
+    'athena-wc028-monitoring-intent-key-reader',
+    (Normalize-ResourceId -ResourceId $MonitoringIntentSigningKeyResourceId)
+)
+$intentKeyReaderRoleDefinitionId = (
+    "$subscriptionScope/providers/Microsoft.Authorization/roleDefinitions/" +
+    $intentKeyReaderRoleDefinitionGuid
+)
 $ipFlowRoleDefinitionGuid = New-ArmTemplateGuid -Values @(
     $subscriptionScope,
     'athena-wc028-ip-flow-verify',
-    $networkWatcherId
+    $historicalNetworkWatcherId
 )
 $ipFlowRoleDefinitionId = (
     "$subscriptionScope/providers/Microsoft.Authorization/roleDefinitions/" +
     $ipFlowRoleDefinitionGuid
 )
-$ipFlowRoleDefinition = Get-ExactRoleDefinition `
-    -RoleDefinitionId $ipFlowRoleDefinitionId
-if ($null -ne $ipFlowRoleDefinition) {
-    Assert-ReviewedIpFlowRoleDefinition `
-        -RoleDefinition $ipFlowRoleDefinition `
-        -ExpectedRoleDefinitionId $ipFlowRoleDefinitionId `
-        -ExpectedAssignableScope $networkWatcherResourceGroupId
+$historicalRoleDefinitions = @(
+    [pscustomobject]@{
+        Name = 'bounded acquisition reader'
+        RoleDefinitionId = $boundedReaderRoleDefinitionId
+        Definition = Get-ExactRoleDefinition -RoleDefinitionId $boundedReaderRoleDefinitionId
+        ExpectedAssignableScope = $historicalWorkloadResourceGroupId
+        ExpectedActions = @(
+            'Microsoft.Insights/eventtypes/values/read'
+            'Microsoft.ResourceGraph/resources/read'
+            'Microsoft.Resources/changes/read'
+        )
+        ExpectedDataActions = @()
+    },
+    [pscustomobject]@{
+        Name = 'change-evidence create-only writer'
+        RoleDefinitionId = $changeWriterRoleDefinitionId
+        Definition = Get-ExactRoleDefinition -RoleDefinitionId $changeWriterRoleDefinitionId
+        ExpectedAssignableScope = $changeEvidenceResourceGroupId
+        ExpectedActions = @()
+        ExpectedDataActions = @(
+            'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read'
+            'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write'
+        )
+    },
+    [pscustomobject]@{
+        Name = 'monitoring-intent key reader'
+        RoleDefinitionId = $intentKeyReaderRoleDefinitionId
+        Definition = Get-ExactRoleDefinition -RoleDefinitionId $intentKeyReaderRoleDefinitionId
+        ExpectedAssignableScope = $monitoringIntentKeyResourceGroupId
+        ExpectedActions = @()
+        ExpectedDataActions = @(
+            'Microsoft.KeyVault/vaults/keys/read'
+        )
+    },
+    [pscustomobject]@{
+        Name = 'Network Watcher IP Flow verifier'
+        RoleDefinitionId = $ipFlowRoleDefinitionId
+        Definition = Get-ExactRoleDefinition -RoleDefinitionId $ipFlowRoleDefinitionId
+        ExpectedAssignableScope = $networkWatcherResourceGroupId
+        ExpectedActions = @(
+            'Microsoft.Network/networkWatchers/ipFlowVerify/action'
+        )
+        ExpectedDataActions = @()
+    }
+)
+foreach ($historicalRole in $historicalRoleDefinitions) {
+    if ($null -ne $historicalRole.Definition) {
+        Assert-ReviewedRoleDefinition `
+            -RoleDefinition $historicalRole.Definition `
+            -ExpectedRoleDefinitionId $historicalRole.RoleDefinitionId `
+            -ExpectedAssignableScope $historicalRole.ExpectedAssignableScope `
+            -ExpectedActions $historicalRole.ExpectedActions `
+            -ExpectedDataActions $historicalRole.ExpectedDataActions
+    }
 }
 $ipFlowAssignmentGuid = New-ArmTemplateGuid -Values @(
-    $networkWatcherId,
+    $historicalNetworkWatcherId,
     [string]$collectorIdentity.principalId,
     $ipFlowRoleDefinitionId
 )
 $ipFlowAssignmentId = (
-    "$networkWatcherId/providers/Microsoft.Authorization/roleAssignments/" +
+    "$historicalNetworkWatcherId/providers/Microsoft.Authorization/roleAssignments/" +
     $ipFlowAssignmentGuid
 )
 
@@ -309,12 +466,6 @@ $storageBlobDataContributorRoleDefinitionId = (
     "/subscriptions/$SubscriptionId/providers/Microsoft.Authorization/roleDefinitions/" +
     'ba92f5b4-2d11-453d-a403-e96b0029c9fe'
 )
-$boundedReaderRoleDefinitionId = Find-RoleDefinitionId `
-    -RoleName 'Athena WC028 Bounded Acquisition Reader'
-$changeWriterRoleDefinitionId = Find-RoleDefinitionId `
-    -RoleName 'Athena WC028 Change Evidence Create-Only Writer'
-$intentKeyReaderRoleDefinitionId = Find-RoleDefinitionId `
-    -RoleName 'Athena WC028 Monitoring Intent Key Reader'
 
 $targets = @(
     [pscustomobject]@{
@@ -334,32 +485,26 @@ $targets = @(
         Scope = $networkWatcherId
         RoleDefinitionId = $ipFlowRoleDefinitionId
         ExpectedAssignmentId = $ipFlowAssignmentId
-    }
-)
-if ($null -ne $boundedReaderRoleDefinitionId) {
-    $targets += [pscustomobject]@{
+    },
+    [pscustomobject]@{
         Name = 'collector bounded acquisition reader'
-        Scope = $WorkloadResourceGroupResourceId
+        Scope = $workloadResourceGroupId
         RoleDefinitionId = $boundedReaderRoleDefinitionId
         ExpectedAssignmentId = $null
-    }
-}
-if ($null -ne $changeWriterRoleDefinitionId) {
-    $targets += [pscustomobject]@{
+    },
+    [pscustomobject]@{
         Name = 'collector change-evidence writer'
         Scope = $ChangeEvidenceContainerResourceId
         RoleDefinitionId = $changeWriterRoleDefinitionId
         ExpectedAssignmentId = $null
-    }
-}
-if ($null -ne $intentKeyReaderRoleDefinitionId) {
-    $targets += [pscustomobject]@{
+    },
+    [pscustomobject]@{
         Name = 'collector monitoring-intent key reader'
         Scope = $MonitoringIntentSigningKeyResourceId
         RoleDefinitionId = $intentKeyReaderRoleDefinitionId
         ExpectedAssignmentId = $null
     }
-}
+)
 
 $assignments = @(
     Invoke-AzJson -AzArguments @(
@@ -416,26 +561,21 @@ foreach ($target in $targets) {
 }
 
 $removedRoleDefinitionIds = [System.Collections.Generic.List[string]]::new()
-$reviewedObsoleteRoleDefinitionIds = @(
-    $boundedReaderRoleDefinitionId,
-    $changeWriterRoleDefinitionId
-)
-if ($null -ne $ipFlowRoleDefinition) {
-    $reviewedObsoleteRoleDefinitionIds += $ipFlowRoleDefinitionId
-}
-foreach ($roleDefinitionId in $reviewedObsoleteRoleDefinitionIds) {
-    if ($null -ne $roleDefinitionId) {
+foreach ($historicalRole in $historicalRoleDefinitions) {
+    $roleDefinitionId = [string]$historicalRole.RoleDefinitionId
+    if ($null -ne $historicalRole.Definition) {
         $roleDefinitionGuid = $roleDefinitionId.TrimEnd('/').Split('/')[-1]
         Invoke-AzCommand -AzArguments @(
             'role', 'definition', 'delete',
             '--name', $roleDefinitionGuid,
             '--subscription', $SubscriptionId
         )
-        Assert-RoleDefinitionAbsent -RoleDefinitionId $roleDefinitionId
+    }
+    Assert-RoleDefinitionAbsent -RoleDefinitionId $roleDefinitionId
+    if ($null -ne $historicalRole.Definition) {
         $removedRoleDefinitionIds.Add([string]$roleDefinitionId)
     }
 }
-Assert-RoleDefinitionAbsent -RoleDefinitionId $ipFlowRoleDefinitionId
 
 $remainingAssignments = @(
     Invoke-AzJson -AzArguments @(
@@ -481,10 +621,9 @@ $evidence = [ordered]@{
             Sort-Object
     )
     reviewedRoleDefinitionIds = @(
-        $reviewedObsoleteRoleDefinitionIds |
-            Where-Object { $null -ne $_ } |
+        $historicalRoleDefinitions |
             ForEach-Object {
-                Normalize-ResourceId -ResourceId ([string]$_)
+                Normalize-ResourceId -ResourceId ([string]$_.RoleDefinitionId)
             } |
             Sort-Object
     )
