@@ -77,20 +77,40 @@ missing, duplicate, contradictory, nested type-changing, or out-of-snapshot entr
 root deletion/removal, conflicting snapshots, or any non-empty effective property change makes the
 artifact malformed rather than silently safe.
 Documents that mix root-level and `properties` result envelopes are rejected rather than choosing
-one representation. Empty delta child arrays are not inspectable evidence, and dotted JSON property
-names cannot impersonate structurally nested protected settings. Property paths use an allowlisted
-grammar: the only root aliases are exact `<resource>`, `<resource>.`, and `.`; non-root paths use
-dotted ASCII identifier components and canonical numeric indexes such as `containers[0]`. Forward
-slashes, backslashes, tildes/JSON-pointer escapes, non-exact root suffixes, empty components,
-non-numeric or malformed brackets, and leading-zero indexes are rejected. Unicode characters whose
-case fold or lowercase form is ASCII-equivalent are rejected in JSON keys and textual property
-paths. Each canonical path is limited to 4096 characters, and one evaluation has bounded aggregate
+one representation. The union of `changes` and `potentialChanges` must contain each canonical
+resource ID exactly once. Exact duplicates, case/trailing-slash aliases, and a contradictory
+`Modify`/`NoChange` pair fail before any resource property is evaluated; percent-encoded aliases are
+not canonical ARM IDs. The raw result and exact request remain bound by `whatIfDigest` and
+`whatIfRequestDigest`, so an alias row cannot be inserted after attestation.
+
+Empty delta child arrays are not inspectable evidence, and dotted JSON property names cannot
+impersonate structurally nested protected settings. Property paths use an allowlisted grammar: the
+only root aliases are exact `<resource>`, `<resource>.`, and `.`; non-root paths use dotted ASCII
+identifier components and canonical numeric indexes such as `containers[0]`. Forward slashes,
+backslashes, tildes/JSON-pointer escapes, non-exact root suffixes, empty components, non-numeric or
+malformed brackets, and leading-zero indexes are rejected. Unicode characters whose case fold or
+lowercase form is ASCII-equivalent are rejected in JSON keys and textual property paths. Protected
+schemas additionally require `properties`, network ACLs, Container Apps configuration/ingress, and
+managed-environment VNet configuration to remain objects; access-policy collections remain arrays;
+and boolean/string leaves cannot have descendants. Indexing an object prefix such as
+`properties[0]`, adding `.value` below a scalar setting, or mixing exact and array paths fails
+closed. Dynamically named protected descendants also cannot be represented as both objects and
+arrays. Malformed snapshot keys below protected objects, including repeated or combined leading `.`
+and `<resource>.` aliases, are rejected instead of being omitted from the canonical index.
+Protected values observed through deltas and full snapshots must be type-compatible and consistent.
+Create requires prior absence and final presence; Delete/Remove requires prior presence and final
+absence. Those presence and value claims reconcile across exact and ancestor/descendant delta
+representations in either order. Protected strings are exact trimmed ASCII tokens with field-specific
+enum validation even when unchanged.
+
+Each canonical path is limited to 4096 characters, and one evaluation has bounded aggregate
 generated-path count and character work. Nested path accumulation and wide generated snapshots fail
 deterministically before an unbounded candidate set is materialized. Complete snapshot pairs build
 one canonical lowercase-key index per snapshot; all `NoEffect` paths use constant-time indexed
-lookups, and index/token work is charged to the same deterministic evaluation budget. The
-`NoChange` path is walked once; its previous second delta traversal is removed while retaining root
-object and inspectable-array validation.
+lookups. Protected delta reconciliation uses the same index, while partial-snapshot and
+delta-ancestor traversal charges mapping width and array access to the aggregate lookup-work budget.
+The `NoChange` path is walked once; its previous second delta traversal is removed while retaining
+root object and inspectable-array validation.
 Status, change type, property-change type, role/principal type, collection method, resource type,
 public network access, network default action, public access, and every other protected enum or
 security decision are normalized only after the raw token is proven trimmed ASCII. Surrounding

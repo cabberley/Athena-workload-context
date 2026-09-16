@@ -159,6 +159,19 @@ Use the following guarded preflight contract:
     identity-separation finding. Unique violations are deduplicated and checked against the
     256-finding limit as they are generated, before assignment-by-rule amplification. Scope-prefix
     minimization is a segment-sorted linear containment pass rather than an all-pairs scan.
+22. The combined what-if `changes` and `potentialChanges` collections contain at most one row for
+    each canonical resource ID. Exact duplicates, case/trailing-slash aliases, and contradictory
+    change types are rejected before property evaluation. Percent-encoded aliases remain invalid.
+    The complete row set and exact collection request are covered by the manifest's existing
+    `whatIfDigest` and `whatIfRequestDigest`.
+23. Protected property paths follow explicit object, array, boolean, and string schemas. Object
+    prefixes cannot be indexed, scalar leaves cannot have descendants, and access-policy arrays
+    cannot be addressed as objects. Delta before/after values and full snapshots must use compatible,
+    non-conflicting representations for every protected path. Create/Delete/Remove presence and
+    parent/child value claims reconcile in either order through a prefix-aware structure. Complete
+    snapshots use the canonical snapshot index; raw partial/ancestor traversal charges actual
+    mapping width and array access to the existing lookup-work budget. Protected strings retain
+    exact-token and allowed-enum validation even when unchanged.
 
 The pure evaluators remain free of storage I/O. One-time consumption belongs to the production CLI
 boundary after parsing, policy evaluation, and bounded rendering succeed but before success or
@@ -251,3 +264,9 @@ Fully attested resource-family regressions additionally cover deployment-stack
 `denySettings`/`actionOnUnmanage`, storage local-user SSH/password/permission scopes, all three Key
 Vault privileged deployment-access flags across deltas and full snapshots, safe disablement, and
 exact resource-group Create/Modify/NoChange, allowlist, delta, snapshot-type, and boundary behavior.
+Additional adversarial cases cover duplicate canonical resource rows across changes and potential
+changes, post-attestation alias injection, protected scalar descendants, object/array divergence,
+mixed exact/indexed and dynamic object/array paths, repeated or combined malformed snapshot aliases,
+conflicting delta/full-snapshot representations, parent/child presence and value contradictions in
+either order, malformed Key Vault before evidence, unchanged padded security strings, indexed
+wide-snapshot reconciliation, and bounded wide ancestor observations.

@@ -1598,6 +1598,1240 @@ def test_what_if_rejects_malformed_potential_changes() -> None:
         evaluate_what_if(document)
 
 
+def test_attested_what_if_rejects_duplicate_canonical_resource_rows_before_evaluation(
+    monkeypatch,
+) -> None:
+    alias_resource_id = _STORAGE_ID.upper() + "/"
+    modify = _change(
+        _STORAGE_ID,
+        "Modify",
+        path="properties.allowSharedKeyAccess",
+        after=False,
+    )
+    no_change = _change(alias_resource_id, "NoChange")
+
+    def unexpected_property_evaluation(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("duplicate resources must fail before property evaluation")
+
+    monkeypatch.setattr(
+        wc029_preflight_module,
+        "_unsafe_property_violations",
+        unexpected_property_evaluation,
+    )
+
+    with pytest.raises(
+        PreflightInputError,
+        match="duplicate canonical resourceId",
+    ):
+        _evaluate_attested_what_if(
+            _what_if(modify, no_change),
+            allowed_change_ids=frozenset({_STORAGE_ID}),
+        )
+
+
+def test_attested_what_if_rejects_duplicate_resource_across_changes_and_potential_changes() -> None:
+    modify = _change(
+        _KEY_VAULT_ID,
+        "Modify",
+        path="properties.enabledForDeployment",
+        after=False,
+    )
+    document = _what_if(modify)
+    properties = document["properties"]
+    assert isinstance(properties, dict)
+    properties["potentialChanges"] = [
+        {
+            "resourceId": _KEY_VAULT_ID.upper() + "/",
+            "changeType": "Delete",
+        }
+    ]
+
+    with pytest.raises(
+        PreflightInputError,
+        match="duplicate canonical resourceId",
+    ):
+        _evaluate_attested_what_if(
+            document,
+            allowed_change_ids=frozenset({_KEY_VAULT_ID}),
+        )
+
+
+def test_attested_key_vault_rejects_contradictory_modify_and_nochange_rows() -> None:
+    modify = _change(
+        _KEY_VAULT_ID,
+        "Modify",
+        path="properties.enabledForDeployment",
+        after=False,
+    )
+    no_change = _change(_KEY_VAULT_ID.upper() + "/", "NoChange")
+
+    with pytest.raises(
+        PreflightInputError,
+        match="duplicate canonical resourceId",
+    ):
+        _evaluate_attested_what_if(
+            _what_if(modify, no_change),
+            allowed_change_ids=frozenset({_KEY_VAULT_ID}),
+        )
+
+
+def test_attested_what_if_rejects_percent_encoded_resource_alias() -> None:
+    encoded_alias = _STORAGE_ID.replace(
+        "/resourceGroups/",
+        "%2FresourceGroups%2F",
+    )
+
+    with pytest.raises(
+        PreflightInputError,
+        match="canonical ARM scope",
+    ):
+        _evaluate_attested_what_if(
+            _what_if(_change(encoded_alias, "NoChange")),
+        )
+
+
+def test_post_attestation_duplicate_resource_injection_breaks_digest_binding() -> None:
+    document = _what_if(
+        _change(
+            _STORAGE_ID,
+            "Modify",
+            path="properties.allowSharedKeyAccess",
+            after=False,
+        )
+    )
+    artifact = _attested_what_if(
+        document,
+        allowed_change_ids=frozenset({_STORAGE_ID}),
+    )
+    attested_document = artifact["whatIf"]
+    assert isinstance(attested_document, dict)
+    properties = attested_document["properties"]
+    assert isinstance(properties, dict)
+    changes = properties["changes"]
+    assert isinstance(changes, list)
+    changes.append(_change(_STORAGE_ID.upper() + "/", "NoChange"))
+
+    with pytest.raises(
+        PreflightInputError,
+        match="whatIfDigest does not match",
+    ):
+        evaluate_what_if(
+            artifact,
+            allowed_change_ids=frozenset({_STORAGE_ID}),
+            require_attestation=True,
+            expected_collection_run_id=_COLLECTION_RUN_ID,
+            expected_deployment_execution_id=_DEPLOYMENT_EXECUTION_ID,
+            attestation_manifest_digest=_json_digest(artifact["manifest"]),
+            deployment_digest=_DEPLOYMENT_DIGEST,
+            template_digest=_TEMPLATE_DIGEST,
+            parameters_digest=_PARAMETERS_DIGEST,
+        )
+
+
+@pytest.mark.parametrize(
+    ("resource_id", "path", "after"),
+    [
+        (
+            _STORAGE_ID,
+            "properties.allowSharedKeyAccess.value",
+            False,
+        ),
+        (
+            _KEY_VAULT_ID,
+            "properties.publicNetworkAccess.value",
+            "Disabled",
+        ),
+        (
+            _CONTAINER_APP_ID,
+            "properties.configuration.ingress.external.value",
+            False,
+        ),
+        (
+            _KEY_VAULT_ID,
+            "properties[0].enableRbacAuthorization",
+            False,
+        ),
+        (
+            _KEY_VAULT_ID,
+            "properties.networkAcls[0].defaultAction",
+            "Deny",
+        ),
+    ],
+)
+def test_attested_what_if_rejects_protected_path_schema_divergence(
+    resource_id: str,
+    path: str,
+    after: object,
+) -> None:
+    with pytest.raises(
+        PreflightInputError,
+        match="delta path diverges from protected property schema",
+    ):
+        _evaluate_attested_what_if(
+            _what_if(
+                _change(
+                    resource_id,
+                    "Modify",
+                    path=path,
+                    after=after,
+                )
+            ),
+            allowed_change_ids=frozenset({resource_id}),
+        )
+
+
+@pytest.mark.parametrize(
+    ("resource_id", "path", "after", "expected_kind"),
+    [
+        (
+            _STORAGE_ID,
+            "properties",
+            [],
+            "object",
+        ),
+        (
+            _CONTAINER_APP_ID,
+            "properties.configuration.ingress",
+            [],
+            "object",
+        ),
+        (
+            _KEY_VAULT_ID,
+            "properties.accessPolicies",
+            {},
+            "array",
+        ),
+    ],
+)
+def test_attested_what_if_rejects_invalid_protected_ancestor_values(
+    resource_id: str,
+    path: str,
+    after: object,
+    expected_kind: str,
+) -> None:
+    with pytest.raises(
+        PreflightInputError,
+        match=rf"must remain {expected_kind}-valued",
+    ):
+        _evaluate_attested_what_if(
+            _what_if(
+                _change(
+                    resource_id,
+                    "Modify",
+                    path=path,
+                    after=after,
+                )
+            ),
+            allowed_change_ids=frozenset({resource_id}),
+        )
+
+
+@pytest.mark.parametrize(
+    ("resource_id", "alias_key", "alias_value"),
+    [
+        (
+            _STORAGE_ID,
+            "allowSharedKeyAccess.value",
+            False,
+        ),
+        (
+            _STORAGE_ID,
+            "..allowSharedKeyAccess",
+            True,
+        ),
+        (
+            _KEY_VAULT_ID,
+            "accessPolicies[00]",
+            [],
+        ),
+        (
+            _CONTAINER_APP_ID,
+            "configuration.ingress.external",
+            False,
+        ),
+    ],
+)
+def test_attested_no_change_rejects_malformed_protected_snapshot_alias(
+    resource_id: str,
+    alias_key: str,
+    alias_value: object,
+) -> None:
+    change = _change(resource_id, "NoChange")
+    for snapshot_name in ("before", "after"):
+        snapshot = change[snapshot_name]
+        assert isinstance(snapshot, dict)
+        properties = snapshot["properties"]
+        assert isinstance(properties, dict)
+        properties[alias_key] = copy.deepcopy(alias_value)
+
+    with pytest.raises(
+        PreflightInputError,
+        match="malformed property alias",
+    ):
+        _evaluate_attested_what_if(
+            _what_if(change),
+        )
+
+
+@pytest.mark.parametrize(
+    "alias_key",
+    [
+        "properties.allowSharedKeyAccess",
+        "<resource>..properties.allowSharedKeyAccess",
+    ],
+)
+def test_attested_no_change_rejects_root_level_protected_snapshot_alias(
+    alias_key: str,
+) -> None:
+    change = _change(_STORAGE_ID, "NoChange")
+    for snapshot_name in ("before", "after"):
+        snapshot = change[snapshot_name]
+        assert isinstance(snapshot, dict)
+        snapshot[alias_key] = False
+
+    with pytest.raises(
+        PreflightInputError,
+        match="malformed property alias",
+    ):
+        _evaluate_attested_what_if(
+            _what_if(change),
+        )
+
+
+def test_attested_modify_rejects_conflicting_protected_full_snapshot_alias() -> None:
+    safe_properties = {
+        "allowSharedKeyAccess": False,
+        "allowBlobPublicAccess": False,
+        "publicNetworkAccess": "Disabled",
+        "networkAcls": {"defaultAction": "Deny"},
+    }
+    before = _resource_snapshot(
+        _STORAGE_ID,
+        properties=copy.deepcopy(safe_properties),
+        tags={"release": "before"},
+    )
+    after = _resource_snapshot(
+        _STORAGE_ID,
+        properties={
+            **copy.deepcopy(safe_properties),
+            "publicNetworkAccess.value": "Enabled",
+        },
+        tags={"release": "after"},
+    )
+    change = {
+        "resourceId": _STORAGE_ID,
+        "changeType": "Modify",
+        "before": before,
+        "after": after,
+        "delta": [
+            {
+                "path": "tags.release",
+                "propertyChangeType": "Modify",
+                "before": "before",
+                "after": "after",
+            }
+        ],
+    }
+
+    with pytest.raises(
+        PreflightInputError,
+        match="malformed property alias",
+    ):
+        _evaluate_attested_what_if(
+            _what_if(change),
+            allowed_change_ids=frozenset({_STORAGE_ID}),
+        )
+
+
+def test_attested_modify_rejects_malformed_protected_alias_in_ancestor_value() -> None:
+    change = {
+        "resourceId": _STORAGE_ID,
+        "changeType": "Modify",
+        "delta": [
+            {
+                "path": "properties",
+                "propertyChangeType": "Modify",
+                "after": {
+                    "allowSharedKeyAccess": False,
+                    "allowSharedKeyAccess.value": True,
+                },
+            }
+        ],
+    }
+
+    with pytest.raises(
+        PreflightInputError,
+        match="malformed property alias",
+    ):
+        _evaluate_attested_what_if(
+            _what_if(change),
+            allowed_change_ids=frozenset({_STORAGE_ID}),
+        )
+
+
+@pytest.mark.parametrize("reverse_order", [False, True])
+def test_attested_what_if_rejects_dynamic_object_array_divergence(
+    reverse_order: bool,
+) -> None:
+    deltas = [
+        {
+            "path": "properties.networkAcls.ipRules.name",
+            "propertyChangeType": "Modify",
+            "after": "synthetic-rule",
+        },
+        {
+            "path": "properties.networkAcls.ipRules[0]",
+            "propertyChangeType": "Modify",
+            "after": "192.0.2.10",
+        },
+    ]
+    if reverse_order:
+        deltas.reverse()
+    change = {
+        "resourceId": _STORAGE_ID,
+        "changeType": "Modify",
+        "delta": deltas,
+    }
+
+    with pytest.raises(
+        PreflightInputError,
+        match="container representations conflict",
+    ):
+        _evaluate_attested_what_if(
+            _what_if(change),
+            allowed_change_ids=frozenset({_STORAGE_ID}),
+        )
+
+
+def test_attested_what_if_rejects_mixed_exact_and_array_protected_paths() -> None:
+    change = {
+        "resourceId": _STORAGE_ID,
+        "changeType": "Modify",
+        "delta": [
+            {
+                "path": "properties.allowSharedKeyAccess",
+                "propertyChangeType": "Modify",
+                "after": False,
+            },
+            {
+                "path": "properties[0].allowSharedKeyAccess",
+                "propertyChangeType": "Modify",
+                "after": False,
+            },
+        ],
+    }
+
+    with pytest.raises(
+        PreflightInputError,
+        match="delta path diverges from protected property schema",
+    ):
+        _evaluate_attested_what_if(
+            _what_if(change),
+            allowed_change_ids=frozenset({_STORAGE_ID}),
+        )
+
+
+def test_attested_what_if_rejects_conflicting_protected_delta_representations() -> None:
+    change = {
+        "resourceId": _STORAGE_ID,
+        "changeType": "Modify",
+        "delta": [
+            {
+                "path": "properties",
+                "propertyChangeType": "Modify",
+                "after": {"allowSharedKeyAccess": False},
+            },
+            {
+                "path": "properties.allowSharedKeyAccess",
+                "propertyChangeType": "Modify",
+                "after": True,
+            },
+        ],
+    }
+
+    with pytest.raises(
+        PreflightInputError,
+        match="conflict",
+    ):
+        _evaluate_attested_what_if(
+            _what_if(change),
+            allowed_change_ids=frozenset({_STORAGE_ID}),
+        )
+
+
+def test_attested_what_if_rejects_delta_conflicting_with_full_snapshot() -> None:
+    safe_properties = {
+        "allowSharedKeyAccess": False,
+        "allowBlobPublicAccess": False,
+        "publicNetworkAccess": "Disabled",
+        "networkAcls": {"defaultAction": "Deny"},
+    }
+    before = _resource_snapshot(
+        _STORAGE_ID,
+        properties=copy.deepcopy(safe_properties),
+        tags={"release": "before"},
+    )
+    after = copy.deepcopy(before)
+    after["tags"] = {"release": "after"}
+    change = {
+        "resourceId": _STORAGE_ID,
+        "changeType": "Modify",
+        "before": before,
+        "after": after,
+        "delta": [
+            {
+                "path": "properties.allowSharedKeyAccess",
+                "propertyChangeType": "Modify",
+                "after": True,
+            }
+        ],
+    }
+
+    with pytest.raises(
+        PreflightInputError,
+        match="conflict",
+    ):
+        _evaluate_attested_what_if(
+            _what_if(change),
+            allowed_change_ids=frozenset({_STORAGE_ID}),
+        )
+
+
+@pytest.mark.parametrize(
+    ("resource_id", "path", "value", "message"),
+    [
+        (
+            _STORAGE_ID,
+            "properties.allowSharedKeyAccess",
+            "false",
+            "allowSharedKeyAccess must be boolean",
+        ),
+        (
+            _CONTAINER_APP_ID,
+            "properties.configuration.ingress.external",
+            "false",
+            "Container Apps ingress.external must be boolean",
+        ),
+        (
+            _KEY_VAULT_ID,
+            "properties.publicNetworkAccess",
+            False,
+            "must remain string-valued",
+        ),
+    ],
+)
+def test_attested_what_if_rejects_equal_malformed_protected_delta_values(
+    resource_id: str,
+    path: str,
+    value: object,
+    message: str,
+) -> None:
+    change = {
+        "resourceId": resource_id,
+        "changeType": "Modify",
+        "delta": [
+            {
+                "path": path,
+                "propertyChangeType": "Modify",
+                "before": value,
+                "after": value,
+            },
+            {
+                "path": "tags.release",
+                "propertyChangeType": "Modify",
+                "after": "wc029",
+            },
+        ],
+    }
+
+    with pytest.raises(
+        PreflightInputError,
+        match=message,
+    ):
+        _evaluate_attested_what_if(
+            _what_if(change),
+            allowed_change_ids=frozenset({resource_id}),
+        )
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "enabledForDeployment",
+        "enabledForDiskEncryption",
+        "enabledForTemplateDeployment",
+    ],
+)
+def test_attested_key_vault_rejects_malformed_before_with_exact_false_after(
+    field_name: str,
+) -> None:
+    change = {
+        "resourceId": _KEY_VAULT_ID,
+        "changeType": "Modify",
+        "delta": [
+            {
+                "path": f"properties.{field_name}",
+                "propertyChangeType": "Modify",
+                "before": "not-a-boolean",
+                "after": False,
+            }
+        ],
+    }
+
+    with pytest.raises(
+        PreflightInputError,
+        match="must remain boolean-valued",
+    ):
+        _evaluate_attested_what_if(
+            _what_if(change),
+            allowed_change_ids=frozenset({_KEY_VAULT_ID}),
+        )
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "enabledForDeployment",
+        "enabledForDiskEncryption",
+        "enabledForTemplateDeployment",
+    ],
+)
+def test_attested_key_vault_create_rejects_explicit_existing_before(
+    field_name: str,
+) -> None:
+    safe_properties = {
+        "publicNetworkAccess": "Disabled",
+        "networkAcls": {"defaultAction": "Deny"},
+    }
+    change = {
+        "resourceId": _KEY_VAULT_ID,
+        "changeType": "Modify",
+        "before": _resource_snapshot(
+            _KEY_VAULT_ID,
+            properties={
+                **safe_properties,
+                field_name: True,
+            },
+        ),
+        "after": _resource_snapshot(
+            _KEY_VAULT_ID,
+            properties={
+                **safe_properties,
+                field_name: False,
+            },
+        ),
+        "delta": [
+            {
+                "path": f"properties.{field_name}",
+                "propertyChangeType": "Create",
+                "before": True,
+                "after": False,
+            }
+        ],
+    }
+
+    with pytest.raises(
+        PreflightInputError,
+        match="Create delta cannot supply before at protected path",
+    ):
+        _evaluate_attested_what_if(
+            _what_if(change),
+            allowed_change_ids=frozenset({_KEY_VAULT_ID}),
+        )
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "enabledForDeployment",
+        "enabledForDiskEncryption",
+        "enabledForTemplateDeployment",
+    ],
+)
+def test_attested_key_vault_missing_after_still_validates_before_type(
+    field_name: str,
+) -> None:
+    safe_properties = {
+        "publicNetworkAccess": "Disabled",
+        "networkAcls": {"defaultAction": "Deny"},
+        field_name: False,
+    }
+    before = _resource_snapshot(
+        _KEY_VAULT_ID,
+        properties=copy.deepcopy(safe_properties),
+        tags={"release": "before"},
+    )
+    after = copy.deepcopy(before)
+    after["tags"] = {"release": "after"}
+    change = {
+        "resourceId": _KEY_VAULT_ID,
+        "changeType": "Modify",
+        "before": before,
+        "after": after,
+        "delta": [
+            {
+                "path": f"properties.{field_name}",
+                "propertyChangeType": "Modify",
+                "before": "not-a-boolean",
+            }
+        ],
+    }
+
+    with pytest.raises(
+        PreflightInputError,
+        match="must remain boolean-valued",
+    ):
+        _evaluate_attested_what_if(
+            _what_if(change),
+            allowed_change_ids=frozenset({_KEY_VAULT_ID}),
+        )
+
+
+def test_attested_what_if_rejects_protected_descendant_missing_from_full_snapshot() -> None:
+    before = _resource_snapshot(
+        _CONTAINER_APP_ID,
+        properties={},
+        tags={"release": "before"},
+    )
+    after = copy.deepcopy(before)
+    after["tags"] = {"release": "after"}
+    change = {
+        "resourceId": _CONTAINER_APP_ID,
+        "changeType": "Modify",
+        "before": before,
+        "after": after,
+        "delta": [
+            {
+                "path": "properties.configuration.foo",
+                "propertyChangeType": "Create",
+                "after": "synthetic",
+            }
+        ],
+    }
+
+    with pytest.raises(
+        PreflightInputError,
+        match="conflict",
+    ):
+        _evaluate_attested_what_if(
+            _what_if(change),
+            allowed_change_ids=frozenset({_CONTAINER_APP_ID}),
+        )
+
+
+def test_attested_what_if_rejects_value_less_delete_missing_from_before_snapshot() -> None:
+    before = _resource_snapshot(
+        _CONTAINER_APP_ID,
+        properties={},
+        tags={"release": "before"},
+    )
+    change = {
+        "resourceId": _CONTAINER_APP_ID,
+        "changeType": "Modify",
+        "before": before,
+        "delta": [
+            {
+                "path": "properties.configuration.foo",
+                "propertyChangeType": "Delete",
+            }
+        ],
+    }
+
+    with pytest.raises(
+        PreflightInputError,
+        match="conflict",
+    ):
+        _evaluate_attested_what_if(
+            _what_if(change),
+            allowed_change_ids=frozenset({_CONTAINER_APP_ID}),
+        )
+
+
+def test_attested_what_if_rejects_value_less_create_present_in_before_snapshot() -> None:
+    before = _resource_snapshot(
+        _CONTAINER_APP_ID,
+        properties={
+            "configuration": {
+                "foo": "existing",
+            }
+        },
+        tags={"release": "before"},
+    )
+    change = {
+        "resourceId": _CONTAINER_APP_ID,
+        "changeType": "Modify",
+        "before": before,
+        "delta": [
+            {
+                "path": "properties.configuration.foo",
+                "propertyChangeType": "Create",
+                "after": "replacement",
+            }
+        ],
+    }
+
+    with pytest.raises(
+        PreflightInputError,
+        match="conflict",
+    ):
+        _evaluate_attested_what_if(
+            _what_if(change),
+            allowed_change_ids=frozenset({_CONTAINER_APP_ID}),
+        )
+
+
+@pytest.mark.parametrize("reverse_order", [False, True])
+def test_attested_what_if_rejects_conflicting_implicit_create_presence(
+    reverse_order: bool,
+) -> None:
+    deltas = [
+        {
+            "path": "properties.allowSharedKeyAccess",
+            "propertyChangeType": "Modify",
+            "before": True,
+            "after": False,
+        },
+        {
+            "path": "properties.allowSharedKeyAccess",
+            "propertyChangeType": "Create",
+            "after": False,
+        },
+    ]
+    if reverse_order:
+        deltas.reverse()
+    change = {
+        "resourceId": _STORAGE_ID,
+        "changeType": "Modify",
+        "delta": deltas,
+    }
+
+    with pytest.raises(
+        PreflightInputError,
+        match="protected path presence representations conflict",
+    ):
+        _evaluate_attested_what_if(
+            _what_if(change),
+            allowed_change_ids=frozenset({_STORAGE_ID}),
+        )
+
+
+@pytest.mark.parametrize("reverse_order", [False, True])
+def test_attested_what_if_rejects_parent_child_presence_conflict(
+    reverse_order: bool,
+) -> None:
+    deltas = [
+        {
+            "path": "properties.networkAcls",
+            "propertyChangeType": "Modify",
+            "before": {},
+            "after": {},
+        },
+        {
+            "path": "properties.networkAcls.defaultAction",
+            "propertyChangeType": "Modify",
+            "before": "Allow",
+            "after": "Deny",
+        },
+    ]
+    if reverse_order:
+        deltas.reverse()
+    change = {
+        "resourceId": _STORAGE_ID,
+        "changeType": "Modify",
+        "delta": deltas,
+    }
+
+    with pytest.raises(
+        PreflightInputError,
+        match="conflict",
+    ):
+        _evaluate_attested_what_if(
+            _what_if(change),
+            allowed_change_ids=frozenset({_STORAGE_ID}),
+        )
+
+
+@pytest.mark.parametrize("reverse_order", [False, True])
+def test_attested_what_if_rejects_deleted_parent_with_created_descendant(
+    reverse_order: bool,
+) -> None:
+    deltas = [
+        {
+            "path": "properties.configuration.foo",
+            "propertyChangeType": "Delete",
+            "before": {"bar": "old"},
+        },
+        {
+            "path": "properties.configuration.foo.bar",
+            "propertyChangeType": "Create",
+            "after": "new",
+        },
+    ]
+    if reverse_order:
+        deltas.reverse()
+    change = {
+        "resourceId": _CONTAINER_APP_ID,
+        "changeType": "Modify",
+        "delta": deltas,
+    }
+
+    with pytest.raises(
+        PreflightInputError,
+        match="conflict",
+    ):
+        _evaluate_attested_what_if(
+            _what_if(change),
+            allowed_change_ids=frozenset({_CONTAINER_APP_ID}),
+        )
+
+
+@pytest.mark.parametrize("reverse_order", [False, True])
+def test_attested_what_if_rejects_created_parent_with_existing_descendant(
+    reverse_order: bool,
+) -> None:
+    deltas = [
+        {
+            "path": "properties.configuration.foo",
+            "propertyChangeType": "Create",
+            "after": {"bar": "new"},
+        },
+        {
+            "path": "properties.configuration.foo.bar",
+            "propertyChangeType": "Modify",
+            "before": "old",
+            "after": "new",
+        },
+    ]
+    if reverse_order:
+        deltas.reverse()
+    change = {
+        "resourceId": _CONTAINER_APP_ID,
+        "changeType": "Modify",
+        "delta": deltas,
+    }
+
+    with pytest.raises(
+        PreflightInputError,
+        match="conflict",
+    ):
+        _evaluate_attested_what_if(
+            _what_if(change),
+            allowed_change_ids=frozenset({_CONTAINER_APP_ID}),
+        )
+
+
+@pytest.mark.parametrize("reverse_order", [False, True])
+def test_attested_what_if_rejects_conflicting_parent_child_values(
+    reverse_order: bool,
+) -> None:
+    deltas = [
+        {
+            "path": "properties.configuration.foo",
+            "propertyChangeType": "Modify",
+            "before": {"bar": "before"},
+            "after": {"bar": "parent"},
+        },
+        {
+            "path": "properties.configuration.foo.bar",
+            "propertyChangeType": "Modify",
+            "before": "before",
+            "after": "child",
+        },
+    ]
+    if reverse_order:
+        deltas.reverse()
+    change = {
+        "resourceId": _CONTAINER_APP_ID,
+        "changeType": "Modify",
+        "delta": deltas,
+    }
+
+    with pytest.raises(
+        PreflightInputError,
+        match="protected path representations conflict",
+    ):
+        _evaluate_attested_what_if(
+            _what_if(change),
+            allowed_change_ids=frozenset({_CONTAINER_APP_ID}),
+        )
+
+
+def test_attested_protected_snapshot_reconciliation_is_indexed_and_budgeted(
+    monkeypatch,
+) -> None:
+    leaf_count = 2000
+    delta_count = 1000
+    properties: dict[str, object] = {
+        "configuration": {
+            "ingress": {
+                "external": False,
+            }
+        },
+        **{f"leaf{index:04d}": f"value-{index:04d}" for index in range(leaf_count)},
+    }
+    before = _resource_snapshot(
+        _CONTAINER_APP_ID,
+        properties=copy.deepcopy(properties),
+        tags={"release": "before"},
+    )
+    after = copy.deepcopy(before)
+    after["tags"] = {"release": "after"}
+    change = {
+        "resourceId": _CONTAINER_APP_ID,
+        "changeType": "Modify",
+        "before": before,
+        "after": after,
+        "delta": [
+            {
+                "path": f"properties.leaf{index:04d}",
+                "propertyChangeType": "NoEffect",
+                "before": f"value-{index:04d}",
+                "after": f"value-{index:04d}",
+            }
+            for index in range(delta_count)
+        ],
+    }
+    original_resolve = wc029_preflight_module._ProtectedPropertyEvidence._resolve_value
+    raw_snapshot_resolutions = 0
+    original_charge_lookup = _PropertyPathBudget.charge_lookup
+    charged_lookup_work = 0
+
+    def counted_resolve(
+        evidence: object,
+        value: object,
+        tokens: object,
+    ) -> tuple[bool, object]:
+        nonlocal raw_snapshot_resolutions
+        raw_snapshot_resolutions += 1
+        return original_resolve(evidence, value, tokens)
+
+    def counted_charge_lookup(
+        budget: _PropertyPathBudget,
+        work: int,
+    ) -> None:
+        nonlocal charged_lookup_work
+        charged_lookup_work += work
+        original_charge_lookup(budget, work)
+
+    monkeypatch.setattr(
+        wc029_preflight_module._ProtectedPropertyEvidence,
+        "_resolve_value",
+        counted_resolve,
+    )
+    monkeypatch.setattr(
+        _PropertyPathBudget,
+        "charge_lookup",
+        counted_charge_lookup,
+    )
+
+    assert (
+        _evaluate_attested_what_if(
+            _what_if(change),
+            allowed_change_ids=frozenset({_CONTAINER_APP_ID}),
+        )
+        == ()
+    )
+    schema_entry_count = len(
+        wc029_preflight_module._PROTECTED_PROPERTY_SCHEMAS[
+            wc029_preflight_module._CONTAINER_APP_TYPE
+        ]
+    )
+    assert raw_snapshot_resolutions <= 2 * schema_entry_count
+    assert delta_count < charged_lookup_work < wc029_preflight_module.MAX_PROPERTY_LOOKUP_WORK
+
+
+def test_attested_wide_protected_delta_observation_consumes_lookup_budget() -> None:
+    inert_key_count = 63000
+    properties: dict[str, object] = {
+        **{f"leaf{index:05d}": f"value-{index:05d}" for index in range(inert_key_count)},
+        "publicNetworkAccess": "Disabled",
+        "networkAcls": {"defaultAction": "Deny"},
+        "enabledForDeployment": False,
+    }
+    change = {
+        "resourceId": _KEY_VAULT_ID,
+        "changeType": "Modify",
+        "delta": [
+            {
+                "path": "properties",
+                "propertyChangeType": "Modify",
+                "after": properties,
+            }
+        ],
+    }
+
+    with pytest.raises(
+        PreflightInputError,
+        match="property snapshot lookup exceeds its aggregate work budget",
+    ):
+        _evaluate_attested_what_if(
+            _what_if(change),
+            allowed_change_ids=frozenset({_KEY_VAULT_ID}),
+        )
+
+
+@pytest.mark.parametrize(
+    ("resource_id", "properties", "message"),
+    [
+        (
+            _STORAGE_ID,
+            {
+                "allowSharedKeyAccess": False,
+                "allowBlobPublicAccess": False,
+                "publicNetworkAccess": " Disabled ",
+                "networkAcls": {"defaultAction": "Deny"},
+            },
+            "publicNetworkAccess must be an exact trimmed ASCII token",
+        ),
+        (
+            _STORAGE_ID,
+            {
+                "allowSharedKeyAccess": False,
+                "allowBlobPublicAccess": False,
+                "publicNetworkAccess": "Disabled",
+                "networkAcls": {"defaultAction": " Deny "},
+            },
+            "properties.networkacls.defaultaction must be an exact trimmed ASCII token",
+        ),
+        (
+            _STORAGE_CONTAINER_ID,
+            {
+                "publicAccess": " None ",
+            },
+            "publicAccess must be an exact trimmed ASCII token",
+        ),
+    ],
+)
+def test_attested_no_change_rejects_noncanonical_protected_string(
+    resource_id: str,
+    properties: dict[str, object],
+    message: str,
+) -> None:
+    change = _change(resource_id, "NoChange")
+    assert isinstance(change["before"], dict)
+    assert isinstance(change["after"], dict)
+    change["before"]["properties"] = copy.deepcopy(properties)
+    change["after"]["properties"] = copy.deepcopy(properties)
+
+    with pytest.raises(
+        PreflightInputError,
+        match=message,
+    ):
+        _evaluate_attested_what_if(
+            _what_if(change),
+        )
+
+
+def test_attested_modify_rejects_equal_noncanonical_protected_string() -> None:
+    change = {
+        "resourceId": _STORAGE_ID,
+        "changeType": "Modify",
+        "delta": [
+            {
+                "path": "properties.publicNetworkAccess",
+                "propertyChangeType": "Modify",
+                "before": " Disabled ",
+                "after": " Disabled ",
+            },
+            {
+                "path": "tags.release",
+                "propertyChangeType": "Modify",
+                "after": "wc029",
+            },
+        ],
+    }
+
+    with pytest.raises(
+        PreflightInputError,
+        match="publicNetworkAccess must be an exact trimmed ASCII token",
+    ):
+        _evaluate_attested_what_if(
+            _what_if(change),
+            allowed_change_ids=frozenset({_STORAGE_ID}),
+        )
+
+
+def test_attested_what_if_rejects_protected_descendant_conflicting_with_full_snapshot() -> None:
+    properties = {
+        "configuration": {
+            "ingress": {
+                "external": False,
+                "targetPort": 443,
+            }
+        }
+    }
+    before = _resource_snapshot(
+        _CONTAINER_APP_ID,
+        properties=copy.deepcopy(properties),
+        tags={"release": "before"},
+    )
+    after = copy.deepcopy(before)
+    after["tags"] = {"release": "after"}
+    change = {
+        "resourceId": _CONTAINER_APP_ID,
+        "changeType": "Modify",
+        "before": before,
+        "after": after,
+        "delta": [
+            {
+                "path": "properties.configuration.ingress.targetPort",
+                "propertyChangeType": "Modify",
+                "after": 80,
+            }
+        ],
+    }
+
+    with pytest.raises(
+        PreflightInputError,
+        match="conflict",
+    ):
+        _evaluate_attested_what_if(
+            _what_if(change),
+            allowed_change_ids=frozenset({_CONTAINER_APP_ID}),
+        )
+
+
+@pytest.mark.parametrize(
+    ("resource_id", "properties", "message"),
+    [
+        (
+            _STORAGE_ID,
+            {"allowSharedKeyAccess": {"value": False}},
+            "allowSharedKeyAccess must be boolean",
+        ),
+        (
+            _CONTAINER_APP_ID,
+            {
+                "configuration": {
+                    "ingress": {
+                        "external": {"value": False},
+                    }
+                }
+            },
+            "Container Apps ingress.external must be boolean",
+        ),
+    ],
+)
+def test_attested_no_change_rejects_invalid_protected_snapshot_schema(
+    resource_id: str,
+    properties: dict[str, object],
+    message: str,
+) -> None:
+    change = _change(resource_id, "NoChange")
+    assert isinstance(change["before"], dict)
+    assert isinstance(change["after"], dict)
+    change["before"]["properties"] = copy.deepcopy(properties)
+    change["after"]["properties"] = copy.deepcopy(properties)
+
+    with pytest.raises(
+        PreflightInputError,
+        match=message,
+    ):
+        _evaluate_attested_what_if(
+            _what_if(change),
+        )
+
+
 @pytest.mark.parametrize(
     ("resource_id", "change_type"),
     [
@@ -2142,30 +3376,32 @@ def test_attested_key_vault_deployment_access_requires_exact_final_false(
 def test_attested_key_vault_deployment_access_rejects_child_only_evidence(
     field_name: str,
 ) -> None:
-    violations = _evaluate_attested_what_if(
-        _what_if(
-            {
-                "resourceId": _KEY_VAULT_ID,
-                "changeType": "Modify",
-                "delta": [
-                    {
-                        "path": f"properties.{field_name}",
-                        "propertyChangeType": "Modify",
-                        "children": [
-                            {
-                                "path": "value",
-                                "propertyChangeType": "Modify",
-                                "after": False,
-                            }
-                        ],
-                    }
-                ],
-            }
-        ),
-        allowed_change_ids=frozenset({_KEY_VAULT_ID}),
-    )
-
-    assert "authorization-change-unsupported" in {violation.code for violation in violations}
+    with pytest.raises(
+        PreflightInputError,
+        match="delta path diverges from protected property schema",
+    ):
+        _evaluate_attested_what_if(
+            _what_if(
+                {
+                    "resourceId": _KEY_VAULT_ID,
+                    "changeType": "Modify",
+                    "delta": [
+                        {
+                            "path": f"properties.{field_name}",
+                            "propertyChangeType": "Modify",
+                            "children": [
+                                {
+                                    "path": "value",
+                                    "propertyChangeType": "Modify",
+                                    "after": False,
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ),
+            allowed_change_ids=frozenset({_KEY_VAULT_ID}),
+        )
 
 
 @pytest.mark.parametrize(
@@ -2254,38 +3490,40 @@ def test_attested_key_vault_deployment_access_rejects_conflicting_snapshot_and_d
         "publicNetworkAccess": "Disabled",
         "networkAcls": {"defaultAction": "Deny"},
     }
-    violations = _evaluate_attested_what_if(
-        _what_if(
-            {
-                "resourceId": _KEY_VAULT_ID,
-                "changeType": "Modify",
-                "before": _resource_snapshot(
-                    _KEY_VAULT_ID,
-                    properties={
-                        **safe_properties,
-                        field_name: True,
-                    },
-                ),
-                "after": _resource_snapshot(
-                    _KEY_VAULT_ID,
-                    properties={
-                        **safe_properties,
-                        field_name: False,
-                    },
-                ),
-                "delta": [
-                    {
-                        "path": f"properties.{field_name}",
-                        "propertyChangeType": "Modify",
-                        "after": True,
-                    }
-                ],
-            }
-        ),
-        allowed_change_ids=frozenset({_KEY_VAULT_ID}),
-    )
-
-    assert "authorization-change-unsupported" in {violation.code for violation in violations}
+    with pytest.raises(
+        PreflightInputError,
+        match="conflict",
+    ):
+        _evaluate_attested_what_if(
+            _what_if(
+                {
+                    "resourceId": _KEY_VAULT_ID,
+                    "changeType": "Modify",
+                    "before": _resource_snapshot(
+                        _KEY_VAULT_ID,
+                        properties={
+                            **safe_properties,
+                            field_name: True,
+                        },
+                    ),
+                    "after": _resource_snapshot(
+                        _KEY_VAULT_ID,
+                        properties={
+                            **safe_properties,
+                            field_name: False,
+                        },
+                    ),
+                    "delta": [
+                        {
+                            "path": f"properties.{field_name}",
+                            "propertyChangeType": "Modify",
+                            "after": True,
+                        }
+                    ],
+                }
+            ),
+            allowed_change_ids=frozenset({_KEY_VAULT_ID}),
+        )
 
 
 @pytest.mark.parametrize(
@@ -2299,30 +3537,32 @@ def test_attested_key_vault_deployment_access_rejects_conflicting_snapshot_and_d
 def test_attested_key_vault_deployment_access_rejects_conflicting_delta_observations(
     field_name: str,
 ) -> None:
-    violations = _evaluate_attested_what_if(
-        _what_if(
-            {
-                "resourceId": _KEY_VAULT_ID,
-                "changeType": "Modify",
-                "delta": [
-                    {
-                        "path": f"properties.{field_name}",
-                        "propertyChangeType": "Modify",
-                        "before": True,
-                        "after": True,
-                    },
-                    {
-                        "path": f"properties.{field_name}",
-                        "propertyChangeType": "Modify",
-                        "after": False,
-                    },
-                ],
-            }
-        ),
-        allowed_change_ids=frozenset({_KEY_VAULT_ID}),
-    )
-
-    assert "authorization-change-unsupported" in {violation.code for violation in violations}
+    with pytest.raises(
+        PreflightInputError,
+        match="conflict",
+    ):
+        _evaluate_attested_what_if(
+            _what_if(
+                {
+                    "resourceId": _KEY_VAULT_ID,
+                    "changeType": "Modify",
+                    "delta": [
+                        {
+                            "path": f"properties.{field_name}",
+                            "propertyChangeType": "Modify",
+                            "before": True,
+                            "after": True,
+                        },
+                        {
+                            "path": f"properties.{field_name}",
+                            "propertyChangeType": "Modify",
+                            "after": False,
+                        },
+                    ],
+                }
+            ),
+            allowed_change_ids=frozenset({_KEY_VAULT_ID}),
+        )
 
 
 @pytest.mark.parametrize(
@@ -2370,12 +3610,21 @@ def test_attested_key_vault_create_rejects_true_observation(
             },
         )
 
-    violations = _evaluate_attested_what_if(
-        _what_if(change),
-        allowed_change_ids=frozenset({_KEY_VAULT_ID}),
-    )
-
-    assert "authorization-change-unsupported" in {violation.code for violation in violations}
+    if include_final_snapshot:
+        with pytest.raises(
+            PreflightInputError,
+            match="conflict",
+        ):
+            _evaluate_attested_what_if(
+                _what_if(change),
+                allowed_change_ids=frozenset({_KEY_VAULT_ID}),
+            )
+    else:
+        violations = _evaluate_attested_what_if(
+            _what_if(change),
+            allowed_change_ids=frozenset({_KEY_VAULT_ID}),
+        )
+        assert "authorization-change-unsupported" in {violation.code for violation in violations}
 
 
 @pytest.mark.parametrize(
@@ -2536,36 +3785,38 @@ def test_attested_key_vault_exact_false_does_not_mask_ambiguous_ancestor_observa
         "networkAcls": {"defaultAction": "Deny"},
         **other_deployment_access,
     }
-    violations = _evaluate_attested_what_if(
-        _what_if(
-            {
-                "resourceId": _KEY_VAULT_ID,
-                "changeType": "Modify",
-                "delta": [
-                    {
-                        "path": f"properties.{field_name}",
-                        "propertyChangeType": "Modify",
-                        "before": False,
-                        "after": False,
-                    },
-                    {
-                        "path": "properties",
-                        "propertyChangeType": "Modify",
-                        "before": copy.deepcopy(observed_properties),
-                        "after": copy.deepcopy(observed_properties),
-                    },
-                    {
-                        "path": "tags.release",
-                        "propertyChangeType": "Modify",
-                        "after": "wc029",
-                    },
-                ],
-            }
-        ),
-        allowed_change_ids=frozenset({_KEY_VAULT_ID}),
-    )
-
-    assert "authorization-change-unsupported" in {violation.code for violation in violations}
+    with pytest.raises(
+        PreflightInputError,
+        match="conflict",
+    ):
+        _evaluate_attested_what_if(
+            _what_if(
+                {
+                    "resourceId": _KEY_VAULT_ID,
+                    "changeType": "Modify",
+                    "delta": [
+                        {
+                            "path": f"properties.{field_name}",
+                            "propertyChangeType": "Modify",
+                            "before": False,
+                            "after": False,
+                        },
+                        {
+                            "path": "properties",
+                            "propertyChangeType": "Modify",
+                            "before": copy.deepcopy(observed_properties),
+                            "after": copy.deepcopy(observed_properties),
+                        },
+                        {
+                            "path": "tags.release",
+                            "propertyChangeType": "Modify",
+                            "after": "wc029",
+                        },
+                    ],
+                }
+            ),
+            allowed_change_ids=frozenset({_KEY_VAULT_ID}),
+        )
 
 
 @pytest.mark.parametrize(
@@ -2579,38 +3830,40 @@ def test_attested_key_vault_exact_false_does_not_mask_ambiguous_ancestor_observa
 def test_attested_key_vault_false_observation_rejects_one_sided_snapshot_omission(
     field_name: str,
 ) -> None:
-    violations = _evaluate_attested_what_if(
-        _what_if(
-            {
-                "resourceId": _KEY_VAULT_ID,
-                "changeType": "Modify",
-                "after": _resource_snapshot(
-                    _KEY_VAULT_ID,
-                    properties={
-                        "publicNetworkAccess": "Disabled",
-                        "networkAcls": {"defaultAction": "Deny"},
-                    },
-                    tags={"release": "after"},
-                ),
-                "delta": [
-                    {
-                        "path": f"properties.{field_name}",
-                        "propertyChangeType": "Modify",
-                        "before": False,
-                        "after": False,
-                    },
-                    {
-                        "path": "tags.release",
-                        "propertyChangeType": "Modify",
-                        "after": "after",
-                    },
-                ],
-            }
-        ),
-        allowed_change_ids=frozenset({_KEY_VAULT_ID}),
-    )
-
-    assert "authorization-change-unsupported" in {violation.code for violation in violations}
+    with pytest.raises(
+        PreflightInputError,
+        match="delta and full snapshot conflict",
+    ):
+        _evaluate_attested_what_if(
+            _what_if(
+                {
+                    "resourceId": _KEY_VAULT_ID,
+                    "changeType": "Modify",
+                    "after": _resource_snapshot(
+                        _KEY_VAULT_ID,
+                        properties={
+                            "publicNetworkAccess": "Disabled",
+                            "networkAcls": {"defaultAction": "Deny"},
+                        },
+                        tags={"release": "after"},
+                    ),
+                    "delta": [
+                        {
+                            "path": f"properties.{field_name}",
+                            "propertyChangeType": "Modify",
+                            "before": False,
+                            "after": False,
+                        },
+                        {
+                            "path": "tags.release",
+                            "propertyChangeType": "Modify",
+                            "after": "after",
+                        },
+                    ],
+                }
+            ),
+            allowed_change_ids=frozenset({_KEY_VAULT_ID}),
+        )
 
 
 def test_what_if_allows_unchanged_key_vault_authorization_mode() -> None:
@@ -3800,7 +5053,7 @@ def test_what_if_rejects_empty_delta_children() -> None:
         )
 
 
-def test_dotted_payload_keys_cannot_spoof_storage_protection() -> None:
+def test_dotted_payload_keys_fail_closed_in_storage_protection() -> None:
     document = _what_if(
         {
             "resourceId": _STORAGE_ID,
@@ -3814,13 +5067,14 @@ def test_dotted_payload_keys_cannot_spoof_storage_protection() -> None:
         }
     )
 
-    assert {
-        item.code
-        for item in evaluate_what_if(
+    with pytest.raises(
+        PreflightInputError,
+        match="malformed property alias",
+    ):
+        evaluate_what_if(
             document,
             allowed_change_ids=frozenset({_STORAGE_ID}),
         )
-    } == {"storage-protection-missing"}
 
 
 def test_unicode_folded_property_keys_and_paths_are_rejected() -> None:

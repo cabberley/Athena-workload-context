@@ -83,6 +83,8 @@ _CONTAINER_APP_TYPE = "microsoft.app/containerapps"
 _CONTAINER_ENVIRONMENT_TYPE = "microsoft.app/managedenvironments"
 _RESOURCE_ROOT_PATH = "<resource>"
 _MISSING_AFTER_VALUE = object()
+_NO_EXPLICIT_VALUE = object()
+_PROTECTED_OBJECT_PRESENT = object()
 _PROPERTY_OBSERVATION = "observation"
 _RESOURCE_ROOT_ALIASES = frozenset(
     {
@@ -210,6 +212,55 @@ _NON_EFFECTIVE_RESOURCE_METADATA_ROOTS = frozenset(
         "type",
     }
 )
+_PROTECTED_PROPERTY_SCHEMAS: dict[str, tuple[tuple[str, str], ...]] = {
+    _STORAGE_ACCOUNT_TYPE: (
+        ("properties", "object"),
+        ("properties.allowsharedkeyaccess", "boolean"),
+        ("properties.allowblobpublicaccess", "boolean"),
+        ("properties.publicnetworkaccess", "string"),
+        ("properties.networkacls", "object"),
+        ("properties.networkacls.defaultaction", "string"),
+    ),
+    _STORAGE_CONTAINER_TYPE: (
+        ("properties", "object"),
+        ("properties.publicaccess", "string"),
+    ),
+    _KEY_VAULT_TYPE: (
+        ("properties", "object"),
+        ("properties.accesspolicies", "array"),
+        ("properties.enablerbacauthorization", "boolean"),
+        ("properties.enabledfordeployment", "boolean"),
+        ("properties.enabledfordiskencryption", "boolean"),
+        ("properties.enabledfortemplatedeployment", "boolean"),
+        ("properties.publicnetworkaccess", "string"),
+        ("properties.networkacls", "object"),
+        ("properties.networkacls.defaultaction", "string"),
+    ),
+    _CONTAINER_APP_TYPE: (
+        ("properties", "object"),
+        ("properties.configuration", "object"),
+        ("properties.configuration.ingress", "object"),
+        ("properties.configuration.ingress.external", "boolean"),
+        ("properties.publicnetworkaccess", "string"),
+    ),
+    _CONTAINER_ENVIRONMENT_TYPE: (
+        ("properties", "object"),
+        ("properties.publicnetworkaccess", "string"),
+        ("properties.vnetconfiguration", "object"),
+        ("properties.vnetconfiguration.internal", "boolean"),
+    ),
+}
+_PROTECTED_PROPERTY_TYPE_ERRORS = {
+    "properties.allowsharedkeyaccess": "allowSharedKeyAccess must be boolean",
+    "properties.allowblobpublicaccess": "allowBlobPublicAccess must be boolean",
+    "properties.configuration.ingress.external": (
+        "Container Apps ingress.external must be boolean"
+    ),
+    "properties.vnetconfiguration.internal": (
+        "Container Apps vnetConfiguration.internal must be boolean"
+    ),
+    "properties.publicaccess": "publicAccess must be an exact trimmed ASCII token",
+}
 
 
 class PreflightInputError(ValueError):
@@ -249,6 +300,13 @@ class DeploymentTarget:
     tenant_id: str
     subscription_id: str
     resource_group_scopes: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _WhatIfResourceRow:
+    value: dict[str, Any]
+    resource_id: str
+    canonical_resource_id: str
 
 
 @dataclass(slots=True)
@@ -1394,6 +1452,20 @@ def _get_case_insensitive(mapping: dict[str, Any], name: str) -> object:
     return None
 
 
+def _budgeted_case_insensitive_lookup(
+    mapping: dict[str, Any],
+    name: str,
+    *,
+    budget: _PropertyPathBudget,
+) -> tuple[bool, object]:
+    budget.charge_lookup(len(mapping) + 1)
+    expected = name.lower()
+    for key, value in mapping.items():
+        if key.lower() == expected:
+            return True, value
+    return False, None
+
+
 def _require_literal_subscription_tenant(properties: dict[str, Any]) -> object:
     tenant_keys = [key for key in properties if key.casefold() in {"tenant", "tenantid"}]
     if tenant_keys != ["tenant"]:
@@ -1654,6 +1726,65 @@ def _what_if_changes(
     )
 
 
+def _canonical_what_if_resource_rows(
+    changes: Sequence[object],
+    potential_changes: Sequence[object],
+    *,
+    deployment_target: DeploymentTarget | None,
+) -> tuple[tuple[_WhatIfResourceRow, ...], tuple[_WhatIfResourceRow, ...]]:
+    seen_resource_ids: dict[str, str] = {}
+
+    def parse_rows(
+        values: Sequence[object],
+        *,
+        row_kind: str,
+        resource_id_field_name: str,
+    ) -> tuple[_WhatIfResourceRow, ...]:
+        rows: list[_WhatIfResourceRow] = []
+        for raw_value in values:
+            value = _mapping(raw_value, field_name=row_kind)
+            resource_id = _require_string(
+                _get_case_insensitive(value, "resourceId"),
+                field_name=resource_id_field_name,
+            )
+            canonical_resource_id = (
+                _canonical_scope(resource_id)
+                if deployment_target is None
+                else _validate_deployment_resource_id(
+                    resource_id,
+                    deployment_target=deployment_target,
+                    field_name=resource_id_field_name,
+                )
+            )
+            previous_kind = seen_resource_ids.get(canonical_resource_id)
+            if previous_kind is not None:
+                raise PreflightInputError(
+                    "what-if result contains duplicate canonical resourceId "
+                    f"across {previous_kind} and {row_kind}"
+                )
+            seen_resource_ids[canonical_resource_id] = row_kind
+            rows.append(
+                _WhatIfResourceRow(
+                    value=value,
+                    resource_id=resource_id,
+                    canonical_resource_id=canonical_resource_id,
+                )
+            )
+        return tuple(rows)
+
+    parsed_changes = parse_rows(
+        changes,
+        row_kind="change",
+        resource_id_field_name="resourceId",
+    )
+    parsed_potential_changes = parse_rows(
+        potential_changes,
+        row_kind="potential change",
+        resource_id_field_name="potential change resourceId",
+    )
+    return parsed_changes, parsed_potential_changes
+
+
 def _delta_entries(change: dict[str, Any]) -> list[dict[str, Any]]:
     raw = _get_case_insensitive(change, "delta")
     if raw is None:
@@ -1668,18 +1799,22 @@ def _delta_entries(change: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
+def _is_property_name(value: str) -> bool:
+    return (
+        value.isascii()
+        and value.lower() == value.casefold()
+        and not _contains_non_ascii_case_alias(value)
+        and _PROPERTY_NAME.fullmatch(value) is not None
+    )
+
+
 def _property_child_path(
     parent: str,
     key: str,
     *,
     budget: _PropertyPathBudget,
 ) -> str | None:
-    if (
-        not key.isascii()
-        or key.lower() != key.casefold()
-        or _contains_non_ascii_case_alias(key)
-        or _PROPERTY_NAME.fullmatch(key) is None
-    ):
+    if not _is_property_name(key):
         return None
     path = _format_property_path((*_property_path_tokens(parent), key.lower()))
     budget.charge(path)
@@ -1785,6 +1920,7 @@ def _walk_delta(
     budget: _PropertyPathBudget,
     snapshot_index: _SnapshotPairIndex | None = None,
     preserve_evidence_for: frozenset[str] = frozenset(),
+    protected_evidence: _ProtectedPropertyEvidence | None = None,
 ) -> list[tuple[str, object, str]]:
     values: list[tuple[str, object, str]] = []
     stack: list[tuple[dict[str, Any], str]] = [(item, "") for item in reversed(items)]
@@ -1831,6 +1967,8 @@ def _walk_delta(
             or _property_path_contains(target, canonical_path)
             for target in preserve_evidence_for
         )
+        if protected_evidence is not None:
+            protected_evidence.validate_path(canonical_path)
         if (
             canonical_path == _RESOURCE_ROOT_PATH
             and property_change_type not in {"delete", "remove", "noeffect"}
@@ -1846,6 +1984,15 @@ def _walk_delta(
                 canonical_path == target or _property_path_contains(target, canonical_path)
                 for target in preserve_evidence_for
             ):
+                if protected_evidence is not None:
+                    protected_evidence.observe_delta(
+                        canonical_path,
+                        property_change_type=property_change_type,
+                        before_supplied=before_supplied,
+                        before=before,
+                        after_supplied=after_supplied,
+                        after=after,
+                    )
                 values.append(
                     (
                         canonical_path,
@@ -1867,6 +2014,22 @@ def _walk_delta(
             ]
             if not child_items:
                 raise PreflightInputError("delta item contains no inspectable children")
+        if property_change_type == "noeffect":
+            _validate_no_effect_entry(
+                item,
+                canonical_path=canonical_path,
+                snapshot_index=snapshot_index,
+                budget=budget,
+            )
+        if protected_evidence is not None:
+            protected_evidence.observe_delta(
+                canonical_path,
+                property_change_type=property_change_type,
+                before_supplied=before_supplied,
+                before=before,
+                after_supplied=after_supplied,
+                after=after,
+            )
         if property_change_type in {"delete", "remove"}:
             values.append(
                 (
@@ -1876,12 +2039,6 @@ def _walk_delta(
                 )
             )
         elif property_change_type == "noeffect":
-            _validate_no_effect_entry(
-                item,
-                canonical_path=canonical_path,
-                snapshot_index=snapshot_index,
-                budget=budget,
-            )
             if preserve_observation:
                 values.append(
                     (
@@ -2077,6 +2234,751 @@ def _validate_resource_snapshot(
     )
 
 
+@dataclass(slots=True)
+class _ProtectedPathNode:
+    presence: bool | None = None
+    subtree_present: bool = False
+    child_kind: Literal["array", "object"] | None = None
+    explicit_value: object = _NO_EXPLICIT_VALUE
+    children: dict[PropertyPathToken, _ProtectedPathNode] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class _ProtectedPropertyEvidence:
+    resource_type: str
+    budget: _PropertyPathBudget
+    entries: tuple[tuple[str, tuple[PropertyPathToken, ...], str], ...]
+    values: dict[tuple[str, str], object] = field(default_factory=dict)
+    path_roots: dict[str, _ProtectedPathNode] = field(
+        default_factory=lambda: {
+            "before": _ProtectedPathNode(),
+            "after": _ProtectedPathNode(),
+        }
+    )
+    complete_snapshot_stages: set[str] = field(default_factory=set)
+    complete_snapshot_indexes: dict[str, dict[str, object]] = field(default_factory=dict)
+    complete_snapshot_paths: dict[str, set[str]] = field(
+        default_factory=lambda: {"before": set(), "after": set()}
+    )
+
+    @classmethod
+    def for_resource_type(
+        cls,
+        resource_type: str,
+        *,
+        budget: _PropertyPathBudget,
+    ) -> _ProtectedPropertyEvidence:
+        return cls(
+            resource_type=resource_type,
+            budget=budget,
+            entries=tuple(
+                (path, _property_path_tokens(path), value_kind)
+                for path, value_kind in _PROTECTED_PROPERTY_SCHEMAS.get(
+                    resource_type,
+                    (),
+                )
+            ),
+        )
+
+    def validate_path(self, canonical_path: str) -> None:
+        path_tokens = _property_path_tokens(canonical_path)
+        for schema_path, schema_tokens, value_kind in self.entries:
+            if (
+                len(path_tokens) <= len(schema_tokens)
+                or path_tokens[: len(schema_tokens)] != schema_tokens
+            ):
+                continue
+            next_token = path_tokens[len(schema_tokens)]
+            if (
+                value_kind == "object"
+                and isinstance(next_token, str)
+                or value_kind == "array"
+                and isinstance(next_token, int)
+            ):
+                continue
+            raise PreflightInputError(
+                f"delta path diverges from protected property schema at {schema_path}"
+            )
+
+    def observe_snapshot(
+        self,
+        stage: str,
+        snapshot: dict[str, Any],
+        *,
+        complete: bool,
+        snapshot_index: dict[str, object] | None = None,
+    ) -> None:
+        if complete:
+            self._validate_structure(
+                _RESOURCE_ROOT_PATH,
+                snapshot,
+            )
+            if snapshot_index is None:
+                raise PreflightInputError("complete protected snapshot requires an index")
+            self.complete_snapshot_stages.add(stage)
+            self.complete_snapshot_indexes[stage] = snapshot_index
+            for schema_path, _, value_kind in self.entries:
+                self.budget.charge_lookup(1)
+                if schema_path not in snapshot_index:
+                    continue
+                observed_value = snapshot_index[schema_path]
+                self._validate_value_kind(
+                    schema_path,
+                    observed_value,
+                    value_kind=value_kind,
+                )
+                self._record(
+                    stage,
+                    schema_path,
+                    observed_value,
+                    value_kind=value_kind,
+                    from_snapshot=True,
+                )
+        else:
+            self._observe_value(
+                stage,
+                _RESOURCE_ROOT_PATH,
+                snapshot,
+                from_snapshot=True,
+            )
+
+    def observe_delta(
+        self,
+        canonical_path: str,
+        *,
+        property_change_type: str,
+        before_supplied: bool,
+        before: object,
+        after_supplied: bool,
+        after: object,
+    ) -> None:
+        self.validate_path(canonical_path)
+        protected_path = self._path_is_protected(canonical_path)
+        if protected_path and property_change_type == "create" and before_supplied:
+            raise PreflightInputError(
+                f"Create delta cannot supply before at protected path {canonical_path}"
+            )
+        if protected_path and property_change_type in {"delete", "remove"} and after_supplied:
+            raise PreflightInputError(
+                f"Delete/Remove delta cannot supply after at protected path {canonical_path}"
+            )
+        if before_supplied:
+            self._record_explicit_path_value(
+                "before",
+                canonical_path,
+                before,
+            )
+            self._observe_value(
+                "before",
+                canonical_path,
+                before,
+                from_snapshot=False,
+            )
+            self._reconcile_explicit_snapshot_value(
+                "before",
+                canonical_path,
+                before,
+            )
+        else:
+            self._reconcile_implicit_snapshot_presence(
+                "before",
+                canonical_path,
+                should_exist=property_change_type != "create",
+            )
+        if after_supplied:
+            self._record_explicit_path_value(
+                "after",
+                canonical_path,
+                after,
+            )
+            self._observe_value(
+                "after",
+                canonical_path,
+                after,
+                from_snapshot=False,
+            )
+            self._reconcile_explicit_snapshot_value(
+                "after",
+                canonical_path,
+                after,
+            )
+        else:
+            self._reconcile_implicit_snapshot_presence(
+                "after",
+                canonical_path,
+                should_exist=property_change_type not in {"delete", "remove"},
+            )
+
+    def _observe_value(
+        self,
+        stage: str,
+        canonical_path: str,
+        value: object,
+        *,
+        from_snapshot: bool,
+    ) -> None:
+        deferred_value_kind_paths = (
+            frozenset(_KEY_VAULT_DEPLOYMENT_ACCESS_TARGETS)
+            if (self.resource_type == _KEY_VAULT_TYPE and not from_snapshot and stage == "after")
+            else frozenset()
+        )
+        self._validate_structure(
+            canonical_path,
+            value,
+            deferred_value_kind_paths=deferred_value_kind_paths,
+        )
+        observation_tokens = _property_path_tokens(canonical_path)
+        for schema_path, schema_tokens, value_kind in self.entries:
+            if schema_tokens[: len(observation_tokens)] != observation_tokens:
+                continue
+            exists, observed_value = self._resolve_value(
+                value,
+                schema_tokens[len(observation_tokens) :],
+            )
+            if not exists:
+                if not from_snapshot:
+                    self._record(
+                        stage,
+                        schema_path,
+                        _MISSING_AFTER_VALUE,
+                        value_kind=value_kind,
+                        from_snapshot=False,
+                    )
+                continue
+            if not (
+                not from_snapshot
+                and stage == "after"
+                and schema_path in _KEY_VAULT_DEPLOYMENT_ACCESS_TARGETS
+            ):
+                self._validate_value_kind(
+                    schema_path,
+                    observed_value,
+                    value_kind=value_kind,
+                )
+            self._record(
+                stage,
+                schema_path,
+                observed_value,
+                value_kind=value_kind,
+                from_snapshot=from_snapshot,
+            )
+
+    def _validate_structure(
+        self,
+        canonical_path: str,
+        value: object,
+        *,
+        deferred_value_kind_paths: frozenset[str] = frozenset(),
+    ) -> None:
+        path_tokens = _property_path_tokens(canonical_path)
+        related_entries = tuple(
+            entry for entry in self.entries if entry[1][: len(path_tokens)] == path_tokens
+        )
+        if not related_entries:
+            return
+        stack = [(path_tokens, value, related_entries)]
+        while stack:
+            current_tokens, current_value, current_entries = stack.pop()
+            current_path = _format_property_path(current_tokens)
+            exact_kinds = {
+                value_kind
+                for _, schema_tokens, value_kind in current_entries
+                if schema_tokens == current_tokens
+            }
+            if exact_kinds and current_path not in deferred_value_kind_paths:
+                if len(exact_kinds) != 1:
+                    raise PreflightInputError(
+                        "protected property schema is internally inconsistent"
+                    )
+                self._validate_value_kind(
+                    current_path,
+                    current_value,
+                    value_kind=next(iter(exact_kinds)),
+                )
+
+            child_entries: dict[
+                PropertyPathToken,
+                list[tuple[str, tuple[PropertyPathToken, ...], str]],
+            ] = {}
+            for entry in current_entries:
+                schema_tokens = entry[1]
+                if len(schema_tokens) == len(current_tokens):
+                    continue
+                child_entries.setdefault(
+                    schema_tokens[len(current_tokens)],
+                    [],
+                ).append(entry)
+            if not child_entries:
+                continue
+
+            if all(isinstance(token, str) for token in child_entries):
+                if not isinstance(current_value, dict):
+                    raise PreflightInputError(
+                        f"protected property {current_path} must remain object-valued"
+                    )
+                self.budget.charge_lookup(len(current_value) + 1)
+                expected_children = frozenset(
+                    token for token in child_entries if isinstance(token, str)
+                )
+                for raw_key in current_value:
+                    if _is_property_name(raw_key):
+                        continue
+                    if current_tokens or self._malformed_key_targets_protected_child(
+                        raw_key,
+                        expected_children=expected_children,
+                    ):
+                        raise PreflightInputError(
+                            f"protected object {current_path} contains a malformed property alias"
+                        )
+                lowered = {key.lower(): child for key, child in current_value.items()}
+                for child_token, entries in child_entries.items():
+                    assert isinstance(child_token, str)
+                    if child_token not in lowered:
+                        continue
+                    stack.append(
+                        (
+                            (*current_tokens, child_token),
+                            lowered[child_token],
+                            tuple(entries),
+                        )
+                    )
+                continue
+
+            if all(isinstance(token, int) for token in child_entries):
+                if not isinstance(current_value, list):
+                    raise PreflightInputError(
+                        f"protected property {current_path} must remain array-valued"
+                    )
+                self.budget.charge_lookup(len(child_entries) + 1)
+                for child_token, entries in child_entries.items():
+                    assert isinstance(child_token, int)
+                    if child_token >= len(current_value):
+                        continue
+                    stack.append(
+                        (
+                            (*current_tokens, child_token),
+                            current_value[child_token],
+                            tuple(entries),
+                        )
+                    )
+                continue
+
+            raise PreflightInputError("protected property schema is internally inconsistent")
+
+    @staticmethod
+    def _malformed_key_targets_protected_child(
+        raw_key: str,
+        *,
+        expected_children: frozenset[str],
+    ) -> bool:
+        resource_prefix = f"{_RESOURCE_ROOT_PATH}."
+        candidates: set[str] = set()
+        for raw_candidate in (raw_key.lower(), raw_key.strip().lower()):
+            offset = 0
+            while offset < len(raw_candidate):
+                if raw_candidate.startswith(resource_prefix, offset):
+                    offset += len(resource_prefix)
+                    continue
+                if raw_candidate[offset] == ".":
+                    offset += 1
+                    continue
+                break
+            candidates.add(raw_candidate[offset:])
+        for candidate in candidates:
+            for expected_child in expected_children:
+                if candidate == expected_child:
+                    return True
+                if not candidate.startswith(expected_child):
+                    continue
+                suffix = candidate[len(expected_child) :]
+                if suffix and not (
+                    suffix[0].isascii() and (suffix[0].isalnum() or suffix[0] in "_$-")
+                ):
+                    return True
+        return False
+
+    def _record_explicit_path_value(
+        self,
+        stage: str,
+        canonical_path: str,
+        value: object,
+    ) -> None:
+        if not self._path_is_protected(canonical_path):
+            return
+        path_tokens = _property_path_tokens(canonical_path)
+        target_node = self._record_path_presence(
+            stage,
+            canonical_path,
+            present=True,
+        )
+        node = self.path_roots[stage]
+        for index, token in enumerate(path_tokens):
+            if node.explicit_value is not _NO_EXPLICIT_VALUE:
+                exists, ancestor_value = self._resolve_explicit_value(
+                    node.explicit_value,
+                    path_tokens[index:],
+                )
+                if not exists or not _json_values_equal(ancestor_value, value):
+                    raise PreflightInputError(
+                        f"protected path representations conflict at {canonical_path}"
+                    )
+            node = node.children[token]
+        if target_node.explicit_value is not _NO_EXPLICIT_VALUE and not _json_values_equal(
+            target_node.explicit_value,
+            value,
+        ):
+            raise PreflightInputError(
+                f"protected path representations conflict at {canonical_path}"
+            )
+        if target_node.child_kind is not None and not self._matches_container_kind(
+            value,
+            target_node.child_kind,
+        ):
+            raise PreflightInputError(
+                f"protected path container representations conflict at {canonical_path}"
+            )
+        self._validate_descendant_states(
+            target_node,
+            value,
+            canonical_path=canonical_path,
+        )
+        target_node.explicit_value = value
+
+    def _record_path_presence(
+        self,
+        stage: str,
+        canonical_path: str,
+        *,
+        present: bool,
+    ) -> _ProtectedPathNode:
+        path_tokens = _property_path_tokens(canonical_path)
+        self.budget.charge_lookup(len(path_tokens) + 1)
+        node = self.path_roots[stage]
+        lineage = [node]
+        if present and node.presence is False:
+            raise PreflightInputError(
+                f"protected path presence representations conflict at {canonical_path}"
+            )
+        for token in path_tokens:
+            child_kind: Literal["array", "object"] = "object" if isinstance(token, str) else "array"
+            if node.child_kind is not None and node.child_kind != child_kind:
+                raise PreflightInputError(
+                    f"protected path container representations conflict at {canonical_path}"
+                )
+            if node.explicit_value is not _NO_EXPLICIT_VALUE and not self._matches_container_kind(
+                node.explicit_value,
+                child_kind,
+            ):
+                raise PreflightInputError(
+                    f"protected path container representations conflict at {canonical_path}"
+                )
+            node.child_kind = child_kind
+            node = node.children.setdefault(token, _ProtectedPathNode())
+            lineage.append(node)
+            if present and node.presence is False:
+                raise PreflightInputError(
+                    f"protected path presence representations conflict at {canonical_path}"
+                )
+        if present:
+            node.presence = True
+            for ancestor in lineage:
+                ancestor.subtree_present = True
+        else:
+            if node.subtree_present or node.presence is True:
+                raise PreflightInputError(
+                    f"protected path presence representations conflict at {canonical_path}"
+                )
+            node.presence = False
+        return node
+
+    @staticmethod
+    def _matches_container_kind(
+        value: object,
+        child_kind: Literal["array", "object"],
+    ) -> bool:
+        return isinstance(value, list if child_kind == "array" else dict)
+
+    def _validate_implicit_presence_against_explicit_values(
+        self,
+        stage: str,
+        canonical_path: str,
+        *,
+        should_exist: bool,
+    ) -> None:
+        path_tokens = _property_path_tokens(canonical_path)
+        node = self.path_roots[stage]
+        for index in range(len(path_tokens) + 1):
+            if node.explicit_value is not _NO_EXPLICIT_VALUE:
+                exists, _ = self._resolve_explicit_value(
+                    node.explicit_value,
+                    path_tokens[index:],
+                )
+                if exists != should_exist:
+                    raise PreflightInputError(
+                        f"protected path presence representations conflict at {canonical_path}"
+                    )
+            if index == len(path_tokens):
+                break
+            child = node.children.get(path_tokens[index])
+            if child is None:
+                break
+            node = child
+
+    def _validate_descendant_states(
+        self,
+        node: _ProtectedPathNode,
+        value: object,
+        *,
+        canonical_path: str,
+    ) -> None:
+        stack: list[tuple[_ProtectedPathNode, tuple[PropertyPathToken, ...]]] = [
+            (child, (token,)) for token, child in node.children.items()
+        ]
+        while stack:
+            descendant, relative_tokens = stack.pop()
+            self.budget.charge_lookup(1)
+            exists, resolved = self._resolve_explicit_value(
+                value,
+                relative_tokens,
+            )
+            if descendant.presence is not None and exists != descendant.presence:
+                raise PreflightInputError(
+                    f"protected path presence representations conflict below {canonical_path}"
+                )
+            if descendant.explicit_value is not _NO_EXPLICIT_VALUE and (
+                not exists
+                or not _json_values_equal(
+                    resolved,
+                    descendant.explicit_value,
+                )
+            ):
+                raise PreflightInputError(
+                    f"protected path representations conflict below {canonical_path}"
+                )
+            stack.extend(
+                (child, (*relative_tokens, token)) for token, child in descendant.children.items()
+            )
+
+    def _resolve_explicit_value(
+        self,
+        value: object,
+        tokens: Sequence[PropertyPathToken],
+    ) -> tuple[bool, object]:
+        resolved = value
+        for token in tokens:
+            if isinstance(token, str):
+                if not isinstance(resolved, dict):
+                    return False, None
+                exists, child = _budgeted_case_insensitive_lookup(
+                    resolved,
+                    token,
+                    budget=self.budget,
+                )
+                if not exists:
+                    return False, None
+                resolved = child
+            elif not isinstance(resolved, list) or token >= len(resolved):
+                self.budget.charge_lookup(1)
+                return False, None
+            else:
+                self.budget.charge_lookup(1)
+                resolved = resolved[token]
+        return True, resolved
+
+    def _reconcile_explicit_snapshot_value(
+        self,
+        stage: str,
+        canonical_path: str,
+        value: object,
+    ) -> None:
+        if stage not in self.complete_snapshot_stages or not self._path_is_protected(
+            canonical_path
+        ):
+            return
+        self.budget.charge_lookup(len(_property_path_tokens(canonical_path)) + 2)
+        snapshot_index = self.complete_snapshot_indexes[stage]
+        exists = canonical_path in snapshot_index
+        snapshot_value = snapshot_index.get(canonical_path)
+        if not exists or not _json_values_equal(snapshot_value, value):
+            raise PreflightInputError(
+                f"delta and full snapshot conflict at protected path {canonical_path}"
+            )
+
+    def _reconcile_implicit_snapshot_presence(
+        self,
+        stage: str,
+        canonical_path: str,
+        *,
+        should_exist: bool,
+    ) -> None:
+        if not self._path_is_protected(canonical_path):
+            return
+        self._validate_implicit_presence_against_explicit_values(
+            stage,
+            canonical_path,
+            should_exist=should_exist,
+        )
+        self._record_path_presence(
+            stage,
+            canonical_path,
+            present=should_exist,
+        )
+        if stage not in self.complete_snapshot_stages:
+            return
+        self.budget.charge_lookup(len(_property_path_tokens(canonical_path)) + 2)
+        exists = canonical_path in self.complete_snapshot_indexes[stage]
+        if exists != should_exist:
+            raise PreflightInputError(
+                f"delta and full snapshot conflict at protected path {canonical_path}"
+            )
+
+    def _path_is_protected(self, canonical_path: str) -> bool:
+        path_tokens = _property_path_tokens(canonical_path)
+        return any(
+            path_tokens[: len(schema_tokens)] == schema_tokens
+            or schema_tokens[: len(path_tokens)] == path_tokens
+            for _, schema_tokens, _ in self.entries
+        )
+
+    def _resolve_value(
+        self,
+        value: object,
+        tokens: Sequence[PropertyPathToken],
+    ) -> tuple[bool, object]:
+        resolved = value
+        for token in tokens:
+            if isinstance(token, str):
+                if not isinstance(resolved, dict):
+                    return False, None
+                exists, child = _budgeted_case_insensitive_lookup(
+                    resolved,
+                    token,
+                    budget=self.budget,
+                )
+                if not exists:
+                    return False, None
+                resolved = child
+            elif not isinstance(resolved, list) or token >= len(resolved):
+                self.budget.charge_lookup(1)
+                return False, None
+            else:
+                self.budget.charge_lookup(1)
+                resolved = resolved[token]
+        return True, resolved
+
+    def _validate_value_kind(
+        self,
+        schema_path: str,
+        value: object,
+        *,
+        value_kind: str,
+    ) -> None:
+        valid = (
+            value_kind == "object"
+            and isinstance(value, dict)
+            or value_kind == "array"
+            and isinstance(value, list)
+            or value_kind == "boolean"
+            and type(value) is bool
+            or value_kind == "string"
+            and isinstance(value, str)
+        )
+        if not valid:
+            raise PreflightInputError(
+                _PROTECTED_PROPERTY_TYPE_ERRORS.get(
+                    schema_path,
+                    f"protected property {schema_path} must remain {value_kind}-valued",
+                )
+            )
+        if value_kind == "string":
+            self._validate_string_value(schema_path, value)
+
+    def _validate_string_value(
+        self,
+        schema_path: str,
+        value: object,
+    ) -> None:
+        assert isinstance(value, str)
+        field_name = (
+            "publicNetworkAccess"
+            if schema_path == "properties.publicnetworkaccess"
+            else ("publicAccess" if schema_path == "properties.publicaccess" else schema_path)
+        )
+        normalized = _normalized_ascii_token(
+            value,
+            field_name=field_name,
+            maximum_length=64,
+        )
+        if schema_path == "properties.publicnetworkaccess":
+            allowed_values = (
+                {"disabled", "enabled"}
+                if self.resource_type
+                in {
+                    _CONTAINER_APP_TYPE,
+                    _CONTAINER_ENVIRONMENT_TYPE,
+                }
+                else {"disabled", "enabled", "securedbyperimeter"}
+            )
+            if normalized not in allowed_values:
+                if self.resource_type in {
+                    _CONTAINER_APP_TYPE,
+                    _CONTAINER_ENVIRONMENT_TYPE,
+                }:
+                    raise PreflightInputError("Container Apps publicNetworkAccess is unsupported")
+                raise PreflightInputError(f"{schema_path} has an unsupported value")
+        elif schema_path == "properties.networkacls.defaultaction":
+            if normalized not in {"allow", "deny"}:
+                raise PreflightInputError(f"{schema_path} has an unsupported value")
+        elif schema_path == "properties.publicaccess" and normalized not in {
+            "blob",
+            "container",
+            "none",
+        }:
+            raise PreflightInputError("publicAccess has an unsupported value")
+
+    def _record(
+        self,
+        stage: str,
+        schema_path: str,
+        value: object,
+        *,
+        value_kind: str,
+        from_snapshot: bool,
+    ) -> None:
+        if from_snapshot:
+            self.complete_snapshot_paths[stage].add(schema_path)
+        elif stage in self.complete_snapshot_stages:
+            snapshot_has_value = schema_path in self.complete_snapshot_paths[stage]
+            delta_has_value = value is not _MISSING_AFTER_VALUE
+            if snapshot_has_value != delta_has_value:
+                raise PreflightInputError(
+                    f"delta and full snapshot conflict at protected property {schema_path}"
+                )
+        normalized_value = (
+            _PROTECTED_OBJECT_PRESENT
+            if value_kind == "object" and value is not _MISSING_AFTER_VALUE
+            else value
+        )
+        key = (stage, schema_path)
+        existing = self.values.get(key, _MISSING_AFTER_VALUE)
+        if key in self.values and not self._values_equal(existing, normalized_value):
+            raise PreflightInputError(
+                f"protected property representations conflict at {schema_path}"
+            )
+        self.values[key] = normalized_value
+
+    @staticmethod
+    def _values_equal(left: object, right: object) -> bool:
+        if (
+            left is _MISSING_AFTER_VALUE
+            or right is _MISSING_AFTER_VALUE
+            or left is _PROTECTED_OBJECT_PRESENT
+            or right is _PROTECTED_OBJECT_PRESENT
+        ):
+            return left is right
+        return _json_values_equal(left, right)
+
+
 def _validate_no_change(
     resource_id: str,
     change: dict[str, Any],
@@ -2108,6 +3010,22 @@ def _validate_no_change(
         before,
         after,
         budget=budget,
+    )
+    protected_evidence = _ProtectedPropertyEvidence.for_resource_type(
+        _resource_type(resource_id),
+        budget=budget,
+    )
+    protected_evidence.observe_snapshot(
+        "before",
+        before,
+        complete=True,
+        snapshot_index=snapshot_index.before,
+    )
+    protected_evidence.observe_snapshot(
+        "after",
+        after,
+        complete=True,
+        snapshot_index=snapshot_index.after,
     )
     delta = _delta_entries(change)
     stack: list[tuple[dict[str, Any], str]] = [(item, "") for item in reversed(delta)]
@@ -2142,6 +3060,11 @@ def _validate_no_change(
         )
         if property_change_type not in {"array", "noeffect"}:
             raise PreflightInputError("NoChange contains a non-NoEffect property delta")
+        before_supplied = _has_case_insensitive(item, "before")
+        after_supplied = _has_case_insensitive(item, "after")
+        item_before = _get_case_insensitive(item, "before")
+        item_after = _get_case_insensitive(item, "after")
+        protected_evidence.validate_path(canonical_path)
         if property_change_type == "noeffect":
             _validate_no_effect_entry(
                 item,
@@ -2149,9 +3072,14 @@ def _validate_no_change(
                 snapshot_index=snapshot_index,
                 budget=budget,
             )
-        before_supplied = _has_case_insensitive(item, "before")
-        after_supplied = _has_case_insensitive(item, "after")
-        item_after = _get_case_insensitive(item, "after")
+        protected_evidence.observe_delta(
+            canonical_path,
+            property_change_type=property_change_type,
+            before_supplied=before_supplied,
+            before=item_before,
+            after_supplied=after_supplied,
+            after=item_after,
+        )
         if (
             canonical_path == _RESOURCE_ROOT_PATH
             and property_change_type == "array"
@@ -2265,16 +3193,26 @@ def _has_complete_resource_snapshot_shape(value: object) -> bool:
 def _snapshot_property_state(
     value: object,
     target: str,
+    *,
+    budget: _PropertyPathBudget,
 ) -> tuple[bool, object]:
     if not isinstance(value, dict):
         return False, None
-    properties = _get_case_insensitive(value, "properties")
+    has_properties, properties = _budgeted_case_insensitive_lookup(
+        value,
+        "properties",
+        budget=budget,
+    )
+    if not has_properties:
+        return False, None
     if not isinstance(properties, dict):
         return False, None
     field_name = target.rsplit(".", 1)[-1]
-    if not _has_case_insensitive(properties, field_name):
-        return False, None
-    return True, _get_case_insensitive(properties, field_name)
+    return _budgeted_case_insensitive_lookup(
+        properties,
+        field_name,
+        budget=budget,
+    )
 
 
 def _resolve_property_observation(
@@ -2282,6 +3220,7 @@ def _resolve_property_observation(
     observation_path: str,
     observed_after: object,
     target: str,
+    budget: _PropertyPathBudget,
 ) -> tuple[bool, bool, object]:
     path_tokens = _property_path_tokens(observation_path)
     target_tokens = _property_path_tokens(target)
@@ -2292,12 +3231,21 @@ def _resolve_property_observation(
     value = observed_after
     for token in target_tokens[len(path_tokens) :]:
         if isinstance(token, str):
-            if not isinstance(value, dict) or not _has_case_insensitive(value, token):
+            if not isinstance(value, dict):
                 return True, False, None
-            value = _get_case_insensitive(value, token)
+            exists, child = _budgeted_case_insensitive_lookup(
+                value,
+                token,
+                budget=budget,
+            )
+            if not exists:
+                return True, False, None
+            value = child
         elif not isinstance(value, list) or token >= len(value):
+            budget.charge_lookup(1)
             return True, False, None
         else:
+            budget.charge_lookup(1)
             value = value[token]
     return True, True, value
 
@@ -2306,6 +3254,7 @@ def _deployment_access_delta_evidence(
     target: str,
     declared_delta_candidates: Sequence[tuple[str, object, str]],
     delta_observations: Sequence[tuple[str, object, str]],
+    budget: _PropertyPathBudget,
 ) -> tuple[bool, bool, bool, bool]:
     related: list[tuple[str, object, str]] = []
     for raw_path, after, property_change_type in declared_delta_candidates:
@@ -2320,6 +3269,7 @@ def _deployment_access_delta_evidence(
             observation_path=path,
             observed_after=after,
             target=target,
+            budget=budget,
         )
         if not observation_related:
             continue
@@ -2361,6 +3311,7 @@ def _key_vault_deployment_access_is_unsafe(
     before_payload: object,
     after_payload: object,
     complete_snapshots: bool,
+    budget: _PropertyPathBudget,
 ) -> bool:
     for target in _KEY_VAULT_DEPLOYMENT_ACCESS_TARGETS:
         (
@@ -2372,9 +3323,18 @@ def _key_vault_deployment_access_is_unsafe(
             target,
             declared_delta_candidates,
             delta_observations,
+            budget,
         )
-        before_has_value, before_value = _snapshot_property_state(before_payload, target)
-        after_has_value, after_value = _snapshot_property_state(after_payload, target)
+        before_has_value, before_value = _snapshot_property_state(
+            before_payload,
+            target,
+            budget=budget,
+        )
+        after_has_value, after_value = _snapshot_property_state(
+            after_payload,
+            target,
+            budget=budget,
+        )
         snapshot_mentions_target = before_has_value or after_has_value
 
         if observations_related and not observations_safe:
@@ -2446,6 +3406,10 @@ def _unsafe_property_violations(
     after_payload_supplied = _has_case_insensitive(change, "after")
     before_payload = _get_case_insensitive(change, "before")
     after_payload = _get_case_insensitive(change, "after")
+    protected_evidence = _ProtectedPropertyEvidence.for_resource_type(
+        resource_type,
+        budget=budget,
+    )
     snapshot_delta_candidates: list[tuple[str, object, str]] = []
     snapshot_index: _SnapshotPairIndex | None = None
     complete_snapshots = (
@@ -2472,11 +3436,46 @@ def _unsafe_property_violations(
             after_payload,
             budget=budget,
         )
+        protected_evidence.observe_snapshot(
+            "before",
+            before_payload,
+            complete=True,
+            snapshot_index=snapshot_index.before,
+        )
+        protected_evidence.observe_snapshot(
+            "after",
+            after_payload,
+            complete=True,
+            snapshot_index=snapshot_index.after,
+        )
         snapshot_delta_candidates = _derive_snapshot_delta(
             before_payload,
             after_payload,
             budget=budget,
         )
+    else:
+        if isinstance(before_payload, dict):
+            before_complete = _has_complete_resource_snapshot_shape(before_payload)
+            protected_evidence.observe_snapshot(
+                "before",
+                before_payload,
+                complete=before_complete,
+                snapshot_index=(
+                    _build_snapshot_index(before_payload, budget=budget)
+                    if before_complete
+                    else None
+                ),
+            )
+        if isinstance(after_payload, dict):
+            after_complete = _has_complete_resource_snapshot_shape(after_payload)
+            protected_evidence.observe_snapshot(
+                "after",
+                after_payload,
+                complete=after_complete,
+                snapshot_index=(
+                    _build_snapshot_index(after_payload, budget=budget) if after_complete else None
+                ),
+            )
     walked_delta_candidates = (
         _walk_delta(
             delta,
@@ -2487,6 +3486,7 @@ def _unsafe_property_violations(
                 if resource_type == _KEY_VAULT_TYPE
                 else frozenset()
             ),
+            protected_evidence=protected_evidence,
         )
         if delta
         else []
@@ -2588,6 +3588,7 @@ def _unsafe_property_violations(
             before_payload=before_payload,
             after_payload=after_payload,
             complete_snapshots=complete_snapshots,
+            budget=budget,
         )
         if authorization_mutation or unsafe_deployment_access:
             violations.append(
@@ -3087,45 +4088,23 @@ def evaluate_what_if(
     violations: list[PreflightViolation] = []
     path_budget = _PropertyPathBudget()
     changes, potential_changes = _what_if_changes(document)
-    for raw_change in potential_changes:
-        potential_change = _mapping(
-            raw_change,
-            field_name="potential change",
-        )
-        resource_id = _require_string(
-            _get_case_insensitive(potential_change, "resourceId"),
-            field_name="potential change resourceId",
-        )
-        if deployment_target is None:
-            _canonical_scope(resource_id)
-        else:
-            _validate_deployment_resource_id(
-                resource_id,
-                deployment_target=deployment_target,
-                field_name="potential change resourceId",
-            )
+    canonical_changes, canonical_potential_changes = _canonical_what_if_resource_rows(
+        changes,
+        potential_changes,
+        deployment_target=deployment_target,
+    )
+    for row in canonical_potential_changes:
         violations.append(
             PreflightViolation(
                 code="unpredictable-change",
-                subject=resource_id,
+                subject=row.resource_id,
                 detail="ARM what-if reported an unresolved potential change",
             )
         )
-    for raw_change in changes:
-        change = _mapping(raw_change, field_name="change")
-        resource_id = _require_string(
-            _get_case_insensitive(change, "resourceId"),
-            field_name="resourceId",
-        )
-        canonical_resource_id = (
-            _canonical_scope(resource_id)
-            if deployment_target is None
-            else _validate_deployment_resource_id(
-                resource_id,
-                deployment_target=deployment_target,
-                field_name="resourceId",
-            )
-        )
+    for row in canonical_changes:
+        change = row.value
+        resource_id = row.resource_id
+        canonical_resource_id = row.canonical_resource_id
         _validate_what_if_snapshot_ids(
             change,
             canonical_resource_id=canonical_resource_id,

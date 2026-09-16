@@ -276,6 +276,12 @@ exact shape. Create and Modify still require the reviewed allowlist and meaningf
 evidence; NoChange still requires identical complete snapshots. Every row remains bound to the
 reviewed subscription and resource-group boundary.
 
+Every canonical resource ID may appear only once across the combined `changes` and
+`potentialChanges` collections. Duplicate exact IDs, case or trailing-slash aliases, and
+contradictory rows such as Modify plus NoChange fail before property evaluation. Percent-encoded
+resource aliases are invalid, and the complete row set remains bound to the reviewed
+`whatIfDigest` and exact request digest.
+
 ARM resource and role-definition IDs, scopes, reviewed allowlist values, and request URLs must
 remain ASCII. Do not normalize or transliterate Unicode lookalikes; Kelvin sign `K`, long-s `ſ`, and
 percent-encoded Unicode aliases fail the gate.
@@ -285,6 +291,17 @@ work budget. Complete snapshot pairs are indexed once by canonical lowercase pat
 `NoEffect` lookup/token is charged to a deterministic aggregate budget. Nested delta hierarchies,
 wide snapshots, or lookup work that exceeds a bound fail before candidate materialization.
 `NoChange` uses one delta traversal and retains explicit root-object and inspectable-array checks.
+Protected schemas require object-valued `properties` and protected parents, array-valued access
+policy collections, and leaf booleans/strings without descendants. Paths such as
+`properties[0]`, `allowSharedKeyAccess.value`, `publicNetworkAccess.value`, or
+`ingress.external.value`, mixed exact/array paths, and delta/full-snapshot representation conflicts
+are malformed rather than interpreted. The same rule applies to dynamically named protected
+descendants that are represented as both objects and arrays, and to repeated or combined dotted
+snapshot aliases. Create/Delete/Remove presence claims and parent/child values must agree across
+every delta representation regardless of order. Complete snapshots are reconciled through their
+canonical path index; wide partial observations and ancestor traversal consume the same bounded
+lookup-work budget. Unchanged protected strings still require exact trimmed ASCII spelling and an
+allowed enum value.
 All status, change, method, principal/role type, and protected network/access values must be exact
 trimmed ASCII tokens before normalization. Do not repair whitespace or Unicode lookalikes manually.
 
