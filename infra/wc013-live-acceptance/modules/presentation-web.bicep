@@ -147,6 +147,21 @@ module presentationImagePull './acr-pull-rbac.bicep' = {
   params: {
     registryResourceId: presentationImageRegistryResourceId
     identityPrincipalId: presentationIdentityPrincipalId
+    image: validatedPresentationImage
+    registryRoleAssignmentMode: presentationImageRegistryRoleAssignmentMode
+  }
+}
+
+module presentationDeliveryImagePull './acr-pull-rbac.bicep' = if (presentationImageRegistryRoleAssignmentMode == 'AbacRepositoryPermissions') {
+  name: 'wc013-presentation-delivery-image-pull'
+  scope: resourceGroup(
+    split(presentationImageRegistryResourceId, '/')[2],
+    split(presentationImageRegistryResourceId, '/')[4]
+  )
+  params: {
+    registryResourceId: presentationImageRegistryResourceId
+    identityPrincipalId: presentationIdentityPrincipalId
+    image: validatedDeliveryImage
     registryRoleAssignmentMode: presentationImageRegistryRoleAssignmentMode
   }
 }
@@ -155,6 +170,7 @@ module presentationApp 'br/public:avm/res/app/container-app:0.23.0' = {
   name: 'wc013-private-presentation-app'
   dependsOn: [
     presentationImagePull
+    presentationDeliveryImagePull
   ]
   params: {
     name: presentationName
@@ -317,14 +333,34 @@ output identityClientId string = presentationIdentityClientId
 output identityPrincipalId string = presentationIdentityPrincipalId
 
 @description('Exact current presentation ACR pull assignment evidence.')
-output acrPullAssignment object = {
-  label: 'presentation'
-  assignmentResourceId: presentationImagePull.outputs.roleAssignmentResourceId
-  principalId: presentationIdentityPrincipalId
-  principalType: 'ServicePrincipal'
-  roleDefinitionId: presentationImagePull.outputs.roleDefinitionResourceId
-  roleAssignmentMode: presentationImagePull.outputs.roleAssignmentMode
-  scope: presentationImagePull.outputs.registryResourceId
-  conditionVersion: null
-  condition: null
-}
+output acrPullAssignments array = concat([
+  {
+    label: 'presentation'
+    assignmentResourceId: presentationImagePull.outputs.roleAssignmentResourceId
+    principalId: presentationIdentityPrincipalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: presentationImagePull.outputs.roleDefinitionResourceId
+    roleAssignmentMode: presentationImagePull.outputs.roleAssignmentMode
+    scope: presentationImagePull.outputs.registryResourceId
+    image: validatedPresentationImage
+    repositoryName: presentationImagePull.outputs.repositoryName
+    conditionVersion: presentationImagePull.outputs.?conditionVersion
+    condition: presentationImagePull.outputs.?condition
+  }
+], presentationImageRegistryRoleAssignmentMode == 'AbacRepositoryPermissions'
+  ? [
+      {
+        label: 'presentation-delivery'
+        assignmentResourceId: presentationDeliveryImagePull!.outputs.roleAssignmentResourceId
+        principalId: presentationIdentityPrincipalId
+        principalType: 'ServicePrincipal'
+        roleDefinitionId: presentationDeliveryImagePull!.outputs.roleDefinitionResourceId
+        roleAssignmentMode: presentationDeliveryImagePull!.outputs.roleAssignmentMode
+        scope: presentationDeliveryImagePull!.outputs.registryResourceId
+        image: validatedDeliveryImage
+        repositoryName: presentationDeliveryImagePull!.outputs.repositoryName
+        conditionVersion: presentationDeliveryImagePull!.outputs.?conditionVersion
+        condition: presentationDeliveryImagePull!.outputs.?condition
+      }
+    ]
+  : [])

@@ -268,6 +268,16 @@ fully materialized assignment array for every principal and group; a leaked cont
 malformed response, or unavailable assignment query fails closed rather than being interpreted as
 an empty page.
 
+For every exact queue, Blob container, Table, Key Vault key, and ACR registry scope used by a
+governed identity, readiness also calls the ARM `denyAssignments` endpoint with
+`$filter=atScope()` and follows every trusted `nextLink`. The evaluation includes direct
+principals, every resolved transitive group, the `All Principals` system identity, principal and
+group exclusions, inherited scopes, `doNotApplyToChildScopes`, enforced versus audit effects, and
+assignment-level and permission-level condition version `2.0` expressions. A deny that covers any
+required control-plane or data-plane runtime action blocks readiness. Missing pages, malformed
+permission arrays, unsupported conditions, or any other incomplete deny evidence also fail
+closed.
+
 ## Phase 4: deploy
 
 Deployment is an explicit operator action. The approved command, commit SHA, image digests,
@@ -312,12 +322,13 @@ earlier source commit, but its receipt, plan, handoff, stage scope, and inventor
 internally exact, including deployment name and predecessor-receipt lineage. Every pre-existing
 producer authority container, even an empty one, requires prior producer evidence; an out-of-band
 deployment cannot establish a new baseline. If a reviewed fresh producer create succeeds but
-eventually consistent ARM/RBAC readback prevents the handoff and receipt, rerun the same apply with
-`--resume-succeeded-deployment`. That read-only recovery path is limited to the original fresh
-producer plan: it never runs what-if or create, and it requires the exact succeeded deployment name,
-incremental mode, reviewed parameters, exported compiled template, outputs, enabled versioning, and
-empty container before issuing the recovery receipt. Deployment and readiness readbacks use eight
-bounded attempts with no delete or unreviewed mutation.
+eventually consistent ARM/RBAC readback or a crash before receipt publication prevents completion,
+rerun the same apply with `--resume-succeeded-deployment`. That read-only recovery path is limited
+to the original fresh producer plan: it never runs what-if or create, and it requires the exact
+succeeded deployment name, incremental mode, reviewed parameters, exported compiled template,
+outputs, enabled versioning, and empty container before issuing the recovery receipt. If the first
+attempt already published a handoff, the recovered handoff must be byte-identical. Deployment and
+readiness readbacks use eight bounded attempts with no delete or unreviewed mutation.
 
 Identity and role migrations use two separately reviewed phases. Phase A runs
 `prepare-revocation`, verifies each exact stale assignment while it is still present, and emits
@@ -333,14 +344,18 @@ Supply `--rotation-transition-assignment <exact-role-assignment-id>
 `--legacy-crypto-user-migration-assignment <exact-role-assignment-id>` in the same phase.
 
 Upgrading from an earlier ACR module requires a separate reviewed migration because the corrected
-principal-object-ID seed intentionally produces a new role-assignment GUID. Record each old
-assignment to `prepare-revocation` with `--legacy-acr-pull-migration-assignment
+principal-object-ID or repository seed intentionally produces a new role-assignment GUID. Record
+each old assignment to `prepare-revocation` with `--legacy-acr-pull-migration-assignment
 <old-assignment-id> <exact-principal-id>`. Phase A requires every listed legacy assignment to be present with its
-exact ACR scope, `AcrPull` role, service-principal type, and absent condition. A controlled
-operator action must revoke all listed assignments before apply; apply and post-deployment
-readiness require continued absence. This boundary covers the producer, publisher, and all WC-013
-acceptance, evidence, controller, detector, orchestrator, notification, and presentation pull
-assignments. The orchestrator never deletes them.
+exact ACR scope, service-principal type, and one recognized obsolete profile: unconditioned
+`AcrPull`, or the exact pre-remediation unconditioned `Container Registry Repository Reader` on an
+ABAC-enabled registry. A controlled operator action must revoke all listed assignments before
+apply; apply and post-deployment readiness require continued absence. Canonically conditioned
+Repository Reader assignments for a retired principal use
+`--rotation-transition-assignment <assignment-id> <retired-principal-id>` instead; their exact
+repository condition is preserved in revocation evidence. This boundary covers the producer,
+publisher, and all WC-013 acceptance, evidence, controller, detector, orchestrator, notification,
+and presentation pull assignments. The orchestrator never deletes them.
 
 ```powershell
 $Orchestrator = '.\scripts\wc029_deployment_orchestration.py'
@@ -370,8 +385,8 @@ python $Orchestrator plan --stage producer `
 python $Orchestrator apply --plan-manifest <reviewed producer plan> `
   --reviewed-plan-sha256 <independently recorded sha256:...>
 
-# Only after the exact fresh producer deployment succeeded but receipt issuance was
-# blocked by eventually consistent readback:
+# Only after the exact fresh producer deployment succeeded but evidence completion was
+# blocked by eventually consistent readback or a crash after the handoff write:
 python $Orchestrator apply --plan-manifest <same reviewed producer plan> `
   --reviewed-plan-sha256 <same independently recorded sha256:...> `
   --resume-succeeded-deployment
@@ -407,13 +422,21 @@ parameter artifact, evidence directory, and explicit `--allow-change` entry for 
 create or modify. WC-027 resource-group stages additionally require
 `--resource-group rg-athena-wc013-live`. Do not treat these abbreviated placeholders as executable
 approval; record the complete reviewed commands and plan-file SHA-256 values separately in the
-evidence bundle. `apply` writes the immutable `athena.wc029DeploymentHandoff.v5` handoff and a separate
+evidence bundle. `apply` writes the immutable `athena.wc029DeploymentHandoff.v6` handoff and a separate
 `athena.wc029DeploymentReceipt.v4`, then prints the receipt path. Independently record the receipt
 SHA-256 before using it in a later stage. Each later `plan` loads the predecessor receipt, its
 referenced plan, effective parameters, what-if, handoff, and earlier receipt chain; a handoff's
 self-computed hashes alone are never approval evidence. The evidence directory must be outside the
 repository. Planning and apply both refuse a dirty working tree, duplicate allowlist entries, the
 wrong stage scope, or any missing or extra predecessor handoff/receipt/approval digest.
+
+Fresh-producer recovery is idempotent across the handoff/receipt publication boundary. If create
+succeeded and the byte-exact handoff was durably written but the process stopped before writing
+the receipt, rerun the same reviewed plan with `--resume-succeeded-deployment`. The orchestrator
+re-attests the succeeded deployment, template, parameters, outputs, RBAC, deny assignments,
+image-pull proof, and authority checkpoint, then compares the existing handoff byte-for-byte with
+the newly derived handoff and writes only the missing receipt. An existing conflicting handoff or
+any existing receipt is never overwritten.
 
 The two WC-027 roots derive their configuration JSON from live ARM resource references, which ARM
 what-if cannot fully resolve. Their reviewed digest parameters are therefore recomputed against
@@ -442,25 +465,35 @@ accepted WC-027 handoffs.
 Every ACR pull module is deployed at the exact subscription and resource group parsed from
 `registryResourceId`; for the fixed topology this is `rg-athena-platform-dev`, not the WC-027
 runtime resource group. The role-assignment GUID is seeded with the canonical registry ID, the
-server-returned service-principal object ID, and the full role-definition ID, so deleting and
-recreating a same-name UAMI produces a new legal assignment. Each assignment sets
+server-returned service-principal object ID, and the full role-definition ID; ABAC assignments add
+the exact repository parsed from the reviewed digest-pinned image to the seed so one principal can
+hold distinct per-repository grants. Deleting and recreating a same-name UAMI therefore produces a
+new legal assignment. Each assignment sets
 `principalType: ServicePrincipal`. The module explicitly calls guarded
 `reference(registry.id, '2025-04-01', 'Full')` and exports that server-returned ID; a constructed
 `existing.id` alone is never treated as runtime evidence.
 
-Foundation and live-acceptance outputs inventory the seven current WC-013/WC-016/presentation ACR
-assignments with exact label, assignment ID, principal, role, mode, scope, type, and null condition.
-The handoff also carries the phase-A `revocationAssignments` records for retired assignments with a
-separate digest. Readiness re-reads every current assignment and each registry mode, enumerates the
-registry scopes, and rejects any extra legacy or mode-compatible pull grant held by a governed
-principal.
+Foundation and live-acceptance outputs inventory the current WC-013/WC-016/presentation ACR
+assignments with exact label, digest-pinned image, parsed repository, assignment ID, principal,
+role, mode, scope, type, and condition. Legacy mode has the seven existing registry-wide
+`AcrPull` assignments with null conditions. ABAC mode adds a separate presentation-delivery
+assignment because the presentation identity pulls two repositories, and every Repository Reader
+assignment has condition version `2.0` plus the canonical exact repository-name condition. The
+handoff also carries the phase-A `revocationAssignments` records for retired assignments with a
+separate digest. Readiness re-reads every current assignment and each registry mode, resolves every
+effective role definition across direct, inherited, and transitive-group assignments throughout
+the governed subscription, and rejects all extra pull-capable grants even when they target a
+sibling registry. This includes `AcrPush`, Repository Writer/Contributor, and custom roles whose
+effective actions or data actions grant legacy pull or repository content read.
 
 Readiness compares the reviewed mode with the live ACR `roleAssignmentMode`.
 `LegacyRegistryPermissions` requires `AcrPull`; `AbacRepositoryPermissions` requires
-`Container Registry Repository Reader` because an ABAC-enabled registry does not honor legacy
-`AcrPull`. After exact RBAC verification, readiness starts a bounded no-op Container Apps Job
-execution with the digest-pinned image, waits for `Succeeded`, validates the execution image and
-command override, and records the execution in digest-bound handoff/receipt evidence. The probe
+`Container Registry Repository Reader` with the exact repository condition because an ABAC-enabled
+registry does not honor legacy `AcrPull`. Missing, altered, prefix, multi-repository, or
+registry-wide conditions fail closed. After exact RBAC verification, readiness starts a bounded
+no-op Container Apps Job execution with the digest-pinned image, waits for `Succeeded`, validates
+the execution image and command override, and records the execution in digest-bound handoff/receipt
+evidence. The probe
 does not pass `--registry-identity`, create RBAC, or invoke the production job entry point.
 
 Producer verification also models the publisher transition explicitly.

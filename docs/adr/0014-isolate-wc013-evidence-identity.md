@@ -52,8 +52,9 @@ path, and `athena/wc013-live` ACR RepoDigest. It then pulls and verifies the con
 executes its fixed entrypoint in a read-only unprivileged container. Controller code is never
 installed on or executed through host Python. A short-lived ARM token is piped to container stdin,
 consumed once, and never stored in an argument, environment variable, file, or mount. The
-identity receives only the Job actions and ACR `AcrPull`; it cannot read deployments and has no client secret, caller
-path, command, or image/template override.
+identity receives only the Job actions and the mode-compatible ACR image-pull role; ABAC mode
+restricts Repository Reader to the exact controller repository. It cannot read deployments and has
+no client secret, caller path, command, or image/template override.
 
 Collector artifacts use a dedicated immutable Blob container. The evidence identity has
 create/read capability only on that collector container and replay table. The context identity has
@@ -120,7 +121,8 @@ access is not supported.
 
 - Static Bicep tests prove collector and evaluator jobs have disjoint identity sets and storage
   roles, that collector start permission is assigned only to the controller role, and that this
-  identity has only one additional registry-scoped `AcrPull` assignment.
+  identity has only one additional registry-scoped image-pull assignment, with an exact
+  repository-name condition when the registry uses ABAC permissions.
 - Deterministic tests cover exact deployed-template validation, exact-template-pinned start requests,
   plan/transport-bound handoff loading, cross-endpoint relabel rejection, exact immutable Blob
   reads, artifact-capacity boundaries, tampered envelope rejection, and evidence-only collector

@@ -1189,6 +1189,7 @@ module acceptanceImagePull 'modules/acr-pull-rbac.bicep' = {
   params: {
     registryResourceId: acceptanceImageRegistryResourceId
     identityPrincipalId: acceptanceJobIdentity.properties.principalId
+    image: validatedAcceptanceImage
     registryRoleAssignmentMode: acceptanceImageRegistryRoleAssignmentMode
   }
 }
@@ -1205,6 +1206,7 @@ module evidenceCollectorImagePull 'modules/acr-pull-rbac.bicep' = {
   params: {
     registryResourceId: acceptanceImageRegistryResourceId
     identityPrincipalId: evidenceIdentity.properties.principalId
+    image: validatedAcceptanceImage
     registryRoleAssignmentMode: acceptanceImageRegistryRoleAssignmentMode
   }
 }
@@ -1218,6 +1220,7 @@ module collectorControllerImagePull 'modules/acr-pull-rbac.bicep' = {
   params: {
     registryResourceId: acceptanceImageRegistryResourceId
     identityPrincipalId: collectorControllerIdentity.outputs.principalId
+    image: validatedControllerImage
     registryRoleAssignmentMode: acceptanceImageRegistryRoleAssignmentMode
   }
 }
@@ -1231,6 +1234,7 @@ module wc016DetectorImagePull 'modules/acr-pull-rbac.bicep' = if (validatedWc016
   params: {
     registryResourceId: acceptanceImageRegistryResourceId
     identityPrincipalId: wc016DetectorIdentity.outputs.principalId
+    image: validatedWc016DetectorImage
     registryRoleAssignmentMode: acceptanceImageRegistryRoleAssignmentMode
   }
 }
@@ -1244,6 +1248,7 @@ module wc016OrchestratorImagePull 'modules/acr-pull-rbac.bicep' = if (validatedW
   params: {
     registryResourceId: acceptanceImageRegistryResourceId
     identityPrincipalId: wc016OrchestratorIdentity.outputs.principalId
+    image: validatedWc016OrchestratorImage
     registryRoleAssignmentMode: acceptanceImageRegistryRoleAssignmentMode
   }
 }
@@ -1257,11 +1262,12 @@ module wc016NotificationImagePull 'modules/acr-pull-rbac.bicep' = if (validatedW
   params: {
     registryResourceId: acceptanceImageRegistryResourceId
     identityPrincipalId: wc016NotificationIdentity.outputs.principalId
+    image: validatedWc016OrchestratorImage
     registryRoleAssignmentMode: acceptanceImageRegistryRoleAssignmentMode
   }
 }
 
-var wc013CoreAcrPullAssignments = [
+var wc013CoreAcrPullAssignments = concat([
   {
     label: 'acceptance'
     assignmentResourceId: acceptanceImagePull.outputs.roleAssignmentResourceId
@@ -1270,8 +1276,10 @@ var wc013CoreAcrPullAssignments = [
     roleDefinitionId: acceptanceImagePull.outputs.roleDefinitionResourceId
     roleAssignmentMode: acceptanceImagePull.outputs.roleAssignmentMode
     scope: acceptanceImagePull.outputs.registryResourceId
-    conditionVersion: null
-    condition: null
+    image: validatedAcceptanceImage
+    repositoryName: acceptanceImagePull.outputs.repositoryName
+    conditionVersion: acceptanceImagePull.outputs.?conditionVersion
+    condition: acceptanceImagePull.outputs.?condition
   }
   {
     label: 'evidence'
@@ -1281,8 +1289,10 @@ var wc013CoreAcrPullAssignments = [
     roleDefinitionId: evidenceCollectorImagePull.outputs.roleDefinitionResourceId
     roleAssignmentMode: evidenceCollectorImagePull.outputs.roleAssignmentMode
     scope: evidenceCollectorImagePull.outputs.registryResourceId
-    conditionVersion: null
-    condition: null
+    image: validatedAcceptanceImage
+    repositoryName: evidenceCollectorImagePull.outputs.repositoryName
+    conditionVersion: evidenceCollectorImagePull.outputs.?conditionVersion
+    condition: evidenceCollectorImagePull.outputs.?condition
   }
   {
     label: 'controller'
@@ -1292,11 +1302,12 @@ var wc013CoreAcrPullAssignments = [
     roleDefinitionId: collectorControllerImagePull.outputs.roleDefinitionResourceId
     roleAssignmentMode: collectorControllerImagePull.outputs.roleAssignmentMode
     scope: collectorControllerImagePull.outputs.registryResourceId
-    conditionVersion: null
-    condition: null
+    image: validatedControllerImage
+    repositoryName: collectorControllerImagePull.outputs.repositoryName
+    conditionVersion: collectorControllerImagePull.outputs.?conditionVersion
+    condition: collectorControllerImagePull.outputs.?condition
   }
-  presentationWeb.outputs.acrPullAssignment
-]
+], presentationWeb.outputs.acrPullAssignments)
 var wc016AcrPullAssignments = validatedWc016RuntimeEnabled
   ? [
       {
@@ -1307,8 +1318,10 @@ var wc016AcrPullAssignments = validatedWc016RuntimeEnabled
         roleDefinitionId: wc016DetectorImagePull!.outputs.roleDefinitionResourceId
         roleAssignmentMode: wc016DetectorImagePull!.outputs.roleAssignmentMode
         scope: wc016DetectorImagePull!.outputs.registryResourceId
-        conditionVersion: null
-        condition: null
+        image: validatedWc016DetectorImage
+        repositoryName: wc016DetectorImagePull!.outputs.repositoryName
+        conditionVersion: wc016DetectorImagePull!.outputs.?conditionVersion
+        condition: wc016DetectorImagePull!.outputs.?condition
       }
       {
         label: 'wc016-orchestrator'
@@ -1318,8 +1331,10 @@ var wc016AcrPullAssignments = validatedWc016RuntimeEnabled
         roleDefinitionId: wc016OrchestratorImagePull!.outputs.roleDefinitionResourceId
         roleAssignmentMode: wc016OrchestratorImagePull!.outputs.roleAssignmentMode
         scope: wc016OrchestratorImagePull!.outputs.registryResourceId
-        conditionVersion: null
-        condition: null
+        image: validatedWc016OrchestratorImage
+        repositoryName: wc016OrchestratorImagePull!.outputs.repositoryName
+        conditionVersion: wc016OrchestratorImagePull!.outputs.?conditionVersion
+        condition: wc016OrchestratorImagePull!.outputs.?condition
       }
       {
         label: 'wc016-notification'
@@ -1329,8 +1344,10 @@ var wc016AcrPullAssignments = validatedWc016RuntimeEnabled
         roleDefinitionId: wc016NotificationImagePull!.outputs.roleDefinitionResourceId
         roleAssignmentMode: wc016NotificationImagePull!.outputs.roleAssignmentMode
         scope: wc016NotificationImagePull!.outputs.registryResourceId
-        conditionVersion: null
-        condition: null
+        image: validatedWc016OrchestratorImage
+        repositoryName: wc016NotificationImagePull!.outputs.repositoryName
+        conditionVersion: wc016NotificationImagePull!.outputs.?conditionVersion
+        condition: wc016NotificationImagePull!.outputs.?condition
       }
     ]
   : []

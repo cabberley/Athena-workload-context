@@ -6,6 +6,7 @@ import binascii
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -13,12 +14,12 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
-from urllib.parse import urlparse
+from typing import Any, Never
+from urllib.parse import parse_qs, urlparse
 from uuid import UUID, uuid5
 
 from cryptography.hazmat.primitives import serialization
@@ -68,8 +69,11 @@ SUBSCRIPTION_STAGES = frozenset({"foundation", "live-acceptance"})
 SHA256_PREFIX = "sha256:"
 ARM_GUID_NAMESPACE = UUID("11fb06fb-712d-4ddd-98c7-e71bbd588830")
 GRAPH_HOST = "graph.microsoft.com"
+ARM_HOST = "management.azure.com"
 MAX_TRANSITIVE_GROUPS = 10_000
 MAX_GRAPH_MEMBERSHIP_PAGES = 128
+MAX_DENY_ASSIGNMENT_PAGES = 128
+MAX_DENY_ASSIGNMENTS = 10_000
 MAX_APPROVED_TRIGGER_QUEUE_TRANSITION_ASSIGNMENTS = 4
 MAX_APPROVED_ROTATION_TRANSITION_ASSIGNMENTS = 32
 MAX_LEGACY_CRYPTO_USER_MIGRATION_ASSIGNMENTS = 5
@@ -85,11 +89,11 @@ REVIEWED_RSA_KEY_SIZE_BITS = 3072
 REVIEWED_RSA_KEY_OPERATIONS = frozenset({"sign", "verify"})
 PREFLIGHT_PATH = ROOT / "src" / "athena_context" / "wc029_preflight.py"
 PLAN_SCHEMA_VERSION = "athena.wc029DeploymentPlan.v7"
-HANDOFF_SCHEMA_VERSION = "athena.wc029DeploymentHandoff.v5"
+HANDOFF_SCHEMA_VERSION = "athena.wc029DeploymentHandoff.v6"
 RECEIPT_SCHEMA_VERSION = "athena.wc029DeploymentReceipt.v4"
 REVOCATION_PLAN_SCHEMA_VERSION = "athena.wc029RevocationPlan.v1"
 AUTHORITY_BLOB_INVENTORY_SCHEMA_VERSION = "athena.wc029AuthorityBlobInventory.v2"
-IMAGE_PULL_EVIDENCE_SCHEMA_VERSION = "athena.wc029ImagePullEvidence.v1"
+IMAGE_PULL_EVIDENCE_SCHEMA_VERSION = "athena.wc029ImagePullEvidence.v2"
 HANDOFF_FIELDS = frozenset(
     {
         "schemaVersion",
@@ -261,6 +265,16 @@ WC013_ACR_ASSIGNMENT_LABELS = (
     "wc016-orchestrator",
     "wc016-notification",
 )
+WC013_ACR_ABAC_ASSIGNMENT_LABELS = (
+    "acceptance",
+    "evidence",
+    "controller",
+    "presentation",
+    "presentation-delivery",
+    "wc016-detector",
+    "wc016-orchestrator",
+    "wc016-notification",
+)
 PUBLISHER_INVOCATION_BOUNDARY = {
     "schemaVersion": "athena.wc029PublisherInvocationBoundary.v1",
     "automaticRequestProducerPresent": False,
@@ -346,8 +360,11 @@ PRODUCER_OUTPUT_FIELDS = frozenset(
         "notificationQueueResourceId",
         "registryResourceId",
         "registryRoleAssignmentMode",
+        "registryRepositoryName",
         "registryPullRoleDefinitionId",
         "registryPullRoleAssignmentResourceId",
+        "registryPullConditionVersion",
+        "registryPullCondition",
         "namespaceHostName",
     }
 )
@@ -371,8 +388,11 @@ PUBLISHER_OUTPUT_FIELDS = frozenset(
         "bindingKeyVaultKeyId",
         "registryResourceId",
         "registryRoleAssignmentMode",
+        "registryRepositoryName",
         "registryPullRoleDefinitionId",
         "registryPullRoleAssignmentResourceId",
+        "registryPullConditionVersion",
+        "registryPullCondition",
     }
 )
 PRODUCER_BINDING_FIELDS = frozenset(
@@ -444,6 +464,18 @@ class _ExpectedRoleAssignment:
     condition_version: str | None = None
     condition: str | None = None
     custom_role_permissions: _RolePermissionProfile | None = None
+    repository_name: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _RequiredRuntimeAction:
+    label: str
+    principal_id: str
+    scope: str
+    action: str
+    is_data_action: bool
+    repository_name: str | None = None
+    suboperation: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -953,6 +985,79 @@ def _digest_pinned_image(value: object, *, field: str) -> str:
     return image
 
 
+def _acr_repository_name(
+    image: object,
+    registry_resource_id: object,
+    *,
+    field: str,
+) -> str:
+    digest_pinned_image = _digest_pinned_image(image, field=field)
+    registry_id = _azure_resource_id(
+        registry_resource_id,
+        field=f"{field} registry resource ID",
+    )
+    if _resource_type(registry_id) != "microsoft.containerregistry/registries":
+        raise OrchestrationError(f"{field} registry resource ID must identify one registry")
+    registry_name = registry_id.rstrip("/").rsplit("/", 1)[-1].casefold()
+    registry_prefix = f"{registry_name}.azurecr.io/"
+    repository_reference = digest_pinned_image.rsplit("@sha256:", 1)[0]
+    if not repository_reference.startswith(registry_prefix):
+        raise OrchestrationError(
+            f"{field} registry server does not match its reviewed registry resource ID"
+        )
+    repository_name = repository_reference.removeprefix(registry_prefix)
+    if (
+        len(repository_name) > 256
+        or re.fullmatch(
+            r"[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*",
+            repository_name,
+        )
+        is None
+    ):
+        raise OrchestrationError(f"{field} contains an invalid ACR repository name")
+    return repository_name
+
+
+def _acr_repository_condition(repository_name: str) -> str:
+    if (
+        len(repository_name) > 256
+        or re.fullmatch(
+            r"[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*",
+            repository_name,
+        )
+        is None
+    ):
+        raise OrchestrationError("ACR repository condition requires one canonical repository name")
+    return f"{ACR_REPOSITORY_CONDITION_PREFIX}{repository_name}{ACR_REPOSITORY_CONDITION_SUFFIX}"
+
+
+def _acr_repository_name_from_condition(value: object, *, field: str) -> str:
+    condition = _string(value, field=field)
+    if not (
+        condition.startswith(ACR_REPOSITORY_CONDITION_PREFIX)
+        and condition.endswith(ACR_REPOSITORY_CONDITION_SUFFIX)
+    ):
+        raise OrchestrationError(f"{field} is not the canonical exact-repository condition")
+    repository_name = condition[
+        len(ACR_REPOSITORY_CONDITION_PREFIX) : -len(ACR_REPOSITORY_CONDITION_SUFFIX)
+    ]
+    if _acr_repository_condition(repository_name) != condition:
+        raise OrchestrationError(f"{field} is not the canonical exact-repository condition")
+    return repository_name
+
+
+def _acr_pull_assignment_condition(
+    *,
+    role_assignment_mode: str,
+    repository_name: str,
+) -> tuple[str | None, str | None]:
+    if role_assignment_mode == ACR_LEGACY_ROLE_ASSIGNMENT_MODE:
+        return None, None
+    if role_assignment_mode != ACR_ABAC_ROLE_ASSIGNMENT_MODE:
+        raise OrchestrationError("ACR role-assignment mode is unsupported")
+    return "2.0", _acr_repository_condition(repository_name)
+
+
 def _azure_resource_id(value: object, *, field: str) -> str:
     resource_id = _string(value, field=field)
     segments = [segment for segment in resource_id.split("/") if segment]
@@ -1018,17 +1123,98 @@ def _require_subscription_resource_id_equal(
 
 def _write_new_bytes(path: Path, raw_bytes: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = -1
+    temporary_path: Path | None = None
     try:
-        with path.open("xb") as handle:
-            handle.write(raw_bytes)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=path.parent,
+        )
+        temporary_path = Path(temporary_name)
+        os.chmod(temporary_path, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = -1
+            offset = 0
+            while offset < len(raw_bytes):
+                written = handle.write(raw_bytes[offset:])
+                if written is None or written <= 0:
+                    raise OrchestrationError(
+                        f"immutable evidence write made no progress for {path}"
+                    )
+                offset += written
             handle.flush()
             os.fsync(handle.fileno())
+        os.link(temporary_path, path)
     except FileExistsError as exc:
         raise OrchestrationError(f"refusing to overwrite immutable evidence {path}") from exc
+    except OrchestrationError:
+        raise
+    except OSError as exc:
+        raise OrchestrationError(
+            f"cannot atomically publish immutable evidence {path}: {exc}"
+        ) from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary_path is not None:
+            with suppress(FileNotFoundError):
+                temporary_path.unlink()
 
 
 def _write_new_json(path: Path, value: object) -> None:
     _write_new_bytes(path, _canonical_json_file_bytes(value))
+
+
+def _publish_evidence_bundle(
+    *,
+    handoff_path: Path,
+    handoff_raw_bytes: bytes,
+    receipt_path: Path,
+    receipt_raw_bytes: bytes,
+    allow_existing_handoff: bool,
+) -> None:
+    if receipt_path.exists():
+        raise OrchestrationError(f"refusing to overwrite immutable evidence {receipt_path}")
+    if handoff_path.exists():
+        if not allow_existing_handoff:
+            raise OrchestrationError(f"refusing to overwrite immutable evidence {handoff_path}")
+        existing_handoff_bytes, _ = _read_regular_file_once(
+            handoff_path,
+            field="partially published deployment handoff",
+        )
+        if existing_handoff_bytes != handoff_raw_bytes:
+            raise OrchestrationError(
+                "existing partial deployment handoff conflicts with revalidated deployment evidence"
+            )
+    else:
+        _write_new_bytes(handoff_path, handoff_raw_bytes)
+    _write_new_bytes(receipt_path, receipt_raw_bytes)
+
+
+def _load_partial_handoff_for_resume(
+    *,
+    handoff_path: Path,
+    receipt_path: Path,
+    resume_succeeded_deployment: bool,
+    stage: str,
+    artifact_reader: _ArtifactReader,
+) -> dict[str, Any] | None:
+    if receipt_path.exists():
+        raise OrchestrationError(f"refusing to overwrite immutable evidence {receipt_path}")
+    if not handoff_path.exists():
+        return None
+    if not resume_succeeded_deployment:
+        raise OrchestrationError(f"refusing to overwrite immutable evidence {handoff_path}")
+    return _load_handoff(
+        handoff_path,
+        expected_stage=stage,
+        document=artifact_reader.capture_json(
+            handoff_path,
+            field="partially published deployment handoff",
+        ).document,
+        artifact_reader=artifact_reader,
+    )
 
 
 def _write_and_capture_exact_json(
@@ -3084,6 +3270,8 @@ def _validated_wc013_acr_pull_assignments(
                     "roleDefinitionId",
                     "roleAssignmentMode",
                     "scope",
+                    "image",
+                    "repositoryName",
                     "conditionVersion",
                     "condition",
                 }
@@ -3128,30 +3316,101 @@ def _validated_wc013_acr_pull_assignments(
         )
         if _resource_type(scope) != "microsoft.containerregistry/registries":
             raise OrchestrationError("WC-013 ACR pull assignment scope must identify one registry")
+        image = _digest_pinned_image(
+            assignment.get("image"),
+            field=f"WC-013 ACR pull assignment {index} image",
+        )
+        repository_name = _acr_repository_name(
+            image,
+            scope,
+            field=f"WC-013 ACR pull assignment {index} image",
+        )
+        _require_equal(
+            assignment.get("repositoryName"),
+            repository_name,
+            field=f"WC-013 ACR pull assignment {index} repository name",
+        )
         _require_subscription_resource_id_equal(
             assignment_resource_id,
-            _deterministic_principal_role_assignment_id(
-                scope,
-                principal_id,
-                expected_role_definition_id,
+            _acr_pull_role_assignment_id(
+                scope=scope,
+                principal_id=principal_id,
+                role_definition_id=expected_role_definition_id,
+                role_assignment_mode=role_assignment_mode,
+                repository_name=repository_name,
             ),
             subscription_id=subscription_id,
             field=f"WC-013 ACR pull assignment {index} deterministic ID",
         )
+        expected_condition_version, expected_condition = _acr_pull_assignment_condition(
+            role_assignment_mode=role_assignment_mode,
+            repository_name=repository_name,
+        )
         if (
-            assignment.get("conditionVersion") is not None
-            or assignment.get("condition") is not None
+            assignment.get("conditionVersion") != expected_condition_version
+            or assignment.get("condition") != expected_condition
         ):
-            raise OrchestrationError("WC-013 ACR pull assignment must not contain a condition")
+            raise OrchestrationError(
+                "WC-013 ACR pull assignment condition does not restrict its exact repository"
+            )
         assignments.append(dict(assignment))
-    if tuple(item["label"] for item in assignments) != WC013_ACR_ASSIGNMENT_LABELS:
+    labels = tuple(item["label"] for item in assignments)
+    presentation = next(
+        (item for item in assignments if item["label"] == "presentation"),
+        None,
+    )
+    if presentation is None:
         raise OrchestrationError(
             "WC-013 ACR pull assignment labels/order do not match the exact inventory"
         )
-    if len({str(item["assignmentResourceId"]).casefold() for item in assignments}) != len(
-        assignments
-    ) or len({str(item["principalId"]).casefold() for item in assignments}) != len(assignments):
-        raise OrchestrationError("WC-013 ACR pull assignment IDs and principals must be distinct")
+    expected_labels = (
+        WC013_ACR_ABAC_ASSIGNMENT_LABELS
+        if presentation["roleAssignmentMode"] == ACR_ABAC_ROLE_ASSIGNMENT_MODE
+        else WC013_ACR_ASSIGNMENT_LABELS
+    )
+    if labels != expected_labels:
+        raise OrchestrationError(
+            "WC-013 ACR pull assignment labels/order do not match the exact inventory"
+        )
+    assignment_ids = {str(item["assignmentResourceId"]).casefold() for item in assignments}
+    if len(assignment_ids) != len(assignments):
+        raise OrchestrationError("WC-013 ACR pull assignment IDs must be distinct")
+    labels_by_principal: dict[str, set[str]] = {}
+    for item in assignments:
+        labels_by_principal.setdefault(
+            str(item["principalId"]).casefold(),
+            set(),
+        ).add(str(item["label"]))
+    duplicate_label_sets = {
+        frozenset(item_labels)
+        for item_labels in labels_by_principal.values()
+        if len(item_labels) > 1
+    }
+    allowed_duplicate_label_sets = (
+        {frozenset({"presentation", "presentation-delivery"})}
+        if labels == WC013_ACR_ABAC_ASSIGNMENT_LABELS
+        else set()
+    )
+    if duplicate_label_sets - allowed_duplicate_label_sets:
+        raise OrchestrationError(
+            "WC-013 ACR pull assignment principals must be distinct except for "
+            "the exact ABAC presentation image pair"
+        )
+    if labels == WC013_ACR_ABAC_ASSIGNMENT_LABELS:
+        presentation_delivery = next(
+            item for item in assignments if item["label"] == "presentation-delivery"
+        )
+        if (
+            presentation_delivery["principalId"] != presentation["principalId"]
+            or str(presentation_delivery["scope"]).casefold()
+            != str(presentation["scope"]).casefold()
+            or presentation_delivery["roleAssignmentMode"] != ACR_ABAC_ROLE_ASSIGNMENT_MODE
+            or presentation_delivery["repositoryName"] == presentation["repositoryName"]
+        ):
+            raise OrchestrationError(
+                "WC-013 ABAC presentation assignments must bind one principal to "
+                "two distinct exact image repositories"
+            )
     return assignments
 
 
@@ -3164,7 +3423,12 @@ def _verify_wc013_acr_pull_assignments(
         value,
         subscription_id=subscription_id,
     )
-    expected_by_principal = {str(item["principalId"]).casefold(): item for item in assignments}
+    expected_by_principal: dict[str, list[dict[str, object]]] = {}
+    for item in assignments:
+        expected_by_principal.setdefault(
+            str(item["principalId"]).casefold(),
+            [],
+        ).append(item)
     registry_modes: dict[str, str] = {}
     for assignment in assignments:
         scope = str(assignment["scope"])
@@ -3226,54 +3490,92 @@ def _verify_wc013_acr_pull_assignments(
                 field="WC-013 ACR assignment scope",
             )
         if (
-            properties.get("conditionVersion") is not None
-            or properties.get("condition") is not None
+            properties.get("conditionVersion") != assignment["conditionVersion"]
+            or properties.get("condition") != assignment["condition"]
         ):
-            raise OrchestrationError("WC-013 ACR assignment must not contain a condition")
-    registry_scopes = {str(item["scope"]).casefold() for item in assignments}
-    for principal_id, expected in expected_by_principal.items():
+            raise OrchestrationError(
+                "WC-013 ACR assignment does not preserve its exact repository condition"
+            )
+    role_definitions: dict[str, dict[str, Any]] = {}
+    for principal_id, expected_assignments in expected_by_principal.items():
         observed = _resolved_effective_role_assignments(
             principal_id,
             subscription_id=subscription_id,
             field=f"effective WC-013 ACR assignments for {principal_id}",
         )
-        expected_assignment_id = str(expected["assignmentResourceId"]).casefold()
-        expected_seen = False
-        for raw_assignment in observed:
+        expected_by_id = {
+            str(expected["assignmentResourceId"]).casefold(): expected
+            for expected in expected_assignments
+        }
+        observed_expected_ids: set[str] = set()
+        for observed_index, raw_assignment in enumerate(observed):
             observed_assignment = _mapping(
                 raw_assignment,
-                field="effective WC-013 ACR assignment",
+                field=f"effective WC-013 ACR assignment {observed_index}",
             )
-            role_definition_id = observed_assignment.get("roleDefinitionId")
-            assignment_scope = observed_assignment.get("scope")
-            if (
-                isinstance(role_definition_id, str)
-                and isinstance(assignment_scope, str)
-                and role_definition_id.casefold().rsplit("/", 1)[-1]
-                in {ACR_PULL_ROLE_ID, ACR_REPOSITORY_READER_ROLE_ID}
-                and any(
-                    _scopes_overlap(assignment_scope, registry_scope)
-                    for registry_scope in registry_scopes
+            assignment_scope = _string(
+                observed_assignment.get("scope"),
+                field="effective WC-013 ACR assignment scope",
+            )
+            role_definition_id = _string(
+                observed_assignment.get("roleDefinitionId"),
+                field="effective WC-013 ACR role definition ID",
+            )
+            normalized_role_definition_id = role_definition_id.casefold()
+            role_definition = role_definitions.get(normalized_role_definition_id)
+            if role_definition is None:
+                role_definition = _get_role_definition(
+                    role_definition_id,
+                    subscription_id=subscription_id,
                 )
+                role_definitions[normalized_role_definition_id] = role_definition
+            if not _role_definition_grants_acr_pull(role_definition):
+                continue
+            observed_id = _string(
+                observed_assignment.get("id"),
+                field="effective WC-013 ACR assignment ID",
+            ).casefold()
+            observed_principal_id = _canonical_directory_object_id(
+                observed_assignment.get("principalId"),
+                field="effective WC-013 ACR assignment principal ID",
+            )
+            expected = expected_by_id.get(observed_id)
+            if (
+                expected is None
+                or assignment_scope.casefold() != str(expected["scope"]).casefold()
+                or role_definition_id.casefold() != str(expected["roleDefinitionId"]).casefold()
+                or observed_principal_id != principal_id
             ):
-                observed_id = _string(
-                    observed_assignment.get("id"),
-                    field="effective WC-013 ACR assignment ID",
-                ).casefold()
-                if (
-                    observed_id != expected_assignment_id
-                    or assignment_scope.casefold() != str(expected["scope"]).casefold()
-                    or role_definition_id.casefold() != str(expected["roleDefinitionId"]).casefold()
-                ):
-                    raise OrchestrationError(
-                        "WC-013 identity retains a stale, inherited, group-derived, "
-                        "or otherwise unreviewed ACR pull grant"
-                    )
-                expected_seen = True
-        if not expected_seen:
+                raise OrchestrationError(
+                    "WC-013 identity retains a stale, inherited, group-derived, "
+                    "or otherwise unreviewed ACR pull-capable grant"
+                )
+            observed_expected_ids.add(observed_id)
+        if observed_expected_ids != set(expected_by_id):
             raise OrchestrationError(
                 "WC-013 effective ACR evidence is missing its exact current assignment"
             )
+    _verify_no_applicable_deny_assignments(
+        [
+            _ExpectedRoleAssignment(
+                label=f"WC-013 {assignment['label']} image pull",
+                principal_id=str(assignment["principalId"]),
+                scope=str(assignment["scope"]),
+                role_definition_id=str(assignment["roleDefinitionId"]),
+                condition_version=(
+                    None
+                    if assignment["conditionVersion"] is None
+                    else str(assignment["conditionVersion"])
+                ),
+                condition=(
+                    None if assignment["condition"] is None else str(assignment["condition"])
+                ),
+                repository_name=str(assignment["repositoryName"]),
+            )
+            for assignment in assignments
+        ],
+        subscription_id=subscription_id,
+    )
     return assignments
 
 
@@ -3624,9 +3926,33 @@ def _producer_outputs(handoff: Mapping[str, object]) -> dict[str, Any]:
             raise OrchestrationError(
                 f"producer output {name} does not match the deployed configuration"
             )
-    _acr_role_assignment_mode(
+    registry_mode = _acr_role_assignment_mode(
         outputs.get("registryRoleAssignmentMode"),
         field="producer registry role-assignment mode",
+    )
+    repository_name = _acr_repository_name(
+        outputs["producerImage"],
+        outputs["registryResourceId"],
+        field="producer image",
+    )
+    _require_equal(
+        outputs.get("registryRepositoryName"),
+        repository_name,
+        field="producer registry repository name",
+    )
+    condition_version, condition = _acr_pull_assignment_condition(
+        role_assignment_mode=registry_mode,
+        repository_name=repository_name,
+    )
+    _require_equal(
+        outputs.get("registryPullConditionVersion"),
+        condition_version,
+        field="producer registry pull condition version",
+    )
+    _require_equal(
+        outputs.get("registryPullCondition"),
+        condition,
+        field="producer registry pull condition",
     )
     _string(
         outputs.get("registryPullRoleDefinitionId"),
@@ -3793,9 +4119,33 @@ def _publisher_outputs(handoff: Mapping[str, object]) -> dict[str, Any]:
             raise OrchestrationError(
                 f"publisher output {name} does not match the deployed configuration"
             )
-    _acr_role_assignment_mode(
+    registry_mode = _acr_role_assignment_mode(
         outputs.get("registryRoleAssignmentMode"),
         field="publisher registry role-assignment mode",
+    )
+    repository_name = _acr_repository_name(
+        outputs["publisherImage"],
+        outputs["registryResourceId"],
+        field="publisher image",
+    )
+    _require_equal(
+        outputs.get("registryRepositoryName"),
+        repository_name,
+        field="publisher registry repository name",
+    )
+    condition_version, condition = _acr_pull_assignment_condition(
+        role_assignment_mode=registry_mode,
+        repository_name=repository_name,
+    )
+    _require_equal(
+        outputs.get("registryPullConditionVersion"),
+        condition_version,
+        field="publisher registry pull condition version",
+    )
+    _require_equal(
+        outputs.get("registryPullCondition"),
+        condition,
+        field="publisher registry pull condition",
     )
     _string(
         outputs.get("registryPullRoleDefinitionId"),
@@ -4671,6 +5021,10 @@ def _verify_acr_pull_binding(
     subscription_id: str,
     field: str,
 ) -> str:
+    image = _digest_pinned_image(
+        outputs.get(f"{field}Image"),
+        field=f"{field} image",
+    )
     registry_resource_id = _canonical_subscription_resource_id(
         outputs.get("registryResourceId"),
         subscription_id=subscription_id,
@@ -4722,10 +5076,36 @@ def _verify_acr_pull_binding(
         subscription_id=subscription_id,
         field=f"{field} registry pull role definition",
     )
-    expected_assignment_id = _deterministic_principal_role_assignment_id(
+    repository_name = _acr_repository_name(
+        image,
         registry_resource_id,
-        principal_id,
-        expected_role_definition_id,
+        field=f"{field} image",
+    )
+    _require_equal(
+        outputs.get("registryRepositoryName"),
+        repository_name,
+        field=f"{field} registry repository name",
+    )
+    condition_version, condition = _acr_pull_assignment_condition(
+        role_assignment_mode=role_assignment_mode,
+        repository_name=repository_name,
+    )
+    _require_equal(
+        outputs.get("registryPullConditionVersion"),
+        condition_version,
+        field=f"{field} registry pull condition version",
+    )
+    _require_equal(
+        outputs.get("registryPullCondition"),
+        condition,
+        field=f"{field} registry pull condition",
+    )
+    expected_assignment_id = _acr_pull_role_assignment_id(
+        scope=registry_resource_id,
+        principal_id=principal_id,
+        role_definition_id=expected_role_definition_id,
+        role_assignment_mode=role_assignment_mode,
+        repository_name=repository_name,
     )
     _require_subscription_resource_id_equal(
         outputs.get("registryPullRoleAssignmentResourceId"),
@@ -5482,7 +5862,10 @@ def _resource_group_scope(resource_id: str) -> str:
 
 
 ACR_PULL_ROLE_ID = "7f951dda-4ed3-4680-a7ca-43fe172d538d"
+ACR_PUSH_ROLE_ID = "8311e382-0749-4cb8-b61a-304f252e45ec"
 ACR_REPOSITORY_READER_ROLE_ID = "b93aa761-3e63-49ed-ac28-beffa264f7ac"
+ACR_REPOSITORY_WRITER_ROLE_ID = "2a1e307c-b015-4ebd-883e-5b7698a07328"
+ACR_REPOSITORY_CONTRIBUTOR_ROLE_ID = "2efddaa5-3f1f-4df3-97df-af3f13818f4c"
 ACR_LEGACY_ROLE_ASSIGNMENT_MODE = "LegacyRegistryPermissions"
 ACR_ABAC_ROLE_ASSIGNMENT_MODE = "AbacRepositoryPermissions"
 SERVICE_BUS_DATA_RECEIVER_ROLE_ID = "4f6c0938-94ea-4d52-8e5a-2e02b7ef8e7d"
@@ -5491,6 +5874,24 @@ BLOB_DATA_READER_ROLE_ID = "2a2b9908-6ea1-4ae2-8e65-a410df84e7d1"
 TABLE_DATA_CONTRIBUTOR_ROLE_ID = "0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3"
 TABLE_DATA_READER_ROLE_ID = "76199698-9eea-4c19-bc75-cec21354c6b6"
 KEY_VAULT_CRYPTO_USER_ROLE_ID = "12338af0-0e69-4776-bea7-57ae8d297424"
+ACR_LEGACY_PULL_ACTION = "Microsoft.ContainerRegistry/registries/pull/read"
+ACR_REPOSITORY_CONTENT_READ_DATA_ACTION = (
+    "Microsoft.ContainerRegistry/registries/repositories/content/read"
+)
+ACR_REPOSITORY_METADATA_READ_DATA_ACTION = (
+    "Microsoft.ContainerRegistry/registries/repositories/metadata/read"
+)
+ACR_REPOSITORY_CONDITION_PREFIX = (
+    "((!(ActionMatches{"
+    f"'{ACR_REPOSITORY_CONTENT_READ_DATA_ACTION}'"
+    "}) AND !(ActionMatches{"
+    f"'{ACR_REPOSITORY_METADATA_READ_DATA_ACTION}'"
+    "})) OR (@Request[Microsoft.ContainerRegistry/registries/repositories:name] "
+    "StringEqualsIgnoreCase '"
+)
+ACR_REPOSITORY_CONDITION_SUFFIX = "'))"
+SERVICE_BUS_RECEIVE_DATA_ACTION = "Microsoft.ServiceBus/namespaces/messages/receive/action"
+SERVICE_BUS_SEND_DATA_ACTION = "Microsoft.ServiceBus/namespaces/messages/send/action"
 BLOB_READ_DATA_ACTION = "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read"
 BLOB_WRITE_DATA_ACTION = "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write"
 BLOB_ADD_DATA_ACTION = "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action"
@@ -5506,6 +5907,8 @@ TABLE_ENTITY_UPDATE_DATA_ACTION = (
 KEY_READ_DATA_ACTION = "Microsoft.KeyVault/vaults/keys/read"
 KEY_VERIFY_DATA_ACTION = "Microsoft.KeyVault/vaults/keys/verify/action"
 KEY_SIGN_DATA_ACTION = "Microsoft.KeyVault/vaults/keys/sign/action"
+ALL_PRINCIPALS_ID = "00000000-0000-0000-0000-000000000000"
+DENY_ASSIGNMENTS_API_VERSION = "2022-04-01"
 BUILT_IN_DATA_ROLE_IDS = frozenset(
     {
         ACR_PULL_ROLE_ID,
@@ -5544,6 +5947,31 @@ KEY_SIGN_PERMISSION_PROFILE = _RolePermissionProfile(data_actions=frozenset({KEY
 KEY_SIGN_VERIFY_PERMISSION_PROFILE = _RolePermissionProfile(
     data_actions=frozenset({KEY_SIGN_DATA_ACTION, KEY_VERIFY_DATA_ACTION})
 )
+BUILT_IN_REQUIRED_PERMISSION_PROFILES = {
+    ACR_PULL_ROLE_ID: _RolePermissionProfile(actions=frozenset({ACR_LEGACY_PULL_ACTION})),
+    ACR_REPOSITORY_READER_ROLE_ID: _RolePermissionProfile(
+        data_actions=frozenset(
+            {
+                ACR_REPOSITORY_CONTENT_READ_DATA_ACTION,
+                ACR_REPOSITORY_METADATA_READ_DATA_ACTION,
+            }
+        )
+    ),
+    SERVICE_BUS_DATA_RECEIVER_ROLE_ID: _RolePermissionProfile(
+        data_actions=frozenset({SERVICE_BUS_RECEIVE_DATA_ACTION})
+    ),
+    SERVICE_BUS_DATA_SENDER_ROLE_ID: _RolePermissionProfile(
+        data_actions=frozenset({SERVICE_BUS_SEND_DATA_ACTION})
+    ),
+    BLOB_DATA_READER_ROLE_ID: _RolePermissionProfile(
+        data_actions=frozenset({BLOB_READ_DATA_ACTION})
+    ),
+    TABLE_DATA_CONTRIBUTOR_ROLE_ID: TABLE_CAS_PERMISSION_PROFILE,
+    TABLE_DATA_READER_ROLE_ID: _RolePermissionProfile(
+        data_actions=frozenset({TABLE_ENTITY_READ_DATA_ACTION})
+    ),
+    KEY_VAULT_CRYPTO_USER_ROLE_ID: KEY_SIGN_VERIFY_PERMISSION_PROFILE,
+}
 APPROVED_CUSTOM_ROLE_PERMISSION_PROFILES = frozenset(
     {
         FEED_BLOB_WRITER_PERMISSION_PROFILE,
@@ -5729,6 +6157,27 @@ def _deterministic_principal_role_assignment_id(
     return f"{scope}/providers/Microsoft.Authorization/roleAssignments/{assignment_name}"
 
 
+def _acr_pull_role_assignment_id(
+    *,
+    scope: str,
+    principal_id: str,
+    role_definition_id: str,
+    role_assignment_mode: str,
+    repository_name: str,
+) -> str:
+    canonical_principal_id = _canonical_directory_object_id(
+        principal_id,
+        field="ACR role assignment principal ID",
+    )
+    assignment_name = _arm_guid(
+        scope,
+        canonical_principal_id,
+        role_definition_id,
+        *((repository_name,) if role_assignment_mode == ACR_ABAC_ROLE_ASSIGNMENT_MODE else ()),
+    )
+    return f"{scope}/providers/Microsoft.Authorization/roleAssignments/{assignment_name}"
+
+
 def _acr_role_assignment_mode(value: object, *, field: str) -> str:
     mode = _string(value, field=field)
     if mode not in {
@@ -5837,6 +6286,7 @@ def _expected_role_assignment(
     condition_version: str | None = None,
     condition: str | None = None,
     custom_role_permissions: _RolePermissionProfile | None = None,
+    repository_name: str | None = None,
 ) -> _ExpectedRoleAssignment:
     return _ExpectedRoleAssignment(
         label=label,
@@ -5850,6 +6300,7 @@ def _expected_role_assignment(
         condition_version=condition_version,
         condition=condition,
         custom_role_permissions=custom_role_permissions,
+        repository_name=repository_name,
     )
 
 
@@ -5988,6 +6439,15 @@ def _producer_expected_rbac_assignments(
         registry_pull_role_definition_id,
         subscription_id=subscription_id,
         field="producer registry pull role definition",
+    )
+    registry_repository_name = _acr_repository_name(
+        outputs.get("producerImage"),
+        registry_id,
+        field="producer image",
+    )
+    registry_condition_version, registry_condition = _acr_pull_assignment_condition(
+        role_assignment_mode=registry_role_assignment_mode,
+        repository_name=registry_repository_name,
     )
     feed_container_id = _azure_resource_id(
         outputs.get("feedV2ContainerResourceId"),
@@ -6132,6 +6592,9 @@ def _producer_expected_rbac_assignments(
             principal_ids_by_identity=principal_ids_by_identity,
             scope=registry_id,
             role_definition_id=built_in_roles["acr_pull"],
+            condition_version=registry_condition_version,
+            condition=registry_condition,
+            repository_name=registry_repository_name,
         ),
         _expected_role_assignment(
             "producer feed-v2 writer",
@@ -6755,6 +7218,15 @@ def _publisher_expected_rbac_assignments(
         subscription_id=subscription_id,
         field="publisher registry pull role definition",
     )
+    registry_repository_name = _acr_repository_name(
+        outputs.get("publisherImage"),
+        registry_id,
+        field="publisher image",
+    )
+    registry_condition_version, registry_condition = _acr_pull_assignment_condition(
+        role_assignment_mode=registry_role_assignment_mode,
+        repository_name=registry_repository_name,
+    )
 
     blob_condition = {
         "condition_version": "2.0",
@@ -6844,6 +7316,9 @@ def _publisher_expected_rbac_assignments(
             principal_ids_by_identity=principal_ids_by_identity,
             scope=registry_id,
             role_definition_id=built_in_roles["acr_pull"],
+            condition_version=registry_condition_version,
+            condition=registry_condition,
+            repository_name=registry_repository_name,
         ),
     ]
     for index, identity_resource_id in enumerate(
@@ -6892,32 +7367,236 @@ def _role_assignment_scope(resource_id: str) -> str:
     return resource_id[: normalized.rindex(marker)]
 
 
-def _verify_custom_role(resource: Mapping[str, object]) -> _RolePermissionProfile:
-    properties = _mapping(resource.get("properties"), field="custom role properties")
+def _role_permission_profiles(
+    resource: Mapping[str, object],
+    *,
+    field: str,
+) -> tuple[_RolePermissionProfile, ...]:
+    properties = _mapping(resource.get("properties"), field=f"{field} properties")
     permissions = properties.get("permissions")
-    if not isinstance(permissions, list) or len(permissions) != 1:
-        raise OrchestrationError("custom role must contain exactly one permission block")
-    permission = _mapping(permissions[0], field="custom role permission")
+    if not isinstance(permissions, list) or not 1 <= len(permissions) <= 64:
+        raise OrchestrationError(f"{field} must contain a bounded non-empty permissions array")
 
-    def permission_set(json_field: str) -> frozenset[str]:
-        values = permission.get(json_field)
-        if not isinstance(values, list) or any(
-            not isinstance(item, str) or not item for item in values
-        ):
-            raise OrchestrationError(f"custom role {json_field} must be a string array")
-        if len(set(values)) != len(values):
-            raise OrchestrationError(f"custom role {json_field} must contain distinct values")
-        return frozenset(values)
+    profiles: list[_RolePermissionProfile] = []
+    for index, raw_permission in enumerate(permissions):
+        permission = _mapping(
+            raw_permission,
+            field=f"{field} permission {index}",
+        )
 
-    profile = _RolePermissionProfile(
-        actions=permission_set("actions"),
-        not_actions=permission_set("notActions"),
-        data_actions=permission_set("dataActions"),
-        not_data_actions=permission_set("notDataActions"),
+        def permission_set(
+            json_field: str,
+            *,
+            current_permission: Mapping[str, object] = permission,
+            permission_index: int = index,
+        ) -> frozenset[str]:
+            values = current_permission.get(json_field)
+            if not isinstance(values, list) or any(
+                not isinstance(item, str) or not item or item != item.strip() or len(item) > 512
+                for item in values
+            ):
+                raise OrchestrationError(
+                    f"{field} permission {permission_index} {json_field} "
+                    "must be a bounded string array"
+                )
+            normalized = [item.casefold() for item in values]
+            if len(set(normalized)) != len(normalized):
+                raise OrchestrationError(
+                    f"{field} permission {permission_index} {json_field} "
+                    "must contain distinct values"
+                )
+            return frozenset(values)
+
+        profiles.append(
+            _RolePermissionProfile(
+                actions=permission_set("actions"),
+                not_actions=permission_set("notActions"),
+                data_actions=permission_set("dataActions"),
+                not_data_actions=permission_set("notDataActions"),
+            )
+        )
+    return tuple(profiles)
+
+
+def _verify_custom_role(resource: Mapping[str, object]) -> _RolePermissionProfile:
+    profiles = _role_permission_profiles(
+        resource,
+        field="custom role",
     )
-    if profile not in APPROVED_CUSTOM_ROLE_PERMISSION_PROFILES:
+    if len(profiles) != 1 or profiles[0] not in APPROVED_CUSTOM_ROLE_PERMISSION_PROFILES:
         raise OrchestrationError("custom data role permissions do not match an approved profile")
-    return profile
+    return profiles[0]
+
+
+def _azure_permission_pattern_matches(pattern: str, action: str) -> bool:
+    normalized_pattern = pattern.casefold()
+    normalized_action = action.casefold()
+    expression = re.escape(normalized_pattern).replace(r"\*", ".*")
+    return re.fullmatch(expression, normalized_action) is not None
+
+
+def _permission_profile_grants_action(
+    profile: _RolePermissionProfile,
+    action: str,
+    *,
+    is_data_action: bool,
+) -> bool:
+    granted = profile.data_actions if is_data_action else profile.actions
+    excluded = profile.not_data_actions if is_data_action else profile.not_actions
+    return any(
+        _azure_permission_pattern_matches(pattern, action) for pattern in granted
+    ) and not any(_azure_permission_pattern_matches(pattern, action) for pattern in excluded)
+
+
+def _get_role_definition(
+    role_definition_id: str,
+    *,
+    subscription_id: str,
+) -> dict[str, Any]:
+    normalized = role_definition_id.casefold()
+    marker = "/providers/microsoft.authorization/roledefinitions/"
+    if (
+        marker not in normalized
+        or role_definition_id != role_definition_id.strip()
+        or role_definition_id.endswith("/")
+        or urlparse(role_definition_id).query
+        or urlparse(role_definition_id).fragment
+    ):
+        raise OrchestrationError("effective ACR role definition ID is not canonical")
+    try:
+        role_definition_guid = str(UUID(role_definition_id.rsplit("/", 1)[-1]))
+    except ValueError as exc:
+        raise OrchestrationError(
+            "effective ACR role definition ID must end in one canonical UUID"
+        ) from exc
+    if role_definition_id.rsplit("/", 1)[-1] != role_definition_guid:
+        raise OrchestrationError(
+            "effective ACR role definition ID must use canonical lowercase UUID form"
+        )
+    if normalized.startswith("/subscriptions/"):
+        canonical_id = _canonical_subscription_resource_id(
+            role_definition_id,
+            subscription_id=subscription_id,
+            field="effective ACR role definition ID",
+        )
+    elif normalized.startswith("/providers/microsoft.management/managementgroups/"):
+        segments = role_definition_id.split("/")
+        if (
+            len(segments) != 9
+            or segments[0] != ""
+            or segments[1] != "providers"
+            or segments[2].casefold() != "microsoft.management"
+            or segments[3].casefold() != "managementgroups"
+            or segments[5] != "providers"
+            or segments[6].casefold() != "microsoft.authorization"
+            or segments[7].casefold() != "roledefinitions"
+        ):
+            raise OrchestrationError(
+                "effective ACR management-group role definition ID is not canonical"
+            )
+        _validate_resource_id_segment(
+            segments[4],
+            field="effective ACR role definition management group",
+        )
+        canonical_id = role_definition_id
+    elif normalized.startswith("/providers/microsoft.authorization/roledefinitions/"):
+        segments = role_definition_id.split("/")
+        if (
+            len(segments) != 5
+            or segments[0] != ""
+            or segments[1] != "providers"
+            or segments[2].casefold() != "microsoft.authorization"
+            or segments[3].casefold() != "roledefinitions"
+        ):
+            raise OrchestrationError("effective ACR tenant role definition ID is not canonical")
+        canonical_id = role_definition_id
+    else:
+        raise OrchestrationError(
+            "effective ACR role definition is outside the governed subscription hierarchy"
+        )
+    role = _mapping(
+        _run_json(
+            [
+                "az",
+                "rest",
+                "--method",
+                "get",
+                "--url",
+                (f"https://{ARM_HOST}{canonical_id}?api-version={DENY_ASSIGNMENTS_API_VERSION}"),
+                "--only-show-errors",
+                "--output",
+                "json",
+            ],
+            field="effective ACR role definition",
+        ),
+        field="effective ACR role definition",
+    )
+    if str(role.get("id", "")).casefold() != normalized:
+        raise OrchestrationError(
+            "effective ACR role definition readback does not match its assignment"
+        )
+    return role
+
+
+def _role_definition_grants_acr_pull(resource: Mapping[str, object]) -> bool:
+    profiles = _role_permission_profiles(
+        resource,
+        field="effective ACR role definition",
+    )
+    required_reads = (
+        (ACR_LEGACY_PULL_ACTION, False),
+        (ACR_LEGACY_PULL_ACTION, True),
+        (ACR_REPOSITORY_CONTENT_READ_DATA_ACTION, False),
+        (ACR_REPOSITORY_CONTENT_READ_DATA_ACTION, True),
+    )
+    return any(
+        _permission_profile_grants_action(
+            profile,
+            action,
+            is_data_action=is_data_action,
+        )
+        for profile in profiles
+        for action, is_data_action in required_reads
+    )
+
+
+def _verify_role_profile_condition(
+    *,
+    scope: str,
+    role_definition_id: str,
+    custom_permissions: _RolePermissionProfile | None,
+    condition_version: object,
+    condition: object,
+    field: str,
+) -> str | None:
+    role_id = role_definition_id.casefold().rsplit("/", 1)[-1]
+    scope_type = _resource_type(scope)
+    grants_blob_read = role_id == BLOB_DATA_READER_ROLE_ID or (
+        custom_permissions is not None and BLOB_READ_DATA_ACTION in custom_permissions.data_actions
+    )
+    expected_condition_version: str | None = None
+    expected_condition: str | None = None
+    repository_name: str | None = None
+    if grants_blob_read:
+        expected_condition_version = "2.0"
+        expected_condition = BLOB_LIST_DENY_CONDITION
+    elif (
+        scope_type == "microsoft.containerregistry/registries"
+        and role_id == ACR_REPOSITORY_READER_ROLE_ID
+    ):
+        if condition_version != "2.0":
+            raise OrchestrationError(
+                f"{field} Repository Reader condition version must be exactly 2.0"
+            )
+        repository_name = _acr_repository_name_from_condition(
+            condition,
+            field=f"{field} Repository Reader condition",
+        )
+        expected_condition_version = "2.0"
+        expected_condition = _acr_repository_condition(repository_name)
+    if condition_version != expected_condition_version or condition != expected_condition:
+        raise OrchestrationError(f"{field} condition does not match its exact role profile")
+    return repository_name
 
 
 def _verify_rbac_resources(
@@ -7287,24 +7966,10 @@ def _verify_legacy_acr_pull_migration(
         raise OrchestrationError(
             "legacy ACR pull migration evidence does not exactly match the reviewed assignment IDs"
         )
-    expected_role_definition_id = _built_in_role_definition_id(
-        subscription_id,
-        ACR_PULL_ROLE_ID,
-    )
     for assignment_id in sorted(observed_ids):
         reviewed = reviewed_by_id[assignment_id]
         original_assignment_id = observed_resource_ids[assignment_id]
-        if (
-            assignment_id
-            == _deterministic_principal_role_assignment_id(
-                _role_assignment_scope(original_assignment_id),
-                reviewed["principalId"],
-                expected_role_definition_id,
-            ).casefold()
-        ):
-            raise OrchestrationError(
-                "current principal-seeded ACR assignment cannot be classified as legacy"
-            )
+        scope = _role_assignment_scope(original_assignment_id)
         resource = _get_resource(
             original_assignment_id,
             subscription_id=subscription_id,
@@ -7327,14 +7992,14 @@ def _verify_legacy_acr_pull_migration(
             or properties.get("principalType") != "ServicePrincipal"
         ):
             raise OrchestrationError("legacy ACR pull assignment principal does not match review")
-        _require_subscription_resource_id_equal(
+        role_definition_id = _canonical_subscription_resource_id(
             properties.get("roleDefinitionId"),
-            expected_role_definition_id,
             subscription_id=subscription_id,
             field="legacy ACR pull role definition",
         )
+        role_id = role_definition_id.casefold().rsplit("/", 1)[-1]
         _require_resource_id_equal(
-            _role_assignment_scope(original_assignment_id),
+            scope,
             _role_assignment_scope(reviewed["assignmentResourceId"]),
             field="legacy ACR pull scope",
         )
@@ -7344,11 +8009,63 @@ def _verify_legacy_acr_pull_migration(
                 _role_assignment_scope(reviewed["assignmentResourceId"]),
                 field="legacy ACR pull scope property",
             )
-        if (
-            properties.get("conditionVersion") is not None
-            or properties.get("condition") is not None
-        ):
-            raise OrchestrationError("legacy ACR pull assignment must not contain a condition")
+        registry = _get_resource(
+            scope,
+            subscription_id=subscription_id,
+        )
+        _require_resource_id_equal(
+            registry.get("id"),
+            scope,
+            field="legacy ACR registry readback",
+        )
+        registry_mode = _acr_role_assignment_mode(
+            _mapping(
+                registry.get("properties"),
+                field="legacy ACR registry properties",
+            ).get("roleAssignmentMode"),
+            field="legacy ACR registry role-assignment mode",
+        )
+        if role_id == ACR_PULL_ROLE_ID:
+            if (
+                properties.get("conditionVersion") is not None
+                or properties.get("condition") is not None
+            ):
+                raise OrchestrationError(
+                    "legacy AcrPull migration assignment must not contain a condition"
+                )
+            if (
+                registry_mode == ACR_LEGACY_ROLE_ASSIGNMENT_MODE
+                and assignment_id
+                == _acr_pull_role_assignment_id(
+                    scope=scope,
+                    principal_id=reviewed["principalId"],
+                    role_definition_id=role_definition_id,
+                    role_assignment_mode=ACR_LEGACY_ROLE_ASSIGNMENT_MODE,
+                    repository_name="",
+                ).casefold()
+            ):
+                raise OrchestrationError(
+                    "current principal-seeded AcrPull assignment cannot be classified as legacy"
+                )
+            continue
+        if role_id == ACR_REPOSITORY_READER_ROLE_ID:
+            if registry_mode != ACR_ABAC_ROLE_ASSIGNMENT_MODE:
+                raise OrchestrationError(
+                    "obsolete Repository Reader migration requires an ABAC-enabled registry"
+                )
+            if (
+                properties.get("conditionVersion") is not None
+                or properties.get("condition") is not None
+            ):
+                raise OrchestrationError(
+                    "obsolete Repository Reader migration is limited to the "
+                    "unconditioned pre-remediation assignment"
+                )
+            continue
+        raise OrchestrationError(
+            "legacy ACR migration must identify AcrPull or the obsolete "
+            "unconditioned Repository Reader role"
+        )
 
 
 def _capture_revocation_assignment_evidence(
@@ -7577,19 +8294,14 @@ def _verify_revocation_assignment_evidence_bindings(
                 )
             ):
                 raise OrchestrationError("revocation evidence custom role does not match its scope")
-        grants_blob_read = role_id == BLOB_DATA_READER_ROLE_ID or (
-            custom_permissions is not None
-            and BLOB_READ_DATA_ACTION in custom_permissions.data_actions
+        _verify_role_profile_condition(
+            scope=scope,
+            role_definition_id=role_definition_id,
+            custom_permissions=custom_permissions,
+            condition_version=item["conditionVersion"],
+            condition=item["condition"],
+            field="revocation evidence",
         )
-        expected_condition_version = "2.0" if grants_blob_read else None
-        expected_condition = BLOB_LIST_DENY_CONDITION if grants_blob_read else None
-        if (
-            item["conditionVersion"] != expected_condition_version
-            or item["condition"] != expected_condition
-        ):
-            raise OrchestrationError(
-                "revocation evidence condition does not match its exact role profile"
-            )
         if scope_type == "microsoft.containerregistry/registries":
             mode = _acr_role_assignment_mode(
                 item["registryRoleAssignmentMode"],
@@ -7608,21 +8320,29 @@ def _verify_revocation_assignment_evidence_bindings(
         item = by_id[migration["assignmentResourceId"].casefold()]
         if item["principalId"] != migration["principalId"]:
             raise OrchestrationError("legacy ACR revocation evidence principal differs from review")
-        if (
-            _resource_type(str(item["scope"])) != "microsoft.containerregistry/registries"
-            or item["conditionVersion"] is not None
-            or item["condition"] is not None
-        ):
-            raise OrchestrationError("legacy ACR revocation evidence scope or condition is invalid")
-        _require_subscription_resource_id_equal(
+        if _resource_type(str(item["scope"])) != "microsoft.containerregistry/registries":
+            raise OrchestrationError("legacy ACR revocation evidence scope is invalid")
+        mode = _acr_role_assignment_mode(
+            item["registryRoleAssignmentMode"],
+            field="legacy ACR revocation evidence mode",
+        )
+        role_definition_id = _canonical_subscription_resource_id(
             item["roleDefinitionId"],
-            _built_in_role_definition_id(subscription_id, ACR_PULL_ROLE_ID),
             subscription_id=subscription_id,
             field="legacy ACR revocation evidence role",
         )
-        _acr_role_assignment_mode(
-            item["registryRoleAssignmentMode"],
-            field="legacy ACR revocation evidence mode",
+        role_id = role_definition_id.casefold().rsplit("/", 1)[-1]
+        if item["conditionVersion"] is not None or item["condition"] is not None:
+            raise OrchestrationError(
+                "legacy ACR revocation evidence must identify an unconditioned assignment"
+            )
+        if role_id == ACR_PULL_ROLE_ID:
+            continue
+        if role_id == ACR_REPOSITORY_READER_ROLE_ID and mode == ACR_ABAC_ROLE_ASSIGNMENT_MODE:
+            continue
+        raise OrchestrationError(
+            "legacy ACR revocation evidence must identify AcrPull or the obsolete "
+            "ABAC Repository Reader role"
         )
     if legacy_crypto_expected is not None:
         for assignment_id, expected in legacy_crypto_expected.items():
@@ -8376,19 +9096,14 @@ def _verify_reviewed_rotation_transitions(
                 )
             ):
                 raise OrchestrationError("approved rotation custom role does not match its scope")
-        grants_blob_read = role_id == BLOB_DATA_READER_ROLE_ID or (
-            custom_permissions is not None
-            and BLOB_READ_DATA_ACTION in custom_permissions.data_actions
+        _verify_role_profile_condition(
+            scope=scope,
+            role_definition_id=role_definition_id,
+            custom_permissions=custom_permissions,
+            condition_version=properties.get("conditionVersion"),
+            condition=properties.get("condition"),
+            field="approved rotation transition",
         )
-        expected_condition_version = "2.0" if grants_blob_read else None
-        expected_condition = BLOB_LIST_DENY_CONDITION if grants_blob_read else None
-        if (
-            properties.get("conditionVersion") != expected_condition_version
-            or properties.get("condition") != expected_condition
-        ):
-            raise OrchestrationError(
-                "approved rotation transition condition does not match its exact role profile"
-            )
     if transition_state == "present":
         missing = transition_ids - observed_transition_ids
         if missing:
@@ -8690,6 +9405,643 @@ def _scopes_overlap(first: str, second: str) -> bool:
         or normalized_first.startswith(normalized_second + "/")
         or normalized_second.startswith(normalized_first + "/")
     )
+
+
+def _scope_contains_resource(ancestor: str, resource_scope: str) -> bool:
+    normalized_ancestor = ancestor.rstrip("/").casefold() or "/"
+    normalized_resource = resource_scope.rstrip("/").casefold() or "/"
+    if normalized_ancestor == "/":
+        return True
+    if normalized_ancestor.startswith("/providers/microsoft.management/managementgroups/"):
+        # The atScope() response is authoritative for management-group ancestry.
+        return True
+    return normalized_resource == normalized_ancestor or normalized_resource.startswith(
+        normalized_ancestor + "/"
+    )
+
+
+def _validate_deny_assignment_url(url: str, *, scope: str) -> None:
+    if len(url) > 16_384:
+        raise OrchestrationError(
+            "deny-assignment pagination returned an oversized continuation URL"
+        )
+    parsed = urlparse(url)
+    expected_path = f"{scope.rstrip('/')}/providers/Microsoft.Authorization/denyAssignments"
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    if (
+        parsed.scheme != "https"
+        or parsed.netloc.casefold() != ARM_HOST
+        or parsed.path.casefold() != expected_path.casefold()
+        or parsed.fragment
+        or parsed.username is not None
+        or parsed.password is not None
+        or query.get("api-version") != [DENY_ASSIGNMENTS_API_VERSION]
+        or any(key not in {"api-version", "$filter", "$skiptoken"} for key in query)
+        or any(len(values) != 1 for values in query.values())
+        or ("$filter" in query and query["$filter"] != ["atScope()"])
+    ):
+        raise OrchestrationError(
+            "deny-assignment pagination returned an untrusted continuation URL"
+        )
+
+
+def _deny_assignments_at_or_above_scope(
+    scope: str,
+    *,
+    subscription_id: str,
+) -> list[dict[str, Any]]:
+    canonical_scope = _canonical_subscription_resource_id(
+        scope,
+        subscription_id=subscription_id,
+        field="deny-assignment governed scope",
+    )
+    next_url: str | None = (
+        f"https://{ARM_HOST}{canonical_scope}/providers/"
+        "Microsoft.Authorization/denyAssignments"
+        f"?api-version={DENY_ASSIGNMENTS_API_VERSION}&%24filter=atScope%28%29"
+    )
+    assignments: dict[str, dict[str, Any]] = {}
+    seen_urls: set[str] = set()
+    page_number = 0
+    while next_url is not None:
+        page_number += 1
+        if page_number > MAX_DENY_ASSIGNMENT_PAGES:
+            raise OrchestrationError("deny-assignment pagination exceeded its page bound")
+        _validate_deny_assignment_url(next_url, scope=canonical_scope)
+        if next_url in seen_urls:
+            raise OrchestrationError("deny-assignment pagination contains a cycle")
+        seen_urls.add(next_url)
+        page = _mapping(
+            _run_json(
+                [
+                    "az",
+                    "rest",
+                    "--method",
+                    "get",
+                    "--url",
+                    next_url,
+                    "--only-show-errors",
+                    "--output",
+                    "json",
+                ],
+                field=f"deny assignments for {canonical_scope} page {page_number}",
+            ),
+            field=f"deny assignments for {canonical_scope} page {page_number}",
+        )
+        values = page.get("value")
+        if not isinstance(values, list):
+            raise OrchestrationError("deny-assignment page must contain a value array")
+        for index, raw_assignment in enumerate(values):
+            assignment = _mapping(
+                raw_assignment,
+                field=f"deny-assignment page {page_number} item {index}",
+            )
+            assignment_id = _string(
+                assignment.get("id"),
+                field="deny-assignment ID",
+            )
+            normalized_id = assignment_id.casefold()
+            existing = assignments.get(normalized_id)
+            if existing is not None and _canonical_json_bytes(existing) != _canonical_json_bytes(
+                assignment
+            ):
+                raise OrchestrationError(
+                    "deny-assignment pagination returned conflicting duplicate evidence"
+                )
+            assignments[normalized_id] = assignment
+            if len(assignments) > MAX_DENY_ASSIGNMENTS:
+                raise OrchestrationError("deny-assignment evidence exceeds its bounded maximum")
+        continuation = page.get("nextLink")
+        if continuation is None:
+            next_url = None
+        elif not isinstance(continuation, str) or not continuation:
+            raise OrchestrationError("deny-assignment continuation is invalid")
+        else:
+            next_url = continuation
+    return list(assignments.values())
+
+
+def _deny_assignment_scope(
+    assignment: Mapping[str, object],
+) -> str:
+    assignment_id = _string(
+        assignment.get("id"),
+        field="deny-assignment ID",
+    )
+    marker = "/providers/microsoft.authorization/denyassignments/"
+    normalized_id = assignment_id.casefold()
+    if marker not in normalized_id:
+        raise OrchestrationError("deny-assignment ID has no deny-assignment boundary")
+    scope_from_id = assignment_id[: normalized_id.rindex(marker)] or "/"
+    properties = _mapping(
+        assignment.get("properties"),
+        field="deny-assignment properties",
+    )
+    scope_value = properties.get("scope")
+    if scope_value is None:
+        return scope_from_id
+    scope = _string(scope_value, field="deny-assignment scope")
+    if scope.rstrip("/").casefold() != scope_from_id.rstrip("/").casefold():
+        raise OrchestrationError("deny-assignment scope does not match its resource identifier")
+    return scope
+
+
+def _deny_principal_ids(
+    value: object,
+    *,
+    field: str,
+    allow_all_principals: bool,
+) -> set[str]:
+    if not isinstance(value, list) or len(value) > MAX_TRANSITIVE_GROUPS + 1:
+        raise OrchestrationError(f"{field} must be a bounded array")
+    principal_ids: set[str] = set()
+    for index, raw_principal in enumerate(value):
+        principal = _mapping(
+            raw_principal,
+            field=f"{field}[{index}]",
+        )
+        principal_id = _canonical_directory_object_id(
+            principal.get("id"),
+            field=f"{field}[{index}].id",
+        )
+        principal_type = _string(
+            principal.get("type"),
+            field=f"{field}[{index}].type",
+        )
+        if principal_id == ALL_PRINCIPALS_ID:
+            if not allow_all_principals or principal_type.casefold() != "systemdefined":
+                raise OrchestrationError(f"{field} contains an invalid All Principals entry")
+        elif principal_type.casefold() == "systemdefined":
+            raise OrchestrationError(f"{field} contains an invalid system-defined principal")
+        if principal_id in principal_ids:
+            raise OrchestrationError(f"{field} contains a duplicate principal")
+        principal_ids.add(principal_id)
+    return principal_ids
+
+
+def _resource_condition_attributes(scope: str) -> dict[tuple[str, str], str]:
+    segments = [segment for segment in scope.split("/") if segment]
+    lowered = [segment.casefold() for segment in segments]
+    try:
+        provider_index = lowered.index("providers")
+        namespace = segments[provider_index + 1]
+    except (ValueError, IndexError) as exc:
+        raise OrchestrationError(
+            "deny-condition governed resource scope has no provider boundary"
+        ) from exc
+    attributes: dict[tuple[str, str], str] = {}
+    type_segments: list[str] = []
+    index = provider_index + 2
+    while index + 1 < len(segments):
+        if lowered[index] == "providers":
+            if index + 3 >= len(segments):
+                raise OrchestrationError(
+                    "deny-condition governed resource scope has an incomplete extension path"
+                )
+            namespace = segments[index + 1]
+            type_segments = []
+            index += 2
+        resource_type = segments[index]
+        resource_name = segments[index + 1]
+        type_segments.append(resource_type)
+        type_path = "/".join((namespace, *type_segments)).casefold()
+        attributes[(type_path, "name")] = resource_name
+        alias = {
+            "registries": "registryname",
+            "storageaccounts": "storageaccountname",
+            "namespaces": "namespacename",
+            "blobservices": "blobservicename",
+            "queues": "queuename",
+            "containers": "containername",
+            "tableservices": "tableservicename",
+            "tables": "tablename",
+            "vaults": "vaultname",
+            "keys": "keyname",
+        }.get(resource_type.casefold())
+        if alias is not None:
+            attributes[(type_path, alias)] = resource_name
+        index += 2
+    if index != len(segments):
+        raise OrchestrationError(
+            "deny-condition governed resource scope has an unmatched resource path"
+        )
+    return attributes
+
+
+class _DenyConditionParser:
+    def __init__(
+        self,
+        condition: str,
+        *,
+        action: str,
+        scope: str,
+        repository_name: str | None,
+        suboperation: str | None,
+    ) -> None:
+        self._condition = condition
+        self._position = 0
+        self._action = action
+        self._suboperation = suboperation
+        self._attributes = {
+            ("resource", type_path, attribute): value
+            for (type_path, attribute), value in _resource_condition_attributes(scope).items()
+        }
+        if repository_name is not None:
+            self._attributes[
+                (
+                    "request",
+                    "microsoft.containerregistry/registries/repositories",
+                    "name",
+                )
+            ] = repository_name
+
+    def parse(self) -> bool:
+        result = self._parse_or()
+        self._skip_whitespace()
+        if self._position != len(self._condition):
+            self._fail()
+        return result
+
+    def _skip_whitespace(self) -> None:
+        while self._position < len(self._condition) and self._condition[self._position].isspace():
+            self._position += 1
+
+    def _consume_character(self, character: str) -> bool:
+        self._skip_whitespace()
+        if self._condition.startswith(character, self._position):
+            self._position += len(character)
+            return True
+        return False
+
+    def _consume_keyword(self, keyword: str) -> bool:
+        self._skip_whitespace()
+        end = self._position + len(keyword)
+        if self._condition[self._position : end].casefold() != keyword.casefold():
+            return False
+        if end < len(self._condition) and (
+            self._condition[end].isalnum() or self._condition[end] == "_"
+        ):
+            return False
+        self._position = end
+        return True
+
+    def _parse_or(self) -> bool:
+        result = self._parse_and()
+        while self._consume_keyword("OR"):
+            right = self._parse_and()
+            result = result or right
+        return result
+
+    def _parse_and(self) -> bool:
+        result = self._parse_unary()
+        while self._consume_keyword("AND"):
+            right = self._parse_unary()
+            result = result and right
+        return result
+
+    def _parse_unary(self) -> bool:
+        if self._consume_character("!"):
+            return not self._parse_unary()
+        if self._consume_keyword("NOT"):
+            return not self._parse_unary()
+        if self._consume_character("("):
+            result = self._parse_or()
+            if not self._consume_character(")"):
+                self._fail()
+            return result
+        return self._parse_atom()
+
+    def _parse_atom(self) -> bool:
+        self._skip_whitespace()
+        remaining = self._condition[self._position :]
+        action_match = re.match(
+            r"ActionMatches\s*\{\s*'([^']+)'\s*\}",
+            remaining,
+            flags=re.IGNORECASE,
+        )
+        if action_match is not None:
+            if "\\" in action_match.group(1):
+                self._fail()
+            self._position += action_match.end()
+            return _azure_permission_pattern_matches(
+                action_match.group(1),
+                self._action,
+            )
+        suboperation_match = re.match(
+            r"SubOperationMatches\s*\{\s*'([^']+)'\s*\}",
+            remaining,
+            flags=re.IGNORECASE,
+        )
+        if suboperation_match is not None:
+            if "\\" in suboperation_match.group(1):
+                self._fail()
+            self._position += suboperation_match.end()
+            return (
+                self._suboperation is not None
+                and self._suboperation.casefold() == suboperation_match.group(1).casefold()
+            )
+        attribute_match = re.match(
+            (
+                r"@(Resource|Request)\[([^\]]+)\]\s+"
+                r"(StringEqualsIgnoreCase|StringNotEqualsIgnoreCase|"
+                r"StringStartsWithIgnoreCase|StringNotStartsWithIgnoreCase)\s+"
+                r"'([^']*)'"
+            ),
+            remaining,
+            flags=re.IGNORECASE,
+        )
+        if attribute_match is None:
+            self._fail()
+        self._position += attribute_match.end()
+        attribute_reference = attribute_match.group(2)
+        if ":" not in attribute_reference:
+            self._fail()
+        resource_type, attribute_name = attribute_reference.rsplit(":", 1)
+        actual = self._attributes.get(
+            (
+                attribute_match.group(1).casefold(),
+                resource_type.casefold(),
+                attribute_name.casefold(),
+            )
+        )
+        if actual is None:
+            raise OrchestrationError(
+                "deny-assignment condition evidence is incomplete for a referenced attribute"
+            )
+        expected = attribute_match.group(4)
+        if "\\" in expected:
+            self._fail()
+        operator = attribute_match.group(3).casefold()
+        if operator == "stringequalsignorecase":
+            return actual.casefold() == expected.casefold()
+        if operator == "stringnotequalsignorecase":
+            return actual.casefold() != expected.casefold()
+        if operator == "stringstartswithignorecase":
+            return actual.casefold().startswith(expected.casefold())
+        if operator == "stringnotstartswithignorecase":
+            return not actual.casefold().startswith(expected.casefold())
+        self._fail()
+
+    def _fail(self) -> Never:
+        raise OrchestrationError(
+            "deny-assignment condition evidence is incomplete or uses unsupported syntax"
+        )
+
+
+def _deny_condition_applies(
+    condition: str,
+    *,
+    action: str,
+    scope: str,
+    repository_name: str | None,
+    suboperation: str | None,
+) -> bool:
+    if not condition or len(condition) > 16_384:
+        raise OrchestrationError("deny-assignment condition must be a bounded expression")
+    return _DenyConditionParser(
+        condition,
+        action=action,
+        scope=scope,
+        repository_name=repository_name,
+        suboperation=suboperation,
+    ).parse()
+
+
+def _deny_permission_blocks_action(
+    permission: Mapping[str, object],
+    *,
+    action: str,
+    is_data_action: bool,
+    scope: str,
+    repository_name: str | None,
+    suboperation: str | None,
+    field: str,
+) -> bool:
+    allowed_fields = {
+        "actions",
+        "notActions",
+        "dataActions",
+        "notDataActions",
+        "condition",
+        "conditionVersion",
+    }
+    unexpected_fields = set(permission) - allowed_fields
+    if unexpected_fields:
+        raise OrchestrationError(
+            f"{field} contains unsupported fields: {sorted(unexpected_fields)}"
+        )
+
+    def permission_set(json_field: str) -> tuple[str, ...]:
+        values = permission.get(json_field)
+        if not isinstance(values, list) or any(
+            not isinstance(item, str) or not item or item != item.strip() or len(item) > 512
+            for item in values
+        ):
+            raise OrchestrationError(f"{field}.{json_field} must be a bounded string array")
+        normalized = [item.casefold() for item in values]
+        if len(set(normalized)) != len(normalized):
+            raise OrchestrationError(f"{field}.{json_field} contains duplicates")
+        return tuple(values)
+
+    actions = permission_set("actions")
+    not_actions = permission_set("notActions")
+    data_actions = permission_set("dataActions")
+    not_data_actions = permission_set("notDataActions")
+    granted = data_actions if is_data_action else actions
+    excluded = not_data_actions if is_data_action else not_actions
+    action_is_denied = any(
+        _azure_permission_pattern_matches(pattern, action) for pattern in granted
+    ) and not any(_azure_permission_pattern_matches(pattern, action) for pattern in excluded)
+    if not action_is_denied:
+        return False
+    condition = permission.get("condition")
+    condition_version = permission.get("conditionVersion")
+    if condition is None and condition_version is None:
+        return True
+    if not (isinstance(condition, str) and condition and condition_version == "2.0"):
+        raise OrchestrationError(f"{field} condition evidence is incomplete or unsupported")
+    return _deny_condition_applies(
+        condition,
+        action=action,
+        scope=scope,
+        repository_name=repository_name,
+        suboperation=suboperation,
+    )
+
+
+def _deny_assignment_blocks_runtime_action(
+    assignment: Mapping[str, object],
+    *,
+    runtime_action: _RequiredRuntimeAction,
+    principal_memberships: set[str],
+) -> bool:
+    properties = _mapping(
+        assignment.get("properties"),
+        field="deny-assignment properties",
+    )
+    assignment_scope = _deny_assignment_scope(assignment)
+    if not _scope_contains_resource(assignment_scope, runtime_action.scope):
+        raise OrchestrationError(
+            "deny-assignment atScope evidence contains an unrelated assignment scope"
+        )
+    do_not_apply_to_children = properties.get("doNotApplyToChildScopes", False)
+    if not isinstance(do_not_apply_to_children, bool):
+        raise OrchestrationError("deny-assignment doNotApplyToChildScopes must be boolean")
+    if (
+        do_not_apply_to_children
+        and assignment_scope.rstrip("/").casefold() != runtime_action.scope.rstrip("/").casefold()
+    ):
+        return False
+    principals = _deny_principal_ids(
+        properties.get("principals"),
+        field="deny-assignment principals",
+        allow_all_principals=True,
+    )
+    exclusions = _deny_principal_ids(
+        properties.get("excludePrincipals", []),
+        field="deny-assignment exclusions",
+        allow_all_principals=False,
+    )
+    if not principals:
+        raise OrchestrationError("deny-assignment principals must not be empty")
+    applies_to_principal = ALL_PRINCIPALS_ID in principals or bool(
+        principals & principal_memberships
+    )
+    if not applies_to_principal or bool(exclusions & principal_memberships):
+        return False
+    effect = properties.get("denyAssignmentEffect", "Enforced")
+    if not isinstance(effect, str) or effect.casefold() not in {"enforced", "audit"}:
+        raise OrchestrationError("deny-assignment effect is invalid")
+    if effect.casefold() == "audit":
+        return False
+    permissions = properties.get("permissions")
+    if not isinstance(permissions, list) or not 1 <= len(permissions) <= 64:
+        raise OrchestrationError("deny-assignment permissions must be a bounded non-empty array")
+    action_is_denied = any(
+        _deny_permission_blocks_action(
+            _mapping(
+                raw_permission,
+                field=f"deny-assignment permission {index}",
+            ),
+            action=runtime_action.action,
+            is_data_action=runtime_action.is_data_action,
+            scope=runtime_action.scope,
+            repository_name=runtime_action.repository_name,
+            suboperation=runtime_action.suboperation,
+            field=f"deny-assignment permission {index}",
+        )
+        for index, raw_permission in enumerate(permissions)
+    )
+    if not action_is_denied:
+        return False
+    condition = properties.get("condition")
+    condition_version = properties.get("conditionVersion")
+    if condition is None and condition_version is None:
+        condition_applies = True
+    elif isinstance(condition, str) and condition and condition_version == "2.0":
+        condition_applies = _deny_condition_applies(
+            condition,
+            action=runtime_action.action,
+            scope=runtime_action.scope,
+            repository_name=runtime_action.repository_name,
+            suboperation=runtime_action.suboperation,
+        )
+    else:
+        raise OrchestrationError("deny-assignment condition evidence is incomplete or unsupported")
+    return condition_applies
+
+
+def _required_runtime_actions(
+    expected_assignments: Sequence[_ExpectedRoleAssignment],
+) -> list[_RequiredRuntimeAction]:
+    required: list[_RequiredRuntimeAction] = []
+    seen: set[tuple[str, str, str, bool, str | None]] = set()
+    for expected in expected_assignments:
+        role_id = expected.role_definition_id.casefold().rsplit("/", 1)[-1]
+        profile = (
+            expected.custom_role_permissions
+            if expected.custom_role_permissions is not None
+            else BUILT_IN_REQUIRED_PERMISSION_PROFILES.get(role_id)
+        )
+        if profile is None:
+            raise OrchestrationError(
+                f"{expected.label} has no complete required runtime-action profile"
+            )
+        for is_data_action, actions in (
+            (False, profile.actions),
+            (True, profile.data_actions),
+        ):
+            for action in sorted(actions):
+                key = (
+                    expected.principal_id.casefold(),
+                    expected.scope.casefold(),
+                    action.casefold(),
+                    is_data_action,
+                    expected.repository_name,
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                required.append(
+                    _RequiredRuntimeAction(
+                        label=expected.label,
+                        principal_id=expected.principal_id,
+                        scope=expected.scope,
+                        action=action,
+                        is_data_action=is_data_action,
+                        repository_name=expected.repository_name,
+                    )
+                )
+    return required
+
+
+def _verify_no_applicable_deny_assignments(
+    expected_assignments: Sequence[_ExpectedRoleAssignment],
+    *,
+    subscription_id: str,
+) -> None:
+    runtime_actions = _required_runtime_actions(expected_assignments)
+    memberships_by_principal: dict[str, set[str]] = {}
+    deny_assignments_by_scope: dict[str, list[dict[str, Any]]] = {}
+    for runtime_action in runtime_actions:
+        principal_id = _canonical_directory_object_id(
+            runtime_action.principal_id,
+            field=f"{runtime_action.label} principal ID",
+        )
+        principal_memberships = memberships_by_principal.get(principal_id)
+        if principal_memberships is None:
+            principal_memberships = {
+                principal_id,
+                *(group_id.casefold() for group_id in _transitive_group_ids(principal_id)),
+            }
+            memberships_by_principal[principal_id] = principal_memberships
+        canonical_scope = _canonical_subscription_resource_id(
+            runtime_action.scope,
+            subscription_id=subscription_id,
+            field=f"{runtime_action.label} governed scope",
+        )
+        normalized_scope = canonical_scope.casefold()
+        deny_assignments = deny_assignments_by_scope.get(normalized_scope)
+        if deny_assignments is None:
+            deny_assignments = _deny_assignments_at_or_above_scope(
+                canonical_scope,
+                subscription_id=subscription_id,
+            )
+            deny_assignments_by_scope[normalized_scope] = deny_assignments
+        for assignment in deny_assignments:
+            if _deny_assignment_blocks_runtime_action(
+                assignment,
+                runtime_action=runtime_action,
+                principal_memberships=principal_memberships,
+            ):
+                assignment_id = _string(
+                    assignment.get("id"),
+                    field="deny-assignment ID",
+                )
+                raise OrchestrationError(
+                    f"{runtime_action.label} required action {runtime_action.action} "
+                    f"is denied by {assignment_id}"
+                )
 
 
 def _verify_exact_effective_assignments(
@@ -9070,8 +10422,11 @@ def _validated_image_pull_evidence(
                     "registryResourceId",
                     "principalId",
                     "registryRoleAssignmentMode",
+                    "registryRepositoryName",
                     "registryPullRoleDefinitionId",
                     "registryPullRoleAssignmentResourceId",
+                    "registryPullConditionVersion",
+                    "registryPullCondition",
                     "status",
                 }
             ),
@@ -9092,7 +10447,7 @@ def _validated_image_pull_evidence(
             execution.get("executionName"),
             field=f"image-pull execution {index} name",
         )
-        _digest_pinned_image(
+        image = _digest_pinned_image(
             execution.get("image"),
             field=f"image-pull execution {index} image",
         )
@@ -9100,7 +10455,7 @@ def _validated_image_pull_evidence(
             execution.get("containerName"),
             field=f"image-pull execution {index} container",
         )
-        _canonical_subscription_resource_id(
+        registry_resource_id = _canonical_subscription_resource_id(
             execution.get("registryResourceId"),
             subscription_id=subscription_id,
             field=f"image-pull execution {index} registry",
@@ -9130,16 +10485,43 @@ def _validated_image_pull_evidence(
         )
         _require_subscription_resource_id_equal(
             execution.get("registryPullRoleAssignmentResourceId"),
-            _deterministic_principal_role_assignment_id(
-                _string(
-                    execution.get("registryResourceId"),
-                    field=f"image-pull execution {index} registry",
+            _acr_pull_role_assignment_id(
+                scope=registry_resource_id,
+                principal_id=principal_id,
+                role_definition_id=expected_role_definition_id,
+                role_assignment_mode=role_assignment_mode,
+                repository_name=_acr_repository_name(
+                    image,
+                    registry_resource_id,
+                    field=f"image-pull execution {index} image",
                 ),
-                principal_id,
-                expected_role_definition_id,
             ),
             subscription_id=subscription_id,
             field=f"image-pull execution {index} deterministic role assignment",
+        )
+        repository_name = _acr_repository_name(
+            image,
+            registry_resource_id,
+            field=f"image-pull execution {index} image",
+        )
+        _require_equal(
+            execution.get("registryRepositoryName"),
+            repository_name,
+            field=f"image-pull execution {index} repository",
+        )
+        condition_version, condition = _acr_pull_assignment_condition(
+            role_assignment_mode=role_assignment_mode,
+            repository_name=repository_name,
+        )
+        _require_equal(
+            execution.get("registryPullConditionVersion"),
+            condition_version,
+            field=f"image-pull execution {index} condition version",
+        )
+        _require_equal(
+            execution.get("registryPullCondition"),
+            condition,
+            field=f"image-pull execution {index} condition",
         )
         _require_equal(
             execution.get("status"),
@@ -9182,6 +10564,15 @@ def _verify_digest_pinned_job_image_pull(
     _, resource_group = _resource_subscription_and_group(job_id)
     job_name = _resource_name(job_id)
     expected_image = _digest_pinned_image(image, field="image-pull probe image")
+    repository_name = _acr_repository_name(
+        expected_image,
+        registry_resource_id,
+        field="image-pull probe image",
+    )
+    condition_version, condition = _acr_pull_assignment_condition(
+        role_assignment_mode=registry_role_assignment_mode,
+        repository_name=repository_name,
+    )
     last_error: OrchestrationError | None = None
     for attempt in range(1, READBACK_MAX_ATTEMPTS + 1):
         try:
@@ -9298,10 +10689,13 @@ def _verify_digest_pinned_job_image_pull(
                         "registryResourceId": registry_resource_id,
                         "principalId": principal_id,
                         "registryRoleAssignmentMode": registry_role_assignment_mode,
+                        "registryRepositoryName": repository_name,
                         "registryPullRoleDefinitionId": registry_pull_role_definition_id,
                         "registryPullRoleAssignmentResourceId": (
                             registry_pull_role_assignment_resource_id
                         ),
+                        "registryPullConditionVersion": condition_version,
+                        "registryPullCondition": condition,
                         "status": "Succeeded",
                     }
                 if status == "Failed":
@@ -9411,8 +10805,11 @@ def _expected_image_pull_binding(
         "registryResourceId": outputs["registryResourceId"],
         "principalId": principal_id,
         "registryRoleAssignmentMode": outputs["registryRoleAssignmentMode"],
+        "registryRepositoryName": outputs["registryRepositoryName"],
         "registryPullRoleDefinitionId": outputs["registryPullRoleDefinitionId"],
         "registryPullRoleAssignmentResourceId": outputs["registryPullRoleAssignmentResourceId"],
+        "registryPullConditionVersion": outputs["registryPullConditionVersion"],
+        "registryPullCondition": outputs["registryPullCondition"],
         "status": "Succeeded",
     }
 
@@ -10068,6 +11465,13 @@ def _verify_producer_resources(
         subscription_id=subscription_id,
         effective_assignments_by_principal=effective_assignments_by_principal,
     )
+    _verify_no_applicable_deny_assignments(
+        [
+            *expected_assignments.values(),
+            *prospective_publisher_sender.values(),
+        ],
+        subscription_id=subscription_id,
+    )
     namespace_name = _string(
         _parameter_value(effective_parameters, "serviceBusNamespaceName"),
         field="producer Service Bus namespace",
@@ -10427,6 +11831,10 @@ def _verify_publisher_resources(
         publisher_principal_ids=allowed_principal_ids,
         publisher_assignment_ids_by_principal=assignment_ids_by_principal,
         producer_assignment_ids_by_principal=producer_assignment_ids_by_principal,
+        subscription_id=subscription_id,
+    )
+    _verify_no_applicable_deny_assignments(
+        list(expected_assignments.values()),
         subscription_id=subscription_id,
     )
     _verify_service_bus_queue(
@@ -12679,10 +14087,26 @@ def apply(args: argparse.Namespace) -> Path:
         )
     handoff_path = args.plan_manifest.with_name(f"{stage}-{deployment_name}.handoff.json")
     receipt_path = args.plan_manifest.with_name(f"{stage}-{deployment_name}.receipt.json")
-    for output_path in (handoff_path, receipt_path):
-        if output_path.exists():
-            raise OrchestrationError(f"refusing to overwrite immutable evidence {output_path}")
-    application_mode = "resume-succeeded-deployment" if resume_succeeded_deployment else "create"
+    existing_handoff_document = _load_partial_handoff_for_resume(
+        handoff_path=handoff_path,
+        receipt_path=receipt_path,
+        resume_succeeded_deployment=resume_succeeded_deployment,
+        stage=stage,
+        artifact_reader=artifact_reader,
+    )
+    existing_handoff_application_mode = (
+        None
+        if existing_handoff_document is None
+        else _application_mode(
+            existing_handoff_document.get("applicationMode"),
+            field="partially published deployment handoff application mode",
+        )
+    )
+    application_mode = (
+        existing_handoff_application_mode
+        if existing_handoff_application_mode is not None
+        else ("resume-succeeded-deployment" if resume_succeeded_deployment else "create")
+    )
     (
         outputs,
         deployment_record_sha256,
@@ -12723,6 +14147,15 @@ def apply(args: argparse.Namespace) -> Path:
     bindings = _parameter_bindings(stage, effective_parameters)
     handoff_outputs = _handoff_outputs(stage, outputs)
     predecessor_receipt_hashes = _predecessor_receipt_hashes(verified_predecessors)
+    published_image_pull_evidence = (
+        image_pull_evidence
+        if existing_handoff_document is None
+        else _validated_image_pull_evidence(
+            existing_handoff_document.get("imagePullEvidence"),
+            stage=stage,
+            subscription_id=subscription_id,
+        )
+    )
     handoff = {
         "schemaVersion": HANDOFF_SCHEMA_VERSION,
         "stage": stage,
@@ -12744,8 +14177,8 @@ def apply(args: argparse.Namespace) -> Path:
         "authorityBlobInventorySha256": _authority_checkpoint_sha256(
             post_deployment_authority_inventory
         ),
-        "imagePullEvidence": image_pull_evidence,
-        "imagePullEvidenceSha256": _image_pull_evidence_sha256(image_pull_evidence),
+        "imagePullEvidence": published_image_pull_evidence,
+        "imagePullEvidenceSha256": _image_pull_evidence_sha256(published_image_pull_evidence),
         "revocationAssignments": revocation_assignments,
         "revocationAssignmentsSha256": (
             _revocation_assignment_evidence_sha256(revocation_assignments)
@@ -12753,7 +14186,6 @@ def apply(args: argparse.Namespace) -> Path:
     }
     handoff_raw_bytes = _canonical_json_file_bytes(handoff)
     handoff_sha256 = _sha256_bytes(handoff_raw_bytes)
-    _write_new_bytes(handoff_path, handoff_raw_bytes)
     receipt = {
         "schemaVersion": RECEIPT_SCHEMA_VERSION,
         "stage": stage,
@@ -12774,12 +14206,18 @@ def apply(args: argparse.Namespace) -> Path:
         "authorityBlobInventorySha256": _authority_checkpoint_sha256(
             post_deployment_authority_inventory
         ),
-        "imagePullEvidenceSha256": _image_pull_evidence_sha256(image_pull_evidence),
+        "imagePullEvidenceSha256": _image_pull_evidence_sha256(published_image_pull_evidence),
         "revocationAssignmentsSha256": (
             _revocation_assignment_evidence_sha256(revocation_assignments)
         ),
     }
-    _write_new_bytes(receipt_path, _canonical_json_file_bytes(receipt))
+    _publish_evidence_bundle(
+        handoff_path=handoff_path,
+        handoff_raw_bytes=handoff_raw_bytes,
+        receipt_path=receipt_path,
+        receipt_raw_bytes=_canonical_json_file_bytes(receipt),
+        allow_existing_handoff=resume_succeeded_deployment,
+    )
     return receipt_path
 
 

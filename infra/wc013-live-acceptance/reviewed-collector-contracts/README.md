@@ -19,7 +19,8 @@ a digest-pinned Python base, installs the controller and dependencies at build t
 exact ACR RepoDigest in `collectorControllerImage`; Bicep rejects the all-zero placeholder and grants
 the GitHub OIDC identity only the mode-compatible pull role (`AcrPull` for legacy permissions or
 `Container Registry Repository Reader` for ABAC repository permissions) in addition to its exact
-Job permissions.
+Job permissions. The ABAC role assignment carries condition version `2.0` and the canonical exact
+repository-name condition parsed from that reviewed controller image.
 
 The reviewed deployment artifact pins the same complete image reference. At execution, the workflow
 uses only SHA-pinned checkout and `azure/login` actions on `ubuntu-24.04`. Before Azure login,

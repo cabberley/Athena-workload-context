@@ -102,7 +102,9 @@ correlation reader identities/storage domains, and reused producer signing keys 
   delete actions; and
 - the mode-compatible ACR pull role for the broker identity: legacy `AcrPull` only for
   `LegacyRegistryPermissions`, or `Container Registry Repository Reader` for
-  `AbacRepositoryPermissions`.
+  `AbacRepositoryPermissions`. The ABAC assignment uses condition version `2.0` and the canonical
+  `StringEqualsIgnoreCase` repository-name condition for the exact repository parsed from the
+  reviewed digest-pinned producer image; it does not grant registry-wide or prefix-wide access.
 
 Supply the referenced resource IDs/names (user-assigned identities, replay storage account,
 correlation source storage account, Service Bus namespace, and Key Vault keys); the module derives
@@ -123,7 +125,11 @@ swapped assignment fail closed. Every assignment whose resolved role permissions
 canonical no-`Blob.List` expression; absent, altered, or duplicated condition forms fail closed.
 Effective RBAC includes every transitive Microsoft Entra group membership and each group’s direct,
 descendant, and inherited assignments; incomplete membership or assignment pagination fails
-closed. It also requires the producer trigger, publisher request, and notification outbox queues
+closed. Readiness separately enumerates every deny assignment at or above each governed scope and
+evaluates direct and transitive-group principals, `All Principals`, exclusions,
+`doNotApplyToChildScopes`, assignment-level and per-permission conditions, and the exact required
+queue, Blob, Table, Key, and ACR actions. An applicable deny or incomplete deny-assignment evidence
+fails closed. It also requires the producer trigger, publisher request, and notification outbox queues
 to be `Active`, non-forwarding, explicitly non-auto-deleting, and to match their exact
 stage-specific session, duplicate-detection window, TTL, lock, delivery-count, capacity, batching,
 partitioning, and message-size profiles.

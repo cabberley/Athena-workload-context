@@ -107,10 +107,18 @@ def test_wc027_runtime_uses_derived_identities_and_key_scopes() -> None:
 def test_wc027_acr_pull_is_mode_aware_principal_seeded_and_cross_scope() -> None:
     source = RUNTIME.read_text(encoding="utf-8")
     module = ACR_PULL_RBAC.read_text(encoding="utf-8")
+    repository_condition = (
+        "((!(ActionMatches{\\'Microsoft.ContainerRegistry/registries/repositories/"
+        "content/read\\'}) AND !(ActionMatches{\\'Microsoft.ContainerRegistry/"
+        "registries/repositories/metadata/read\\'})) OR (@Request[Microsoft."
+        "ContainerRegistry/registries/repositories:name] StringEqualsIgnoreCase "
+        "\\'${validatedRepositoryName}\\'))"
+    )
 
     for expected in (
         "param registryResourceId string",
         "param identityPrincipalId string",
+        "param image string",
         "param registryRoleAssignmentMode string",
         "reference(registry.id, '2025-04-01', 'Full')",
         "registryRuntime.properties.roleAssignmentMode == registryRoleAssignmentMode",
@@ -119,9 +127,15 @@ def test_wc027_acr_pull_is_mode_aware_principal_seeded_and_cross_scope() -> None
         "b93aa761-3e63-49ed-ac28-beffa264f7ac",
         "7f951dda-4ed3-4680-a7ca-43fe172d538d",
         "guid(registry.id, identityPrincipalId, pullRoleDefinitionResourceId)",
+        "guid(registry.id, identityPrincipalId, pullRoleDefinitionResourceId, "
+        "validatedRepositoryName)",
         "principalType: 'ServicePrincipal'",
+        "conditionVersion: pullConditionVersion",
+        "condition: pullCondition",
+        f"var repositoryCondition = '{repository_condition}'",
         "output registryResourceId string = runtimeRegistryResourceId",
         "output roleAssignmentMode string = validatedRoleAssignmentMode",
+        "output repositoryName string = validatedRepositoryName",
     ):
         assert expected in module
     assert "param identityResourceId string" not in module
@@ -132,9 +146,13 @@ def test_wc027_acr_pull_is_mode_aware_principal_seeded_and_cross_scope() -> None
         "split(registryResourceId, '/')[2]",
         "split(registryResourceId, '/')[4]",
         "identityPrincipalId: validatedBrokerIdentityPrincipalId",
+        "image: validatedProducerImage",
         "registryRoleAssignmentMode: registryRoleAssignmentMode",
         "registryPullRoleAssignmentId",
         "producerImagePull.outputs.registryResourceId",
+        "producerImagePull.outputs.repositoryName",
+        "producerImagePull.outputs.?conditionVersion",
+        "producerImagePull.outputs.?condition",
     ):
         assert expected in source
     assert "guid(registry.id, brokerIdentity.id" not in source

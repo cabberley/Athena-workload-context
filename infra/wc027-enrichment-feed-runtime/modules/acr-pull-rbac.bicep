@@ -6,6 +6,11 @@ param registryResourceId string
 @description('Exact service-principal object ID receiving image-pull permission.')
 param identityPrincipalId string
 
+@description('Exact digest-pinned image whose repository is authorized for this principal.')
+@minLength(1)
+@maxLength(2048)
+param image string
+
 @description('Reviewed ACR role-assignment permissions mode.')
 @allowed([
   'LegacyRegistryPermissions'
@@ -40,18 +45,60 @@ var pullRoleDefinitionResourceId = subscriptionResourceId(
 var guardedPullRoleDefinitionResourceId = !empty(runtimeRegistryResourceId) && !empty(validatedRoleAssignmentMode)
   ? pullRoleDefinitionResourceId
   : fail('ACR runtime identity and permission mode must be validated before role assignment')
+var expectedRegistryServer = '${toLower(last(split(registryResourceId, '/')))}.azurecr.io'
+var imageParts = split(image, '@sha256:')
+var imageRepositoryReference = length(imageParts) == 2 ? imageParts[0] : ''
+var imageDigest = length(imageParts) == 2 ? imageParts[1] : ''
+var repositoryPrefix = '${expectedRegistryServer}/'
+var repositoryNameCandidate = startsWith(imageRepositoryReference, repositoryPrefix)
+  ? substring(imageRepositoryReference, length(repositoryPrefix))
+  : ''
+var imageDigestWithoutDigits = replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(
+  imageDigest,
+  '0',
+  ''
+), '1', ''), '2', ''), '3', ''), '4', ''), '5', ''), '6', ''), '7', ''), '8', ''), '9', '')
+var imageDigestInvalidCharacters = replace(replace(replace(replace(replace(replace(
+  imageDigestWithoutDigits,
+  'a',
+  ''
+), 'b', ''), 'c', ''), 'd', ''), 'e', ''), 'f', '')
+var validatedRepositoryName = image == toLower(image) && length(imageParts) == 2 && startsWith(
+  imageRepositoryReference,
+  repositoryPrefix
+) && !empty(repositoryNameCandidate) && !contains(repositoryNameCandidate, '@') && length(imageDigest) == 64 && empty(
+  imageDigestInvalidCharacters
+) && imageDigest != '0000000000000000000000000000000000000000000000000000000000000000'
+  ? repositoryNameCandidate
+  : fail('image must be a real lowercase digest-pinned image in the supplied registry')
+var repositoryCondition = '((!(ActionMatches{\'Microsoft.ContainerRegistry/registries/repositories/content/read\'}) AND !(ActionMatches{\'Microsoft.ContainerRegistry/registries/repositories/metadata/read\'})) OR (@Request[Microsoft.ContainerRegistry/registries/repositories:name] StringEqualsIgnoreCase \'${validatedRepositoryName}\'))'
+var pullConditionVersion = validatedRoleAssignmentMode == 'AbacRepositoryPermissions' ? '2.0' : null
+var pullCondition = validatedRoleAssignmentMode == 'AbacRepositoryPermissions'
+  ? repositoryCondition
+  : null
+var pullAssignmentName = registryRoleAssignmentMode == 'AbacRepositoryPermissions'
+  ? guid(registry.id, identityPrincipalId, pullRoleDefinitionResourceId, validatedRepositoryName)
+  : guid(registry.id, identityPrincipalId, pullRoleDefinitionResourceId)
 
 resource pullAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(registry.id, identityPrincipalId, pullRoleDefinitionResourceId)
+  name: pullAssignmentName
   scope: registry
-  properties: {
+  properties: union({
     principalId: identityPrincipalId
     principalType: 'ServicePrincipal'
     roleDefinitionId: guardedPullRoleDefinitionResourceId
-  }
+  }, validatedRoleAssignmentMode == 'AbacRepositoryPermissions'
+    ? {
+        conditionVersion: pullConditionVersion
+        condition: pullCondition
+      }
+    : {})
 }
 
 output roleAssignmentResourceId string = pullAssignment.id
 output roleDefinitionResourceId string = guardedPullRoleDefinitionResourceId
 output registryResourceId string = runtimeRegistryResourceId
 output roleAssignmentMode string = validatedRoleAssignmentMode
+output repositoryName string = validatedRepositoryName
+output conditionVersion string? = pullConditionVersion
+output condition string? = pullCondition

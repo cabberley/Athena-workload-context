@@ -247,11 +247,6 @@ var registryPullRoleDefinitionId = subscriptionResourceId(
   'Microsoft.Authorization/roleDefinitions',
   registryPullRoleDefinitionGuid
 )
-var registryPullRoleAssignmentId = extensionResourceId(
-  registryScopedResourceId,
-  'Microsoft.Authorization/roleAssignments',
-  guid(registryScopedResourceId, brokerIdentityPrincipalId, registryPullRoleDefinitionId)
-)
 var storageBlobDataReaderRoleDefinitionId = '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1'
 var storageTableDataContributorRoleDefinitionId = '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3'
 var storageTableDataReaderRoleDefinitionId = '76199698-9eea-4c19-bc75-cec21354c6b6'
@@ -275,6 +270,23 @@ var validatedProducerImage = registryServer == expectedRegistryServer && produce
 ) && length(imageDigest) == 64 && empty(imageDigestInvalidCharacters) && imageDigest != '0000000000000000000000000000000000000000000000000000000000000000'
   ? producerImage
   : fail('producerImage must be a real digest-pinned image in the supplied registry')
+var producerImageRepositoryName = replace(
+  first(split(validatedProducerImage, '@sha256:')),
+  '${expectedRegistryServer}/',
+  ''
+)
+var registryPullRoleAssignmentId = extensionResourceId(
+  registryScopedResourceId,
+  'Microsoft.Authorization/roleAssignments',
+  registryRoleAssignmentMode == 'AbacRepositoryPermissions'
+    ? guid(
+        registryScopedResourceId,
+        brokerIdentityPrincipalId,
+        registryPullRoleDefinitionId,
+        producerImageRepositoryName
+      )
+    : guid(registryScopedResourceId, brokerIdentityPrincipalId, registryPullRoleDefinitionId)
+)
 
 resource brokerIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2024-11-30' existing = {
   name: last(split(brokerIdentityResourceId, '/'))
@@ -908,6 +920,7 @@ module producerImagePull 'modules/acr-pull-rbac.bicep' = {
   params: {
     registryResourceId: registryResourceId
     identityPrincipalId: validatedBrokerIdentityPrincipalId
+    image: validatedProducerImage
     registryRoleAssignmentMode: registryRoleAssignmentMode
   }
 }
@@ -1285,11 +1298,20 @@ output registryResourceId string = producerImagePull.outputs.registryResourceId
 @description('Live ACR role-assignment permissions mode used for producer image pull.')
 output registryRoleAssignmentMode string = producerImagePull.outputs.roleAssignmentMode
 
+@description('Exact ACR repository parsed from the reviewed producer image.')
+output registryRepositoryName string = producerImagePull.outputs.repositoryName
+
 @description('Mode-compatible ACR pull role definition resource ID.')
 output registryPullRoleDefinitionId string = producerImagePull.outputs.roleDefinitionResourceId
 
 @description('Deterministic producer ACR pull role assignment resource ID.')
 output registryPullRoleAssignmentResourceId string = producerImagePull.outputs.roleAssignmentResourceId
+
+@description('Exact condition version on the producer ACR pull assignment, or null in legacy mode.')
+output registryPullConditionVersion string? = producerImagePull.outputs.?conditionVersion
+
+@description('Exact repository-scoped condition on the producer ACR pull assignment, or null in legacy mode.')
+output registryPullCondition string? = producerImagePull.outputs.?condition
 
 @description('Private Service Bus namespace host used by the runtime configuration.')
 output namespaceHostName string = serviceBusNamespaceHostName

@@ -141,11 +141,6 @@ var registryPullRoleDefinitionId = subscriptionResourceId(
   'Microsoft.Authorization/roleDefinitions',
   registryPullRoleDefinitionGuid
 )
-var registryPullRoleAssignmentId = extensionResourceId(
-  registryScopedResourceId,
-  'Microsoft.Authorization/roleAssignments',
-  guid(registryScopedResourceId, brokerIdentityPrincipalId, registryPullRoleDefinitionId)
-)
 
 var expectedRegistryServer = '${toLower(last(split(registryResourceId, '/')))}.azurecr.io'
 var imagePrefix = '${expectedRegistryServer}/athena/wc027-guidance-authority-publisher@sha256:'
@@ -166,6 +161,23 @@ var validatedPublisherImage = registryServer == expectedRegistryServer && publis
 ) && length(imageDigest) == 64 && empty(imageDigestInvalidCharacters) && imageDigest != '0000000000000000000000000000000000000000000000000000000000000000'
   ? publisherImage
   : fail('publisherImage must be a real digest-pinned image in the supplied registry')
+var publisherImageRepositoryName = replace(
+  first(split(validatedPublisherImage, '@sha256:')),
+  '${expectedRegistryServer}/',
+  ''
+)
+var registryPullRoleAssignmentId = extensionResourceId(
+  registryScopedResourceId,
+  'Microsoft.Authorization/roleAssignments',
+  registryRoleAssignmentMode == 'AbacRepositoryPermissions'
+    ? guid(
+        registryScopedResourceId,
+        brokerIdentityPrincipalId,
+        registryPullRoleDefinitionId,
+        publisherImageRepositoryName
+      )
+    : guid(registryScopedResourceId, brokerIdentityPrincipalId, registryPullRoleDefinitionId)
+)
 
 resource brokerIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2024-11-30' existing = {
   name: last(split(brokerIdentityResourceId, '/'))
@@ -379,6 +391,7 @@ module publisherImagePull '../wc027-enrichment-feed-runtime/modules/acr-pull-rba
   params: {
     registryResourceId: registryResourceId
     identityPrincipalId: validatedBrokerIdentityPrincipalId
+    image: validatedPublisherImage
     registryRoleAssignmentMode: registryRoleAssignmentMode
   }
 }
@@ -568,5 +581,8 @@ output bindingKeyResourceId string = bindingKey.id
 output bindingKeyVaultKeyId string = bindingKey.properties.keyUriWithVersion
 output registryResourceId string = publisherImagePull.outputs.registryResourceId
 output registryRoleAssignmentMode string = publisherImagePull.outputs.roleAssignmentMode
+output registryRepositoryName string = publisherImagePull.outputs.repositoryName
 output registryPullRoleDefinitionId string = publisherImagePull.outputs.roleDefinitionResourceId
 output registryPullRoleAssignmentResourceId string = publisherImagePull.outputs.roleAssignmentResourceId
+output registryPullConditionVersion string? = publisherImagePull.outputs.?conditionVersion
+output registryPullCondition string? = publisherImagePull.outputs.?condition

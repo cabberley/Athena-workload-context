@@ -219,10 +219,15 @@ overlap or contain either Athena runtime identity.
 
 `wc016ApprovedConfiguration.wc013AcrPullAssignments` inventories the exact current pull assignment
 for the acceptance, evidence, controller, presentation, detector, orchestrator, and notification
-principals. Each record carries the server-returned registry ID, assignment ID, principal, role,
-permission mode, scope, service-principal type, and null condition. WC-029 foundation and
-live-acceptance readiness re-read this inventory and reject any stale pull assignment for those
-principals.
+principals. Each record carries the reviewed digest-pinned image, parsed repository name,
+server-returned registry ID, assignment ID, principal, role, permission mode, scope,
+service-principal type, and exact condition. Legacy `AcrPull` records have null conditions. In ABAC
+mode every `Container Registry Repository Reader` record has condition version `2.0` and the
+canonical exact repository-name condition; the presentation identity has separate assignments for
+the `athena/presentation-web` and `athena/wc013-live` images. WC-029 foundation and live-acceptance
+readiness re-read this inventory, resolve every effective role definition, and reject any extra
+pull-capable direct, inherited, or transitive-group assignment anywhere in the governed
+subscription, including grants on sibling registries.
 
 The presentation app uses a digest-pinned image and one 0.25-vCPU/0.5-GiB replica in
 `athena-wc013-live-mcp-env`. Its ingress is external to the Container Apps environment only so it

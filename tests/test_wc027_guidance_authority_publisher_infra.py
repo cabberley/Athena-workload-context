@@ -128,6 +128,13 @@ def test_publisher_data_plane_roles_are_exact_and_non_destructive() -> None:
 def test_publisher_acr_pull_uses_exact_registry_scope_and_principal_seed() -> None:
     source = PUBLISHER.read_text(encoding="utf-8")
     module = ACR_PULL.read_text(encoding="utf-8")
+    repository_condition = (
+        "((!(ActionMatches{\\'Microsoft.ContainerRegistry/registries/repositories/"
+        "content/read\\'}) AND !(ActionMatches{\\'Microsoft.ContainerRegistry/"
+        "registries/repositories/metadata/read\\'})) OR (@Request[Microsoft."
+        "ContainerRegistry/registries/repositories:name] StringEqualsIgnoreCase "
+        "\\'${validatedRepositoryName}\\'))"
+    )
 
     for expected in (
         "param brokerIdentityPrincipalId string",
@@ -135,16 +142,25 @@ def test_publisher_acr_pull_uses_exact_registry_scope_and_principal_seed() -> No
         "scope: resourceGroup(registrySubscriptionId, registryResourceGroupName)",
         "registryResourceId: registryResourceId",
         "identityPrincipalId: validatedBrokerIdentityPrincipalId",
+        "image: validatedPublisherImage",
         "registryRoleAssignmentMode: registryRoleAssignmentMode",
         "guid(registryScopedResourceId, brokerIdentityPrincipalId, registryPullRoleDefinitionId)",
         "publisherImagePull.outputs.registryResourceId",
         "publisherImagePull.outputs.roleAssignmentMode",
         "publisherImagePull.outputs.roleDefinitionResourceId",
         "publisherImagePull.outputs.roleAssignmentResourceId",
+        "publisherImagePull.outputs.repositoryName",
+        "publisherImagePull.outputs.?conditionVersion",
+        "publisherImagePull.outputs.?condition",
     ):
         assert expected in source
     assert "guid(registry.id, brokerIdentity.id" not in source
     assert "guid(registry.id, identityPrincipalId, pullRoleDefinitionResourceId)" in module
+    assert (
+        "guid(registry.id, identityPrincipalId, pullRoleDefinitionResourceId, "
+        "validatedRepositoryName)" in module
+    )
+    assert f"var repositoryCondition = '{repository_condition}'" in module
 
 
 def test_runtime_requires_current_activation_and_logical_binding_key() -> None:
