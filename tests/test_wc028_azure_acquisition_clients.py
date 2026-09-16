@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -830,3 +830,187 @@ def test_production_transport_rejects_errors_and_oversized_payloads() -> None:
         )
         with pytest.raises(MonitoringAcquisitionError):
             client.query_log_analytics(request)
+
+
+def _wire_guard_execution(
+    clock_values: list[datetime],
+    *,
+    expires_at: datetime,
+    max_calls: int = 8,
+):
+    class _ClockAdapter:
+        @staticmethod
+        def utc_now() -> datetime:
+            if not clock_values:
+                raise AssertionError("wire guard requested an unexpected timestamp")
+            return clock_values.pop(0)
+
+    class _IdentityProof:
+        expires_at = NOW + timedelta(minutes=10)
+        proof_digest = "sha256:" + "a" * 64
+
+    return monitoring_acquisition_module._AcquisitionExecution(
+        adapter=_ClockAdapter(),
+        identity_proof=_IdentityProof(),
+        authorization_expires_at=expires_at,
+        max_calls=max_calls,
+        max_freshness_seconds=600,
+        effective_rbac_collected_at=NOW - timedelta(minutes=1),
+        effective_rbac_expires_at=expires_at,
+        effective_rbac_max_freshness_seconds=600,
+        started_at=NOW,
+        exchanges=[],
+    )
+
+
+def _multi_resource_activity_request() -> ActivityLogQueryRequest:
+    request = _activity_request()
+    payload = request.model_dump(
+        mode="python",
+        by_alias=True,
+        exclude={"request_digest"},
+    )
+    payload["resourceIds"] = tuple(
+        sorted((PRODUCTION_WEB_ID.casefold(), PRODUCTION_DB_ID.casefold()))
+    )
+    return monitoring_acquisition_module._build_request(
+        ActivityLogQueryRequest,
+        payload,
+    )
+
+
+def test_activity_log_guards_each_actual_http_request() -> None:
+    request = _multi_resource_activity_request()
+    transport = _MockTransport(
+        _ResponseSpec({"value": []}),
+        _ResponseSpec({"value": []}),
+    )
+    clock_values = [NOW, NOW, NOW, NOW]
+    execution = _wire_guard_execution(
+        clock_values,
+        expires_at=NOW + timedelta(minutes=1),
+    )
+    client = AzureActivityLogAcquisitionClient(
+        credential=_Credential(),
+        reviewed_contract=_acquisition_collector_contract(),
+        _transport=transport,
+    )
+    client._set_request_guard(execution)
+
+    result = client.query_activity_log(request)
+
+    assert result.rows == ()
+    assert len(transport.requests) == 2
+    assert clock_values == []
+
+
+def test_activity_log_rejects_second_http_request_after_rbac_expiry() -> None:
+    request = _multi_resource_activity_request()
+    transport = _MockTransport(
+        _ResponseSpec({"value": []}),
+        _ResponseSpec({"value": []}),
+    )
+    execution = _wire_guard_execution(
+        [NOW, NOW, NOW + timedelta(seconds=1)],
+        expires_at=NOW + timedelta(seconds=1),
+    )
+    client = AzureActivityLogAcquisitionClient(
+        credential=_Credential(),
+        reviewed_contract=_acquisition_collector_contract(),
+        _transport=transport,
+    )
+    client._set_request_guard(execution)
+
+    with pytest.raises(
+        MonitoringAcquisitionError,
+        match="expired or stale at Azure wire request start",
+    ):
+        client.query_activity_log(request)
+
+    assert len(transport.requests) == 1
+
+
+def test_claims_challenge_cannot_trigger_unmetered_source_resend() -> None:
+    request = _activity_request()
+    transport = _MockTransport(
+        _ResponseSpec(
+            {"error": "synthetic claims challenge"},
+            status_code=401,
+            headers={
+                "WWW-Authenticate": (
+                    'Bearer error="insufficient_claims", claims="eyJ0ZXN0IjoidHJ1ZSJ9"'
+                )
+            },
+        ),
+        _ResponseSpec({"value": []}),
+    )
+    clock_values = [NOW]
+    execution = _wire_guard_execution(
+        clock_values,
+        expires_at=NOW + timedelta(minutes=1),
+    )
+    client = AzureActivityLogAcquisitionClient(
+        credential=_Credential(),
+        reviewed_contract=_acquisition_collector_contract(),
+        _transport=transport,
+    )
+    client._set_request_guard(execution)
+
+    with pytest.raises(MonitoringAcquisitionError, match="request was unsuccessful"):
+        client.query_activity_log(request)
+
+    assert len(transport.requests) == 1
+    assert clock_values == []
+
+
+def test_resource_health_records_one_bounded_graph_wire_request() -> None:
+    request = _resource_health_request()
+    payload = request.model_dump(
+        mode="python",
+        by_alias=True,
+        exclude={"request_digest"},
+    )
+    payload["resourceIds"] = tuple(
+        sorted((PRODUCTION_WEB_ID.casefold(), PRODUCTION_DB_ID.casefold()))
+    )
+    request = monitoring_acquisition_module._build_request(
+        ResourceHealthQueryRequest,
+        payload,
+    )
+    transport = _MockTransport(
+        _ResponseSpec(
+            {
+                "data": [
+                    {
+                        "resourceId": resource_id,
+                        "occurredAt": (NOW - timedelta(minutes=2)).isoformat(),
+                        "previousStatus": "Available",
+                        "currentStatus": "Unavailable",
+                        "reasonType": "PlatformInitiated",
+                    }
+                    for resource_id in (PRODUCTION_DB_ID, PRODUCTION_WEB_ID)
+                ],
+                "resultTruncated": False,
+            }
+        )
+    )
+    clock_values = [NOW, NOW]
+    execution = _wire_guard_execution(
+        clock_values,
+        expires_at=NOW + timedelta(minutes=1),
+    )
+    client = AzureResourceHealthAcquisitionClient(
+        credential=_Credential(),
+        reviewed_contract=_acquisition_collector_contract(),
+        _transport=transport,
+    )
+    client._set_request_guard(execution)
+
+    result = client.query_resource_health(request)
+
+    assert len(result.rows) == 2
+    assert len(transport.requests) == 1
+    assert clock_values == []
+    body = json.loads(transport.requests[0].body)
+    assert PRODUCTION_DB_ID.casefold() in body["query"]
+    assert PRODUCTION_WEB_ID.casefold() in body["query"]

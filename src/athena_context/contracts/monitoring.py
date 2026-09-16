@@ -4571,22 +4571,29 @@ def verify_monitoring_acquisition_receipt_attestation(
         == expected_athena_context_principal_id.casefold()
     ):
         raise ValueError("deployed acquisition identity separation is invalid")
-    if not (
-        effective_rbac_inventory.collected_at
+    if (
+        not effective_rbac_inventory.collected_at
         <= receipt.execution_started_at
         <= receipt.execution_completed_at
         <= receipt.receipt_issued_at
         < effective_rbac_inventory.expires_at
-        and all(
-            effective_rbac_inventory.collected_at
-            <= exchange.requested_at
-            <= exchange.received_at
-            < effective_rbac_inventory.expires_at
-            for exchange in receipt.exchanges
-        )
+        or (receipt.receipt_issued_at - effective_rbac_inventory.collected_at).total_seconds()
+        > maximum_receipt_age_seconds
     ):
         raise ValueError(
             "acquisition receipt execution is outside measured effective RBAC lifetime"
+        )
+    if any(
+        not effective_rbac_inventory.collected_at
+        <= exchange.requested_at
+        <= exchange.received_at
+        < effective_rbac_inventory.expires_at
+        or (exchange.received_at - effective_rbac_inventory.collected_at).total_seconds()
+        > maximum_receipt_age_seconds
+        for exchange in receipt.exchanges
+    ):
+        raise ValueError(
+            "acquisition receipt exchange times escape measured effective RBAC lifetime"
         )
     if (
         receipt.acquisition_authority_digest != expected_acquisition_authority_digest

@@ -5,6 +5,7 @@ import hashlib
 import json
 import re
 from collections.abc import Callable
+from contextlib import AbstractContextManager
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, NoReturn, cast
 from urllib.parse import urlsplit
@@ -18,6 +19,12 @@ from azure.core.exceptions import (
     ResourceNotFoundError,
     ServiceRequestError,
     ServiceResponseError,
+)
+from azure.core.pipeline.transport import (
+    HttpRequest,
+    HttpResponse,
+    HttpTransport,
+    RequestsTransport,
 )
 from azure.data.tables import TableServiceClient
 from azure.identity import DefaultAzureCredential
@@ -91,6 +98,63 @@ _JWT_REQUIRED_CLAIMS = ("aud", "exp", "iat", "iss", "nbf", "oid", "sub", "tid")
 _BLOB_CONTAINER_PATTERN = re.compile(
     r"[a-z0-9](?:[a-z0-9-]{1,61}[a-z0-9])?"
 )
+type _KeyVaultRequestGuard = Callable[[], AbstractContextManager[None]]
+type _AzureHttpTransport = HttpTransport[HttpRequest, HttpResponse]
+
+
+class _GuardedKeyVaultTransport(HttpTransport[HttpRequest, HttpResponse]):
+    """Apply a fresh authorization guard to every physical Key Vault request."""
+
+    def __init__(
+        self,
+        *,
+        request_guard: _KeyVaultRequestGuard,
+        _transport: _AzureHttpTransport | None = None,
+    ) -> None:
+        self._request_guard = request_guard
+        self._transport = (
+            cast(
+                _AzureHttpTransport,
+                RequestsTransport(connection_timeout=10, read_timeout=30),
+            )
+            if _transport is None
+            else _transport
+        )
+
+    def open(self) -> None:
+        self._transport.open()
+
+    def close(self) -> None:
+        self._transport.close()
+
+    def __enter__(self) -> _GuardedKeyVaultTransport:
+        self.open()
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
+
+    def sleep(self, duration: float) -> None:
+        self._transport.sleep(duration)
+
+    def send(self, request: HttpRequest, **kwargs: Any) -> HttpResponse:
+        with self._request_guard():
+            return self._transport.send(request, **kwargs)
+
+
+def _key_vault_client(
+    *,
+    vault_url: str,
+    credential: DefaultAzureCredential,
+    request_guard: _KeyVaultRequestGuard | None,
+) -> KeyClient:
+    if request_guard is None:
+        return KeyClient(vault_url=vault_url, credential=credential)
+    return KeyClient(
+        vault_url=vault_url,
+        credential=credential,
+        transport=_GuardedKeyVaultTransport(request_guard=request_guard),
+    )
 
 
 def _production_credential(
@@ -234,12 +298,17 @@ class KeyVaultRsaPublicKeyVerifier:
         *,
         trusted_key_anchor: TrustedKeyAnchor,
         managed_identity_client_id: str,
+        request_guard: _KeyVaultRequestGuard | None = None,
     ) -> None:
         vault_url = trusted_key_anchor.key_vault_key_id.split("/keys/", maxsplit=1)[0]
         credential = _production_credential(
             managed_identity_client_id=managed_identity_client_id
         )
-        key = KeyClient(vault_url=vault_url, credential=credential).get_key(
+        key = _key_vault_client(
+            vault_url=vault_url,
+            credential=credential,
+            request_guard=request_guard,
+        ).get_key(
             trusted_key_anchor.key_name,
             trusted_key_anchor.key_version,
         )
@@ -302,6 +371,7 @@ class KeyVaultTrustedKeyResolver:
         *,
         expected_record: TrustedKeyRecord,
         managed_identity_client_id: str,
+        request_guard: _KeyVaultRequestGuard | None = None,
     ) -> None:
         self._expected_record = expected_record
         anchor = expected_record.anchor
@@ -309,7 +379,11 @@ class KeyVaultTrustedKeyResolver:
         credential = _production_credential(
             managed_identity_client_id=managed_identity_client_id
         )
-        self._client = KeyClient(vault_url=vault_url, credential=credential)
+        self._client = _key_vault_client(
+            vault_url=vault_url,
+            credential=credential,
+            request_guard=request_guard,
+        )
 
     def __call__(
         self,

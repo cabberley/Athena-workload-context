@@ -1729,6 +1729,74 @@ def test_identity_proof_time_follows_token_jwks_signature_and_claim_validation()
     )
 
 
+def test_each_source_call_rechecks_live_effective_rbac_start_time() -> None:
+    clock = {"now": NOW}
+
+    class _ClockAdapter:
+        @staticmethod
+        def utc_now() -> datetime:
+            return clock["now"]
+
+    class _IdentityProof:
+        expires_at = NOW + timedelta(minutes=10)
+        proof_digest = "sha256:" + "a" * 64
+
+    execution = monitoring_acquisition_module._AcquisitionExecution(
+        adapter=_ClockAdapter(),
+        identity_proof=_IdentityProof(),
+        authorization_expires_at=NOW + timedelta(seconds=1),
+        max_calls=2,
+        max_freshness_seconds=600,
+        effective_rbac_collected_at=NOW - timedelta(minutes=1),
+        effective_rbac_expires_at=NOW + timedelta(seconds=1),
+        effective_rbac_max_freshness_seconds=600,
+        started_at=NOW,
+        exchanges=[],
+    )
+
+    assert execution._capture_call_start(None) == NOW
+    clock["now"] = NOW + timedelta(seconds=1)
+    with pytest.raises(
+        monitoring_acquisition_module.MonitoringAcquisitionError,
+        match="expired or stale at Azure source request start",
+    ):
+        execution._capture_call_start(None)
+
+
+def test_source_completion_after_effective_rbac_expiry_fails_closed() -> None:
+    payload = _acquisition_collector_contract().model_dump(
+        mode="python",
+        by_alias=True,
+    )
+    inventory = payload["effectiveRbacInventory"]
+    assert isinstance(inventory, dict)
+    inventory.update(
+        {
+            "collectedAt": NOW - timedelta(minutes=1),
+            "expiresAt": NOW + timedelta(seconds=5),
+        }
+    )
+    inventory.pop("inventoryDigest")
+    inventory["inventoryDigest"] = compute_artifact_digest(
+        monitoring_acquisition_module._json_value(inventory)
+    )
+    contract = MonitoringCollectorContract(**payload)
+
+    class _SlowPort(_AcquisitionPort):
+        def _record_request(self, request: object) -> None:
+            super()._record_request(request)
+            _SyntheticClock.now += timedelta(seconds=10)
+
+    port = _SlowPort()
+    with pytest.raises(
+        monitoring_acquisition_module.MonitoringAcquisitionError,
+        match="expired or stale at Azure source request completion",
+    ):
+        _execute(port, collector_contract=contract)
+
+    assert len(port.requests) == 1
+
+
 def test_ambiguous_vm_mapping_and_truncation_degrade_coverage() -> None:
     outcome, commit, _ = _execute(
         _AcquisitionPort(
@@ -2408,20 +2476,23 @@ def test_effective_rbac_inventory_expiry_during_source_io_aborts_without_commit(
 
     with pytest.raises(
         MonitoringAcquisitionError,
-        match="expired during Azure source I/O",
+        match="expired or stale at Azure source request completion",
     ):
         _execute(port)
 
     assert port.requests
 
 
-def test_effective_rbac_inventory_expiry_during_receipt_signing_aborts_commit() -> None:
-    _ReceiptSigner.advance_clock_seconds = 601
+@pytest.mark.parametrize("signing_delay_seconds", (301, 601))
+def test_effective_rbac_inventory_freshness_during_receipt_signing_aborts_commit(
+    signing_delay_seconds: int,
+) -> None:
+    _ReceiptSigner.advance_clock_seconds = signing_delay_seconds
     commit = _CommitPort()
 
     with pytest.raises(
         MonitoringAcquisitionError,
-        match="receipt signing exceeded",
+        match="expired or stale at acquisition receipt signing completion",
     ):
         _execute(_AcquisitionPort(), commit_port=commit)
 

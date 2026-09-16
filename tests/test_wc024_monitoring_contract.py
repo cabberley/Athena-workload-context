@@ -2424,6 +2424,17 @@ def test_signed_acquisition_receipt_reverifies_deployed_identity_policy() -> Non
         enabled=True,
         activated_at=datetime(2026, 1, 1, tzinfo=UTC),
     )
+    with pytest.raises(ValidationError, match="wireAttempts|Extra inputs"):
+        MonitoringAcquisitionReceipt.model_validate(
+            {
+                **receipt.model_dump(
+                    mode="json",
+                    by_alias=True,
+                    exclude_none=True,
+                ),
+                "wireAttempts": [],
+            }
+        )
 
     verify_monitoring_acquisition_receipt_attestation(
         receipt,
@@ -2434,9 +2445,32 @@ def test_signed_acquisition_receipt_reverifies_deployed_identity_policy() -> Non
         expected_acquisition_authority_digest=authority_digest,
         maximum_receipt_age_seconds=600,
     )
+    for escaped_exchange in (
+        exchange.model_copy(
+            update={
+                "requested_at": effective_rbac_inventory.expires_at,
+                "received_at": effective_rbac_inventory.expires_at,
+                "checked_at": effective_rbac_inventory.expires_at,
+            }
+        ),
+        exchange.model_copy(update={"received_at": effective_rbac_inventory.expires_at}),
+    ):
+        with pytest.raises(
+            ValueError,
+            match="exchange times escape measured effective RBAC lifetime",
+        ):
+            verify_monitoring_acquisition_receipt_attestation(
+                receipt.model_copy(update={"exchanges": (escaped_exchange,)}),
+                as_of=observed_at,
+                trusted_key_anchor=anchor,
+                key_resolver=lambda _anchor: record,
+                reviewed_collector_contract=contract,
+                expected_acquisition_authority_digest=authority_digest,
+                maximum_receipt_age_seconds=600,
+            )
     with pytest.raises(
         ValueError,
-        match="outside measured effective RBAC lifetime",
+        match="execution is outside measured effective RBAC lifetime",
     ):
         verify_monitoring_acquisition_receipt_attestation(
             receipt.model_copy(

@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import hashlib
+from contextlib import contextmanager
 from datetime import timedelta
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import jwt
 import pytest
 from azure.core.exceptions import ResourceExistsError
+from azure.core.pipeline.transport import HttpRequest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
@@ -33,6 +35,53 @@ from wc013_support import (
 
 class _Credential:
     pass
+
+
+def test_guarded_key_vault_transport_rechecks_each_physical_request() -> None:
+    events: list[str] = []
+
+    class _Transport:
+        calls = 0
+
+        @staticmethod
+        def open() -> None:
+            return None
+
+        @staticmethod
+        def close() -> None:
+            return None
+
+        @staticmethod
+        def sleep(_duration: float) -> None:
+            return None
+
+        def send(self, _request: object, **_kwargs: object) -> object:
+            self.calls += 1
+            return object()
+
+    @contextmanager
+    def guard():
+        events.append("start")
+        if events.count("start") == 2:
+            raise RuntimeError("synthetic authorization expiry")
+        try:
+            yield
+        finally:
+            events.append("complete")
+
+    inner = _Transport()
+    transport = azure_adapters._GuardedKeyVaultTransport(
+        request_guard=guard,
+        _transport=cast(Any, inner),
+    )
+    request = HttpRequest("GET", "https://synthetic.vault.azure.net/keys/key/version")
+
+    transport.send(request)
+    with pytest.raises(RuntimeError, match="authorization expiry"):
+        transport.send(request)
+
+    assert inner.calls == 1
+    assert events == ["start", "complete", "start"]
 
 
 def test_key_vault_signer_hashes_preimage_and_uses_exact_rs256_key(
