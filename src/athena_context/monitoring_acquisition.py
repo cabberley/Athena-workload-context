@@ -4140,6 +4140,7 @@ class MonitoringAcquisitionCoordinator:
         issued_at: datetime,
         trusted_as_of: datetime,
         expires_at: datetime,
+        stabilize_correlation_window: bool = False,
     ) -> MonitoringAcquisitionOutcome:
         if type(monitoring_intent) is not PublishedMonitoringIntent:
             raise TypeError("acquisition requires an exact PublishedMonitoringIntent")
@@ -4254,6 +4255,12 @@ class MonitoringAcquisitionCoordinator:
                 "effective RBAC inventory expired before Azure source I/O"
             )
         collected_at = identity_proof.verified_at
+        if stabilize_correlation_window:
+            trust_delay = trusted_as_of - issued_at
+            request_lifetime = expires_at - issued_at
+            issued_at = collected_at
+            trusted_as_of = collected_at + trust_delay
+            expires_at = collected_at + request_lifetime
         if (
             issued_at.utcoffset() != UTC.utcoffset(issued_at)
             or trusted_as_of.utcoffset() != UTC.utcoffset(trusted_as_of)

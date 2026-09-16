@@ -18,7 +18,8 @@ Container Apps secret and is accepted only when its exact raw bytes match
 - the private Container Apps managed environment and digest-pinned runtime image;
 - the WC-024 collector identity, versioned `monitoring-evidence-signing` key, storage account,
   immutable `monitoring-evidence` container, and current measured RBAC inventory;
-- the separate runtime-support identity;
+- the separate runtime-support identity plus fresh hierarchy-complete effective-RBAC evidence
+  proving that it has only direct `AcrPull` and exact monitoring-intent key-read access;
 - the exact versioned monitoring-intent signing key whose public material is required for local
   signature verification;
 - the exact workload resource group named by the acquisition authority.
@@ -27,24 +28,31 @@ Monitoring bundles are written only to:
 
 ```text
 wc024-monitoring/{collectionId}/evidence.json
+wc024-monitoring/commits/{replayKey}/recovery.json
 wc024-monitoring/commits/{replayKey}/manifest.json
 ```
 
-The runtime writes or recovers the exact known evidence name, yields it for correlation request
-construction, then publishes the deterministic persistence manifest last as the logical atomic
-commit marker. The evidence name is derived from the reviewed replay key, so a retry cannot commit
-different acquisition bytes under the same execution identity. A caller failure leaves no commit
-marker. The current contract does not execute or persist supporting change controls.
+Every start reads and validates the deterministic manifest name before monitoring-source or Key
+Vault I/O. A valid manifest recovers the committed handoff and exact correlation request directly.
+If only the immutable recovery state or evidence exists, the runtime verifies the signed acquisition
+receipt, recreates the same handoff and correlation bytes, and publishes the manifest without Azure
+source reacquisition. The recovery state is written before evidence and binds the receipt-derived
+request window, incident selection, prepared bundle, execution identity, and replay key. A caller
+failure leaves no commit marker. The current contract does not execute or persist supporting change
+controls.
 
 ## Runtime configuration
 
 `acquisitionRuntimeConfigurationJson` uses
-`athena.wc028MonitoringAcquisitionJobConfiguration.v2`. It embeds the exact signed monitoring
+`athena.wc028MonitoringAcquisitionJobConfiguration.v3`. It embeds the exact signed monitoring
 intent and references, published runtime binding, acquisition authority v5, collector contract v8,
 and approved change scope. It also binds:
 
 - the WC-024 collector resource, client, and principal identities;
 - the separate runtime-support resource, client, and principal identities;
+- the exact registry and monitoring-intent key scopes, the two permitted role IDs, and fresh
+  hierarchy-complete runtime-support effective-RBAC evidence covering direct and inherited
+  assignments, transitive groups, active PIM schedules, conditions, and deny assignments;
 - the separate Athena context resource and principal identities;
 - the monitoring-evidence storage endpoint and container;
 - the resource-context Log Analytics workspace, exact VM scopes, and measured effective RBAC
@@ -74,13 +82,16 @@ IP Flow calls and no IP Flow RBAC.
 An incremental deployment does not delete role assignments created by an older runtime template.
 Before deploying this version over an existing WC-028 runtime, run
 `remove-obsolete-collector-rbac.ps1` with the previous registry, workload resource group,
-change-evidence container, monitoring-evidence container, monitoring-intent key, and exact collector
-resource/principal pair. The script deletes only the five exact legacy collector assignments,
-including the broad monitoring-evidence contributor assignment, removes the two obsolete custom
-role definitions, verifies those bindings are absent, and emits `cleanupEvidenceDigest`.
+change-evidence container, monitoring-evidence container, monitoring-intent key, exact historical
+Network Watcher, and exact collector resource/principal pair. The script deletes only the six exact
+legacy collector assignments, including the deterministic Network Watcher IP Flow assignment and
+the broad monitoring-evidence contributor assignment. It removes the three obsolete custom role
+definitions, verifies every reviewed binding and definition is absent, and emits
+`cleanupEvidenceDigest`.
 
 Pass that digest as both `legacyCollectorRbacCleanupDigest` and the matching field in runtime
-configuration v2. Measure and embed a fresh effective-RBAC inventory only after cleanup. The Job is
+configuration v3. All-zero cleanup evidence is rejected. Measure and embed fresh collector and
+runtime-support effective-RBAC inventories only after cleanup. The Job is
 manual with no replica retry, so every execution requires a newly reviewed configuration, cleanup
 evidence binding, execution ID, and replay key.
 

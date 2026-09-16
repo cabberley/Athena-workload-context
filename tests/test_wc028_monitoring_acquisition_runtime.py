@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import io
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from azure.core.exceptions import AzureError, ServiceRequestError
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from pydantic import ValidationError
@@ -44,12 +46,17 @@ from athena_context.monitoring_acquisition_runtime import (
     _monitoring_persistence_replay_payload,
     _validate_acquisition_authority_preflight,
     _validate_monitoring_intent_key_lifecycle,
+    _validate_runtime_support_effective_rbac,
     load_wc028_monitoring_acquisition_job_configuration,
 )
+from athena_context.monitoring_collection import build_collected_correlation_request
 from test_wc024_monitoring_contract import _acquisition_collector_contract
 from test_wc028_monitoring_acquisition import (
     _acquisition_authority,
+    _AcquisitionPort,
     _authority,
+    _execute,
+    _trust_synthetic_managed_identity_key,
 )
 
 NOW = datetime(2026, 9, 14, 5, 30, tzinfo=UTC)
@@ -60,6 +67,8 @@ COLLECTOR_PRINCIPAL_ID = "44444444-4444-4444-4444-444444444444"
 CONTEXT_PRINCIPAL_ID = "55555555-5555-5555-5555-555555555555"
 SUPPORT_CLIENT_ID = "66666666-6666-6666-6666-666666666666"
 SUPPORT_PRINCIPAL_ID = "77777777-7777-7777-7777-777777777777"
+ATTESTOR_CLIENT_ID = "88888888-8888-8888-8888-888888888888"
+ATTESTOR_PRINCIPAL_ID = "99999999-9999-9999-9999-999999999999"
 COLLECTOR_ID = (
     f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg-athena-demo-monitoring/"
     "providers/Microsoft.ManagedIdentity/userAssignedIdentities/"
@@ -74,6 +83,29 @@ SUPPORT_ID = (
     "providers/Microsoft.ManagedIdentity/userAssignedIdentities/"
     "athena-wc028-runtime-support-id"
 )
+ATTESTOR_ID = (
+    f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg-athena-demo-monitoring/"
+    "providers/Microsoft.ManagedIdentity/userAssignedIdentities/"
+    "athena-wc028-runtime-support-rbac-attestor-id"
+)
+REGISTRY_ID = (
+    f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg-athena-demo-shared/"
+    "providers/Microsoft.ContainerRegistry/registries/athenademoacr"
+)
+MONITORING_INTENT_KEY_RESOURCE_ID = (
+    f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg-athena-demo-context/"
+    "providers/Microsoft.KeyVault/vaults/synthetic-context-kv/"
+    "keys/monitoring-intent-signing"
+)
+ACR_PULL_ROLE_ID = (
+    f"/subscriptions/{SUBSCRIPTION_ID}/providers/Microsoft.Authorization/roleDefinitions/"
+    "7f951dda-4ed3-4680-a7ca-43fe172d538d"
+)
+SUPPORT_KEY_READER_ROLE_ID = (
+    f"/subscriptions/{SUBSCRIPTION_ID}/providers/Microsoft.Authorization/roleDefinitions/"
+    "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+)
+MANAGEMENT_GROUP_SCOPE = "/providers/Microsoft.Management/managementGroups/synthetic-athena-root"
 SOURCE_STORAGE_ID = (
     f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg-athena-demo-context/"
     "providers/Microsoft.Storage/storageAccounts/athenacontextsource"
@@ -118,28 +150,334 @@ DIGEST_C = f"sha256:{'c' * 64}"
 CLEANUP_DIGEST = f"sha256:{'f' * 64}"
 MONITORING_INTENT_ID = f"monitoring-intent-{'d' * 32}"
 EXECUTION_ID = f"wc028-execution-{'e' * 32}"
+
+
+def _digest_json_value(value: object) -> object:
+    if isinstance(value, datetime):
+        return value.isoformat().replace("+00:00", "Z")
+    if isinstance(value, dict):
+        return {str(key): _digest_json_value(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_digest_json_value(item) for item in value]
+    return value
+
+
+def _with_digest(payload: dict[str, object], field_name: str) -> dict[str, object]:
+    return {
+        **payload,
+        field_name: compute_artifact_digest(_digest_json_value(payload)),
+    }
+
+
+def _runtime_support_rbac_inventory(
+    *,
+    subscription_id: str = SUBSCRIPTION_ID,
+    tenant_id: str = TENANT_ID,
+    support_identity_resource_id: str = SUPPORT_ID,
+    registry_resource_id: str = REGISTRY_ID,
+    monitoring_intent_key_resource_id: str = MONITORING_INTENT_KEY_RESOURCE_ID,
+) -> dict[str, object]:
+    registry_id = registry_resource_id.casefold()
+    key_id = monitoring_intent_key_resource_id.casefold()
+    acr_role_id = (
+        f"/subscriptions/{subscription_id}/providers/"
+        "microsoft.authorization/roledefinitions/"
+        "7f951dda-4ed3-4680-a7ca-43fe172d538d"
+    )
+    key_role_id = (
+        f"/subscriptions/{subscription_id}/providers/"
+        "microsoft.authorization/roledefinitions/"
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    )
+    support_principal_id = SUPPORT_PRINCIPAL_ID.casefold()
+    registry_resource_group_name = registry_id.split("/resourcegroups/", maxsplit=1)[1].split(
+        "/", maxsplit=1
+    )[0]
+    key_resource_group_name = key_id.split("/resourcegroups/", maxsplit=1)[1].split(
+        "/", maxsplit=1
+    )[0]
+    target_scopes = tuple(
+        sorted(
+            {
+                MANAGEMENT_GROUP_SCOPE.casefold(),
+                f"/subscriptions/{subscription_id}",
+                (f"/subscriptions/{subscription_id}/resourcegroups/{registry_resource_group_name}"),
+                registry_id,
+                (f"/subscriptions/{subscription_id}/resourcegroups/{key_resource_group_name}"),
+                key_id,
+            }
+        )
+    )
+    principal_evidence = _with_digest(
+        {
+            "principalId": support_principal_id,
+            "queryFilter": "atScope() and assignedTo(principalId)",
+            "targetScopeIds": target_scopes,
+            "firstReadTargetDigests": tuple(DIGEST_A for _ in target_scopes),
+            "secondReadTargetDigests": tuple(DIGEST_A for _ in target_scopes),
+            "roleAssignmentRawPageDigests": (DIGEST_A,),
+            "transitiveGroupIds": (),
+            "transitiveGroupRawPageDigests": (DIGEST_B,),
+            "allPagesRetrieved": True,
+        },
+        "evidenceDigest",
+    )
+    role_definitions = [
+        _with_digest(
+            {
+                "roleDefinitionId": acr_role_id,
+                "roleDefinitionName": "AcrPull",
+                "actions": ("microsoft.containerregistry/registries/pull/read",),
+                "notActions": (),
+                "dataActions": (),
+                "notDataActions": (),
+                "rawDefinitionDigest": DIGEST_A,
+            },
+            "definitionDigest",
+        ),
+        _with_digest(
+            {
+                "roleDefinitionId": key_role_id,
+                "roleDefinitionName": "Athena WC028 Monitoring Intent Key Reader",
+                "actions": (),
+                "notActions": (),
+                "dataActions": ("microsoft.keyvault/vaults/keys/read",),
+                "notDataActions": (),
+                "rawDefinitionDigest": DIGEST_B,
+            },
+            "definitionDigest",
+        ),
+    ]
+    role_definitions.sort(key=lambda item: cast(str, item["roleDefinitionId"]))
+    grants = [
+        _with_digest(
+            {
+                "assignedPrincipalId": support_principal_id,
+                "assignedPrincipalType": "ServicePrincipal",
+                "effectivePrincipalId": support_principal_id,
+                "roleDefinitionId": acr_role_id,
+                "roleDefinitionName": "AcrPull",
+                "assignmentScopeIds": (registry_id,),
+                "inheritance": "direct",
+                "groupDerived": False,
+            },
+            "grantDigest",
+        ),
+        _with_digest(
+            {
+                "assignedPrincipalId": support_principal_id,
+                "assignedPrincipalType": "ServicePrincipal",
+                "effectivePrincipalId": support_principal_id,
+                "roleDefinitionId": key_role_id,
+                "roleDefinitionName": "Athena WC028 Monitoring Intent Key Reader",
+                "assignmentScopeIds": (key_id,),
+                "inheritance": "direct",
+                "groupDerived": False,
+            },
+            "grantDigest",
+        ),
+    ]
+    grants.sort(key=lambda item: cast(str, item["grantDigest"]))
+    raw_snapshot_payload = {
+        "supportPrincipalEvidenceDigest": principal_evidence["evidenceDigest"],
+        "roleDefinitionRawPageDigests": [DIGEST_A],
+        "denyAssignmentRawPageDigests": [DIGEST_B],
+        "pimScheduleInstanceRawPageDigests": [DIGEST_C],
+        "roleDefinitionRawDigests": [item["rawDefinitionDigest"] for item in role_definitions],
+        "denyAssignmentRawDigests": [],
+        "pimScheduleInstanceRawDigests": [],
+    }
+    raw_snapshot_digest = compute_artifact_digest(raw_snapshot_payload)
+    source_manifest_digest = DIGEST_B
+    payload: dict[str, object] = {
+        "schemaVersion": "athena.wc028RuntimeSupportEffectiveRbacInventory.v1",
+        "collectionRunId": f"runtime-support-rbac-{'a' * 32}",
+        "tenantId": tenant_id,
+        "subscriptionId": subscription_id,
+        "supportIdentityResourceId": support_identity_resource_id.casefold(),
+        "supportClientId": SUPPORT_CLIENT_ID,
+        "supportPrincipalId": support_principal_id,
+        "attestorIdentityResourceId": ATTESTOR_ID.casefold().replace(
+            SUBSCRIPTION_ID,
+            subscription_id,
+        ),
+        "attestorClientId": ATTESTOR_CLIENT_ID,
+        "attestorPrincipalId": ATTESTOR_PRINCIPAL_ID,
+        "attestorTenantId": tenant_id,
+        "collectedAt": NOW - timedelta(minutes=1),
+        "expiresAt": NOW + timedelta(minutes=10),
+        "managementGroupAncestry": (MANAGEMENT_GROUP_SCOPE.casefold(),),
+        "ancestorScopeCollectionComplete": True,
+        "subscriptionDescendantCollectionComplete": True,
+        "groupMembershipCollectionComplete": True,
+        "roleDefinitionCollectionComplete": True,
+        "denyAssignmentCollectionComplete": True,
+        "pimScheduleInstanceCollectionComplete": True,
+        "supportSecurityGroupIds": (),
+        "supportGrants": tuple(grants),
+        "supportPrincipalEvidence": principal_evidence,
+        "roleDefinitions": tuple(role_definitions),
+        "denyAssignments": (),
+        "activePimScheduleInstances": (),
+        "roleDefinitionRawPageDigests": (DIGEST_A,),
+        "denyAssignmentRawPageDigests": (DIGEST_B,),
+        "pimScheduleInstanceRawPageDigests": (DIGEST_C,),
+        "firstRawSnapshotDigest": raw_snapshot_digest,
+        "secondRawSnapshotDigest": raw_snapshot_digest,
+        "repeatedReadStable": True,
+        "assignmentCount": 2,
+        "sourceReference": {
+            "name": (
+                "wc028-runtime-support-rbac/"
+                f"runtime-support-rbac-{'a' * 32}/effective-rbac-inventory.json"
+            ),
+            "version": "2026-09-14T05:29:00.0000000Z",
+            "contentDigest": source_manifest_digest,
+        },
+        "sourceManifestDigest": source_manifest_digest,
+    }
+    return _with_digest(payload, "inventoryDigest")
+
+
+def _refresh_support_rbac_inventory(
+    inventory: dict[str, object],
+) -> dict[str, object]:
+    refreshed = copy.deepcopy(inventory)
+    principal_evidence = cast(
+        dict[str, object],
+        refreshed["supportPrincipalEvidence"],
+    )
+    principal_evidence.pop("evidenceDigest", None)
+    principal_evidence.update(_with_digest(principal_evidence, "evidenceDigest"))
+    grants = cast(list[dict[str, object]], list(refreshed["supportGrants"]))
+    refreshed_grants = []
+    for grant in grants:
+        grant.pop("grantDigest", None)
+        refreshed_grants.append(_with_digest(grant, "grantDigest"))
+    refreshed_grants.sort(key=lambda item: cast(str, item["grantDigest"]))
+    refreshed["supportGrants"] = tuple(refreshed_grants)
+    roles = cast(list[dict[str, object]], list(refreshed["roleDefinitions"]))
+    refreshed_roles = []
+    for role in roles:
+        role.pop("definitionDigest", None)
+        refreshed_roles.append(_with_digest(role, "definitionDigest"))
+    refreshed_roles.sort(key=lambda item: cast(str, item["roleDefinitionId"]))
+    refreshed["roleDefinitions"] = tuple(refreshed_roles)
+    denies = cast(list[dict[str, object]], list(refreshed["denyAssignments"]))
+    refreshed_denies = []
+    for deny in denies:
+        deny.pop("denyAssignmentDigest", None)
+        refreshed_denies.append(_with_digest(deny, "denyAssignmentDigest"))
+    refreshed_denies.sort(key=lambda item: cast(str, item["denyAssignmentId"]))
+    refreshed["denyAssignments"] = tuple(refreshed_denies)
+    pim_instances = cast(
+        list[dict[str, object]],
+        list(refreshed["activePimScheduleInstances"]),
+    )
+    refreshed_pim_instances = []
+    for instance in pim_instances:
+        instance.pop("instanceDigest", None)
+        refreshed_pim_instances.append(_with_digest(instance, "instanceDigest"))
+    refreshed_pim_instances.sort(key=lambda item: cast(str, item["scheduleInstanceId"]))
+    refreshed["activePimScheduleInstances"] = tuple(refreshed_pim_instances)
+    raw_snapshot_payload = {
+        "supportPrincipalEvidenceDigest": principal_evidence["evidenceDigest"],
+        "roleDefinitionRawPageDigests": list(
+            cast(tuple[str, ...], refreshed["roleDefinitionRawPageDigests"])
+        ),
+        "denyAssignmentRawPageDigests": list(
+            cast(tuple[str, ...], refreshed["denyAssignmentRawPageDigests"])
+        ),
+        "pimScheduleInstanceRawPageDigests": list(
+            cast(tuple[str, ...], refreshed["pimScheduleInstanceRawPageDigests"])
+        ),
+        "roleDefinitionRawDigests": [item["rawDefinitionDigest"] for item in refreshed_roles],
+        "denyAssignmentRawDigests": [item["rawAssignmentDigest"] for item in refreshed_denies],
+        "pimScheduleInstanceRawDigests": [
+            item["rawInstanceDigest"] for item in refreshed_pim_instances
+        ],
+    }
+    raw_snapshot_digest = compute_artifact_digest(raw_snapshot_payload)
+    refreshed["firstRawSnapshotDigest"] = raw_snapshot_digest
+    refreshed["secondRawSnapshotDigest"] = raw_snapshot_digest
+    refreshed["assignmentCount"] = sum(
+        len(cast(tuple[str, ...], item["assignmentScopeIds"])) for item in refreshed_grants
+    )
+    refreshed.pop("inventoryDigest", None)
+    return _with_digest(refreshed, "inventoryDigest")
+
+
+_SUPPORT_RBAC_INVENTORY = _runtime_support_rbac_inventory()
 PERSISTENCE_REPLAY_KEY = compute_artifact_digest(
     {
-        "schemaVersion": "athena.wc028MonitoringPersistenceReplay.v1",
+        "schemaVersion": "athena.wc028MonitoringPersistenceReplay.v3",
         "executionId": EXECUTION_ID,
         "acquisitionAuthorityDigest": DIGEST_C,
         "monitoringIntentDigest": DIGEST_A,
+        "monitoringIntentReferenceDigest": DIGEST_C,
         "contextBindingDigest": DIGEST_A,
         "incidentRevision": 1,
         "legacyCollectorRbacCleanupDigest": CLEANUP_DIGEST,
+        "runtimeSupportEffectiveRbacInventoryDigest": (_SUPPORT_RBAC_INVENTORY["inventoryDigest"]),
+        "runtimeSupportEffectiveRbacSourceManifestDigest": (
+            _SUPPORT_RBAC_INVENTORY["sourceManifestDigest"]
+        ),
+        "trustDelaySeconds": 60,
+        "requestLifetimeSeconds": 600,
     }
 )
 
 
+def _refresh_configuration_replay_key(payload: dict[str, object]) -> None:
+    support_inventory = cast(
+        dict[str, object],
+        payload["runtimeSupportEffectiveRbacInventory"],
+    )
+    acquisition_authority = cast(
+        dict[str, object],
+        payload["acquisitionAuthority"],
+    )
+    monitoring_intent = cast(dict[str, object], payload["monitoringIntent"])
+    context_binding = cast(dict[str, object], payload["contextBinding"])
+    payload["persistenceReplayKey"] = compute_artifact_digest(
+        {
+            "schemaVersion": "athena.wc028MonitoringPersistenceReplay.v3",
+            "executionId": payload["executionId"],
+            "acquisitionAuthorityDigest": payload["expectedAcquisitionAuthorityDigest"],
+            "monitoringIntentDigest": monitoring_intent["intentDigest"],
+            "monitoringIntentReferenceDigest": cast(
+                dict[str, object],
+                payload["monitoringIntentReference"],
+            )["referenceDigest"],
+            "contextBindingDigest": context_binding["bindingDigest"],
+            "incidentRevision": payload["incidentRevision"],
+            "legacyCollectorRbacCleanupDigest": payload["legacyCollectorRbacCleanupDigest"],
+            "runtimeSupportEffectiveRbacInventoryDigest": support_inventory["inventoryDigest"],
+            "runtimeSupportEffectiveRbacSourceManifestDigest": support_inventory[
+                "sourceManifestDigest"
+            ],
+            "trustDelaySeconds": payload["trustDelaySeconds"],
+            "requestLifetimeSeconds": payload["requestLifetimeSeconds"],
+        }
+    )
+    assert acquisition_authority["authorityDigest"] == payload["expectedAcquisitionAuthorityDigest"]
+
+
 def _configuration_payload() -> dict[str, object]:
+    support_rbac_inventory = copy.deepcopy(_SUPPORT_RBAC_INVENTORY)
     payload: dict[str, object] = {
-        "schemaVersion": "athena.wc028MonitoringAcquisitionJobConfiguration.v2",
+        "schemaVersion": "athena.wc028MonitoringAcquisitionJobConfiguration.v3",
         "managedIdentityClientId": CLIENT_ID,
         "collectorIdentityResourceId": COLLECTOR_ID,
         "athenaContextIdentityResourceId": CONTEXT_ID,
         "runtimeSupportIdentityResourceId": SUPPORT_ID,
         "runtimeSupportIdentityClientId": SUPPORT_CLIENT_ID,
         "runtimeSupportIdentityPrincipalId": SUPPORT_PRINCIPAL_ID,
+        "registryResourceId": REGISTRY_ID,
+        "runtimeSupportAcrPullRoleDefinitionId": ACR_PULL_ROLE_ID,
+        "monitoringIntentSigningKeyResourceId": MONITORING_INTENT_KEY_RESOURCE_ID,
+        "runtimeSupportMonitoringIntentKeyReaderRoleDefinitionId": (SUPPORT_KEY_READER_ROLE_ID),
+        "runtimeSupportEffectiveRbacInventory": support_rbac_inventory,
         "sourceStorageAccountResourceId": SOURCE_STORAGE_ID,
         "evidenceStorageAccountResourceId": EVIDENCE_STORAGE_ID,
         "evidenceBlobEndpoint": "https://athenamonitoring.blob.core.windows.net",
@@ -158,7 +496,10 @@ def _configuration_payload() -> dict[str, object]:
             "schemaVersion": "synthetic",
             "intentDigest": DIGEST_A,
         },
-        "monitoringIntentReference": {"schemaVersion": "synthetic"},
+        "monitoringIntentReference": {
+            "schemaVersion": "synthetic",
+            "referenceDigest": DIGEST_C,
+        },
         "monitoringIntentAttestation": {"schemaVersion": "synthetic"},
         "contextBinding": {
             "schemaVersion": "synthetic",
@@ -249,17 +590,7 @@ def _configuration_payload() -> dict[str, object]:
         "trustDelaySeconds": 60,
         "requestLifetimeSeconds": 600,
     }
-    payload["persistenceReplayKey"] = compute_artifact_digest(
-        {
-            "schemaVersion": "athena.wc028MonitoringPersistenceReplay.v1",
-            "executionId": EXECUTION_ID,
-            "acquisitionAuthorityDigest": DIGEST_C,
-            "monitoringIntentDigest": DIGEST_A,
-            "contextBindingDigest": DIGEST_A,
-            "incidentRevision": 1,
-            "legacyCollectorRbacCleanupDigest": CLEANUP_DIGEST,
-        }
-    )
+    _refresh_configuration_replay_key(payload)
     return payload
 
 
@@ -368,6 +699,169 @@ def test_configuration_rejects_source_identity_and_scope_substitution() -> None:
     with pytest.raises(ValidationError, match="persistenceReplayKey"):
         Wc028MonitoringAcquisitionJobConfiguration.model_validate(substituted_replay_key)
 
+    substituted_window = _configuration_payload()
+    substituted_window["trustDelaySeconds"] = 120
+    substituted_window["requestLifetimeSeconds"] = 700
+    with pytest.raises(ValidationError, match="persistenceReplayKey"):
+        Wc028MonitoringAcquisitionJobConfiguration.model_validate(substituted_window)
+
+    substituted_reference = _configuration_payload()
+    intent_reference = cast(
+        dict[str, object],
+        substituted_reference["monitoringIntentReference"],
+    )
+    intent_reference["referenceDigest"] = DIGEST_B
+    with pytest.raises(ValidationError, match="persistenceReplayKey"):
+        Wc028MonitoringAcquisitionJobConfiguration.model_validate(substituted_reference)
+
+
+def test_configuration_rejects_zero_cleanup_evidence() -> None:
+    payload = _configuration_payload()
+    payload["legacyCollectorRbacCleanupDigest"] = f"sha256:{'0' * 64}"
+
+    with pytest.raises(ValidationError, match="non-zero cleanup evidence"):
+        Wc028MonitoringAcquisitionJobConfiguration.model_validate(payload)
+
+
+def test_runtime_support_rbac_rejects_inherited_and_group_privileges() -> None:
+    inherited = _configuration_payload()
+    inherited_inventory = cast(
+        dict[str, object],
+        inherited["runtimeSupportEffectiveRbacInventory"],
+    )
+    inherited_grants = cast(
+        list[dict[str, object]],
+        list(inherited_inventory["supportGrants"]),
+    )
+    inherited_grants[0]["inheritance"] = "inherited"
+    inherited_inventory["supportGrants"] = tuple(inherited_grants)
+    inherited["runtimeSupportEffectiveRbacInventory"] = _refresh_support_rbac_inventory(
+        inherited_inventory
+    )
+    _refresh_configuration_replay_key(inherited)
+    with pytest.raises(ValidationError, match="exact direct governed"):
+        Wc028MonitoringAcquisitionJobConfiguration.model_validate(inherited)
+
+    group_derived = _configuration_payload()
+    group_inventory = cast(
+        dict[str, object],
+        group_derived["runtimeSupportEffectiveRbacInventory"],
+    )
+    group_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    group_inventory["supportSecurityGroupIds"] = (group_id,)
+    principal_evidence = cast(
+        dict[str, object],
+        group_inventory["supportPrincipalEvidence"],
+    )
+    principal_evidence["transitiveGroupIds"] = (group_id,)
+    group_grants = cast(
+        list[dict[str, object]],
+        list(group_inventory["supportGrants"]),
+    )
+    group_grants[0].update(
+        {
+            "assignedPrincipalId": group_id,
+            "assignedPrincipalType": "Group",
+            "groupDerived": True,
+        }
+    )
+    group_inventory["supportGrants"] = tuple(group_grants)
+    group_derived["runtimeSupportEffectiveRbacInventory"] = _refresh_support_rbac_inventory(
+        group_inventory
+    )
+    _refresh_configuration_replay_key(group_derived)
+    with pytest.raises(ValidationError, match="hierarchy-complete dedicated"):
+        Wc028MonitoringAcquisitionJobConfiguration.model_validate(group_derived)
+
+
+def test_runtime_support_rbac_rejects_conditions_pim_and_applicable_denies() -> None:
+    conditioned = _configuration_payload()
+    conditioned_inventory = cast(
+        dict[str, object],
+        conditioned["runtimeSupportEffectiveRbacInventory"],
+    )
+    conditioned_grants = cast(
+        list[dict[str, object]],
+        list(conditioned_inventory["supportGrants"]),
+    )
+    conditioned_grants[0]["condition"] = "@Resource[synthetic] StringEquals 'denied'"
+    conditioned_grants[0]["conditionVersion"] = "2.0"
+    conditioned_inventory["supportGrants"] = tuple(conditioned_grants)
+    conditioned["runtimeSupportEffectiveRbacInventory"] = _refresh_support_rbac_inventory(
+        conditioned_inventory
+    )
+    _refresh_configuration_replay_key(conditioned)
+    with pytest.raises(ValidationError, match="exact direct governed"):
+        Wc028MonitoringAcquisitionJobConfiguration.model_validate(conditioned)
+
+    pim = _configuration_payload()
+    pim_inventory = cast(
+        dict[str, object],
+        pim["runtimeSupportEffectiveRbacInventory"],
+    )
+    pim_inventory["activePimScheduleInstances"] = (
+        {
+            "scheduleInstanceId": (
+                f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+                "Microsoft.Authorization/roleAssignmentScheduleInstances/"
+                "cccccccc-cccc-cccc-cccc-cccccccccccc"
+            ).casefold(),
+            "principalId": SUPPORT_PRINCIPAL_ID.casefold(),
+            "roleDefinitionId": ACR_PULL_ROLE_ID.casefold(),
+            "scopeId": REGISTRY_ID.casefold(),
+            "assignmentType": "Activated",
+            "startAt": NOW - timedelta(minutes=2),
+            "endAt": NOW + timedelta(minutes=2),
+            "rawInstanceDigest": DIGEST_A,
+        },
+    )
+    pim["runtimeSupportEffectiveRbacInventory"] = _refresh_support_rbac_inventory(pim_inventory)
+    _refresh_configuration_replay_key(pim)
+    with pytest.raises(ValidationError, match="hierarchy-complete dedicated"):
+        Wc028MonitoringAcquisitionJobConfiguration.model_validate(pim)
+
+    denied = _configuration_payload()
+    denied_inventory = cast(
+        dict[str, object],
+        denied["runtimeSupportEffectiveRbacInventory"],
+    )
+    denied_inventory["denyAssignments"] = (
+        {
+            "denyAssignmentId": (
+                f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+                "Microsoft.Authorization/denyAssignments/"
+                "dddddddd-dddd-dddd-dddd-dddddddddddd"
+            ).casefold(),
+            "scopeId": f"/subscriptions/{SUBSCRIPTION_ID}".casefold(),
+            "principalIds": (SUPPORT_PRINCIPAL_ID.casefold(),),
+            "excludedPrincipalIds": (),
+            "actions": (),
+            "notActions": (),
+            "dataActions": ("microsoft.keyvault/vaults/keys/read",),
+            "notDataActions": (),
+            "doNotApplyToChildScopes": False,
+            "rawAssignmentDigest": DIGEST_A,
+        },
+    )
+    denied["runtimeSupportEffectiveRbacInventory"] = _refresh_support_rbac_inventory(
+        denied_inventory
+    )
+    _refresh_configuration_replay_key(denied)
+    with pytest.raises(ValidationError, match="removes an exact required permission"):
+        Wc028MonitoringAcquisitionJobConfiguration.model_validate(denied)
+
+
+def test_runtime_support_rbac_must_be_fresh_before_job_execution() -> None:
+    configuration = Wc028MonitoringAcquisitionJobConfiguration.model_validate(
+        _configuration_payload()
+    )
+
+    with pytest.raises(MonitoringAcquisitionJobError, match="stale before job execution"):
+        _validate_runtime_support_effective_rbac(
+            configuration=configuration,
+            as_of=NOW + timedelta(minutes=11),
+        )
+
 
 @pytest.mark.parametrize(
     ("field_name", "value"),
@@ -415,6 +909,18 @@ def test_configuration_rejects_deployment_binding_substitution(
     monkeypatch.delenv("ATHENA_WC028_DEPLOYED_MONITORING_INTENT_SIGNING_KEY_ID")
     monkeypatch.setenv("ATHENA_WC028_RUNTIME_SUPPORT_CLIENT_ID", CLIENT_ID)
     with pytest.raises(ValidationError, match="RUNTIME_SUPPORT_CLIENT_ID"):
+        Wc028MonitoringAcquisitionJobConfiguration.model_validate(_configuration_payload())
+
+
+def test_configuration_requires_complete_deployment_binding_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "ATHENA_WC028_DEPLOYED_LEGACY_COLLECTOR_RBAC_CLEANUP_DIGEST",
+        CLEANUP_DIGEST,
+    )
+
+    with pytest.raises(ValidationError, match="one complete set"):
         Wc028MonitoringAcquisitionJobConfiguration.model_validate(_configuration_payload())
 
 
@@ -466,6 +972,20 @@ def test_current_contract_and_authority_pass_exact_preflight_scope_binding() -> 
         collector_contract=collector_contract,
     )
     payload = _configuration_payload()
+    subscription_id = collector_contract.collector_identity_resource_id.strip("/").split("/")[1]
+    support_identity_id = SUPPORT_ID.replace(SUBSCRIPTION_ID, subscription_id)
+    registry_id = REGISTRY_ID.replace(SUBSCRIPTION_ID, subscription_id)
+    monitoring_intent_key_resource_id = MONITORING_INTENT_KEY_RESOURCE_ID.replace(
+        SUBSCRIPTION_ID,
+        subscription_id,
+    )
+    support_rbac_inventory = _runtime_support_rbac_inventory(
+        subscription_id=subscription_id,
+        tenant_id=cast(str, collector_contract.collector_tenant_id),
+        support_identity_resource_id=support_identity_id,
+        registry_resource_id=registry_id,
+        monitoring_intent_key_resource_id=monitoring_intent_key_resource_id,
+    )
     evidence_storage_id = collector_contract.evidence_storage_account_resource_id
     evidence_storage_name = evidence_storage_id.rsplit("/", maxsplit=1)[-1]
     payload.update(
@@ -473,6 +993,20 @@ def test_current_contract_and_authority_pass_exact_preflight_scope_binding() -> 
             "managedIdentityClientId": collector_contract.collector_identity_client_id,
             "collectorIdentityResourceId": collector_contract.collector_identity_resource_id,
             "athenaContextIdentityResourceId": collector_contract.athena_context_identity_id,
+            "runtimeSupportIdentityResourceId": support_identity_id,
+            "registryResourceId": registry_id,
+            "runtimeSupportAcrPullRoleDefinitionId": (
+                ACR_PULL_ROLE_ID.replace(SUBSCRIPTION_ID, subscription_id)
+            ),
+            "monitoringIntentSigningKeyResourceId": monitoring_intent_key_resource_id,
+            "runtimeSupportMonitoringIntentKeyReaderRoleDefinitionId": (
+                SUPPORT_KEY_READER_ROLE_ID.replace(SUBSCRIPTION_ID, subscription_id)
+            ),
+            "runtimeSupportEffectiveRbacInventory": support_rbac_inventory,
+            "sourceStorageAccountResourceId": SOURCE_STORAGE_ID.replace(
+                SUBSCRIPTION_ID,
+                subscription_id,
+            ),
             "evidenceStorageAccountResourceId": evidence_storage_id,
             "evidenceBlobEndpoint": (f"https://{evidence_storage_name}.blob.core.windows.net"),
             "monitoringIntent": monitoring_intent.model_dump(
@@ -505,13 +1039,31 @@ def test_current_contract_and_authority_pass_exact_preflight_scope_binding() -> 
     signing_key["keyVaultKeyId"] = collector_contract.signing_key_resource_id
     payload["persistenceReplayKey"] = compute_artifact_digest(
         {
-            "schemaVersion": "athena.wc028MonitoringPersistenceReplay.v1",
+            "schemaVersion": "athena.wc028MonitoringPersistenceReplay.v3",
             "executionId": EXECUTION_ID,
             "acquisitionAuthorityDigest": acquisition_authority.authority_digest,
             "monitoringIntentDigest": monitoring_intent.intent_digest,
+            "monitoringIntentReferenceDigest": cast(
+                dict[str, object],
+                payload["monitoringIntentReference"],
+            )["referenceDigest"],
             "contextBindingDigest": context_binding.binding_digest,
             "incidentRevision": 1,
             "legacyCollectorRbacCleanupDigest": CLEANUP_DIGEST,
+            "runtimeSupportEffectiveRbacInventoryDigest": (
+                cast(
+                    dict[str, object],
+                    payload["runtimeSupportEffectiveRbacInventory"],
+                )["inventoryDigest"]
+            ),
+            "runtimeSupportEffectiveRbacSourceManifestDigest": (
+                cast(
+                    dict[str, object],
+                    payload["runtimeSupportEffectiveRbacInventory"],
+                )["sourceManifestDigest"]
+            ),
+            "trustDelaySeconds": payload["trustDelaySeconds"],
+            "requestLifetimeSeconds": payload["requestLifetimeSeconds"],
         }
     )
     configuration = Wc028MonitoringAcquisitionJobConfiguration.model_validate(payload)
@@ -961,7 +1513,12 @@ def test_job_composes_hardened_coordinator_transaction_and_commit_port(
     stores: list[tuple[dict[str, object], object]] = []
 
     def build_store(**kwargs: object) -> object:
-        store = object()
+        class _EmptyStore:
+            @staticmethod
+            def read_current(_request: object) -> object:
+                raise ArtifactNotFoundError("synthetic Blob is absent")
+
+        store = _EmptyStore()
         stores.append((dict(kwargs), store))
         return store
 
@@ -1033,6 +1590,181 @@ def test_job_composes_hardened_coordinator_transaction_and_commit_port(
     assert execute_arguments["commit_port"] is commit_port
     assert "collector_contract_digest" not in execute_arguments
     assert execute_arguments["trusted_as_of"] == NOW + timedelta(seconds=60)
+    assert execute_arguments["stabilize_correlation_window"] is True
+
+
+def test_job_checks_commit_manifest_before_key_or_source_io(
+    monkeypatch: pytest.MonkeyPatch,
+    persistence_case: _PersistenceCase,
+) -> None:
+    store = _MemoryStore(container_name="monitoring-evidence")
+    with _commit_port(store, persistence_case).transaction(persistence_case.prepared) as committed:
+        pass
+    manifest_name, _, _ = runtime_module._monitoring_persistence_blob_names(PERSISTENCE_REPLAY_KEY)
+    manifest = MonitoringPersistenceCommitManifest.model_validate_json(
+        store.blobs[manifest_name].payload
+    )
+    receipt = persistence_case.prepared.monitoring_bundle.acquisition_receipt
+    assert receipt is not None
+    expected_correlation = build_collected_correlation_request(
+        persistence_case.prepared,
+        committed,
+        context_binding=persistence_case.context_binding,
+        incident_revision=1,
+        issued_at=receipt.execution_started_at,
+        trusted_as_of=receipt.execution_started_at + timedelta(seconds=60),
+        expires_at=receipt.execution_started_at + timedelta(seconds=600),
+    )
+    assert manifest.correlation_request_id == expected_correlation.request_id
+    assert manifest.correlation_request_digest == expected_correlation.request_digest
+    expected_outcome = SimpleNamespace(
+        committed=committed,
+        correlation_request=expected_correlation,
+    )
+    configuration = Wc028MonitoringAcquisitionJobConfiguration.model_validate(
+        _configuration_payload()
+    )
+    context_binding = SimpleNamespace(binding_digest=DIGEST_A)
+    collector_contract = SimpleNamespace(
+        collector_identity_resource_id=COLLECTOR_ID.casefold(),
+        compute_artifact_digest_value=lambda: DIGEST_B,
+    )
+    embedded = {
+        "PublishedMonitoringIntent": object(),
+        "PublishedMonitoringIntentAssetReference": object(),
+        "PublishedMonitoringIntentAttestation": object(),
+        "PublishedRuntimeContextBinding": context_binding,
+        "MonitoringCollectorContract": collector_contract,
+        "ApprovedChangeScope": object(),
+        "MonitoringAcquisitionAuthority": object(),
+    }
+    monkeypatch.setattr(
+        runtime_module,
+        "_embedded_model",
+        lambda model, _payload: embedded[model.__name__],
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "_validate_acquisition_authority_preflight",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(runtime_module, "_utc_now_milliseconds", lambda: NOW)
+    events: list[str] = []
+    original_read_current = store.read_current
+
+    def tracked_read_current(request: Any) -> ArtifactReadResult:
+        events.append(f"blob:{request.blob_name}")
+        return original_read_current(request)
+
+    monkeypatch.setattr(store, "read_current", tracked_read_current)
+    monkeypatch.setattr(
+        runtime_module,
+        "AzureBlobChangeEvidenceReplayStore",
+        lambda **_kwargs: store,
+    )
+
+    def build_verifier(**kwargs: object) -> object:
+        events.append("key:" + cast(str, kwargs["managed_identity_client_id"]))
+        return SimpleNamespace(public_key=object())
+
+    monkeypatch.setattr(runtime_module, "KeyVaultRsaPublicKeyVerifier", build_verifier)
+    monkeypatch.setattr(runtime_module, "TrustedKeyRecord", lambda **_kwargs: object())
+    monkeypatch.setattr(
+        runtime_module,
+        "KeyVaultTrustedKeyResolver",
+        lambda **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "KeyVaultRsaSigner",
+        lambda **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "_build_acquisition_receipt_verifier",
+        lambda **_kwargs: lambda _receipt, _as_of: None,
+    )
+
+    class _RecoveryCommitPort:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        @staticmethod
+        def recover(_probe: object) -> object:
+            return expected_outcome
+
+    monkeypatch.setattr(
+        runtime_module,
+        "MonitoringEvidenceCommitPort",
+        _RecoveryCommitPort,
+    )
+
+    def reject_source_client(**_kwargs: object) -> object:
+        raise AssertionError("source client must not be constructed during manifest recovery")
+
+    monkeypatch.setattr(
+        runtime_module,
+        "AzureMonitoringAdapter",
+        reject_source_client,
+    )
+
+    outcome = runtime_module.run_wc028_monitoring_acquisition_job(configuration=configuration)
+
+    assert outcome is expected_outcome
+    assert events[0] == f"blob:{manifest_name}"
+    assert events.index(f"key:{CLIENT_ID}") > events.index(f"blob:{manifest_name}")
+    assert f"key:{SUPPORT_CLIENT_ID}" not in events
+
+
+def test_job_wraps_key_client_construction_and_read_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configuration = Wc028MonitoringAcquisitionJobConfiguration.model_validate(
+        _configuration_payload()
+    )
+    embedded = {
+        "PublishedMonitoringIntent": object(),
+        "PublishedMonitoringIntentAssetReference": object(),
+        "PublishedMonitoringIntentAttestation": object(),
+        "PublishedRuntimeContextBinding": SimpleNamespace(binding_digest=DIGEST_A),
+        "MonitoringCollectorContract": SimpleNamespace(
+            collector_identity_resource_id=COLLECTOR_ID.casefold(),
+            compute_artifact_digest_value=lambda: DIGEST_B,
+        ),
+        "ApprovedChangeScope": object(),
+        "MonitoringAcquisitionAuthority": object(),
+    }
+    monkeypatch.setattr(
+        runtime_module,
+        "_embedded_model",
+        lambda model, _payload: embedded[model.__name__],
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "_validate_acquisition_authority_preflight",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(runtime_module, "_utc_now_milliseconds", lambda: NOW)
+    monkeypatch.setattr(
+        runtime_module,
+        "AzureBlobChangeEvidenceReplayStore",
+        lambda **_kwargs: _MemoryStore(container_name="monitoring-evidence"),
+    )
+
+    def fail_key_read(**_kwargs: object) -> object:
+        raise AzureError("synthetic Key Vault client failure")
+
+    monkeypatch.setattr(
+        runtime_module,
+        "KeyVaultRsaPublicKeyVerifier",
+        fail_key_read,
+    )
+
+    with pytest.raises(
+        MonitoringAcquisitionJobError,
+        match="Azure client or transport operation failed",
+    ):
+        runtime_module.run_wc028_monitoring_acquisition_job(configuration=configuration)
 
 
 class _MemoryStore:
@@ -1041,9 +1773,11 @@ class _MemoryStore:
         *,
         container_name: str,
         fail_once_on_suffix: str | None = None,
+        ambiguous_once_on_suffix: str | None = None,
     ) -> None:
         self.container_name = container_name
         self.fail_once_on_suffix = fail_once_on_suffix
+        self.ambiguous_once_on_suffix = ambiguous_once_on_suffix
         self.create_requests: list[Any] = []
         self.read_requests: list[Any] = []
         self.blobs: dict[str, ArtifactReadResult] = {}
@@ -1068,6 +1802,11 @@ class _MemoryStore:
             payload_sha256=sha256_hex(request.payload),
         )
         self.blobs[request.blob_name] = result
+        if self.ambiguous_once_on_suffix is not None and request.blob_name.endswith(
+            self.ambiguous_once_on_suffix
+        ):
+            self.ambiguous_once_on_suffix = None
+            raise ServiceRequestError("synthetic ambiguous create transport failure")
         return ArtifactWriteReceipt(
             container_name=self.container_name,
             blob_name=request.blob_name,
@@ -1100,50 +1839,47 @@ class _Signer:
         ).decode("ascii")
 
 
-@dataclass
-class _CollectorContract:
-    collector_identity_client_id: str
-    signing_key_resource_id: str
-    maximum_evidence_age_seconds: int = 600
-    handoff_schema_version: str = "athena.wc028MonitoringEvidenceHandoff.v2"
-
-    def compute_artifact_digest_value(self) -> str:
-        return DIGEST_C
+@dataclass(frozen=True)
+class _PersistenceCase:
+    prepared: Any
+    context_binding: Any
+    collector_contract: Any
+    configuration: Any
 
 
-class _Bundle:
-    collected_at = NOW
-    monitoring_contract_digest = DIGEST_C
-    acquisition_receipt = SimpleNamespace(receipt_digest=DIGEST_B)
-
-    def __init__(
-        self,
-        payload: bytes = b'{"schemaVersion":"synthetic-monitoring-bundle"}\n',
-    ) -> None:
-        self._payload = payload
-
-    def canonical_bytes(self) -> bytes:
-        return self._payload
-
-
-def _prepared(
-    *,
-    change_artifacts: tuple[object, ...] = (),
-    bundle_payload: bytes = b'{"schemaVersion":"synthetic-monitoring-bundle"}\n',
-) -> SimpleNamespace:
-    return SimpleNamespace(
-        intent_id=MONITORING_INTENT_ID,
-        intent_digest=DIGEST_A,
-        context_binding_digest=DIGEST_B,
-        monitoring_bundle=_Bundle(bundle_payload),
-        change_artifacts=change_artifacts,
+@pytest.fixture
+def persistence_case(monkeypatch: pytest.MonkeyPatch) -> _PersistenceCase:
+    cast(Any, _trust_synthetic_managed_identity_key).__wrapped__(monkeypatch)
+    outcome, _, _ = _execute(_AcquisitionPort())
+    context_binding, _, _ = _authority()
+    receipt = outcome.prepared.monitoring_bundle.acquisition_receipt
+    assert receipt is not None
+    return _PersistenceCase(
+        prepared=outcome.prepared,
+        context_binding=context_binding,
+        collector_contract=_acquisition_collector_contract(),
+        configuration=SimpleNamespace(
+            execution_id=EXECUTION_ID,
+            expected_acquisition_authority_digest=(receipt.acquisition_authority_digest),
+            legacy_collector_rbac_cleanup_digest=CLEANUP_DIGEST,
+            incident_revision=1,
+            trust_delay_seconds=60,
+            request_lifetime_seconds=600,
+        ),
     )
 
 
 def _commit_port(
     monitoring_store: _MemoryStore,
+    case: _PersistenceCase,
+    *,
+    private_key: rsa.RSAPrivateKey | None = None,
+    signer: object | None = None,
 ) -> MonitoringEvidenceCommitPort:
-    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    private_key = private_key or rsa.generate_private_key(
+        public_exponent=65537,
+        key_size=2048,
+    )
     public_key = private_key.public_key()
     fingerprint = sha256_hex(
         public_key.public_bytes(
@@ -1152,46 +1888,47 @@ def _commit_port(
         )
     )
     trusted_key = MonitoringRuntimeTrustedKey(
-        keyVaultKeyId=COLLECTOR_KEY_ID,
+        keyVaultKeyId=case.collector_contract.signing_key_resource_id,
         publicKeyFingerprint=fingerprint,
-        activatedAt=NOW - timedelta(days=1),
+        activatedAt=datetime(2020, 1, 1, tzinfo=UTC),
     )
     key_record = TrustedKeyRecord(
         anchor=trusted_key.anchor,
         public_key=public_key,
         enabled=True,
-        activated_at=NOW - timedelta(days=1),
+        activated_at=datetime(2020, 1, 1, tzinfo=UTC),
     )
     return MonitoringEvidenceCommitPort(
         monitoring_writer=monitoring_store,
         monitoring_current_reader=monitoring_store,
         persistence_replay_key=PERSISTENCE_REPLAY_KEY,
-        signer=_Signer(private_key),
+        signer=cast(Any, signer or _Signer(private_key)),
         trusted_key=trusted_key,
-        reviewed_collector_contract=cast(
-            Any,
-            _CollectorContract(
-                collector_identity_client_id=CLIENT_ID,
-                signing_key_resource_id=COLLECTOR_KEY_ID,
-            ),
-        ),
+        reviewed_collector_contract=case.collector_contract,
+        configuration=case.configuration,
+        context_binding=case.context_binding,
+        monitoring_intent_reference=case.prepared.monitoring_intent_reference,
+        acquisition_receipt_verifier=lambda _receipt, _as_of: None,
         key_record=key_record,
     )
 
 
-def test_commit_port_publishes_replay_manifest_last() -> None:
+def test_commit_port_publishes_replay_manifest_last(
+    persistence_case: _PersistenceCase,
+) -> None:
     store = _MemoryStore(container_name="monitoring-evidence")
-    prepared = _prepared()
+    prepared = persistence_case.prepared
     prepared_digest = compute_artifact_digest(
         _monitoring_persistence_replay_payload(cast(Any, prepared))
     )
     replay_key = PERSISTENCE_REPLAY_KEY
     manifest_name = f"wc024-monitoring/commits/{replay_key.removeprefix('sha256:')}/manifest.json"
 
-    with _commit_port(store).transaction(cast(Any, prepared)) as committed:
+    with _commit_port(store, persistence_case).transaction(prepared) as committed:
         assert manifest_name not in store.blobs
 
     written_names = [item.blob_name for item in store.create_requests]
+    assert written_names[0].endswith("/recovery.json")
     assert written_names[-1] == manifest_name
     manifest = MonitoringPersistenceCommitManifest.model_validate_json(
         store.blobs[manifest_name].payload
@@ -1200,90 +1937,374 @@ def test_commit_port_publishes_replay_manifest_last() -> None:
     assert manifest.collection_id == f"wc024-{replay_key.removeprefix('sha256:')[:12]}"
     assert manifest.prepared_digest == prepared_digest
     assert manifest.monitoring_handoff == committed.monitoring_handoff
+    receipt = prepared.monitoring_bundle.acquisition_receipt
+    assert receipt is not None
+    expected_correlation = build_collected_correlation_request(
+        prepared,
+        committed,
+        context_binding=persistence_case.context_binding,
+        incident_revision=1,
+        issued_at=receipt.execution_started_at,
+        trusted_as_of=receipt.execution_started_at + timedelta(seconds=60),
+        expires_at=receipt.execution_started_at + timedelta(seconds=600),
+    )
+    assert manifest.correlation_request_id == expected_correlation.request_id
+    assert manifest.correlation_request_digest == expected_correlation.request_digest
 
 
-def test_commit_port_leaves_no_commit_marker_when_correlation_fails() -> None:
+def test_commit_port_leaves_no_commit_marker_when_correlation_fails(
+    persistence_case: _PersistenceCase,
+) -> None:
     store = _MemoryStore(container_name="monitoring-evidence")
-    prepared = _prepared()
+    prepared = persistence_case.prepared
     manifest_name = (
         f"wc024-monitoring/commits/{PERSISTENCE_REPLAY_KEY.removeprefix('sha256:')}/manifest.json"
     )
 
     with (
         pytest.raises(RuntimeError, match="synthetic correlation failure"),
-        _commit_port(store).transaction(cast(Any, prepared)),
+        _commit_port(store, persistence_case).transaction(prepared),
     ):
         raise RuntimeError("synthetic correlation failure")
 
     assert manifest_name not in store.blobs
 
 
-def test_commit_port_replays_durable_manifest_without_new_writes() -> None:
+def test_commit_port_replays_durable_manifest_without_new_writes(
+    persistence_case: _PersistenceCase,
+) -> None:
     store = _MemoryStore(container_name="monitoring-evidence")
-    port = _commit_port(store)
-    with port.transaction(cast(Any, _prepared())) as first:
+    port = _commit_port(store, persistence_case)
+    with port.transaction(persistence_case.prepared) as first:
         pass
     create_count = len(store.create_requests)
 
-    with port.transaction(cast(Any, _prepared())) as replayed:
+    with port.transaction(persistence_case.prepared) as replayed:
         pass
 
     assert replayed == first
     assert len(store.create_requests) == create_count
 
 
-def test_commit_port_recovers_partial_write_before_manifest() -> None:
+def test_commit_port_recovers_partial_write_before_manifest(
+    persistence_case: _PersistenceCase,
+) -> None:
     store = _MemoryStore(
         container_name="monitoring-evidence",
         fail_once_on_suffix="/manifest.json",
     )
-    prepared = _prepared()
-    port = _commit_port(store)
+    prepared = persistence_case.prepared
+    port = _commit_port(store, persistence_case)
 
     with (
         pytest.raises(RuntimeError, match="staged persistence failure"),
-        port.transaction(cast(Any, prepared)),
+        port.transaction(prepared),
     ):
         pass
-    assert len(store.blobs) == 1
+    assert len(store.blobs) == 2
 
-    with port.transaction(cast(Any, prepared)) as committed:
+    with port.transaction(prepared) as committed:
         pass
 
     assert committed.monitoring_handoff.evidence.name in store.blobs
     assert any(name.endswith("/manifest.json") for name in store.blobs)
 
 
-def test_commit_port_rejects_changed_reacquisition_under_same_replay_identity() -> None:
+def test_commit_port_recovers_ambiguous_create_by_exact_known_name(
+    persistence_case: _PersistenceCase,
+) -> None:
+    store = _MemoryStore(
+        container_name="monitoring-evidence",
+        ambiguous_once_on_suffix="/evidence.json",
+    )
+
+    with _commit_port(store, persistence_case).transaction(persistence_case.prepared) as committed:
+        pass
+
+    assert committed.monitoring_handoff.evidence.name in store.blobs
+    assert any(name.endswith("/manifest.json") for name in store.blobs)
+
+
+@pytest.mark.parametrize(
+    ("failure_kind", "message"),
+    (
+        ("collision", "already exists"),
+        ("transport", "conflicting immutable bytes"),
+    ),
+)
+def test_create_recovery_rejects_identical_bytes_under_wrong_blob_name(
+    persistence_case: _PersistenceCase,
+    failure_kind: str,
+    message: str,
+) -> None:
+    payload = b'{"schemaVersion":"synthetic"}\n'
+    expected_name = "wc024-monitoring/commits/synthetic/recovery.json"
+
+    class _FailingWriter:
+        @staticmethod
+        def create(_request: object) -> object:
+            if failure_kind == "collision":
+                raise ArtifactAlreadyExistsError("synthetic collision")
+            raise ServiceRequestError("synthetic ambiguous create")
+
+    class _WrongNameReader:
+        @staticmethod
+        def read_current(_request: object) -> ArtifactReadResult:
+            return ArtifactReadResult(
+                container_name="monitoring-evidence",
+                blob_name="wc024-monitoring/commits/different/recovery.json",
+                version_id="synthetic-version",
+                payload=payload,
+                size_bytes=len(payload),
+                content_type="application/json",
+                payload_sha256=sha256_hex(payload),
+            )
+
+    with pytest.raises(MonitoringAcquisitionJobError, match=message):
+        _commit_port(
+            _MemoryStore(container_name="monitoring-evidence"),
+            persistence_case,
+        )._write(
+            writer=cast(Any, _FailingWriter()),
+            current_reader=cast(Any, _WrongNameReader()),
+            blob_name=expected_name,
+            payload=payload,
+        )
+
+
+def test_commit_port_wraps_azure_signing_failure(
+    persistence_case: _PersistenceCase,
+) -> None:
+    class _FailingSigner:
+        @staticmethod
+        def sign_preimage(_payload: bytes) -> str:
+            raise AzureError("synthetic Key Vault signing failure")
+
+    store = _MemoryStore(container_name="monitoring-evidence")
+
+    with (
+        pytest.raises(MonitoringAcquisitionJobError, match="handoff failed verification"),
+        _commit_port(
+            store,
+            persistence_case,
+            signer=_FailingSigner(),
+        ).transaction(persistence_case.prepared),
+    ):
+        pass
+
+
+@pytest.mark.parametrize("remove_recovery_state", (False, True))
+def test_restart_recovers_signed_evidence_without_reacquisition_byte_identically(
+    persistence_case: _PersistenceCase,
+    remove_recovery_state: bool,
+) -> None:
     store = _MemoryStore(
         container_name="monitoring-evidence",
         fail_once_on_suffix="/manifest.json",
     )
-    port = _commit_port(store)
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    first_port = _commit_port(
+        store,
+        persistence_case,
+        private_key=private_key,
+    )
+    first_committed = None
+    with (
+        pytest.raises(RuntimeError, match="staged persistence failure"),
+        first_port.transaction(persistence_case.prepared) as committed,
+    ):
+        first_committed = committed
+    assert first_committed is not None
+    manifest_name, recovery_name, evidence_name = runtime_module._monitoring_persistence_blob_names(
+        PERSISTENCE_REPLAY_KEY
+    )
+    assert manifest_name not in store.blobs
+    assert evidence_name in store.blobs
+    if remove_recovery_state:
+        del store.blobs[recovery_name]
+
+    receipt = persistence_case.prepared.monitoring_bundle.acquisition_receipt
+    assert receipt is not None
+    expected_correlation = build_collected_correlation_request(
+        persistence_case.prepared,
+        first_committed,
+        context_binding=persistence_case.context_binding,
+        incident_revision=1,
+        issued_at=receipt.execution_started_at,
+        trusted_as_of=receipt.execution_started_at + timedelta(seconds=60),
+        expires_at=receipt.execution_started_at + timedelta(seconds=600),
+    )
+    restarted_port = _commit_port(
+        store,
+        persistence_case,
+        private_key=private_key,
+    )
+    recovered = restarted_port.recover(
+        runtime_module._probe_monitoring_persistence(
+            reader=store,
+            replay_key=PERSISTENCE_REPLAY_KEY,
+        )
+    )
+
+    assert recovered is not None
+    assert recovered.committed == first_committed
+    assert recovered.correlation_request == expected_correlation
+    assert recovered.correlation_request.canonical_bytes() == (
+        expected_correlation.canonical_bytes()
+    )
+    assert manifest_name in store.blobs
+    assert recovery_name in store.blobs
+
+
+@pytest.mark.parametrize("incident_override", ("alternate", "missing"))
+def test_restart_rejects_self_hashed_incident_observation_override(
+    persistence_case: _PersistenceCase,
+    incident_override: str,
+) -> None:
+    store = _MemoryStore(
+        container_name="monitoring-evidence",
+        fail_once_on_suffix="/manifest.json",
+    )
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    with (
+        pytest.raises(RuntimeError, match="staged persistence failure"),
+        _commit_port(
+            store,
+            persistence_case,
+            private_key=private_key,
+        ).transaction(persistence_case.prepared),
+    ):
+        pass
+    manifest_name, recovery_name, _ = runtime_module._monitoring_persistence_blob_names(
+        PERSISTENCE_REPLAY_KEY
+    )
+    recovery_state = runtime_module.MonitoringPersistenceRecoveryState.model_validate_json(
+        store.blobs[recovery_name].payload
+    )
+    if incident_override == "alternate":
+        alternate_ids = [
+            item.observation_id
+            for item in persistence_case.prepared.monitoring_bundle.observations
+            if item.observation_id != persistence_case.prepared.previous_health_observation_id
+            and runtime_module.MonitoringEvidenceCommitPort._observation_health_state(item)
+            == "healthy"
+        ]
+        assert alternate_ids
+        replacement_observation_id = alternate_ids[0]
+    else:
+        replacement_observation_id = f"obs-{'f' * 32}"
+    recovery_state = recovery_state.model_copy(
+        update={"previous_health_observation_id": replacement_observation_id}
+    )
+    state_digest = compute_artifact_digest(
+        recovery_state.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=True,
+            exclude={"state_digest"},
+        )
+    )
+    recovery_state = recovery_state.model_copy(update={"state_digest": state_digest})
+    tampered_state = recovery_state.canonical_bytes()
+    store.blobs[recovery_name] = replace(
+        store.blobs[recovery_name],
+        payload=tampered_state,
+        size_bytes=len(tampered_state),
+        payload_sha256=sha256_hex(tampered_state),
+    )
+
+    with pytest.raises(
+        MonitoringAcquisitionJobError,
+        match="incident fields do not match signed evidence",
+    ):
+        _commit_port(
+            store,
+            persistence_case,
+            private_key=private_key,
+        ).recover(
+            runtime_module._probe_monitoring_persistence(
+                reader=store,
+                replay_key=PERSISTENCE_REPLAY_KEY,
+            )
+        )
+
+    assert manifest_name not in store.blobs
+
+
+def test_manifest_probe_rejects_tampering_before_other_recovery_reads(
+    persistence_case: _PersistenceCase,
+) -> None:
+    store = _MemoryStore(container_name="monitoring-evidence")
+    with _commit_port(store, persistence_case).transaction(persistence_case.prepared):
+        pass
+    manifest_name, recovery_name, evidence_name = runtime_module._monitoring_persistence_blob_names(
+        PERSISTENCE_REPLAY_KEY
+    )
+    manifest = MonitoringPersistenceCommitManifest.model_validate_json(
+        store.blobs[manifest_name].payload
+    )
+    replacement_digest = DIGEST_A
+    if manifest.correlation_request_digest == replacement_digest:
+        replacement_digest = DIGEST_B
+    tampered = store.blobs[manifest_name].payload.replace(
+        manifest.correlation_request_digest.encode("ascii"),
+        replacement_digest.encode("ascii"),
+    )
+    store.blobs[manifest_name] = replace(
+        store.blobs[manifest_name],
+        payload=tampered,
+        size_bytes=len(tampered),
+        payload_sha256=sha256_hex(tampered),
+    )
+    store.read_requests.clear()
+
+    with pytest.raises(MonitoringAcquisitionJobError, match="commit manifest is invalid"):
+        runtime_module._probe_monitoring_persistence(
+            reader=store,
+            replay_key=PERSISTENCE_REPLAY_KEY,
+        )
+
+    assert [item.blob_name for item in store.read_requests] == [manifest_name]
+    assert recovery_name in store.blobs
+    assert evidence_name in store.blobs
+
+
+def test_commit_port_rejects_changed_reacquisition_under_same_replay_identity(
+    persistence_case: _PersistenceCase,
+) -> None:
+    store = _MemoryStore(
+        container_name="monitoring-evidence",
+        fail_once_on_suffix="/manifest.json",
+    )
+    port = _commit_port(store, persistence_case)
 
     with (
         pytest.raises(RuntimeError, match="staged persistence failure"),
-        port.transaction(cast(Any, _prepared())),
+        port.transaction(persistence_case.prepared),
     ):
         pass
 
+    changed_bundle = persistence_case.prepared.monitoring_bundle.model_copy(
+        update={"workload_id": "synthetic-different-workload"}
+    )
+    changed_prepared = replace(
+        persistence_case.prepared,
+        monitoring_bundle=changed_bundle,
+    )
     with (
-        pytest.raises(MonitoringAcquisitionJobError, match="already exists"),
-        port.transaction(
-            cast(
-                Any,
-                _prepared(bundle_payload=b'{"schemaVersion":"different-monitoring-bundle"}\n'),
-            )
-        ),
+        pytest.raises(MonitoringAcquisitionJobError, match="does not match"),
+        port.transaction(changed_prepared),
     ):
         pass
 
     assert not any(name.endswith("/manifest.json") for name in store.blobs)
 
 
-def test_commit_port_rejects_conflicting_existing_artifact() -> None:
+def test_commit_port_rejects_conflicting_existing_artifact(
+    persistence_case: _PersistenceCase,
+) -> None:
     store = _MemoryStore(container_name="monitoring-evidence")
-    prepared = _prepared()
+    prepared = persistence_case.prepared
     collection_id = f"wc024-{PERSISTENCE_REPLAY_KEY.removeprefix('sha256:')[:12]}"
     bundle_name = f"wc024-monitoring/{collection_id}/evidence.json"
     conflicting = b'{"schemaVersion":"conflicting"}\n'
@@ -1298,13 +2319,15 @@ def test_commit_port_rejects_conflicting_existing_artifact() -> None:
     )
 
     with (
-        pytest.raises(MonitoringAcquisitionJobError, match="already exists"),
-        _commit_port(store).transaction(cast(Any, prepared)),
+        pytest.raises(MonitoringAcquisitionJobError, match="does not match"),
+        _commit_port(store, persistence_case).transaction(prepared),
     ):
         pass
 
 
-def test_commit_port_rejects_unreviewed_change_artifacts_before_write() -> None:
+def test_commit_port_rejects_unreviewed_change_artifacts_before_write(
+    persistence_case: _PersistenceCase,
+) -> None:
     monitoring_store = _MemoryStore(container_name="monitoring-evidence")
     evidence_id = "chg-" + hashlib.sha256(DIGEST_A.encode("utf-8")).hexdigest()[:12]
     artifact = SimpleNamespace(
@@ -1315,11 +2338,14 @@ def test_commit_port_rejects_unreviewed_change_artifacts_before_write() -> None:
         ),
         canonical_bytes=lambda: b'{"schemaVersion":"synthetic-change"}\n',
     )
-    prepared = _prepared(change_artifacts=(artifact,))
+    prepared = replace(
+        persistence_case.prepared,
+        change_artifacts=(cast(Any, artifact),),
+    )
 
     with (
         pytest.raises(MonitoringAcquisitionJobError, match="change persistence"),
-        _commit_port(monitoring_store).transaction(cast(Any, prepared)),
+        _commit_port(monitoring_store, persistence_case).transaction(prepared),
     ):
         pass
 
@@ -1359,3 +2385,40 @@ def test_cli_runs_wc028_job_and_reports_exact_handoffs(
     assert "wc024-aaaaaaaaaaaa" in stdout.getvalue()
     assert "request-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" in stdout.getvalue()
     assert stderr.getvalue() == ""
+
+
+def test_cli_reports_wrapped_wc028_dependency_failure_without_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "load_wc028_monitoring_acquisition_job_configuration",
+        lambda **_: object(),
+    )
+
+    def fail_job(**_kwargs: object) -> object:
+        try:
+            raise ServiceRequestError("synthetic transport details")
+        except ServiceRequestError as exc:
+            raise MonitoringAcquisitionJobError(
+                "WC-028 Azure client or transport operation failed"
+            ) from exc
+
+    monkeypatch.setattr(cli, "run_wc028_monitoring_acquisition_job", fail_job)
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+
+    result = cli.main(
+        ["wc028-monitoring-acquisition-job", "--config-json", "{}"],
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert result == 1
+    assert stdout.getvalue() == ""
+    assert stderr.getvalue() == (
+        "wc028-monitoring-acquisition-job failed: "
+        "WC-028 Azure client or transport operation failed\n"
+    )
+    assert "Traceback" not in stderr.getvalue()
+    assert "synthetic transport details" not in stderr.getvalue()

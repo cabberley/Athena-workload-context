@@ -4,11 +4,15 @@ import os
 import re
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any, Literal, Protocol, cast
 from urllib.parse import urlsplit
 
+from azure.core.exceptions import AzureError
+from azure.servicebus.exceptions import ServiceBusError
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from athena_context.artifacts import (
@@ -17,6 +21,7 @@ from athena_context.artifacts import (
     ArtifactMetadataHashes,
     ArtifactNotFoundError,
     ArtifactReadError,
+    ArtifactReadResult,
     ArtifactWriteError,
     ArtifactWriteRequest,
     CreateOnlyArtifactWriterPort,
@@ -37,10 +42,19 @@ from athena_context.contracts import (
     MONITORING_IDENTITY_PROOF_TOKEN_VERSION,
     ApprovedChangeScope,
     CorrelationRequest,
+    EndpointHealthObservation,
+    GuestSignalObservation,
     MonitoringAcquisitionReceipt,
     MonitoringCollectorContract,
+    MonitoringEffectiveRbacDenyAssignment,
+    MonitoringEffectiveRbacGrant,
+    MonitoringEffectiveRbacPimScheduleInstance,
+    MonitoringEffectiveRbacPrincipalEvidence,
+    MonitoringEffectiveRbacRoleDefinition,
     MonitoringEvidenceAttestation,
+    MonitoringEvidenceBundle,
     MonitoringEvidenceHandoff,
+    PlatformHealthObservation,
     PublishedMonitoringIntent,
     PublishedMonitoringIntentAssetReference,
     PublishedMonitoringIntentAttestation,
@@ -63,7 +77,6 @@ from athena_context.monitoring_acquisition import (
     MonitoringAcquisitionAuthority,
     MonitoringAcquisitionCoordinator,
     MonitoringAcquisitionError,
-    MonitoringAcquisitionOutcome,
     compute_monitoring_acquisition_authority_scope,
 )
 from athena_context.monitoring_collection import (
@@ -71,6 +84,7 @@ from athena_context.monitoring_collection import (
     MonitoringCollectionError,
     MonitoringCollectionTransaction,
     PreparedMonitoringCollection,
+    build_collected_correlation_request,
 )
 
 _IDENTITY_PATTERN = re.compile(
@@ -80,6 +94,18 @@ _IDENTITY_PATTERN = re.compile(
 _STORAGE_ID_PATTERN = re.compile(
     r"^/subscriptions/[0-9a-f-]{36}/resourcegroups/[a-z0-9._()-]{1,90}/providers/"
     r"microsoft\.storage/storageaccounts/[a-z0-9]{3,24}$"
+)
+_REGISTRY_ID_PATTERN = re.compile(
+    r"^/subscriptions/[0-9a-f-]{36}/resourcegroups/[a-z0-9._()-]{1,90}/providers/"
+    r"microsoft\.containerregistry/registries/[a-z0-9]{5,50}$"
+)
+_KEY_RESOURCE_ID_PATTERN = re.compile(
+    r"^/subscriptions/[0-9a-f-]{36}/resourcegroups/[a-z0-9._()-]{1,90}/providers/"
+    r"microsoft\.keyvault/vaults/[a-z0-9-]{3,24}/keys/[a-z0-9-]{1,127}$"
+)
+_ROLE_DEFINITION_ID_PATTERN = re.compile(
+    r"^/subscriptions/[0-9a-f-]{36}/providers/microsoft\.authorization/"
+    r"roledefinitions/[0-9a-f-]{36}$"
 )
 _GUID_PATTERN = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 _MAX_CONFIGURATION_BYTES = 512 * 1024
@@ -95,6 +121,13 @@ _RESOURCE_LOG_ALLOWED_OPERATIONS = (
 _RESOURCE_HEALTH_ALLOWED_OPERATIONS = (
     "Microsoft.ResourceHealth/AvailabilityStatuses/current/read",
 )
+_ACR_PULL_ROLE_DEFINITION_GUID = "7f951dda-4ed3-4680-a7ca-43fe172d538d"
+_ACR_PULL_ROLE_NAME = "AcrPull"
+_ACR_PULL_ACTION = "Microsoft.ContainerRegistry/registries/pull/read"
+_MONITORING_INTENT_KEY_READER_ROLE_NAME = "Athena WC028 Monitoring Intent Key Reader"
+_MONITORING_INTENT_KEY_READ_DATA_ACTION = "Microsoft.KeyVault/vaults/keys/read"
+_ZERO_DIGEST = f"sha256:{'0' * 64}"
+_EXTERNAL_AZURE_FAILURES = (AzureError, ServiceBusError, OSError, TimeoutError)
 
 
 def _configuration_tuple(value: object) -> tuple[object, ...]:
@@ -106,6 +139,61 @@ def _configuration_resource_ids(value: object) -> tuple[str, ...]:
         str(item).casefold().rstrip("/")
         for item in _configuration_tuple(value)
         if isinstance(item, str)
+    )
+
+
+def _canonical_resource_id(value: str) -> str:
+    return value.casefold().rstrip("/")
+
+
+def _subscription_id_from_resource_id(value: str) -> str:
+    segments = _canonical_resource_id(value).strip("/").split("/")
+    if (
+        len(segments) < 2
+        or segments[0] != "subscriptions"
+        or _GUID_PATTERN.fullmatch(segments[1]) is None
+    ):
+        raise ValueError("runtime resource ID must identify one Azure subscription")
+    return segments[1]
+
+
+def _resource_scope_ancestry(value: str) -> tuple[str, ...]:
+    normalized = _canonical_resource_id(value)
+    segments = normalized.strip("/").split("/")
+    subscription_scope = f"/subscriptions/{segments[1]}"
+    scopes = {subscription_scope, normalized}
+    if len(segments) >= 4 and segments[2] == "resourcegroups":
+        scopes.add(f"{subscription_scope}/resourcegroups/{segments[3]}")
+    return tuple(sorted(scopes))
+
+
+def _rbac_scope_applies(
+    assignment_scope: str,
+    target_scope: str,
+    *,
+    management_group_ancestry: tuple[str, ...],
+    do_not_apply_to_child_scopes: bool = False,
+) -> bool:
+    assignment = _canonical_resource_id(assignment_scope)
+    target = _canonical_resource_id(target_scope)
+    if assignment == target:
+        return True
+    if do_not_apply_to_child_scopes:
+        return False
+    if assignment in management_group_ancestry:
+        return True
+    return target.startswith(f"{assignment}/")
+
+
+def _rbac_action_matches(
+    action: str,
+    *,
+    actions: tuple[str, ...],
+    not_actions: tuple[str, ...],
+) -> bool:
+    normalized = action.casefold()
+    return any(fnmatchcase(normalized, pattern) for pattern in actions) and not any(
+        fnmatchcase(normalized, pattern) for pattern in not_actions
     )
 
 
@@ -152,8 +240,295 @@ class MonitoringRuntimeTrustedKey(_StrictRuntimeModel):
         )
 
 
+class MonitoringRuntimeSupportEffectiveRbacInventory(_StrictRuntimeModel):
+    """Hierarchy-complete effective RBAC evidence for the runtime-support UAMI."""
+
+    schema_version: Literal["athena.wc028RuntimeSupportEffectiveRbacInventory.v1"] = Field(
+        alias="schemaVersion"
+    )
+    collection_run_id: str = Field(
+        alias="collectionRunId",
+        pattern=r"^runtime-support-rbac-[a-f0-9]{32}$",
+    )
+    tenant_id: str = Field(alias="tenantId", pattern=_GUID_PATTERN.pattern)
+    subscription_id: str = Field(alias="subscriptionId", pattern=_GUID_PATTERN.pattern)
+    support_identity_resource_id: str = Field(alias="supportIdentityResourceId")
+    support_client_id: str = Field(alias="supportClientId", pattern=_GUID_PATTERN.pattern)
+    support_principal_id: str = Field(alias="supportPrincipalId", pattern=_GUID_PATTERN.pattern)
+    attestor_identity_resource_id: str = Field(alias="attestorIdentityResourceId")
+    attestor_client_id: str = Field(alias="attestorClientId", pattern=_GUID_PATTERN.pattern)
+    attestor_principal_id: str = Field(alias="attestorPrincipalId", pattern=_GUID_PATTERN.pattern)
+    attestor_tenant_id: str = Field(alias="attestorTenantId", pattern=_GUID_PATTERN.pattern)
+    collected_at: datetime = Field(alias="collectedAt")
+    expires_at: datetime = Field(alias="expiresAt")
+    management_group_ancestry: tuple[str, ...] = Field(
+        alias="managementGroupAncestry",
+        min_length=1,
+        max_length=32,
+    )
+    ancestor_scope_collection_complete: Literal[True] = Field(
+        alias="ancestorScopeCollectionComplete"
+    )
+    subscription_descendant_collection_complete: Literal[True] = Field(
+        alias="subscriptionDescendantCollectionComplete"
+    )
+    group_membership_collection_complete: Literal[True] = Field(
+        alias="groupMembershipCollectionComplete"
+    )
+    role_definition_collection_complete: Literal[True] = Field(
+        alias="roleDefinitionCollectionComplete"
+    )
+    deny_assignment_collection_complete: Literal[True] = Field(
+        alias="denyAssignmentCollectionComplete"
+    )
+    pim_schedule_instance_collection_complete: Literal[True] = Field(
+        alias="pimScheduleInstanceCollectionComplete"
+    )
+    support_security_group_ids: tuple[str, ...] = Field(
+        default=(),
+        alias="supportSecurityGroupIds",
+        max_length=256,
+    )
+    support_grants: tuple[MonitoringEffectiveRbacGrant, ...] = Field(
+        alias="supportGrants",
+        min_length=2,
+        max_length=2,
+    )
+    support_principal_evidence: MonitoringEffectiveRbacPrincipalEvidence = Field(
+        alias="supportPrincipalEvidence"
+    )
+    role_definitions: tuple[MonitoringEffectiveRbacRoleDefinition, ...] = Field(
+        alias="roleDefinitions",
+        min_length=2,
+        max_length=2,
+    )
+    deny_assignments: tuple[MonitoringEffectiveRbacDenyAssignment, ...] = Field(
+        alias="denyAssignments",
+        max_length=256,
+    )
+    active_pim_schedule_instances: tuple[MonitoringEffectiveRbacPimScheduleInstance, ...] = Field(
+        alias="activePimScheduleInstances",
+        max_length=256,
+    )
+    role_definition_raw_page_digests: tuple[str, ...] = Field(
+        alias="roleDefinitionRawPageDigests",
+        min_length=1,
+        max_length=1024,
+    )
+    deny_assignment_raw_page_digests: tuple[str, ...] = Field(
+        alias="denyAssignmentRawPageDigests",
+        min_length=1,
+        max_length=1024,
+    )
+    pim_schedule_instance_raw_page_digests: tuple[str, ...] = Field(
+        alias="pimScheduleInstanceRawPageDigests",
+        min_length=1,
+        max_length=1024,
+    )
+    first_raw_snapshot_digest: str = Field(
+        alias="firstRawSnapshotDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    second_raw_snapshot_digest: str = Field(
+        alias="secondRawSnapshotDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    repeated_read_stable: Literal[True] = Field(alias="repeatedReadStable")
+    assignment_count: int = Field(alias="assignmentCount", ge=0, le=1024)
+    source_reference: VersionPinnedBlobReference = Field(alias="sourceReference")
+    source_manifest_digest: str = Field(
+        alias="sourceManifestDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    inventory_digest: str = Field(
+        alias="inventoryDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+
+    @field_validator(
+        "tenant_id",
+        "subscription_id",
+        "support_client_id",
+        "support_principal_id",
+        "attestor_client_id",
+        "attestor_principal_id",
+        "attestor_tenant_id",
+    )
+    @classmethod
+    def normalize_guid(cls, value: str) -> str:
+        return value.casefold()
+
+    @field_validator("support_identity_resource_id", "attestor_identity_resource_id")
+    @classmethod
+    def normalize_identity_resource_id(cls, value: str) -> str:
+        normalized = _canonical_resource_id(value)
+        if _IDENTITY_PATTERN.fullmatch(normalized) is None:
+            raise ValueError("runtime-support RBAC identity must be one user-assigned identity")
+        return normalized
+
+    @field_validator("collected_at", "expires_at")
+    @classmethod
+    def validate_evidence_time(cls, value: datetime) -> datetime:
+        if value.utcoffset() != UTC.utcoffset(value) or value.microsecond % 1000:
+            raise ValueError("runtime-support RBAC times must use millisecond UTC")
+        return value
+
+    @field_validator("management_group_ancestry")
+    @classmethod
+    def normalize_management_group_ancestry(
+        cls,
+        values: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        normalized = tuple(_canonical_resource_id(item) for item in values)
+        if (
+            normalized != tuple(sorted(normalized))
+            or len(normalized) != len(set(normalized))
+            or any(
+                not item.startswith("/providers/microsoft.management/managementgroups/")
+                for item in normalized
+            )
+        ):
+            raise ValueError(
+                "runtime-support management-group ancestry must be sorted and complete"
+            )
+        return normalized
+
+    @field_validator("support_security_group_ids")
+    @classmethod
+    def normalize_group_ids(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        normalized = tuple(item.casefold() for item in values)
+        if (
+            normalized != tuple(sorted(normalized))
+            or len(normalized) != len(set(normalized))
+            or any(_GUID_PATTERN.fullmatch(item) is None for item in normalized)
+        ):
+            raise ValueError("runtime-support security-group IDs must be sorted UUIDs")
+        return normalized
+
+    @field_validator("support_grants")
+    @classmethod
+    def validate_grant_order(
+        cls,
+        values: tuple[MonitoringEffectiveRbacGrant, ...],
+    ) -> tuple[MonitoringEffectiveRbacGrant, ...]:
+        digests = tuple(item.grant_digest for item in values)
+        if digests != tuple(sorted(digests)) or len(digests) != len(set(digests)):
+            raise ValueError("runtime-support grants must be sorted and unique")
+        return values
+
+    @field_validator("role_definitions")
+    @classmethod
+    def validate_role_definition_order(
+        cls,
+        values: tuple[MonitoringEffectiveRbacRoleDefinition, ...],
+    ) -> tuple[MonitoringEffectiveRbacRoleDefinition, ...]:
+        identifiers = tuple(item.role_definition_id for item in values)
+        if identifiers != tuple(sorted(identifiers)) or len(identifiers) != len(set(identifiers)):
+            raise ValueError("runtime-support role definitions must be sorted and unique")
+        return values
+
+    @field_validator("deny_assignments")
+    @classmethod
+    def validate_deny_assignment_order(
+        cls,
+        values: tuple[MonitoringEffectiveRbacDenyAssignment, ...],
+    ) -> tuple[MonitoringEffectiveRbacDenyAssignment, ...]:
+        identifiers = tuple(item.deny_assignment_id for item in values)
+        if identifiers != tuple(sorted(identifiers)) or len(identifiers) != len(set(identifiers)):
+            raise ValueError("runtime-support deny assignments must be sorted and unique")
+        return values
+
+    @field_validator("active_pim_schedule_instances")
+    @classmethod
+    def validate_pim_order(
+        cls,
+        values: tuple[MonitoringEffectiveRbacPimScheduleInstance, ...],
+    ) -> tuple[MonitoringEffectiveRbacPimScheduleInstance, ...]:
+        identifiers = tuple(item.schedule_instance_id for item in values)
+        if identifiers != tuple(sorted(identifiers)) or len(identifiers) != len(set(identifiers)):
+            raise ValueError("runtime-support PIM instances must be sorted and unique")
+        return values
+
+    @field_validator(
+        "role_definition_raw_page_digests",
+        "deny_assignment_raw_page_digests",
+        "pim_schedule_instance_raw_page_digests",
+    )
+    @classmethod
+    def validate_raw_page_digests(
+        cls,
+        values: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        if (
+            values != tuple(sorted(values))
+            or len(values) != len(set(values))
+            or any(re.fullmatch(r"sha256:[a-f0-9]{64}", item) is None for item in values)
+        ):
+            raise ValueError("runtime-support raw page digests must be sorted and unique")
+        return values
+
+    @model_validator(mode="after")
+    def validate_inventory(self) -> MonitoringRuntimeSupportEffectiveRbacInventory:
+        principal_evidence = self.support_principal_evidence
+        raw_snapshot_payload = {
+            "supportPrincipalEvidenceDigest": principal_evidence.evidence_digest,
+            "roleDefinitionRawPageDigests": list(self.role_definition_raw_page_digests),
+            "denyAssignmentRawPageDigests": list(self.deny_assignment_raw_page_digests),
+            "pimScheduleInstanceRawPageDigests": list(self.pim_schedule_instance_raw_page_digests),
+            "roleDefinitionRawDigests": [
+                item.raw_definition_digest for item in self.role_definitions
+            ],
+            "denyAssignmentRawDigests": [
+                item.raw_assignment_digest for item in self.deny_assignments
+            ],
+            "pimScheduleInstanceRawDigests": [
+                item.raw_instance_digest for item in self.active_pim_schedule_instances
+            ],
+        }
+        expected_raw_snapshot_digest = compute_artifact_digest(raw_snapshot_payload)
+        if (
+            self.tenant_id != self.attestor_tenant_id
+            or self.support_identity_resource_id == self.attestor_identity_resource_id
+            or self.support_client_id == self.attestor_client_id
+            or self.support_principal_id == self.attestor_principal_id
+            or _subscription_id_from_resource_id(self.support_identity_resource_id)
+            != self.subscription_id
+            or _subscription_id_from_resource_id(self.attestor_identity_resource_id)
+            != self.subscription_id
+            or not self.collected_at < self.expires_at
+            or (self.expires_at - self.collected_at).total_seconds() > 900
+            or self.assignment_count
+            != sum(len(item.assignment_scope_ids) for item in self.support_grants)
+            or principal_evidence.principal_id != self.support_principal_id
+            or principal_evidence.transitive_group_ids != self.support_security_group_ids
+            or self.first_raw_snapshot_digest != expected_raw_snapshot_digest
+            or self.second_raw_snapshot_digest != expected_raw_snapshot_digest
+            or self.source_reference.name
+            != (
+                f"wc028-runtime-support-rbac/{self.collection_run_id}/effective-rbac-inventory.json"
+            )
+            or self.source_reference.content_digest != self.source_manifest_digest
+        ):
+            raise ValueError(
+                "runtime-support effective RBAC identity, freshness, or raw evidence is invalid"
+            )
+        expected_inventory_digest = compute_artifact_digest(
+            self.model_dump(
+                mode="json",
+                by_alias=True,
+                exclude_none=True,
+                exclude={"inventory_digest"},
+            )
+        )
+        if self.inventory_digest != expected_inventory_digest:
+            raise ValueError(
+                "inventoryDigest does not bind runtime-support effective RBAC evidence"
+            )
+        return self
+
+
 class Wc028MonitoringAcquisitionJobConfiguration(_StrictRuntimeModel):
-    schema_version: Literal["athena.wc028MonitoringAcquisitionJobConfiguration.v2"] = Field(
+    schema_version: Literal["athena.wc028MonitoringAcquisitionJobConfiguration.v3"] = Field(
         alias="schemaVersion"
     )
     managed_identity_client_id: str = Field(
@@ -170,6 +545,19 @@ class Wc028MonitoringAcquisitionJobConfiguration(_StrictRuntimeModel):
     runtime_support_identity_principal_id: str = Field(
         alias="runtimeSupportIdentityPrincipalId",
         pattern=_GUID_PATTERN.pattern,
+    )
+    registry_resource_id: str = Field(alias="registryResourceId")
+    runtime_support_acr_pull_role_definition_id: str = Field(
+        alias="runtimeSupportAcrPullRoleDefinitionId"
+    )
+    monitoring_intent_signing_key_resource_id: str = Field(
+        alias="monitoringIntentSigningKeyResourceId"
+    )
+    runtime_support_monitoring_intent_key_reader_role_definition_id: str = Field(
+        alias="runtimeSupportMonitoringIntentKeyReaderRoleDefinitionId"
+    )
+    runtime_support_effective_rbac_inventory: MonitoringRuntimeSupportEffectiveRbacInventory = (
+        Field(alias="runtimeSupportEffectiveRbacInventory")
     )
     source_storage_account_resource_id: str = Field(alias="sourceStorageAccountResourceId")
     evidence_storage_account_resource_id: str = Field(alias="evidenceStorageAccountResourceId")
@@ -237,6 +625,40 @@ class Wc028MonitoringAcquisitionJobConfiguration(_StrictRuntimeModel):
             raise ValueError("runtime storage account resource ID is invalid")
         return normalized
 
+    @field_validator("registry_resource_id")
+    @classmethod
+    def validate_registry_resource_id(cls, value: str) -> str:
+        normalized = _canonical_resource_id(value)
+        if _REGISTRY_ID_PATTERN.fullmatch(normalized) is None:
+            raise ValueError("runtime registry resource ID is invalid")
+        return normalized
+
+    @field_validator("monitoring_intent_signing_key_resource_id")
+    @classmethod
+    def validate_key_resource_id(cls, value: str) -> str:
+        normalized = _canonical_resource_id(value)
+        if _KEY_RESOURCE_ID_PATTERN.fullmatch(normalized) is None:
+            raise ValueError("monitoring-intent key resource ID is invalid")
+        return normalized
+
+    @field_validator(
+        "runtime_support_acr_pull_role_definition_id",
+        "runtime_support_monitoring_intent_key_reader_role_definition_id",
+    )
+    @classmethod
+    def validate_role_definition_id(cls, value: str) -> str:
+        normalized = _canonical_resource_id(value)
+        if _ROLE_DEFINITION_ID_PATTERN.fullmatch(normalized) is None:
+            raise ValueError("runtime-support role definition ID is invalid")
+        return normalized
+
+    @field_validator("legacy_collector_rbac_cleanup_digest")
+    @classmethod
+    def reject_empty_cleanup_evidence(cls, value: str) -> str:
+        if value == _ZERO_DIGEST:
+            raise ValueError("legacyCollectorRbacCleanupDigest must be non-zero cleanup evidence")
+        return value
+
     @field_validator("evidence_blob_endpoint")
     @classmethod
     def validate_blob_endpoint(cls, value: str) -> str:
@@ -272,6 +694,46 @@ class Wc028MonitoringAcquisitionJobConfiguration(_StrictRuntimeModel):
             raise ValueError("source authority and monitoring evidence storage must be separate")
         if self.trust_delay_seconds >= self.request_lifetime_seconds:
             raise ValueError("request lifetime must extend beyond trustedAsOf")
+        subscription_ids = {
+            _subscription_id_from_resource_id(self.collector_identity_resource_id),
+            _subscription_id_from_resource_id(self.athena_context_identity_resource_id),
+            _subscription_id_from_resource_id(self.runtime_support_identity_resource_id),
+            _subscription_id_from_resource_id(self.registry_resource_id),
+            _subscription_id_from_resource_id(self.monitoring_intent_signing_key_resource_id),
+            _subscription_id_from_resource_id(self.source_storage_account_resource_id),
+            _subscription_id_from_resource_id(self.evidence_storage_account_resource_id),
+        }
+        if len(subscription_ids) != 1:
+            raise ValueError("WC-028 runtime resources must remain in one reviewed subscription")
+        subscription_id = next(iter(subscription_ids))
+        expected_acr_pull_role_definition_id = (
+            f"/subscriptions/{subscription_id}/providers/microsoft.authorization/"
+            f"roledefinitions/{_ACR_PULL_ROLE_DEFINITION_GUID}"
+        )
+        if (
+            self.runtime_support_acr_pull_role_definition_id != expected_acr_pull_role_definition_id
+            or self.runtime_support_acr_pull_role_definition_id
+            == self.runtime_support_monitoring_intent_key_reader_role_definition_id
+        ):
+            raise ValueError("runtime-support role IDs do not bind exact ACR and key-read roles")
+        key_url = urlsplit(self.monitoring_intent_trusted_key.key_vault_key_id)
+        key_path_segments = key_url.path.strip("/").split("/")
+        key_vault_name = (
+            key_url.hostname.removesuffix(".vault.azure.net")
+            if key_url.hostname is not None
+            else ""
+        )
+        expected_key_suffix = (
+            "/providers/microsoft.keyvault/"
+            f"vaults/{key_vault_name.casefold()}/keys/"
+            f"{key_path_segments[1].casefold() if len(key_path_segments) > 1 else ''}"
+        )
+        if (
+            len(key_path_segments) != 3
+            or key_path_segments[0] != "keys"
+            or not self.monitoring_intent_signing_key_resource_id.endswith(expected_key_suffix)
+        ):
+            raise ValueError("monitoring-intent key URI does not match its reviewed ARM resource")
         expected_storage_account_name = self.evidence_storage_account_resource_id.rsplit(
             "/",
             maxsplit=1,
@@ -536,20 +998,31 @@ class Wc028MonitoringAcquisitionJobConfiguration(_StrictRuntimeModel):
         ):
             raise ValueError("current collector contract must not authorize IP Flow")
         monitoring_intent_digest = self.monitoring_intent.get("intentDigest")
+        monitoring_intent_reference_digest = self.monitoring_intent_reference.get("referenceDigest")
         context_binding_digest = self.context_binding.get("bindingDigest")
         expected_replay_key = compute_artifact_digest(
             {
-                "schemaVersion": "athena.wc028MonitoringPersistenceReplay.v1",
+                "schemaVersion": "athena.wc028MonitoringPersistenceReplay.v3",
                 "executionId": self.execution_id,
                 "acquisitionAuthorityDigest": self.expected_acquisition_authority_digest,
                 "monitoringIntentDigest": monitoring_intent_digest,
+                "monitoringIntentReferenceDigest": (monitoring_intent_reference_digest),
                 "contextBindingDigest": context_binding_digest,
                 "incidentRevision": self.incident_revision,
                 "legacyCollectorRbacCleanupDigest": (self.legacy_collector_rbac_cleanup_digest),
+                "runtimeSupportEffectiveRbacInventoryDigest": (
+                    self.runtime_support_effective_rbac_inventory.inventory_digest
+                ),
+                "runtimeSupportEffectiveRbacSourceManifestDigest": (
+                    self.runtime_support_effective_rbac_inventory.source_manifest_digest
+                ),
+                "trustDelaySeconds": self.trust_delay_seconds,
+                "requestLifetimeSeconds": self.request_lifetime_seconds,
             }
         )
         if (
             not isinstance(monitoring_intent_digest, str)
+            or not isinstance(monitoring_intent_reference_digest, str)
             or not isinstance(context_binding_digest, str)
             or self.persistence_replay_key != expected_replay_key
         ):
@@ -568,6 +1041,10 @@ class Wc028MonitoringAcquisitionJobConfiguration(_StrictRuntimeModel):
                 "collector, support, and context client and principal identities "
                 "must be valid and separate"
             )
+        _validate_runtime_support_effective_rbac(
+            configuration=self,
+            as_of=None,
+        )
         environment_client_id = os.environ.get("AZURE_CLIENT_ID")
         if (
             environment_client_id is not None
@@ -602,6 +1079,30 @@ class Wc028MonitoringAcquisitionJobConfiguration(_StrictRuntimeModel):
             (
                 "ATHENA_WC028_DEPLOYED_RUNTIME_SUPPORT_IDENTITY_PRINCIPAL_ID",
                 self.runtime_support_identity_principal_id,
+            ),
+            (
+                "ATHENA_WC028_DEPLOYED_REGISTRY_RESOURCE_ID",
+                self.registry_resource_id,
+            ),
+            (
+                "ATHENA_WC028_DEPLOYED_RUNTIME_SUPPORT_ACR_PULL_ROLE_DEFINITION_ID",
+                self.runtime_support_acr_pull_role_definition_id,
+            ),
+            (
+                "ATHENA_WC028_DEPLOYED_MONITORING_INTENT_SIGNING_KEY_RESOURCE_ID",
+                self.monitoring_intent_signing_key_resource_id,
+            ),
+            (
+                "ATHENA_WC028_DEPLOYED_RUNTIME_SUPPORT_INTENT_KEY_READER_ROLE_DEFINITION_ID",
+                self.runtime_support_monitoring_intent_key_reader_role_definition_id,
+            ),
+            (
+                "ATHENA_WC028_DEPLOYED_RUNTIME_SUPPORT_RBAC_INVENTORY_DIGEST",
+                self.runtime_support_effective_rbac_inventory.inventory_digest,
+            ),
+            (
+                "ATHENA_WC028_DEPLOYED_RUNTIME_SUPPORT_RBAC_SOURCE_MANIFEST_DIGEST",
+                self.runtime_support_effective_rbac_inventory.source_manifest_digest,
             ),
             (
                 "ATHENA_WC028_DEPLOYED_SOURCE_STORAGE_ACCOUNT_RESOURCE_ID",
@@ -640,6 +1141,17 @@ class Wc028MonitoringAcquisitionJobConfiguration(_StrictRuntimeModel):
                 raise ValueError(
                     f"{environment_name} does not match the reviewed runtime configuration"
                 )
+        supplied_deployment_bindings = tuple(
+            environment_name
+            for environment_name, _ in deployment_bindings
+            if os.environ.get(environment_name) is not None
+        )
+        if supplied_deployment_bindings and len(supplied_deployment_bindings) != len(
+            deployment_bindings
+        ):
+            raise ValueError(
+                "WC-028 deployed runtime bindings must be supplied as one complete set"
+            )
         support_client_id = os.environ.get("ATHENA_WC028_RUNTIME_SUPPORT_CLIENT_ID")
         if (
             support_client_id is not None
@@ -648,7 +1160,163 @@ class Wc028MonitoringAcquisitionJobConfiguration(_StrictRuntimeModel):
             raise ValueError(
                 "ATHENA_WC028_RUNTIME_SUPPORT_CLIENT_ID does not match the support identity"
             )
+        if supplied_deployment_bindings and support_client_id is None:
+            raise ValueError(
+                "ATHENA_WC028_RUNTIME_SUPPORT_CLIENT_ID is required with deployed bindings"
+            )
         return self
+
+
+def _validate_runtime_support_effective_rbac(
+    *,
+    configuration: Wc028MonitoringAcquisitionJobConfiguration,
+    as_of: datetime | None,
+) -> None:
+    inventory = configuration.runtime_support_effective_rbac_inventory
+    expected_subscription_id = _subscription_id_from_resource_id(
+        configuration.runtime_support_identity_resource_id
+    )
+    expected_target_scopes = {
+        *inventory.management_group_ancestry,
+        *_resource_scope_ancestry(configuration.registry_resource_id),
+        *_resource_scope_ancestry(configuration.monitoring_intent_signing_key_resource_id),
+    }
+    collector_principal_id = str(
+        configuration.monitoring_collector_contract.get("monitoringReaderPrincipalId", "")
+    ).casefold()
+    context_principal_id = str(
+        configuration.monitoring_collector_contract.get("athenaContextPrincipalId", "")
+    ).casefold()
+    collector_tenant_id = str(
+        configuration.monitoring_collector_contract.get("collectorTenantId", "")
+    ).casefold()
+    if (
+        inventory.subscription_id != expected_subscription_id
+        or inventory.tenant_id != collector_tenant_id
+        or inventory.support_identity_resource_id
+        != configuration.runtime_support_identity_resource_id
+        or inventory.support_client_id.casefold()
+        != configuration.runtime_support_identity_client_id.casefold()
+        or inventory.support_principal_id != configuration.runtime_support_identity_principal_id
+        or inventory.attestor_principal_id
+        in {
+            inventory.support_principal_id,
+            collector_principal_id,
+            context_principal_id,
+        }
+        or inventory.attestor_identity_resource_id
+        in {
+            configuration.runtime_support_identity_resource_id,
+            configuration.collector_identity_resource_id,
+            configuration.athena_context_identity_resource_id,
+        }
+        or inventory.support_security_group_ids
+        or inventory.support_principal_evidence.transitive_group_ids
+        or set(inventory.support_principal_evidence.target_scope_ids) != expected_target_scopes
+        or inventory.active_pim_schedule_instances
+        or inventory.assignment_count != 2
+        or inventory.source_manifest_digest == _ZERO_DIGEST
+        or inventory.inventory_digest == _ZERO_DIGEST
+    ):
+        raise ValueError(
+            "runtime-support identity lacks hierarchy-complete dedicated effective RBAC evidence"
+        )
+    if as_of is not None and (
+        as_of.utcoffset() != UTC.utcoffset(as_of)
+        or as_of.microsecond % 1000
+        or inventory.collected_at > as_of
+        or inventory.expires_at <= as_of
+        or (as_of - inventory.collected_at).total_seconds() > 900
+    ):
+        raise MonitoringAcquisitionJobError(
+            "runtime-support effective RBAC evidence is stale before job execution"
+        )
+    expected_grants = {
+        configuration.runtime_support_acr_pull_role_definition_id: (
+            _ACR_PULL_ROLE_NAME,
+            configuration.registry_resource_id,
+        ),
+        configuration.runtime_support_monitoring_intent_key_reader_role_definition_id: (
+            _MONITORING_INTENT_KEY_READER_ROLE_NAME,
+            configuration.monitoring_intent_signing_key_resource_id,
+        ),
+    }
+    grants_by_role = {item.role_definition_id: item for item in inventory.support_grants}
+    if set(grants_by_role) != set(expected_grants):
+        raise ValueError("runtime-support identity has arbitrary effective Azure privileges")
+    for role_definition_id, (role_name, scope_id) in expected_grants.items():
+        grant = grants_by_role[role_definition_id]
+        if (
+            grant.role_definition_name != role_name
+            or grant.assigned_principal_id != inventory.support_principal_id
+            or grant.assigned_principal_type != "ServicePrincipal"
+            or grant.effective_principal_id != inventory.support_principal_id
+            or grant.assignment_scope_ids != (scope_id,)
+            or grant.inheritance != "direct"
+            or grant.group_derived
+            or grant.condition is not None
+            or grant.condition_version is not None
+        ):
+            raise ValueError(
+                "runtime-support identity grants are not exact direct governed assignments"
+            )
+    roles_by_id = {item.role_definition_id: item for item in inventory.role_definitions}
+    if set(roles_by_id) != set(expected_grants):
+        raise ValueError("runtime-support role-definition evidence is incomplete or arbitrary")
+    acr_pull_role = roles_by_id[configuration.runtime_support_acr_pull_role_definition_id]
+    if (
+        acr_pull_role.role_definition_name != _ACR_PULL_ROLE_NAME
+        or acr_pull_role.actions != (_ACR_PULL_ACTION.casefold(),)
+        or acr_pull_role.not_actions
+        or acr_pull_role.data_actions
+        or acr_pull_role.not_data_actions
+    ):
+        raise ValueError("runtime-support AcrPull role definition is not exact")
+    key_reader_role = roles_by_id[
+        configuration.runtime_support_monitoring_intent_key_reader_role_definition_id
+    ]
+    if (
+        key_reader_role.role_definition_name != _MONITORING_INTENT_KEY_READER_ROLE_NAME
+        or key_reader_role.actions
+        or key_reader_role.not_actions
+        or key_reader_role.data_actions != (_MONITORING_INTENT_KEY_READ_DATA_ACTION.casefold(),)
+        or key_reader_role.not_data_actions
+    ):
+        raise ValueError("runtime-support monitoring-intent key-read role is not exact")
+    effective_principals = {inventory.support_principal_id}
+    for deny in inventory.deny_assignments:
+        if deny.condition is not None:
+            raise ValueError("runtime-support deny conditions are not supported")
+        candidate_principals = (
+            effective_principals
+            if not deny.principal_ids
+            else effective_principals.intersection(deny.principal_ids)
+        )
+        applicable_principals = candidate_principals.difference(deny.excluded_principal_ids)
+        if not applicable_principals:
+            continue
+        denies_acr_pull = _rbac_scope_applies(
+            deny.scope_id,
+            configuration.registry_resource_id,
+            management_group_ancestry=inventory.management_group_ancestry,
+            do_not_apply_to_child_scopes=deny.do_not_apply_to_child_scopes,
+        ) and _rbac_action_matches(
+            _ACR_PULL_ACTION,
+            actions=deny.actions,
+            not_actions=deny.not_actions,
+        )
+        denies_key_read = _rbac_scope_applies(
+            deny.scope_id,
+            configuration.monitoring_intent_signing_key_resource_id,
+            management_group_ancestry=inventory.management_group_ancestry,
+            do_not_apply_to_child_scopes=deny.do_not_apply_to_child_scopes,
+        ) and _rbac_action_matches(
+            _MONITORING_INTENT_KEY_READ_DATA_ACTION,
+            actions=deny.data_actions,
+            not_actions=deny.not_data_actions,
+        )
+        if denies_acr_pull or denies_key_read:
+            raise ValueError("runtime-support deny assignment removes an exact required permission")
 
 
 def load_wc028_monitoring_acquisition_job_configuration(
@@ -751,17 +1419,195 @@ class _UnsupportedChangeEvidenceSigner:
 
 
 class MonitoringAcquisitionJobOutcome(Protocol):
+    @property
+    def committed(self) -> CommittedMonitoringCollection: ...
+
+    @property
+    def correlation_request(self) -> CorrelationRequest: ...
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveredMonitoringAcquisitionJobOutcome:
+    """The durable result returned when restart recovery skips reacquisition."""
+
     committed: CommittedMonitoringCollection
     correlation_request: CorrelationRequest
 
 
-class MonitoringPersistenceCommitManifest(_StrictRuntimeModel):
-    schema_version: Literal["athena.wc028MonitoringPersistenceCommit.v1"] = Field(
+class MonitoringPersistenceRecoveryState(_StrictRuntimeModel):
+    schema_version: Literal["athena.wc028MonitoringPersistenceRecoveryState.v1"] = Field(
         alias="schemaVersion"
     )
     replay_key: str = Field(alias="replayKey", pattern=r"^sha256:[a-f0-9]{64}$")
+    execution_id: str = Field(
+        alias="executionId",
+        pattern=r"^wc028-execution-[a-f0-9]{32}$",
+    )
+    acquisition_authority_digest: str = Field(
+        alias="acquisitionAuthorityDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    legacy_collector_rbac_cleanup_digest: str = Field(
+        alias="legacyCollectorRbacCleanupDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
     prepared_digest: str = Field(alias="preparedDigest", pattern=r"^sha256:[a-f0-9]{64}$")
     collection_id: str = Field(alias="collectionId", pattern=r"^wc024-[a-f0-9]{12}$")
+    incident_revision: int = Field(alias="incidentRevision", ge=1)
+    issued_at: datetime = Field(alias="issuedAt")
+    trusted_as_of: datetime = Field(alias="trustedAsOf")
+    expires_at: datetime = Field(alias="expiresAt")
+    intent_id: str = Field(
+        alias="intentId",
+        pattern=r"^monitoring-intent-[a-f0-9]{32}$",
+    )
+    intent_digest: str = Field(alias="intentDigest", pattern=r"^sha256:[a-f0-9]{64}$")
+    context_binding_digest: str = Field(
+        alias="contextBindingDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    collector_contract_digest: str = Field(
+        alias="collectorContractDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    monitoring_bundle_digest: str = Field(
+        alias="monitoringBundleDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    acquisition_receipt_digest: str = Field(
+        alias="acquisitionReceiptDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    monitoring_intent_reference: PublishedMonitoringIntentAssetReference = Field(
+        alias="monitoringIntentReference"
+    )
+    monitoring_bundle: MonitoringEvidenceBundle = Field(alias="monitoringBundle")
+    incident_resource_id: str = Field(alias="incidentResourceId", min_length=1, max_length=2048)
+    previous_health_source_record_id: str = Field(
+        alias="previousHealthSourceRecordId",
+        min_length=1,
+        max_length=2048,
+    )
+    current_health_source_record_ids: tuple[str, ...] = Field(
+        alias="currentHealthSourceRecordIds",
+        min_length=1,
+        max_length=32,
+    )
+    previous_health_observation_id: str = Field(
+        alias="previousHealthObservationId",
+        min_length=1,
+        max_length=2048,
+    )
+    current_health_observation_ids: tuple[str, ...] = Field(
+        alias="currentHealthObservationIds",
+        min_length=1,
+        max_length=32,
+    )
+    current_health_state: Literal["degraded", "unhealthy", "unavailable"] = Field(
+        alias="currentHealthState"
+    )
+    state_digest: str = Field(alias="stateDigest", pattern=r"^sha256:[a-f0-9]{64}$")
+
+    @field_validator("issued_at", "trusted_as_of", "expires_at")
+    @classmethod
+    def validate_correlation_time(cls, value: datetime) -> datetime:
+        if value.utcoffset() != UTC.utcoffset(value) or value.microsecond % 1000:
+            raise ValueError("recovery correlation times must use millisecond UTC")
+        return value
+
+    @field_validator(
+        "current_health_source_record_ids",
+        "current_health_observation_ids",
+    )
+    @classmethod
+    def validate_sorted_ids(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        if values != tuple(sorted(values)) or len(values) != len(set(values)):
+            raise ValueError("recovery incident IDs must be sorted and unique")
+        return values
+
+    @field_validator("legacy_collector_rbac_cleanup_digest")
+    @classmethod
+    def validate_cleanup_digest(cls, value: str) -> str:
+        if value == _ZERO_DIGEST:
+            raise ValueError("recovery state cannot bind empty cleanup evidence")
+        return value
+
+    @model_validator(mode="after")
+    def validate_state(self) -> MonitoringPersistenceRecoveryState:
+        receipt = self.monitoring_bundle.acquisition_receipt
+        replay_payload = {
+            "intentId": self.intent_id,
+            "intentDigest": self.intent_digest,
+            "contextBindingDigest": self.context_binding_digest,
+            "collectorContractDigest": self.collector_contract_digest,
+            "monitoringBundleDigest": self.monitoring_bundle_digest,
+            "acquisitionReceiptDigest": self.acquisition_receipt_digest,
+        }
+        if (
+            receipt is None
+            or self.collection_id != _monitoring_persistence_collection_id(self.replay_key)
+            or self.monitoring_intent_reference.intent_id != self.intent_id
+            or self.monitoring_intent_reference.intent_digest != self.intent_digest
+            or self.monitoring_bundle.monitoring_contract_digest != self.collector_contract_digest
+            or sha256_hex(self.monitoring_bundle.canonical_bytes()) != self.monitoring_bundle_digest
+            or receipt.receipt_digest != self.acquisition_receipt_digest
+            or receipt.intent_id != self.intent_id
+            or receipt.intent_digest != self.intent_digest
+            or receipt.context_binding_digest != self.context_binding_digest
+            or receipt.collector_contract_digest != self.collector_contract_digest
+            or receipt.acquisition_authority_digest != self.acquisition_authority_digest
+            or receipt.execution_started_at != self.issued_at
+            or not self.issued_at <= self.trusted_as_of <= self.expires_at
+            or (self.expires_at - self.issued_at).total_seconds() > 900
+            or self.prepared_digest != compute_artifact_digest(replay_payload)
+        ):
+            raise ValueError("recovery state does not bind the exact prepared transaction")
+        expected_state_digest = compute_artifact_digest(
+            self.model_dump(
+                mode="json",
+                by_alias=True,
+                exclude_none=True,
+                exclude={"state_digest"},
+            )
+        )
+        if self.state_digest != expected_state_digest:
+            raise ValueError("stateDigest does not bind the persistence recovery state")
+        return self
+
+    def canonical_bytes(self) -> bytes:
+        return (canonicalize_json(self.model_dump(mode="json", by_alias=True)) + "\n").encode(
+            "utf-8"
+        )
+
+    def prepared_collection(self) -> PreparedMonitoringCollection:
+        return PreparedMonitoringCollection(
+            intent_id=self.intent_id,
+            intent_digest=self.intent_digest,
+            context_binding_digest=self.context_binding_digest,
+            monitoring_intent_reference=self.monitoring_intent_reference,
+            monitoring_bundle=self.monitoring_bundle,
+            change_artifacts=(),
+            incident_resource_id=self.incident_resource_id,
+            previous_health_source_record_id=self.previous_health_source_record_id,
+            current_health_source_record_ids=self.current_health_source_record_ids,
+            previous_health_observation_id=self.previous_health_observation_id,
+            current_health_observation_ids=self.current_health_observation_ids,
+            current_health_state=self.current_health_state,
+        )
+
+
+class MonitoringPersistenceCommitManifest(_StrictRuntimeModel):
+    schema_version: Literal["athena.wc028MonitoringPersistenceCommit.v2"] = Field(
+        alias="schemaVersion"
+    )
+    replay_key: str = Field(alias="replayKey", pattern=r"^sha256:[a-f0-9]{64}$")
+    execution_id: str = Field(
+        alias="executionId",
+        pattern=r"^wc028-execution-[a-f0-9]{32}$",
+    )
+    prepared_digest: str = Field(alias="preparedDigest", pattern=r"^sha256:[a-f0-9]{64}$")
+    collection_id: str = Field(alias="collectionId", pattern=r"^wc024-[a-f0-9]{12}$")
+    recovery_state: VersionPinnedBlobReference = Field(alias="recoveryState")
     intent_id: str = Field(
         alias="intentId",
         pattern=r"^monitoring-intent-[a-f0-9]{32}$",
@@ -784,12 +1630,23 @@ class MonitoringPersistenceCommitManifest(_StrictRuntimeModel):
         pattern=r"^sha256:[a-f0-9]{64}$",
     )
     monitoring_handoff: MonitoringEvidenceHandoff = Field(alias="monitoringHandoff")
+    correlation_request_id: str = Field(
+        alias="correlationRequestId",
+        pattern=r"^request-[a-f0-9]{32}$",
+    )
+    correlation_request_digest: str = Field(
+        alias="correlationRequestDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
     manifest_digest: str = Field(alias="manifestDigest", pattern=r"^sha256:[a-f0-9]{64}$")
 
     @model_validator(mode="after")
     def validate_manifest(self) -> MonitoringPersistenceCommitManifest:
         if (
-            self.monitoring_handoff.collection_id != self.collection_id
+            self.collection_id != _monitoring_persistence_collection_id(self.replay_key)
+            or self.recovery_state.name
+            != (f"wc024-monitoring/commits/{self.replay_key.removeprefix('sha256:')}/recovery.json")
+            or self.monitoring_handoff.collection_id != self.collection_id
             or self.monitoring_handoff.collector_contract_digest != self.collector_contract_digest
             or self.monitoring_handoff.evidence.content_digest != self.monitoring_bundle_digest
             or self.monitoring_handoff.acquisition_receipt_digest != self.acquisition_receipt_digest
@@ -809,6 +1666,7 @@ class MonitoringPersistenceCommitManifest(_StrictRuntimeModel):
             self.model_dump(
                 mode="json",
                 by_alias=True,
+                exclude_none=True,
                 exclude={"manifest_digest"},
             )
         )
@@ -848,6 +1706,126 @@ def _monitoring_persistence_collection_id(replay_key: str) -> str:
     if re.fullmatch(r"sha256:[a-f0-9]{64}", replay_key) is None:
         raise ValueError("replay_key must be one exact SHA-256 digest")
     return f"wc024-{replay_key.removeprefix('sha256:')[:12]}"
+
+
+def _monitoring_persistence_blob_names(replay_key: str) -> tuple[str, str, str]:
+    collection_id = _monitoring_persistence_collection_id(replay_key)
+    prefix = f"wc024-monitoring/commits/{replay_key.removeprefix('sha256:')}"
+    return (
+        f"{prefix}/manifest.json",
+        f"{prefix}/recovery.json",
+        f"wc024-monitoring/{collection_id}/evidence.json",
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _MonitoringPersistenceProbe:
+    manifest_result: ArtifactReadResult | None
+    recovery_state_result: ArtifactReadResult | None
+    evidence_result: ArtifactReadResult | None
+
+    @property
+    def has_durable_artifacts(self) -> bool:
+        return any(
+            item is not None
+            for item in (
+                self.manifest_result,
+                self.recovery_state_result,
+                self.evidence_result,
+            )
+        )
+
+
+def _read_current_if_present(
+    reader: CurrentArtifactReaderPort,
+    *,
+    blob_name: str,
+) -> ArtifactReadResult | None:
+    try:
+        return reader.read_current(ArtifactCurrentReadRequest(blob_name=blob_name))
+    except ArtifactNotFoundError:
+        return None
+
+
+def _parse_recovery_state_result(
+    result: ArtifactReadResult,
+    *,
+    expected_blob_name: str,
+) -> MonitoringPersistenceRecoveryState:
+    try:
+        state = MonitoringPersistenceRecoveryState.model_validate_json(result.payload)
+    except (AttributeError, UnicodeDecodeError, ValueError) as exc:
+        raise MonitoringAcquisitionJobError(
+            "recovered monitoring persistence state is invalid"
+        ) from exc
+    if (
+        result.blob_name != expected_blob_name
+        or result.payload_sha256 != sha256_hex(result.payload)
+        or result.payload != state.canonical_bytes()
+    ):
+        raise MonitoringAcquisitionJobError(
+            "recovered monitoring persistence state failed byte verification"
+        )
+    return state
+
+
+def _parse_commit_manifest_result(
+    result: ArtifactReadResult,
+    *,
+    expected_blob_name: str,
+) -> MonitoringPersistenceCommitManifest:
+    try:
+        manifest = MonitoringPersistenceCommitManifest.model_validate_json(result.payload)
+    except (AttributeError, UnicodeDecodeError, ValueError) as exc:
+        raise MonitoringAcquisitionJobError(
+            "recovered monitoring persistence commit manifest is invalid"
+        ) from exc
+    if (
+        result.blob_name != expected_blob_name
+        or result.payload_sha256 != sha256_hex(result.payload)
+        or result.payload != manifest.canonical_bytes()
+    ):
+        raise MonitoringAcquisitionJobError(
+            "recovered monitoring persistence commit manifest failed byte verification"
+        )
+    return manifest
+
+
+def _probe_monitoring_persistence(
+    *,
+    reader: CurrentArtifactReaderPort,
+    replay_key: str,
+) -> _MonitoringPersistenceProbe:
+    manifest_blob_name, recovery_blob_name, evidence_blob_name = _monitoring_persistence_blob_names(
+        replay_key
+    )
+    manifest_result = _read_current_if_present(
+        reader,
+        blob_name=manifest_blob_name,
+    )
+    if manifest_result is not None:
+        _parse_commit_manifest_result(
+            manifest_result,
+            expected_blob_name=manifest_blob_name,
+        )
+    recovery_state_result = _read_current_if_present(
+        reader,
+        blob_name=recovery_blob_name,
+    )
+    if recovery_state_result is not None:
+        _parse_recovery_state_result(
+            recovery_state_result,
+            expected_blob_name=recovery_blob_name,
+        )
+    evidence_result = _read_current_if_present(
+        reader,
+        blob_name=evidence_blob_name,
+    )
+    return _MonitoringPersistenceProbe(
+        manifest_result=manifest_result,
+        recovery_state_result=recovery_state_result,
+        evidence_result=evidence_result,
+    )
 
 
 def _validate_acquisition_authority_preflight(
@@ -1016,7 +1994,7 @@ def _build_acquisition_receipt_verifier(
 
 
 class MonitoringEvidenceCommitPort:
-    """Manifest-last persistence for one replay-safe normalized monitoring transaction."""
+    """Manifest-first recovery and manifest-last commit for one replay-safe transaction."""
 
     def __init__(
         self,
@@ -1027,6 +2005,10 @@ class MonitoringEvidenceCommitPort:
         reviewed_collector_contract: MonitoringCollectorContract,
         monitoring_current_reader: CurrentArtifactReaderPort,
         persistence_replay_key: str,
+        configuration: Wc028MonitoringAcquisitionJobConfiguration,
+        context_binding: PublishedRuntimeContextBinding,
+        monitoring_intent_reference: PublishedMonitoringIntentAssetReference,
+        acquisition_receipt_verifier: Callable[[MonitoringAcquisitionReceipt, datetime], None],
         key_resolver: TrustedKeyResolver | None = None,
         key_record: TrustedKeyRecord | None = None,
     ) -> None:
@@ -1040,6 +2022,10 @@ class MonitoringEvidenceCommitPort:
         self._reviewed_collector_contract = reviewed_collector_contract
         self._monitoring_current_reader = monitoring_current_reader
         self._persistence_replay_key = persistence_replay_key
+        self._configuration = configuration
+        self._context_binding = context_binding
+        self._monitoring_intent_reference = monitoring_intent_reference
+        self._acquisition_receipt_verifier = acquisition_receipt_verifier
         self._key_resolver: TrustedKeyResolver
         if key_resolver is None:
             record = key_record or TrustedKeyRecord(
@@ -1062,59 +2048,237 @@ class MonitoringEvidenceCommitPort:
         else:
             self._key_resolver = key_resolver
 
-    @contextmanager
-    def transaction(
+    @staticmethod
+    def _observation_health_state(observation: object) -> str | None:
+        if isinstance(observation, GuestSignalObservation):
+            return observation.state
+        if isinstance(observation, EndpointHealthObservation | PlatformHealthObservation):
+            return observation.status
+        return None
+
+    @staticmethod
+    def _observations_for_source_record(
+        bundle: MonitoringEvidenceBundle,
+        source_record_id: str,
+    ) -> tuple[Any, ...]:
+        expected_digest = sha256_hex(source_record_id.encode("utf-8"))
+        return tuple(
+            item
+            for item in bundle.observations
+            if item.source_record_reference.endswith(expected_digest)
+        )
+
+    def _prepared_from_evidence_bundle(
+        self,
+        bundle: MonitoringEvidenceBundle,
+    ) -> PreparedMonitoringCollection:
+        receipt = bundle.acquisition_receipt
+        if receipt is None or receipt.selected_incident is None:
+            raise MonitoringAcquisitionJobError(
+                "persisted monitoring evidence omitted its signed incident selection"
+            )
+        selected = receipt.selected_incident
+        previous_candidates = self._observations_for_source_record(
+            bundle,
+            selected.previous_record_id,
+        )
+        if len(previous_candidates) != 1:
+            raise MonitoringAcquisitionJobError(
+                "persisted evidence does not identify one previous incident observation"
+            )
+        current_candidates: list[Any] = []
+        for source_record_id in selected.current_record_ids:
+            candidates = self._observations_for_source_record(bundle, source_record_id)
+            if len(candidates) != 1:
+                raise MonitoringAcquisitionJobError(
+                    "persisted evidence does not identify each current incident observation"
+                )
+            current_candidates.append(candidates[0])
+        previous = previous_candidates[0]
+        incident_start = min(item.observed_start for item in current_candidates)
+        incident_end = max(item.observed_end for item in current_candidates)
+        expanded_current = set(current_candidates)
+        changed = True
+        while changed:
+            changed = False
+            for candidate in bundle.observations:
+                if (
+                    candidate in expanded_current
+                    or candidate.subject_resource_id != selected.incident_resource_id
+                    or self._observation_health_state(candidate) != selected.current_state
+                    or candidate.observed_start > incident_end
+                    or candidate.observed_end < incident_start
+                ):
+                    continue
+                expanded_current.add(candidate)
+                incident_start = min(incident_start, candidate.observed_start)
+                incident_end = max(incident_end, candidate.observed_end)
+                changed = True
+        if (
+            previous.subject_resource_id != selected.incident_resource_id
+            or self._observation_health_state(previous) != "healthy"
+            or any(
+                item.subject_resource_id != selected.incident_resource_id
+                or self._observation_health_state(item) != selected.current_state
+                for item in expanded_current
+            )
+            or previous.observed_end > incident_start
+        ):
+            raise MonitoringAcquisitionJobError(
+                "persisted evidence incident selection is not the signed health transition"
+            )
+        return PreparedMonitoringCollection(
+            intent_id=receipt.intent_id,
+            intent_digest=receipt.intent_digest,
+            context_binding_digest=receipt.context_binding_digest,
+            monitoring_intent_reference=self._monitoring_intent_reference,
+            monitoring_bundle=bundle,
+            change_artifacts=(),
+            incident_resource_id=selected.incident_resource_id,
+            previous_health_source_record_id=selected.previous_record_id,
+            current_health_source_record_ids=selected.current_record_ids,
+            previous_health_observation_id=previous.observation_id,
+            current_health_observation_ids=tuple(
+                sorted(item.observation_id for item in expanded_current)
+            ),
+            current_health_state=selected.current_state,
+        )
+
+    def _build_recovery_state(
         self,
         prepared: PreparedMonitoringCollection,
-    ) -> Iterator[CommittedMonitoringCollection]:
-        if prepared.change_artifacts:
+    ) -> MonitoringPersistenceRecoveryState:
+        receipt = prepared.monitoring_bundle.acquisition_receipt
+        if receipt is None:
             raise MonitoringAcquisitionJobError(
-                "current collector contract does not authorize runtime change persistence"
+                "WC-028 persistence requires the verified acquisition receipt"
             )
-        bundle = prepared.monitoring_bundle
-        observed_at = cast(datetime, bundle.collected_at)
-        bundle_bytes = bundle.canonical_bytes()
+        issued_at = receipt.execution_started_at
+        trusted_as_of = issued_at + timedelta(seconds=self._configuration.trust_delay_seconds)
+        expires_at = issued_at + timedelta(seconds=self._configuration.request_lifetime_seconds)
         replay_payload = _monitoring_persistence_replay_payload(prepared)
-        prepared_digest = compute_artifact_digest(replay_payload)
-        replay_key = self._persistence_replay_key
-        collection_id = _monitoring_persistence_collection_id(replay_key)
-        manifest_blob_name = (
-            f"wc024-monitoring/commits/{replay_key.removeprefix('sha256:')}/manifest.json"
-        )
-        recovered = self._recover_commit_manifest(
-            prepared=prepared,
-            replay_key=replay_key,
-            manifest_blob_name=manifest_blob_name,
-        )
-        if recovered is not None:
-            yield recovered
-            return
-
-        blob_name = f"wc024-monitoring/{collection_id}/evidence.json"
-        evidence_reference = self._write(
-            writer=self._monitoring_writer,
-            current_reader=self._monitoring_current_reader,
-            blob_name=blob_name,
-            payload=bundle_bytes,
-        )
-        acquisition_receipt = bundle.acquisition_receipt
-        if acquisition_receipt is None:
-            raise MonitoringAcquisitionJobError(
-                "WC-028 monitoring bundle omitted its acquisition receipt"
+        payload: dict[str, object] = {
+            "schemaVersion": "athena.wc028MonitoringPersistenceRecoveryState.v1",
+            "replayKey": self._persistence_replay_key,
+            "executionId": self._configuration.execution_id,
+            "acquisitionAuthorityDigest": (
+                self._configuration.expected_acquisition_authority_digest
+            ),
+            "legacyCollectorRbacCleanupDigest": (
+                self._configuration.legacy_collector_rbac_cleanup_digest
+            ),
+            "preparedDigest": compute_artifact_digest(replay_payload),
+            "collectionId": _monitoring_persistence_collection_id(self._persistence_replay_key),
+            "incidentRevision": self._configuration.incident_revision,
+            "issuedAt": issued_at,
+            "trustedAsOf": trusted_as_of,
+            "expiresAt": expires_at,
+            **replay_payload,
+            "monitoringIntentReference": prepared.monitoring_intent_reference.model_dump(
+                mode="json",
+                by_alias=True,
+                exclude_none=True,
+            ),
+            "monitoringBundle": prepared.monitoring_bundle.model_dump(
+                mode="json",
+                by_alias=True,
+                exclude_none=True,
+            ),
+            "incidentResourceId": prepared.incident_resource_id,
+            "previousHealthSourceRecordId": prepared.previous_health_source_record_id,
+            "currentHealthSourceRecordIds": list(prepared.current_health_source_record_ids),
+            "previousHealthObservationId": prepared.previous_health_observation_id,
+            "currentHealthObservationIds": list(prepared.current_health_observation_ids),
+            "currentHealthState": prepared.current_health_state,
+        }
+        return MonitoringPersistenceRecoveryState.model_validate_json(
+            canonicalize_json(
+                {
+                    **payload,
+                    "stateDigest": compute_artifact_digest(payload),
+                }
             )
+        )
+
+    def _validate_recovery_state_binding(
+        self,
+        state: MonitoringPersistenceRecoveryState,
+    ) -> PreparedMonitoringCollection:
+        expected_collector_contract_digest = (
+            self._reviewed_collector_contract.compute_artifact_digest_value()
+        )
+        if (
+            state.replay_key != self._persistence_replay_key
+            or state.execution_id != self._configuration.execution_id
+            or state.acquisition_authority_digest
+            != self._configuration.expected_acquisition_authority_digest
+            or state.legacy_collector_rbac_cleanup_digest
+            != self._configuration.legacy_collector_rbac_cleanup_digest
+            or state.incident_revision != self._configuration.incident_revision
+            or state.trusted_as_of
+            != state.issued_at + timedelta(seconds=self._configuration.trust_delay_seconds)
+            or state.expires_at
+            != state.issued_at + timedelta(seconds=self._configuration.request_lifetime_seconds)
+            or state.intent_id != self._monitoring_intent_reference.intent_id
+            or state.intent_digest != self._monitoring_intent_reference.intent_digest
+            or state.context_binding_digest != self._context_binding.binding_digest
+            or state.collector_contract_digest != expected_collector_contract_digest
+            or state.monitoring_intent_reference != self._monitoring_intent_reference
+        ):
+            raise MonitoringAcquisitionJobError(
+                "recovered persistence state does not match the reviewed runtime configuration"
+            )
+        persisted_prepared = state.prepared_collection()
+        derived_prepared = self._prepared_from_evidence_bundle(state.monitoring_bundle)
+        if persisted_prepared != derived_prepared:
+            raise MonitoringAcquisitionJobError(
+                "recovered persistence incident fields do not match signed evidence"
+            )
+        return derived_prepared
+
+    def _verify_receipt(
+        self,
+        receipt: MonitoringAcquisitionReceipt,
+        *,
+        as_of: datetime,
+    ) -> None:
+        try:
+            self._acquisition_receipt_verifier(receipt, as_of)
+        except MonitoringAcquisitionJobError:
+            raise
+        except (TypeError, ValueError, *_EXTERNAL_AZURE_FAILURES) as exc:
+            raise MonitoringAcquisitionJobError(
+                "recovered acquisition receipt failed signed verification"
+            ) from exc
+
+    def _verify_acquisition_receipt(
+        self,
+        state: MonitoringPersistenceRecoveryState,
+    ) -> None:
+        receipt = state.monitoring_bundle.acquisition_receipt
+        if receipt is None:
+            raise MonitoringAcquisitionJobError(
+                "recovered monitoring evidence omitted its signed acquisition receipt"
+            )
+        self._verify_receipt(receipt, as_of=state.trusted_as_of)
+
+    def _build_committed(
+        self,
+        *,
+        state: MonitoringPersistenceRecoveryState,
+        evidence_reference: VersionPinnedBlobReference,
+    ) -> CommittedMonitoringCollection:
         payload: dict[str, object] = {
             "schemaVersion": "athena.wc028MonitoringEvidenceHandoff.v2",
-            "collectorContractDigest": (
-                self._reviewed_collector_contract.compute_artifact_digest_value()
-            ),
-            "collectionId": collection_id,
-            "observedAt": observed_at,
+            "collectorContractDigest": state.collector_contract_digest,
+            "collectionId": state.collection_id,
+            "observedAt": state.monitoring_bundle.collected_at,
             "evidence": evidence_reference.model_dump(
                 mode="json",
                 by_alias=True,
                 exclude_none=True,
             ),
-            "acquisitionReceiptDigest": acquisition_receipt.receipt_digest,
+            "acquisitionReceiptDigest": state.acquisition_receipt_digest,
         }
         try:
             preimage = monitoring_handoff_preimage(payload)
@@ -1133,67 +2297,134 @@ class MonitoringEvidenceCommitPort:
             )
             verify_monitoring_evidence_handoff_attestation(
                 handoff,
-                as_of=observed_at,
+                as_of=state.trusted_as_of,
                 trusted_key_anchor=self._trusted_key.anchor,
                 key_resolver=self._key_resolver,
                 reviewed_collector_contract=self._reviewed_collector_contract,
             )
-        except (TypeError, ValueError) as exc:
+        except MonitoringAcquisitionJobError:
+            raise
+        except (TypeError, ValueError, *_EXTERNAL_AZURE_FAILURES) as exc:
             raise MonitoringAcquisitionJobError(
                 "signed monitoring evidence handoff failed verification"
             ) from exc
-        committed = CommittedMonitoringCollection(
+        return CommittedMonitoringCollection(
             monitoring_handoff=handoff,
             change_handoffs=(),
         )
-        commit_manifest = self._build_commit_manifest(
-            prepared=prepared,
-            replay_key=replay_key,
-            prepared_digest=prepared_digest,
-            committed=committed,
-        )
-        yield committed
-        self._write(
-            writer=self._monitoring_writer,
-            current_reader=self._monitoring_current_reader,
-            blob_name=manifest_blob_name,
-            payload=commit_manifest.canonical_bytes(),
-        )
-        durable = self._recover_commit_manifest(
-            prepared=prepared,
-            replay_key=replay_key,
-            manifest_blob_name=manifest_blob_name,
-        )
-        if durable is None:
-            raise MonitoringAcquisitionJobError(
-                "monitoring persistence commit manifest disappeared after creation"
+
+    def _build_correlation_request(
+        self,
+        *,
+        state: MonitoringPersistenceRecoveryState,
+        prepared: PreparedMonitoringCollection,
+        committed: CommittedMonitoringCollection,
+    ) -> CorrelationRequest:
+        try:
+            return build_collected_correlation_request(
+                prepared,
+                committed,
+                context_binding=self._context_binding,
+                incident_revision=state.incident_revision,
+                issued_at=state.issued_at,
+                trusted_as_of=state.trusted_as_of,
+                expires_at=state.expires_at,
             )
+        except (KeyError, TypeError, ValueError, MonitoringCollectionError) as exc:
+            raise MonitoringAcquisitionJobError(
+                "deterministic monitoring correlation recovery failed"
+            ) from exc
+
+    @staticmethod
+    def _reference_from_result(result: ArtifactReadResult) -> VersionPinnedBlobReference:
+        return VersionPinnedBlobReference(
+            name=result.blob_name,
+            version=result.version_id,
+            contentDigest=result.payload_sha256,
+        )
+
+    @staticmethod
+    def _validate_recovery_reference(
+        *,
+        result: ArtifactReadResult,
+        reference: VersionPinnedBlobReference,
+        expected_payload: bytes,
+        label: str,
+    ) -> VersionPinnedBlobReference:
+        if (
+            result.blob_name != reference.name
+            or result.version_id != reference.version
+            or result.payload_sha256 != reference.content_digest
+            or result.payload_sha256 != sha256_hex(expected_payload)
+            or result.payload != expected_payload
+        ):
+            raise MonitoringAcquisitionJobError(
+                f"recovered {label} does not match its version-pinned commit reference"
+            )
+        return reference
+
+    def _validate_evidence_result(
+        self,
+        result: ArtifactReadResult,
+        *,
+        expected_blob_name: str,
+        expected_bundle: MonitoringEvidenceBundle | None,
+    ) -> tuple[MonitoringEvidenceBundle, VersionPinnedBlobReference]:
+        try:
+            bundle = MonitoringEvidenceBundle.model_validate_json(result.payload)
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise MonitoringAcquisitionJobError(
+                "recovered immutable monitoring evidence is invalid"
+            ) from exc
+        if (
+            result.blob_name != expected_blob_name
+            or result.payload_sha256 != sha256_hex(result.payload)
+            or result.payload != bundle.canonical_bytes()
+            or (
+                expected_bundle is not None
+                and bundle.canonical_bytes() != expected_bundle.canonical_bytes()
+            )
+        ):
+            raise MonitoringAcquisitionJobError(
+                "recovered immutable monitoring evidence failed byte verification"
+            )
+        return bundle, self._reference_from_result(result)
 
     def _build_commit_manifest(
         self,
         *,
-        prepared: PreparedMonitoringCollection,
-        replay_key: str,
-        prepared_digest: str,
+        state: MonitoringPersistenceRecoveryState,
+        state_reference: VersionPinnedBlobReference,
         committed: CommittedMonitoringCollection,
+        correlation_request: CorrelationRequest,
     ) -> MonitoringPersistenceCommitManifest:
-        acquisition_receipt = prepared.monitoring_bundle.acquisition_receipt
-        if acquisition_receipt is None:
-            raise MonitoringAcquisitionJobError(
-                "WC-028 monitoring bundle omitted its acquisition receipt"
-            )
-        replay_payload = _monitoring_persistence_replay_payload(prepared)
+        replay_payload = {
+            "intentId": state.intent_id,
+            "intentDigest": state.intent_digest,
+            "contextBindingDigest": state.context_binding_digest,
+            "collectorContractDigest": state.collector_contract_digest,
+            "monitoringBundleDigest": state.monitoring_bundle_digest,
+            "acquisitionReceiptDigest": state.acquisition_receipt_digest,
+        }
         payload: dict[str, object] = {
-            "schemaVersion": "athena.wc028MonitoringPersistenceCommit.v1",
-            "replayKey": replay_key,
-            "preparedDigest": prepared_digest,
-            "collectionId": committed.monitoring_handoff.collection_id,
+            "schemaVersion": "athena.wc028MonitoringPersistenceCommit.v2",
+            "replayKey": state.replay_key,
+            "executionId": state.execution_id,
+            "preparedDigest": state.prepared_digest,
+            "collectionId": state.collection_id,
+            "recoveryState": state_reference.model_dump(
+                mode="json",
+                by_alias=True,
+                exclude_none=True,
+            ),
             **replay_payload,
             "monitoringHandoff": committed.monitoring_handoff.model_dump(
                 mode="json",
                 by_alias=True,
                 exclude_none=True,
             ),
+            "correlationRequestId": correlation_request.request_id,
+            "correlationRequestDigest": correlation_request.request_digest,
         }
         return MonitoringPersistenceCommitManifest.model_validate_json(
             canonicalize_json(
@@ -1204,78 +2435,275 @@ class MonitoringEvidenceCommitPort:
             )
         )
 
-    def _recover_commit_manifest(
+    def recover(
         self,
-        *,
-        prepared: PreparedMonitoringCollection,
-        replay_key: str,
-        manifest_blob_name: str,
-    ) -> CommittedMonitoringCollection | None:
-        try:
-            result = self._monitoring_current_reader.read_current(
-                ArtifactCurrentReadRequest(blob_name=manifest_blob_name)
-            )
-        except ArtifactNotFoundError:
+        probe: _MonitoringPersistenceProbe,
+    ) -> RecoveredMonitoringAcquisitionJobOutcome | None:
+        if not probe.has_durable_artifacts:
             return None
-        try:
-            manifest = MonitoringPersistenceCommitManifest.model_validate_json(result.payload)
-        except (UnicodeDecodeError, ValueError) as exc:
-            raise MonitoringAcquisitionJobError(
-                "recovered monitoring persistence commit manifest is invalid"
-            ) from exc
-        if (
-            result.blob_name != manifest_blob_name
-            or result.payload_sha256 != sha256_hex(result.payload)
-            or result.payload != manifest.canonical_bytes()
-            or manifest.replay_key != replay_key
-            or manifest.collection_id != _monitoring_persistence_collection_id(replay_key)
-            or manifest.prepared_digest
-            != compute_artifact_digest(_monitoring_persistence_replay_payload(prepared))
-        ):
-            raise MonitoringAcquisitionJobError(
-                "recovered monitoring persistence commit does not match the prepared transaction"
-            )
-        self._verify_current_reference(
-            reader=self._monitoring_current_reader,
-            reference=manifest.monitoring_handoff.evidence,
-            expected_payload=prepared.monitoring_bundle.canonical_bytes(),
-            label="monitoring evidence",
+        manifest_blob_name, recovery_blob_name, evidence_blob_name = (
+            _monitoring_persistence_blob_names(self._persistence_replay_key)
         )
-        try:
-            verify_monitoring_evidence_handoff_attestation(
-                manifest.monitoring_handoff,
-                as_of=cast(datetime, prepared.monitoring_bundle.collected_at),
-                trusted_key_anchor=self._trusted_key.anchor,
-                key_resolver=self._key_resolver,
-                reviewed_collector_contract=self._reviewed_collector_contract,
+        manifest = (
+            None
+            if probe.manifest_result is None
+            else _parse_commit_manifest_result(
+                probe.manifest_result,
+                expected_blob_name=manifest_blob_name,
             )
-        except (TypeError, ValueError) as exc:
+        )
+        state = (
+            None
+            if probe.recovery_state_result is None
+            else _parse_recovery_state_result(
+                probe.recovery_state_result,
+                expected_blob_name=recovery_blob_name,
+            )
+        )
+        evidence_bundle: MonitoringEvidenceBundle | None = None
+        evidence_reference: VersionPinnedBlobReference | None = None
+        if probe.evidence_result is not None:
+            evidence_bundle, evidence_reference = self._validate_evidence_result(
+                probe.evidence_result,
+                expected_blob_name=evidence_blob_name,
+                expected_bundle=None if state is None else state.monitoring_bundle,
+            )
+        if manifest is not None:
+            if (
+                state is None
+                or probe.recovery_state_result is None
+                or evidence_bundle is None
+                or probe.evidence_result is None
+            ):
+                raise MonitoringAcquisitionJobError(
+                    "commit manifest exists without its exact recovery state and evidence"
+                )
+            self._verify_acquisition_receipt(state)
+            prepared = self._validate_recovery_state_binding(state)
+            self._validate_recovery_reference(
+                result=probe.recovery_state_result,
+                reference=manifest.recovery_state,
+                expected_payload=state.canonical_bytes(),
+                label="persistence recovery state",
+            )
+            self._validate_recovery_reference(
+                result=probe.evidence_result,
+                reference=manifest.monitoring_handoff.evidence,
+                expected_payload=state.monitoring_bundle.canonical_bytes(),
+                label="monitoring evidence",
+            )
+            if (
+                manifest.replay_key != state.replay_key
+                or manifest.execution_id != state.execution_id
+                or manifest.prepared_digest != state.prepared_digest
+                or manifest.collection_id != state.collection_id
+            ):
+                raise MonitoringAcquisitionJobError(
+                    "commit manifest does not bind the exact recovery state"
+                )
+            committed = CommittedMonitoringCollection(
+                monitoring_handoff=manifest.monitoring_handoff,
+                change_handoffs=(),
+            )
+            try:
+                verify_monitoring_evidence_handoff_attestation(
+                    committed.monitoring_handoff,
+                    as_of=state.trusted_as_of,
+                    trusted_key_anchor=self._trusted_key.anchor,
+                    key_resolver=self._key_resolver,
+                    reviewed_collector_contract=self._reviewed_collector_contract,
+                )
+            except (TypeError, ValueError, *_EXTERNAL_AZURE_FAILURES) as exc:
+                raise MonitoringAcquisitionJobError(
+                    "recovered monitoring persistence handoff failed verification"
+                ) from exc
+            rebuilt_correlation = self._build_correlation_request(
+                state=state,
+                prepared=prepared,
+                committed=committed,
+            )
+            if (
+                rebuilt_correlation.request_id != manifest.correlation_request_id
+                or rebuilt_correlation.request_digest != manifest.correlation_request_digest
+            ):
+                raise MonitoringAcquisitionJobError(
+                    "commit manifest correlation request is not byte-identical"
+                )
+            return RecoveredMonitoringAcquisitionJobOutcome(
+                committed=committed,
+                correlation_request=rebuilt_correlation,
+            )
+
+        if state is None:
+            if evidence_bundle is None:
+                raise MonitoringAcquisitionJobError(
+                    "persistence recovery probe returned no usable immutable artifact"
+                )
+            receipt = evidence_bundle.acquisition_receipt
+            if receipt is None:
+                raise MonitoringAcquisitionJobError(
+                    "recovered monitoring evidence omitted its signed acquisition receipt"
+                )
+            self._verify_receipt(
+                receipt,
+                as_of=receipt.execution_started_at
+                + timedelta(seconds=self._configuration.trust_delay_seconds),
+            )
+            prepared = self._prepared_from_evidence_bundle(evidence_bundle)
+            state = self._build_recovery_state(prepared)
+        else:
+            self._verify_acquisition_receipt(state)
+            prepared = self._validate_recovery_state_binding(state)
+        if probe.recovery_state_result is None:
+            state_reference = self._write(
+                writer=self._monitoring_writer,
+                current_reader=self._monitoring_current_reader,
+                blob_name=recovery_blob_name,
+                payload=state.canonical_bytes(),
+            )
+        else:
+            state_reference = self._reference_from_result(probe.recovery_state_result)
+        if evidence_bundle is None:
+            evidence_reference = self._write(
+                writer=self._monitoring_writer,
+                current_reader=self._monitoring_current_reader,
+                blob_name=evidence_blob_name,
+                payload=state.monitoring_bundle.canonical_bytes(),
+            )
+        if evidence_reference is None:
             raise MonitoringAcquisitionJobError(
-                "recovered monitoring persistence handoff failed verification"
-            ) from exc
-        return CommittedMonitoringCollection(
-            monitoring_handoff=manifest.monitoring_handoff,
-            change_handoffs=(),
+                "immutable monitoring evidence recovery did not produce a reference"
+            )
+        committed = self._build_committed(
+            state=state,
+            evidence_reference=evidence_reference,
+        )
+        correlation_request = self._build_correlation_request(
+            state=state,
+            prepared=prepared,
+            committed=committed,
+        )
+        manifest = self._build_commit_manifest(
+            state=state,
+            state_reference=state_reference,
+            committed=committed,
+            correlation_request=correlation_request,
+        )
+        self._write(
+            writer=self._monitoring_writer,
+            current_reader=self._monitoring_current_reader,
+            blob_name=manifest_blob_name,
+            payload=manifest.canonical_bytes(),
+        )
+        durable_result = self._monitoring_current_reader.read_current(
+            ArtifactCurrentReadRequest(blob_name=manifest_blob_name)
+        )
+        durable_manifest = _parse_commit_manifest_result(
+            durable_result,
+            expected_blob_name=manifest_blob_name,
+        )
+        if durable_manifest != manifest:
+            raise MonitoringAcquisitionJobError(
+                "monitoring persistence commit manifest changed after creation"
+            )
+        return RecoveredMonitoringAcquisitionJobOutcome(
+            committed=committed,
+            correlation_request=correlation_request,
         )
 
-    @staticmethod
-    def _verify_current_reference(
-        *,
-        reader: CurrentArtifactReaderPort,
-        reference: VersionPinnedBlobReference,
-        expected_payload: bytes,
-        label: str,
-    ) -> None:
-        result = reader.read_current(ArtifactCurrentReadRequest(blob_name=reference.name))
-        if (
-            result.blob_name != reference.name
-            or result.version_id != reference.version
-            or result.payload_sha256 != reference.content_digest
-            or result.payload_sha256 != sha256_hex(expected_payload)
-            or result.payload != expected_payload
-        ):
+    @contextmanager
+    def transaction(
+        self,
+        prepared: PreparedMonitoringCollection,
+    ) -> Iterator[CommittedMonitoringCollection]:
+        if prepared.change_artifacts:
             raise MonitoringAcquisitionJobError(
-                f"recovered {label} does not match its version-pinned commit reference"
+                "current collector contract does not authorize runtime change persistence"
+            )
+        manifest_blob_name, recovery_blob_name, evidence_blob_name = (
+            _monitoring_persistence_blob_names(self._persistence_replay_key)
+        )
+        probe = _probe_monitoring_persistence(
+            reader=self._monitoring_current_reader,
+            replay_key=self._persistence_replay_key,
+        )
+        if probe.manifest_result is None:
+            if probe.recovery_state_result is not None:
+                persisted_state = _parse_recovery_state_result(
+                    probe.recovery_state_result,
+                    expected_blob_name=recovery_blob_name,
+                )
+                if persisted_state.prepared_collection() != prepared:
+                    raise MonitoringAcquisitionJobError(
+                        "partial persistence state does not match reacquired transaction"
+                    )
+            if (
+                probe.evidence_result is not None
+                and probe.evidence_result.payload != prepared.monitoring_bundle.canonical_bytes()
+            ):
+                raise MonitoringAcquisitionJobError(
+                    "partial immutable evidence does not match reacquired transaction"
+                )
+        recovered = self.recover(probe)
+        if recovered is not None:
+            if (
+                recovered.correlation_request.monitoring_bundle.canonical_bytes()
+                != prepared.monitoring_bundle.canonical_bytes()
+                or recovered.correlation_request.context_binding.binding_digest
+                != prepared.context_binding_digest
+            ):
+                raise MonitoringAcquisitionJobError(
+                    "durable commit does not match the supplied prepared transaction"
+                )
+            yield recovered.committed
+            return
+        state = self._build_recovery_state(prepared)
+        self._verify_acquisition_receipt(state)
+        self._validate_recovery_state_binding(state)
+        state_reference = self._write(
+            writer=self._monitoring_writer,
+            current_reader=self._monitoring_current_reader,
+            blob_name=recovery_blob_name,
+            payload=state.canonical_bytes(),
+        )
+        evidence_reference = self._write(
+            writer=self._monitoring_writer,
+            current_reader=self._monitoring_current_reader,
+            blob_name=evidence_blob_name,
+            payload=state.monitoring_bundle.canonical_bytes(),
+        )
+        committed = self._build_committed(
+            state=state,
+            evidence_reference=evidence_reference,
+        )
+        yield committed
+        correlation_request = self._build_correlation_request(
+            state=state,
+            prepared=prepared,
+            committed=committed,
+        )
+        commit_manifest = self._build_commit_manifest(
+            state=state,
+            state_reference=state_reference,
+            committed=committed,
+            correlation_request=correlation_request,
+        )
+        self._write(
+            writer=self._monitoring_writer,
+            current_reader=self._monitoring_current_reader,
+            blob_name=manifest_blob_name,
+            payload=commit_manifest.canonical_bytes(),
+        )
+        durable_result = self._monitoring_current_reader.read_current(
+            ArtifactCurrentReadRequest(blob_name=manifest_blob_name)
+        )
+        durable = _parse_commit_manifest_result(
+            durable_result,
+            expected_blob_name=manifest_blob_name,
+        )
+        if durable != commit_manifest:
+            raise MonitoringAcquisitionJobError(
+                "monitoring persistence commit manifest changed after creation"
             )
 
     def _write(
@@ -1297,8 +2725,19 @@ class MonitoringEvidenceCommitPort:
                 )
             )
         except ArtifactAlreadyExistsError as exc:
-            recovered = current_reader.read_current(ArtifactCurrentReadRequest(blob_name=blob_name))
-            if recovered.payload == payload and recovered.payload_sha256 == sha256_hex(payload):
+            try:
+                recovered = current_reader.read_current(
+                    ArtifactCurrentReadRequest(blob_name=blob_name)
+                )
+            except (ArtifactReadError, *_EXTERNAL_AZURE_FAILURES) as read_exc:
+                raise MonitoringAcquisitionJobError(
+                    f"immutable persistence collision could not be recovered: {blob_name}"
+                ) from read_exc
+            if (
+                recovered.blob_name == blob_name
+                and recovered.payload == payload
+                and recovered.payload_sha256 == sha256_hex(payload)
+            ):
                 return VersionPinnedBlobReference(
                     name=recovered.blob_name,
                     version=recovered.version_id,
@@ -1306,6 +2745,32 @@ class MonitoringEvidenceCommitPort:
                 )
             raise MonitoringAcquisitionJobError(
                 f"immutable persistence artifact already exists: {blob_name}"
+            ) from exc
+        except _EXTERNAL_AZURE_FAILURES as exc:
+            try:
+                recovered = current_reader.read_current(
+                    ArtifactCurrentReadRequest(blob_name=blob_name)
+                )
+            except ArtifactNotFoundError:
+                raise MonitoringAcquisitionJobError(
+                    f"ambiguous create failed without a durable known-name artifact: {blob_name}"
+                ) from exc
+            except (ArtifactReadError, *_EXTERNAL_AZURE_FAILURES) as read_exc:
+                raise MonitoringAcquisitionJobError(
+                    f"ambiguous create recovery failed for known-name artifact: {blob_name}"
+                ) from read_exc
+            if (
+                recovered.blob_name == blob_name
+                and recovered.payload == payload
+                and recovered.payload_sha256 == sha256_hex(payload)
+            ):
+                return VersionPinnedBlobReference(
+                    name=recovered.blob_name,
+                    version=recovered.version_id,
+                    contentDigest=recovered.payload_sha256,
+                )
+            raise MonitoringAcquisitionJobError(
+                f"ambiguous create recovered conflicting immutable bytes: {blob_name}"
             ) from exc
         if receipt.blob_name != blob_name or receipt.payload_sha256 != sha256_hex(payload):
             raise MonitoringAcquisitionJobError(
@@ -1321,170 +2786,219 @@ class MonitoringEvidenceCommitPort:
 def run_wc028_monitoring_acquisition_job(
     *,
     configuration: Wc028MonitoringAcquisitionJobConfiguration,
-) -> MonitoringAcquisitionOutcome:
+) -> MonitoringAcquisitionJobOutcome:
     try:
-        monitoring_intent = _embedded_model(
-            PublishedMonitoringIntent, configuration.monitoring_intent
-        )
-        intent_reference = _embedded_model(
-            PublishedMonitoringIntentAssetReference, configuration.monitoring_intent_reference
-        )
-        intent_attestation = _embedded_model(
-            PublishedMonitoringIntentAttestation, configuration.monitoring_intent_attestation
-        )
-        context_binding = _embedded_model(
-            PublishedRuntimeContextBinding, configuration.context_binding
-        )
-        collector_contract = _embedded_model(
-            MonitoringCollectorContract, configuration.monitoring_collector_contract
-        )
-        change_scope = _embedded_model(ApprovedChangeScope, configuration.approved_change_scope)
-        acquisition_authority = _embedded_model(
-            MonitoringAcquisitionAuthority, configuration.acquisition_authority
-        )
-    except ValueError as exc:
-        raise MonitoringAcquisitionJobError(
-            "WC-028 production authority configuration is invalid"
-        ) from exc
-    collector_contract_digest = collector_contract.compute_artifact_digest_value()
-    if (
-        collector_contract.collector_identity_resource_id.casefold()
-        != configuration.collector_identity_resource_id
-    ):
-        raise MonitoringAcquisitionJobError(
-            "collector contract changed the deployed identity boundary"
-        )
-    _validate_acquisition_authority_preflight(
-        acquisition_authority=acquisition_authority,
-        configuration=configuration,
-        collector_contract=collector_contract,
-        context_binding=context_binding,
-        monitoring_intent=monitoring_intent,
-    )
-
-    intent_verifier = KeyVaultRsaPublicKeyVerifier(
-        trusted_key_anchor=configuration.monitoring_intent_trusted_key.anchor,
-        managed_identity_client_id=configuration.runtime_support_identity_client_id,
-    )
-    expected_intent_key_record = TrustedKeyRecord(
-        anchor=configuration.monitoring_intent_trusted_key.anchor,
-        public_key=intent_verifier.public_key,
-        enabled=True,
-        activated_at=configuration.monitoring_intent_trusted_key.activated_at,
-        expires_at=configuration.monitoring_intent_trusted_key.expires_at,
-    )
-    intent_key_resolver = KeyVaultTrustedKeyResolver(
-        expected_record=expected_intent_key_record,
-        managed_identity_client_id=configuration.runtime_support_identity_client_id,
-    )
-    resolved_intent_key_record = intent_key_resolver(
-        configuration.monitoring_intent_trusted_key.anchor
-    )
-    if resolved_intent_key_record is None:
-        raise MonitoringAcquisitionJobError(
-            "monitoring intent signing key is not the pinned enabled version"
-        )
-    _validate_monitoring_intent_key_lifecycle(
-        monitoring_intent=monitoring_intent,
-        key_record=resolved_intent_key_record,
-        as_of=_utc_now_milliseconds(),
-    )
-    validate_published_monitoring_intent_assets(
-        intent_reference,
-        monitoring_intent,
-        intent_attestation,
-        trusted_key_id=(configuration.monitoring_intent_trusted_key.key_vault_key_id),
-        signature_verifier=intent_verifier.verify_preimage,
-    )
-    validate_monitoring_intent_activation_eligible(
-        monitoring_intent,
-        context_binding,
-        expected_active_context_authority_digest=(
-            configuration.expected_active_context_authority_digest
-        ),
-    )
-    collector_key_verifier = KeyVaultRsaPublicKeyVerifier(
-        trusted_key_anchor=configuration.collector_signing_key.anchor,
-        managed_identity_client_id=configuration.managed_identity_client_id,
-    )
-    collector_key_record = TrustedKeyRecord(
-        anchor=configuration.collector_signing_key.anchor,
-        public_key=collector_key_verifier.public_key,
-        enabled=True,
-        activated_at=configuration.collector_signing_key.activated_at,
-        expires_at=configuration.collector_signing_key.expires_at,
-    )
-    collector_key_resolver = KeyVaultTrustedKeyResolver(
-        expected_record=collector_key_record,
-        managed_identity_client_id=configuration.managed_identity_client_id,
-    )
-    collector_signer = KeyVaultRsaSigner(
-        trusted_key_anchor=configuration.collector_signing_key.anchor,
-        managed_identity_client_id=configuration.managed_identity_client_id,
-    )
-
-    def load_intent_assets(
-        supplied: PublishedMonitoringIntent,
-    ) -> tuple[
-        PublishedMonitoringIntentAssetReference,
-        PublishedMonitoringIntentAttestation,
-    ]:
-        if supplied != monitoring_intent:
-            raise MonitoringAcquisitionJobError(
-                "coordinator requested assets for another monitoring intent"
+        try:
+            monitoring_intent = _embedded_model(
+                PublishedMonitoringIntent, configuration.monitoring_intent
             )
-        return intent_reference, intent_attestation
+            intent_reference = _embedded_model(
+                PublishedMonitoringIntentAssetReference,
+                configuration.monitoring_intent_reference,
+            )
+            intent_attestation = _embedded_model(
+                PublishedMonitoringIntentAttestation,
+                configuration.monitoring_intent_attestation,
+            )
+            context_binding = _embedded_model(
+                PublishedRuntimeContextBinding, configuration.context_binding
+            )
+            collector_contract = _embedded_model(
+                MonitoringCollectorContract,
+                configuration.monitoring_collector_contract,
+            )
+            change_scope = _embedded_model(
+                ApprovedChangeScope,
+                configuration.approved_change_scope,
+            )
+            acquisition_authority = _embedded_model(
+                MonitoringAcquisitionAuthority,
+                configuration.acquisition_authority,
+            )
+        except (TypeError, ValueError) as exc:
+            raise MonitoringAcquisitionJobError(
+                "WC-028 production authority configuration is invalid"
+            ) from exc
+        collector_contract_digest = collector_contract.compute_artifact_digest_value()
+        if (
+            collector_contract.collector_identity_resource_id.casefold()
+            != configuration.collector_identity_resource_id
+        ):
+            raise MonitoringAcquisitionJobError(
+                "collector contract changed the deployed identity boundary"
+            )
+        _validate_acquisition_authority_preflight(
+            acquisition_authority=acquisition_authority,
+            configuration=configuration,
+            collector_contract=collector_contract,
+            context_binding=context_binding,
+            monitoring_intent=monitoring_intent,
+        )
+        startup_as_of = _utc_now_milliseconds()
+        _validate_runtime_support_effective_rbac(
+            configuration=configuration,
+            as_of=startup_as_of,
+        )
 
-    acquisition_receipt_verifier = _build_acquisition_receipt_verifier(
-        acquisition_authority=acquisition_authority,
-        collector_contract=collector_contract,
-        trusted_key=configuration.collector_signing_key,
-        key_resolver=collector_key_resolver,
-    )
-    collection_transaction = MonitoringCollectionTransaction(
-        acquisition_receipt_verifier=acquisition_receipt_verifier,
-        change_signer=_UnsupportedChangeEvidenceSigner(),
-        change_signing_key_id=configuration.collector_signing_key.key_vault_key_id,
-        monitoring_intent_trusted_key_id=(
-            configuration.monitoring_intent_trusted_key.key_vault_key_id
-        ),
-        monitoring_intent_signature_verifier=intent_verifier.verify_preimage,
-        monitoring_intent_asset_loader=load_intent_assets,
-    )
-    acquisition_adapter = AzureMonitoringAdapter(
-        reviewed_collector_contract=collector_contract,
-    )
-    monitoring_evidence_store = AzureBlobChangeEvidenceReplayStore(
-        blob_endpoint=configuration.evidence_blob_endpoint,
-        container_name=configuration.evidence_container_name,
-        managed_identity_client_id=configuration.managed_identity_client_id,
-    )
-    commit_port = MonitoringEvidenceCommitPort(
-        monitoring_writer=monitoring_evidence_store,
-        signer=collector_signer,
-        trusted_key=configuration.collector_signing_key,
-        reviewed_collector_contract=collector_contract,
-        monitoring_current_reader=monitoring_evidence_store,
-        persistence_replay_key=configuration.persistence_replay_key,
-        key_resolver=collector_key_resolver,
-    )
-    coordinator = MonitoringAcquisitionCoordinator(
-        acquisition_adapter=acquisition_adapter,
-        acquisition_authority=acquisition_authority,
-        expected_acquisition_authority_digest=(configuration.expected_acquisition_authority_digest),
-        expected_collector_contract_digest=collector_contract_digest,
-        monitoring_intent_trusted_key_id=(
-            configuration.monitoring_intent_trusted_key.key_vault_key_id
-        ),
-        monitoring_intent_signature_verifier=intent_verifier.verify_preimage,
-        monitoring_intent_asset_loader=load_intent_assets,
-        collection_transaction=collection_transaction,
-        receipt_signer=collector_signer,
-    )
-    issued_at = _utc_now_milliseconds()
-    trusted_as_of = issued_at + timedelta(seconds=configuration.trust_delay_seconds)
-    expires_at = issued_at + timedelta(seconds=configuration.request_lifetime_seconds)
-    try:
+        monitoring_evidence_store = AzureBlobChangeEvidenceReplayStore(
+            blob_endpoint=configuration.evidence_blob_endpoint,
+            container_name=configuration.evidence_container_name,
+            managed_identity_client_id=configuration.managed_identity_client_id,
+        )
+        persistence_probe = _probe_monitoring_persistence(
+            reader=monitoring_evidence_store,
+            replay_key=configuration.persistence_replay_key,
+        )
+
+        def build_collector_commit_port() -> tuple[
+            KeyVaultRsaSigner,
+            Callable[[MonitoringAcquisitionReceipt, datetime], None],
+            MonitoringEvidenceCommitPort,
+        ]:
+            collector_key_verifier = KeyVaultRsaPublicKeyVerifier(
+                trusted_key_anchor=configuration.collector_signing_key.anchor,
+                managed_identity_client_id=configuration.managed_identity_client_id,
+            )
+            collector_key_record = TrustedKeyRecord(
+                anchor=configuration.collector_signing_key.anchor,
+                public_key=collector_key_verifier.public_key,
+                enabled=True,
+                activated_at=configuration.collector_signing_key.activated_at,
+                expires_at=configuration.collector_signing_key.expires_at,
+            )
+            collector_key_resolver = KeyVaultTrustedKeyResolver(
+                expected_record=collector_key_record,
+                managed_identity_client_id=configuration.managed_identity_client_id,
+            )
+            collector_signer = KeyVaultRsaSigner(
+                trusted_key_anchor=configuration.collector_signing_key.anchor,
+                managed_identity_client_id=configuration.managed_identity_client_id,
+            )
+            acquisition_receipt_verifier = _build_acquisition_receipt_verifier(
+                acquisition_authority=acquisition_authority,
+                collector_contract=collector_contract,
+                trusted_key=configuration.collector_signing_key,
+                key_resolver=collector_key_resolver,
+            )
+            return (
+                collector_signer,
+                acquisition_receipt_verifier,
+                MonitoringEvidenceCommitPort(
+                    monitoring_writer=monitoring_evidence_store,
+                    signer=collector_signer,
+                    trusted_key=configuration.collector_signing_key,
+                    reviewed_collector_contract=collector_contract,
+                    monitoring_current_reader=monitoring_evidence_store,
+                    persistence_replay_key=configuration.persistence_replay_key,
+                    configuration=configuration,
+                    context_binding=context_binding,
+                    monitoring_intent_reference=intent_reference,
+                    acquisition_receipt_verifier=acquisition_receipt_verifier,
+                    key_resolver=collector_key_resolver,
+                ),
+            )
+
+        if persistence_probe.has_durable_artifacts:
+            _, _, recovery_commit_port = build_collector_commit_port()
+            recovered = recovery_commit_port.recover(persistence_probe)
+            if recovered is None:
+                raise MonitoringAcquisitionJobError(
+                    "durable persistence recovery returned no committed result"
+                )
+            return recovered
+
+        intent_verifier = KeyVaultRsaPublicKeyVerifier(
+            trusted_key_anchor=configuration.monitoring_intent_trusted_key.anchor,
+            managed_identity_client_id=configuration.runtime_support_identity_client_id,
+        )
+        expected_intent_key_record = TrustedKeyRecord(
+            anchor=configuration.monitoring_intent_trusted_key.anchor,
+            public_key=intent_verifier.public_key,
+            enabled=True,
+            activated_at=configuration.monitoring_intent_trusted_key.activated_at,
+            expires_at=configuration.monitoring_intent_trusted_key.expires_at,
+        )
+        intent_key_resolver = KeyVaultTrustedKeyResolver(
+            expected_record=expected_intent_key_record,
+            managed_identity_client_id=configuration.runtime_support_identity_client_id,
+        )
+        resolved_intent_key_record = intent_key_resolver(
+            configuration.monitoring_intent_trusted_key.anchor
+        )
+        if resolved_intent_key_record is None:
+            raise MonitoringAcquisitionJobError(
+                "monitoring intent signing key is not the pinned enabled version"
+            )
+        _validate_monitoring_intent_key_lifecycle(
+            monitoring_intent=monitoring_intent,
+            key_record=resolved_intent_key_record,
+            as_of=startup_as_of,
+        )
+        try:
+            validate_published_monitoring_intent_assets(
+                intent_reference,
+                monitoring_intent,
+                intent_attestation,
+                trusted_key_id=(configuration.monitoring_intent_trusted_key.key_vault_key_id),
+                signature_verifier=intent_verifier.verify_preimage,
+            )
+            validate_monitoring_intent_activation_eligible(
+                monitoring_intent,
+                context_binding,
+                expected_active_context_authority_digest=(
+                    configuration.expected_active_context_authority_digest
+                ),
+            )
+        except (TypeError, ValueError) as exc:
+            raise MonitoringAcquisitionJobError(
+                "monitoring intent is not eligible for production acquisition"
+            ) from exc
+
+        collector_signer, acquisition_receipt_verifier, commit_port = build_collector_commit_port()
+
+        def load_intent_assets(
+            supplied: PublishedMonitoringIntent,
+        ) -> tuple[
+            PublishedMonitoringIntentAssetReference,
+            PublishedMonitoringIntentAttestation,
+        ]:
+            if supplied != monitoring_intent:
+                raise MonitoringAcquisitionJobError(
+                    "coordinator requested assets for another monitoring intent"
+                )
+            return intent_reference, intent_attestation
+
+        collection_transaction = MonitoringCollectionTransaction(
+            acquisition_receipt_verifier=acquisition_receipt_verifier,
+            change_signer=_UnsupportedChangeEvidenceSigner(),
+            change_signing_key_id=configuration.collector_signing_key.key_vault_key_id,
+            monitoring_intent_trusted_key_id=(
+                configuration.monitoring_intent_trusted_key.key_vault_key_id
+            ),
+            monitoring_intent_signature_verifier=intent_verifier.verify_preimage,
+            monitoring_intent_asset_loader=load_intent_assets,
+        )
+        acquisition_adapter = AzureMonitoringAdapter(
+            reviewed_collector_contract=collector_contract,
+        )
+        coordinator = MonitoringAcquisitionCoordinator(
+            acquisition_adapter=acquisition_adapter,
+            acquisition_authority=acquisition_authority,
+            expected_acquisition_authority_digest=(
+                configuration.expected_acquisition_authority_digest
+            ),
+            expected_collector_contract_digest=collector_contract_digest,
+            monitoring_intent_trusted_key_id=(
+                configuration.monitoring_intent_trusted_key.key_vault_key_id
+            ),
+            monitoring_intent_signature_verifier=intent_verifier.verify_preimage,
+            monitoring_intent_asset_loader=load_intent_assets,
+            collection_transaction=collection_transaction,
+            receipt_signer=collector_signer,
+        )
+        issued_at = startup_as_of
+        trusted_as_of = issued_at + timedelta(seconds=configuration.trust_delay_seconds)
+        expires_at = issued_at + timedelta(seconds=configuration.request_lifetime_seconds)
         return coordinator.execute(
             monitoring_intent=monitoring_intent,
             context_binding=context_binding,
@@ -1498,18 +3012,33 @@ def run_wc028_monitoring_acquisition_job(
             issued_at=issued_at,
             trusted_as_of=trusted_as_of,
             expires_at=expires_at,
+            stabilize_correlation_window=True,
         )
+    except MonitoringAcquisitionJobError:
+        raise
     except (MonitoringAcquisitionError, MonitoringCollectionError) as exc:
         raise MonitoringAcquisitionJobError(str(exc)) from exc
     except (ArtifactReadError, ArtifactWriteError) as exc:
         raise MonitoringAcquisitionJobError("WC-028 immutable evidence persistence failed") from exc
+    except _EXTERNAL_AZURE_FAILURES as exc:
+        raise MonitoringAcquisitionJobError(
+            "WC-028 Azure client or transport operation failed"
+        ) from exc
+    except ValueError as exc:
+        raise MonitoringAcquisitionJobError(
+            "WC-028 Azure key or persistence verification failed"
+        ) from exc
 
 
 __all__ = [
     "MonitoringAcquisitionJobError",
     "MonitoringAcquisitionJobOutcome",
     "MonitoringEvidenceCommitPort",
+    "MonitoringPersistenceCommitManifest",
+    "MonitoringPersistenceRecoveryState",
+    "MonitoringRuntimeSupportEffectiveRbacInventory",
     "MonitoringRuntimeTrustedKey",
+    "RecoveredMonitoringAcquisitionJobOutcome",
     "Wc028MonitoringAcquisitionJobConfiguration",
     "load_wc028_monitoring_acquisition_job_configuration",
     "run_wc028_monitoring_acquisition_job",

@@ -58,6 +58,16 @@ param acquisitionRuntimeConfigurationDigest string
 @maxLength(71)
 param legacyCollectorRbacCleanupDigest string
 
+@description('Digest of hierarchy-complete effective RBAC evidence for the dedicated runtime-support identity.')
+@minLength(71)
+@maxLength(71)
+param runtimeSupportEffectiveRbacInventoryDigest string
+
+@description('Digest of the immutable source manifest for the runtime-support effective RBAC inventory.')
+@minLength(71)
+@maxLength(71)
+param runtimeSupportEffectiveRbacSourceManifestDigest string
+
 @secure()
 @description('Reviewed WC-028 runtime configuration. It contains no credentials and is secret-backed to avoid command-line or plain environment disclosure.')
 param acquisitionRuntimeConfigurationJson string
@@ -239,13 +249,54 @@ var cleanupDigestInvalidCharacters = replace(replace(replace(replace(replace(rep
   'a',
   ''
 ), 'b', ''), 'c', ''), 'd', ''), 'e', ''), 'f', '')
+var rejectedEvidenceDigest = 'sha256:0000000000000000000000000000000000000000000000000000000000000000'
 var validatedLegacyCollectorRbacCleanupDigest = legacyCollectorRbacCleanupDigest == toLower(
   legacyCollectorRbacCleanupDigest
 ) && startsWith(legacyCollectorRbacCleanupDigest, 'sha256:') && length(
   cleanupDigestCandidate
-) == 64 && empty(cleanupDigestInvalidCharacters)
+) == 64 && empty(cleanupDigestInvalidCharacters) && legacyCollectorRbacCleanupDigest != rejectedEvidenceDigest
   ? legacyCollectorRbacCleanupDigest
-  : fail('legacyCollectorRbacCleanupDigest must be a lowercase SHA-256 digest from the reviewed cleanup script')
+  : fail('legacyCollectorRbacCleanupDigest must be a non-zero lowercase SHA-256 digest from the reviewed cleanup script')
+var supportRbacDigestCandidate = replace(runtimeSupportEffectiveRbacInventoryDigest, 'sha256:', '')
+var supportRbacDigestWithoutDigits = replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(
+  supportRbacDigestCandidate,
+  '0',
+  ''
+), '1', ''), '2', ''), '3', ''), '4', ''), '5', ''), '6', ''), '7', ''), '8', ''), '9', '')
+var supportRbacDigestInvalidCharacters = replace(replace(replace(replace(replace(replace(
+  supportRbacDigestWithoutDigits,
+  'a',
+  ''
+), 'b', ''), 'c', ''), 'd', ''), 'e', ''), 'f', '')
+var validatedRuntimeSupportRbacInventoryDigest = runtimeSupportEffectiveRbacInventoryDigest == toLower(
+  runtimeSupportEffectiveRbacInventoryDigest
+) && startsWith(runtimeSupportEffectiveRbacInventoryDigest, 'sha256:') && length(
+  supportRbacDigestCandidate
+) == 64 && empty(supportRbacDigestInvalidCharacters) && runtimeSupportEffectiveRbacInventoryDigest != rejectedEvidenceDigest
+  ? runtimeSupportEffectiveRbacInventoryDigest
+  : fail('runtimeSupportEffectiveRbacInventoryDigest must be one non-zero lowercase SHA-256 digest')
+var supportRbacSourceDigestCandidate = replace(
+  runtimeSupportEffectiveRbacSourceManifestDigest,
+  'sha256:',
+  ''
+)
+var supportRbacSourceDigestWithoutDigits = replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(
+  supportRbacSourceDigestCandidate,
+  '0',
+  ''
+), '1', ''), '2', ''), '3', ''), '4', ''), '5', ''), '6', ''), '7', ''), '8', ''), '9', '')
+var supportRbacSourceDigestInvalidCharacters = replace(replace(replace(replace(replace(replace(
+  supportRbacSourceDigestWithoutDigits,
+  'a',
+  ''
+), 'b', ''), 'c', ''), 'd', ''), 'e', ''), 'f', '')
+var validatedRuntimeSupportRbacSourceManifestDigest = runtimeSupportEffectiveRbacSourceManifestDigest == toLower(
+  runtimeSupportEffectiveRbacSourceManifestDigest
+) && startsWith(runtimeSupportEffectiveRbacSourceManifestDigest, 'sha256:') && length(
+  supportRbacSourceDigestCandidate
+) == 64 && empty(supportRbacSourceDigestInvalidCharacters) && runtimeSupportEffectiveRbacSourceManifestDigest != rejectedEvidenceDigest
+  ? runtimeSupportEffectiveRbacSourceManifestDigest
+  : fail('runtimeSupportEffectiveRbacSourceManifestDigest must be one non-zero lowercase SHA-256 digest')
 var resourceTags = union(tags, {
   component: 'wc028-monitoring-acquisition'
   dataBoundary: 'customer'
@@ -253,6 +304,8 @@ var resourceTags = union(tags, {
   autoRemediation: 'disabled'
   runtimeConfigurationDigest: validatedConfigurationDigest
   legacyCollectorRbacCleanupDigest: validatedLegacyCollectorRbacCleanupDigest
+  runtimeSupportEffectiveRbacInventoryDigest: validatedRuntimeSupportRbacInventoryDigest
+  runtimeSupportEffectiveRbacSourceManifestDigest: validatedRuntimeSupportRbacSourceManifestDigest
   evidenceStorageAccountResourceId: validatedEvidenceStorageAccountResourceId
   evidenceContainerResourceId: validatedEvidenceContainerResourceId
   signingKeyUri: validatedSigningKeyUri
@@ -380,6 +433,30 @@ resource acquisitionJob 'Microsoft.App/jobs@2025-01-01' = {
               value: runtimeSupportIdentity.properties.principalId
             }
             {
+              name: 'ATHENA_WC028_DEPLOYED_REGISTRY_RESOURCE_ID'
+              value: validatedRegistryResourceId
+            }
+            {
+              name: 'ATHENA_WC028_DEPLOYED_RUNTIME_SUPPORT_ACR_PULL_ROLE_DEFINITION_ID'
+              value: acrPullRoleDefinitionId
+            }
+            {
+              name: 'ATHENA_WC028_DEPLOYED_MONITORING_INTENT_SIGNING_KEY_RESOURCE_ID'
+              value: validatedMonitoringIntentSigningKeyResourceId
+            }
+            {
+              name: 'ATHENA_WC028_DEPLOYED_RUNTIME_SUPPORT_INTENT_KEY_READER_ROLE_DEFINITION_ID'
+              value: acquisitionRbac.outputs.monitoringIntentKeyReaderRoleDefinitionId
+            }
+            {
+              name: 'ATHENA_WC028_DEPLOYED_RUNTIME_SUPPORT_RBAC_INVENTORY_DIGEST'
+              value: validatedRuntimeSupportRbacInventoryDigest
+            }
+            {
+              name: 'ATHENA_WC028_DEPLOYED_RUNTIME_SUPPORT_RBAC_SOURCE_MANIFEST_DIGEST'
+              value: validatedRuntimeSupportRbacSourceManifestDigest
+            }
+            {
               name: 'ATHENA_WC028_DEPLOYED_SOURCE_STORAGE_ACCOUNT_RESOURCE_ID'
               value: sourceAuthorityStorageAccountResourceId
             }
@@ -425,7 +502,6 @@ resource acquisitionJob 'Microsoft.App/jobs@2025-01-01' = {
     }
   }
   dependsOn: [
-    acquisitionRbac
     runtimeSupportImagePull
   ]
 }

@@ -175,29 +175,32 @@ template. Perform these steps in order:
 
 1. Run `infra/wc028-monitoring-acquisition/remove-obsolete-collector-rbac.ps1` as the governed
    deployment identity with the exact previous ACR, workload resource group, change-evidence
-   container, monitoring-evidence container, monitoring-intent key, and collector
-   resource/principal pair.
+   container, monitoring-evidence container, monitoring-intent key, historical Network Watcher,
+   and collector resource/principal pair.
 2. Save the full cleanup JSON outside the repository and retain its `cleanupEvidenceDigest`.
 3. Re-query the collector's hierarchy-complete effective assignments, role definitions, deny
-   assignments, transitive groups, and active PIM schedules. Stop unless all five legacy bindings
-   are absent.
+   assignments, transitive groups, and active PIM schedules. Stop unless all six legacy bindings
+   and all three obsolete custom role definitions, including the deterministic Network Watcher IP
+   Flow assignment and role, are absent.
 4. Produce a fresh collector contract and authority from the PR #99 revision that recognizes the
    conditioned known-name-read/add-only writer. Stop if the contract still requires
    `Storage Blob Data Contributor` or `blobs/write`.
-5. Produce a one-execution runtime configuration v2 whose `legacyCollectorRbacCleanupDigest` and
-   `persistenceReplayKey` bind the cleanup evidence, execution ID, authority, intent, context, and
-   incident revision.
+5. Produce a one-execution runtime configuration v3 whose non-zero
+   `legacyCollectorRbacCleanupDigest`, runtime-support hierarchy-complete RBAC inventory, and
+   `persistenceReplayKey` bind the cleanup evidence, execution ID, authority, intent, context,
+   incident revision, and exact support-inventory/source-manifest digests.
 6. Run resource-group `validate` and `what-if` for
    `infra/wc028-monitoring-acquisition/main.bicep`. The only new assignments may be ACR pull and
    monitoring-intent key read for the distinct runtime-support identity plus the conditioned
    known-name-read/add-only monitoring-evidence role for the measured collector. The collector must
    retain no built-in Blob contributor assignment.
 7. Deploy the manual Job, remeasure both identities, and verify the collector inventory still
-   exactly matches contract v8 before starting the Job.
+   exactly matches contract v8 and the runtime-support identity has only direct `AcrPull` on the
+   reviewed registry plus the exact monitoring-intent key-read role before starting the Job.
 
 The Job uses `triggerType: Manual` and `replicaRetryLimit: 0`. Never reuse a stale configuration or
-start it on a timer; create a new execution ID, cleanup binding, effective-RBAC inventory, and
-replay key for every governed execution.
+start it on a timer; create a new execution ID, cleanup binding, collector and runtime-support
+effective-RBAC inventories, and replay key for every governed execution.
 
 ## Phase 3: effective RBAC
 

@@ -1,4 +1,9 @@
+import json
+import shutil
+import subprocess
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 INFRA = ROOT / "infra" / "wc028-monitoring-acquisition"
@@ -45,6 +50,12 @@ def test_wc028_job_reuses_wc024_identity_key_and_evidence_boundary() -> None:
         "ATHENA_WC028_DEPLOYED_RUNTIME_SUPPORT_IDENTITY_RESOURCE_ID",
         "ATHENA_WC028_DEPLOYED_RUNTIME_SUPPORT_IDENTITY_CLIENT_ID",
         "ATHENA_WC028_DEPLOYED_RUNTIME_SUPPORT_IDENTITY_PRINCIPAL_ID",
+        "ATHENA_WC028_DEPLOYED_REGISTRY_RESOURCE_ID",
+        "ATHENA_WC028_DEPLOYED_RUNTIME_SUPPORT_ACR_PULL_ROLE_DEFINITION_ID",
+        "ATHENA_WC028_DEPLOYED_MONITORING_INTENT_SIGNING_KEY_RESOURCE_ID",
+        "ATHENA_WC028_DEPLOYED_RUNTIME_SUPPORT_INTENT_KEY_READER_ROLE_DEFINITION_ID",
+        "ATHENA_WC028_DEPLOYED_RUNTIME_SUPPORT_RBAC_INVENTORY_DIGEST",
+        "ATHENA_WC028_DEPLOYED_RUNTIME_SUPPORT_RBAC_SOURCE_MANIFEST_DIGEST",
         "ATHENA_WC028_DEPLOYED_SOURCE_STORAGE_ACCOUNT_RESOURCE_ID",
         "ATHENA_WC028_DEPLOYED_EVIDENCE_STORAGE_ACCOUNT_RESOURCE_ID",
         "ATHENA_WC028_DEPLOYED_EVIDENCE_CONTAINER_RESOURCE_ID",
@@ -53,6 +64,9 @@ def test_wc028_job_reuses_wc024_identity_key_and_evidence_boundary() -> None:
         "ATHENA_WC028_DEPLOYED_WORKLOAD_RESOURCE_GROUP_ID",
         "modules/acquisition-rbac.bicep",
         "legacyCollectorRbacCleanupDigest",
+        "runtimeSupportEffectiveRbacInventoryDigest",
+        "runtimeSupportEffectiveRbacSourceManifestDigest",
+        "rejectedEvidenceDigest",
         "scope: registry",
         "7f951dda-4ed3-4680-a7ca-43fe172d538d",
         "configurationDigestInvalidCharacters",
@@ -161,6 +175,13 @@ def test_upgrade_cleanup_targets_only_exact_legacy_collector_bindings() -> None:
         "Athena WC028 Bounded Acquisition Reader",
         "Athena WC028 Change Evidence Create-Only Writer",
         "Athena WC028 Monitoring Intent Key Reader",
+        "Athena WC028 IP Flow Verifier",
+        "Microsoft.Network/networkWatchers/ipFlowVerify/action",
+        "NetworkWatcherResourceId",
+        "historicalIpFlowRoleDefinitionId",
+        "historicalIpFlowRoleAssignmentId",
+        "New-ArmTemplateGuid",
+        "11fb06fb-712d-4ddd-98c7-e71bbd588830",
         "7f951dda-4ed3-4680-a7ca-43fe172d538d",
         "ba92f5b4-2d11-453d-a403-e96b0029c9fe",
         "'role', 'assignment', 'delete', '--ids'",
@@ -170,7 +191,10 @@ def test_upgrade_cleanup_targets_only_exact_legacy_collector_bindings() -> None:
         "verifiedAbsentBindings",
         "Assert-ResourceSubscription",
         "Assert-RoleDefinitionAbsent",
+        "Assert-ReviewedIpFlowRoleDefinition",
         "$roleDefinitionGuid",
+        "reviewedRoleAssignmentIds",
+        "reviewedRoleDefinitionIds",
     ):
         assert expected in cleanup
 
@@ -181,3 +205,58 @@ def test_upgrade_cleanup_targets_only_exact_legacy_collector_bindings() -> None:
         "Microsoft.Authorization/roleAssignments/delete",
     ):
         assert forbidden not in cleanup
+
+    assert "athena.wc028LegacyCollectorRbacCleanup.v3" in cleanup
+    assert "ExpectedAssignmentId = $ipFlowAssignmentId" in cleanup
+    assert "$networkWatcherId/providers/Microsoft.Authorization/roleAssignments/" in cleanup
+
+
+def test_upgrade_cleanup_exact_role_helpers_are_script_scoped() -> None:
+    shell = shutil.which("pwsh") or shutil.which("powershell")
+    if shell is None:
+        pytest.skip("PowerShell is required for cleanup AST validation")
+    cleanup_path = str(INFRA / "remove-obsolete-collector-rbac.ps1").replace("'", "''")
+    command = f"""
+$tokens = $null
+$errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile(
+    '{cleanup_path}',
+    [ref]$tokens,
+    [ref]$errors
+)
+if ($errors.Count -ne 0) {{
+    throw ($errors -join [Environment]::NewLine)
+}}
+@(
+    $ast.FindAll(
+        {{
+            param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst]
+        }},
+        $true
+    ) | ForEach-Object {{
+        $parent = $_.Parent
+        while (
+            $null -ne $parent -and
+            $parent -isnot [System.Management.Automation.Language.FunctionDefinitionAst]
+        ) {{
+            $parent = $parent.Parent
+        }}
+        [ordered]@{{
+            name = $_.Name
+            parent = if ($null -eq $parent) {{ '<script>' }} else {{ $parent.Name }}
+        }}
+    }}
+) | ConvertTo-Json -Compress
+"""
+    completed = subprocess.run(
+        [shell, "-NoProfile", "-NonInteractive", "-Command", command],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    functions = json.loads(completed.stdout)
+    parents = {item["name"]: item["parent"] for item in functions}
+
+    assert parents["Get-ExactRoleDefinition"] == "<script>"
+    assert parents["Assert-ReviewedIpFlowRoleDefinition"] == "<script>"
