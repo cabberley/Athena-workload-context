@@ -13,9 +13,7 @@ TABLE_CAS = (
 KEY_SIGNER = (
     ROOT / "infra" / "wc027-guidance-authority-publisher" / "modules" / "key-signer-rbac.bicep"
 )
-ACR_PULL = (
-    ROOT / "infra" / "wc027-enrichment-feed-runtime" / "modules" / "acr-pull-rbac.bicep"
-)
+ACR_PULL = ROOT / "infra" / "wc027-enrichment-feed-runtime" / "modules" / "acr-pull-rbac.bicep"
 
 
 def test_publisher_is_private_idempotent_and_uses_separated_authorities() -> None:
@@ -146,10 +144,7 @@ def test_publisher_acr_pull_uses_exact_registry_scope_and_principal_seed() -> No
     ):
         assert expected in source
     assert "guid(registry.id, brokerIdentity.id" not in source
-    assert (
-        "guid(registry.id, identityPrincipalId, pullRoleDefinitionResourceId)"
-        in module
-    )
+    assert "guid(registry.id, identityPrincipalId, pullRoleDefinitionResourceId)" in module
 
 
 def test_runtime_requires_current_activation_and_logical_binding_key() -> None:

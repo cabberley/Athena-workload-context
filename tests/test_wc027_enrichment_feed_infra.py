@@ -17,9 +17,7 @@ KEY_SIGN_VERIFY_RBAC = (
 PRIVATE_CONTAINER = (
     ROOT / "infra" / "wc027-enrichment-feed-runtime" / "modules" / "private-container.bicep"
 )
-ACR_PULL_RBAC = (
-    ROOT / "infra" / "wc027-enrichment-feed-runtime" / "modules" / "acr-pull-rbac.bicep"
-)
+ACR_PULL_RBAC = ROOT / "infra" / "wc027-enrichment-feed-runtime" / "modules" / "acr-pull-rbac.bicep"
 
 STORAGE_BLOB_DATA_CONTRIBUTOR_ROLE_ID = "ba92f5b4-2d11-453d-a403-e96b0029c9fe"
 
@@ -87,14 +85,10 @@ def test_wc027_runtime_uses_derived_identities_and_key_scopes() -> None:
     ):
         assert removed not in source
 
-    assert (
-        "brokerIdentity.properties.principalId == brokerIdentityPrincipalId"
-        in source
-    )
+    assert "brokerIdentity.properties.principalId == brokerIdentityPrincipalId" in source
     assert (
         "guid(registryScopedResourceId, brokerIdentityPrincipalId, "
-        "registryPullRoleDefinitionId)"
-        in source
+        "registryPullRoleDefinitionId)" in source
     )
 
     for module_name in (

@@ -308,16 +308,9 @@ def test_controller_identity_oidc_and_workflow_are_closed_and_separate() -> None
     assert "collectorControllerIdentity.outputs.principalId" in controller_pull
     assert "acceptanceImageRegistryResourceId" in controller_pull
     assert "acceptanceImageRegistryRoleAssignmentMode" in controller_pull
+    assert orchestration.count("registryResourceId: acceptanceImageRegistryResourceId") == 6
     assert (
-        orchestration.count(
-            "registryResourceId: acceptanceImageRegistryResourceId"
-        )
-        == 6
-    )
-    assert (
-        orchestration.count(
-            "registryRoleAssignmentMode: acceptanceImageRegistryRoleAssignmentMode"
-        )
+        orchestration.count("registryRoleAssignmentMode: acceptanceImageRegistryRoleAssignmentMode")
         == 6
     )
     for expected in (
