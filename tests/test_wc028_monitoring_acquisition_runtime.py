@@ -176,6 +176,10 @@ def _runtime_support_rbac_inventory(
     support_identity_resource_id: str = SUPPORT_ID,
     registry_resource_id: str = REGISTRY_ID,
     monitoring_intent_key_resource_id: str = MONITORING_INTENT_KEY_RESOURCE_ID,
+    collected_at: datetime | None = None,
+    expires_at: datetime | None = None,
+    collection_run_suffix: str = "a" * 32,
+    source_manifest_digest: str = DIGEST_B,
 ) -> dict[str, object]:
     registry_id = registry_resource_id.casefold()
     key_id = monitoring_intent_key_resource_id.casefold()
@@ -288,10 +292,9 @@ def _runtime_support_rbac_inventory(
         "pimScheduleInstanceRawDigests": [],
     }
     raw_snapshot_digest = compute_artifact_digest(raw_snapshot_payload)
-    source_manifest_digest = DIGEST_B
     payload: dict[str, object] = {
         "schemaVersion": "athena.wc028RuntimeSupportEffectiveRbacInventory.v1",
-        "collectionRunId": f"runtime-support-rbac-{'a' * 32}",
+        "collectionRunId": f"runtime-support-rbac-{collection_run_suffix}",
         "tenantId": tenant_id,
         "subscriptionId": subscription_id,
         "supportIdentityResourceId": support_identity_resource_id.casefold(),
@@ -304,8 +307,8 @@ def _runtime_support_rbac_inventory(
         "attestorClientId": ATTESTOR_CLIENT_ID,
         "attestorPrincipalId": ATTESTOR_PRINCIPAL_ID,
         "attestorTenantId": tenant_id,
-        "collectedAt": NOW - timedelta(minutes=1),
-        "expiresAt": NOW + timedelta(minutes=10),
+        "collectedAt": collected_at or NOW - timedelta(minutes=1),
+        "expiresAt": expires_at or NOW + timedelta(minutes=10),
         "managementGroupAncestry": (MANAGEMENT_GROUP_SCOPE.casefold(),),
         "ancestorScopeCollectionComplete": True,
         "subscriptionDescendantCollectionComplete": True,
@@ -329,7 +332,8 @@ def _runtime_support_rbac_inventory(
         "sourceReference": {
             "name": (
                 "wc028-runtime-support-rbac/"
-                f"runtime-support-rbac-{'a' * 32}/effective-rbac-inventory.json"
+                f"runtime-support-rbac-{collection_run_suffix}/"
+                "effective-rbac-inventory.json"
             ),
             "version": "2026-09-14T05:29:00.0000000Z",
             "contentDigest": source_manifest_digest,
@@ -418,10 +422,6 @@ PERSISTENCE_REPLAY_KEY = compute_artifact_digest(
         "contextBindingDigest": DIGEST_A,
         "incidentRevision": 1,
         "legacyCollectorRbacCleanupDigest": CLEANUP_DIGEST,
-        "runtimeSupportEffectiveRbacInventoryDigest": (_SUPPORT_RBAC_INVENTORY["inventoryDigest"]),
-        "runtimeSupportEffectiveRbacSourceManifestDigest": (
-            _SUPPORT_RBAC_INVENTORY["sourceManifestDigest"]
-        ),
         "trustDelaySeconds": 60,
         "requestLifetimeSeconds": 600,
     }
@@ -429,10 +429,6 @@ PERSISTENCE_REPLAY_KEY = compute_artifact_digest(
 
 
 def _refresh_configuration_replay_key(payload: dict[str, object]) -> None:
-    support_inventory = cast(
-        dict[str, object],
-        payload["runtimeSupportEffectiveRbacInventory"],
-    )
     acquisition_authority = cast(
         dict[str, object],
         payload["acquisitionAuthority"],
@@ -452,10 +448,6 @@ def _refresh_configuration_replay_key(payload: dict[str, object]) -> None:
             "contextBindingDigest": context_binding["bindingDigest"],
             "incidentRevision": payload["incidentRevision"],
             "legacyCollectorRbacCleanupDigest": payload["legacyCollectorRbacCleanupDigest"],
-            "runtimeSupportEffectiveRbacInventoryDigest": support_inventory["inventoryDigest"],
-            "runtimeSupportEffectiveRbacSourceManifestDigest": support_inventory[
-                "sourceManifestDigest"
-            ],
             "trustDelaySeconds": payload["trustDelaySeconds"],
             "requestLifetimeSeconds": payload["requestLifetimeSeconds"],
         }
@@ -627,12 +619,12 @@ def test_configuration_preserves_identity_and_storage_separation(
 
     shared_support_client = _configuration_payload()
     shared_support_client["runtimeSupportIdentityClientId"] = CLIENT_ID
-    with pytest.raises(ValidationError, match="client and principal identities"):
+    with pytest.raises(ValidationError, match="client/principal identities"):
         Wc028MonitoringAcquisitionJobConfiguration.model_validate(shared_support_client)
 
     shared_support_principal = _configuration_payload()
     shared_support_principal["runtimeSupportIdentityPrincipalId"] = COLLECTOR_PRINCIPAL_ID
-    with pytest.raises(ValidationError, match="client and principal identities"):
+    with pytest.raises(ValidationError, match="client/principal identities"):
         Wc028MonitoringAcquisitionJobConfiguration.model_validate(shared_support_principal)
 
 
@@ -719,7 +711,138 @@ def test_configuration_rejects_zero_cleanup_evidence() -> None:
     payload = _configuration_payload()
     payload["legacyCollectorRbacCleanupDigest"] = f"sha256:{'0' * 64}"
 
-    with pytest.raises(ValidationError, match="non-zero cleanup evidence"):
+    with pytest.raises(ValidationError, match="non-zero SHA-256 digest"):
+        Wc028MonitoringAcquisitionJobConfiguration.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    (
+        ("managedIdentityClientId", "00000000-0000-0000-0000-000000000000"),
+        (
+            "runtimeSupportIdentityClientId",
+            "00000000-0000-0000-0000-000000000000",
+        ),
+        (
+            "runtimeSupportIdentityPrincipalId",
+            "00000000-0000-0000-0000-000000000000",
+        ),
+        ("executionId", f"wc028-execution-{'0' * 32}"),
+        ("expectedActiveContextAuthorityDigest", f"sha256:{'0' * 64}"),
+        ("expectedAcquisitionAuthorityDigest", f"sha256:{'0' * 64}"),
+        ("persistenceReplayKey", f"sha256:{'0' * 64}"),
+    ),
+)
+def test_configuration_rejects_nil_guids_and_zero_runtime_sentinels(
+    field_name: str,
+    value: str,
+) -> None:
+    payload = _configuration_payload()
+    payload[field_name] = value
+
+    with pytest.raises(ValidationError, match="non-nil|non-zero|must be non-zero"):
+        Wc028MonitoringAcquisitionJobConfiguration.model_validate(payload)
+
+
+def test_configuration_rejects_zero_nested_evidence_and_nil_subscription() -> None:
+    zero_key_fingerprint = _configuration_payload()
+    trusted_key = cast(
+        dict[str, object],
+        zero_key_fingerprint["monitoringIntentTrustedKey"],
+    )
+    trusted_key["publicKeyFingerprint"] = f"sha256:{'0' * 64}"
+    with pytest.raises(ValidationError, match="non-zero"):
+        Wc028MonitoringAcquisitionJobConfiguration.model_validate(zero_key_fingerprint)
+
+    zero_intent_digest = _configuration_payload()
+    monitoring_intent = cast(
+        dict[str, object],
+        zero_intent_digest["monitoringIntent"],
+    )
+    monitoring_intent["intentDigest"] = f"sha256:{'0' * 64}"
+    with pytest.raises(ValidationError, match="zero evidence sentinel"):
+        Wc028MonitoringAcquisitionJobConfiguration.model_validate(zero_intent_digest)
+
+    nil_subscription = _configuration_payload()
+    nil_subscription["collectorIdentityResourceId"] = COLLECTOR_ID.replace(
+        SUBSCRIPTION_ID,
+        "00000000-0000-0000-0000-000000000000",
+    )
+    with pytest.raises(ValidationError, match="subscription"):
+        Wc028MonitoringAcquisitionJobConfiguration.model_validate(nil_subscription)
+
+
+def test_configuration_rejects_inconsistent_attestor_identity_tuples() -> None:
+    attestor_client_overlap = _configuration_payload()
+    inventory = cast(
+        dict[str, object],
+        attestor_client_overlap["runtimeSupportEffectiveRbacInventory"],
+    )
+    inventory["attestorClientId"] = CLIENT_ID
+    attestor_client_overlap["runtimeSupportEffectiveRbacInventory"] = (
+        _refresh_support_rbac_inventory(inventory)
+    )
+    with pytest.raises(ValidationError, match="client/principal identities"):
+        Wc028MonitoringAcquisitionJobConfiguration.model_validate(attestor_client_overlap)
+
+    attestor_resource_overlap = _configuration_payload()
+    inventory = cast(
+        dict[str, object],
+        attestor_resource_overlap["runtimeSupportEffectiveRbacInventory"],
+    )
+    inventory["attestorIdentityResourceId"] = COLLECTOR_ID.casefold()
+    attestor_resource_overlap["runtimeSupportEffectiveRbacInventory"] = (
+        _refresh_support_rbac_inventory(inventory)
+    )
+    with pytest.raises(ValidationError, match="dedicated effective RBAC evidence"):
+        Wc028MonitoringAcquisitionJobConfiguration.model_validate(attestor_resource_overlap)
+
+
+def test_configuration_rejects_zero_support_evidence_digest() -> None:
+    payload = _configuration_payload()
+    inventory = cast(
+        dict[str, object],
+        payload["runtimeSupportEffectiveRbacInventory"],
+    )
+    inventory["roleDefinitionRawPageDigests"] = (f"sha256:{'0' * 64}",)
+
+    with pytest.raises(ValidationError, match="raw page digests"):
+        Wc028MonitoringAcquisitionJobConfiguration.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "principal_digest_field",
+    (
+        "targetReads",
+        "roleAssignmentPages",
+        "groupPages",
+    ),
+)
+def test_configuration_rejects_rehashed_zero_principal_evidence_digests(
+    principal_digest_field: str,
+) -> None:
+    payload = _configuration_payload()
+    inventory = cast(
+        dict[str, object],
+        payload["runtimeSupportEffectiveRbacInventory"],
+    )
+    principal_evidence = cast(
+        dict[str, object],
+        inventory["supportPrincipalEvidence"],
+    )
+    zero_digest = f"sha256:{'0' * 64}"
+    if principal_digest_field == "targetReads":
+        first_reads = list(cast(tuple[str, ...], principal_evidence["firstReadTargetDigests"]))
+        first_reads[0] = zero_digest
+        principal_evidence["firstReadTargetDigests"] = tuple(first_reads)
+        principal_evidence["secondReadTargetDigests"] = tuple(first_reads)
+    elif principal_digest_field == "roleAssignmentPages":
+        principal_evidence["roleAssignmentRawPageDigests"] = (zero_digest,)
+    else:
+        principal_evidence["transitiveGroupRawPageDigests"] = (zero_digest,)
+    payload["runtimeSupportEffectiveRbacInventory"] = _refresh_support_rbac_inventory(inventory)
+
+    with pytest.raises(ValidationError, match="evidence digests must be non-zero"):
         Wc028MonitoringAcquisitionJobConfiguration.model_validate(payload)
 
 
@@ -863,6 +986,36 @@ def test_runtime_support_rbac_must_be_fresh_before_job_execution() -> None:
         )
 
 
+def test_runtime_support_inventory_refresh_does_not_change_stable_replay_key() -> None:
+    payload = _configuration_payload()
+    stable_replay_key = payload["persistenceReplayKey"]
+    inventory = cast(
+        dict[str, object],
+        payload["runtimeSupportEffectiveRbacInventory"],
+    )
+    inventory["collectionRunId"] = f"runtime-support-rbac-{'b' * 32}"
+    inventory["collectedAt"] = NOW
+    inventory["expiresAt"] = NOW + timedelta(minutes=10)
+    inventory["sourceManifestDigest"] = DIGEST_C
+    inventory["sourceReference"] = {
+        "name": (
+            "wc028-runtime-support-rbac/"
+            f"runtime-support-rbac-{'b' * 32}/effective-rbac-inventory.json"
+        ),
+        "version": "2026-09-14T05:30:00.0000000Z",
+        "contentDigest": DIGEST_C,
+    }
+    payload["runtimeSupportEffectiveRbacInventory"] = _refresh_support_rbac_inventory(inventory)
+
+    configuration = Wc028MonitoringAcquisitionJobConfiguration.model_validate(payload)
+
+    assert configuration.persistence_replay_key == stable_replay_key
+    assert (
+        configuration.runtime_support_effective_rbac_inventory.inventory_digest
+        != _SUPPORT_RBAC_INVENTORY["inventoryDigest"]
+    )
+
+
 @pytest.mark.parametrize(
     ("field_name", "value"),
     (
@@ -963,7 +1116,7 @@ def test_configuration_loader_is_bounded_and_unambiguous(tmp_path: Path) -> None
         )
 
 
-def test_current_contract_and_authority_pass_exact_preflight_scope_binding() -> None:
+def test_current_nil_subscription_contract_is_rejected_at_startup() -> None:
     context_binding, monitoring_intent, controls = _authority(required_control_names={"heartbeat"})
     collector_contract = _acquisition_collector_contract()
     acquisition_authority = _acquisition_authority(
@@ -1050,31 +1203,20 @@ def test_current_contract_and_authority_pass_exact_preflight_scope_binding() -> 
             "contextBindingDigest": context_binding.binding_digest,
             "incidentRevision": 1,
             "legacyCollectorRbacCleanupDigest": CLEANUP_DIGEST,
-            "runtimeSupportEffectiveRbacInventoryDigest": (
-                cast(
-                    dict[str, object],
-                    payload["runtimeSupportEffectiveRbacInventory"],
-                )["inventoryDigest"]
-            ),
-            "runtimeSupportEffectiveRbacSourceManifestDigest": (
-                cast(
-                    dict[str, object],
-                    payload["runtimeSupportEffectiveRbacInventory"],
-                )["sourceManifestDigest"]
-            ),
             "trustDelaySeconds": payload["trustDelaySeconds"],
             "requestLifetimeSeconds": payload["requestLifetimeSeconds"],
         }
     )
-    configuration = Wc028MonitoringAcquisitionJobConfiguration.model_validate(payload)
+    with pytest.raises(ValidationError, match="non-nil GUID"):
+        Wc028MonitoringAcquisitionJobConfiguration.model_validate(payload)
 
-    _validate_acquisition_authority_preflight(
-        acquisition_authority=acquisition_authority,
-        configuration=configuration,
-        collector_contract=collector_contract,
-        context_binding=context_binding,
-        monitoring_intent=monitoring_intent,
-    )
+
+def test_current_published_contract_remains_blocked_on_pr99_bootstrap() -> None:
+    with pytest.raises(
+        MonitoringAcquisitionJobError,
+        match="blocked until PR #99 publishes the conditioned",
+    ):
+        runtime_module._require_pr99_conditioned_blob_contract(_acquisition_collector_contract())
 
 
 def test_authority_scope_digest_and_freshness_fail_before_external_reads(
@@ -1449,6 +1591,11 @@ def test_job_composes_hardened_coordinator_transaction_and_commit_port(
     )
     monkeypatch.setattr(
         runtime_module,
+        "_require_pr99_conditioned_blob_contract",
+        lambda _contract: None,
+    )
+    monkeypatch.setattr(
+        runtime_module,
         "validate_published_monitoring_intent_assets",
         lambda *_args, **_kwargs: None,
     )
@@ -1593,9 +1740,11 @@ def test_job_composes_hardened_coordinator_transaction_and_commit_port(
     assert execute_arguments["stabilize_correlation_window"] is True
 
 
-def test_job_checks_commit_manifest_before_key_or_source_io(
+@pytest.mark.parametrize("partial_only", (False, True))
+def test_job_probes_manifest_and_partial_recovery_before_current_support_freshness(
     monkeypatch: pytest.MonkeyPatch,
     persistence_case: _PersistenceCase,
+    partial_only: bool,
 ) -> None:
     store = _MemoryStore(container_name="monitoring-evidence")
     with _commit_port(store, persistence_case).transaction(persistence_case.prepared) as committed:
@@ -1617,6 +1766,8 @@ def test_job_checks_commit_manifest_before_key_or_source_io(
     )
     assert manifest.correlation_request_id == expected_correlation.request_id
     assert manifest.correlation_request_digest == expected_correlation.request_digest
+    if partial_only:
+        del store.blobs[manifest_name]
     expected_outcome = SimpleNamespace(
         committed=committed,
         correlation_request=expected_correlation,
@@ -1647,6 +1798,28 @@ def test_job_checks_commit_manifest_before_key_or_source_io(
         runtime_module,
         "_validate_acquisition_authority_preflight",
         lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "_require_pr99_conditioned_blob_contract",
+        lambda _contract: None,
+    )
+    freshness_calls: list[datetime | None] = []
+
+    def reject_current_freshness_during_recovery(
+        *,
+        configuration: object,
+        as_of: datetime | None,
+    ) -> None:
+        del configuration
+        freshness_calls.append(as_of)
+        if as_of is not None:
+            raise AssertionError("current support-RBAC freshness must not gate durable recovery")
+
+    monkeypatch.setattr(
+        runtime_module,
+        "_validate_runtime_support_effective_rbac",
+        reject_current_freshness_during_recovery,
     )
     monkeypatch.setattr(runtime_module, "_utc_now_milliseconds", lambda: NOW)
     events: list[str] = []
@@ -1714,6 +1887,7 @@ def test_job_checks_commit_manifest_before_key_or_source_io(
     assert events[0] == f"blob:{manifest_name}"
     assert events.index(f"key:{CLIENT_ID}") > events.index(f"blob:{manifest_name}")
     assert f"key:{SUPPORT_CLIENT_ID}" not in events
+    assert freshness_calls == []
 
 
 def test_job_wraps_key_client_construction_and_read_failures(
@@ -1744,6 +1918,11 @@ def test_job_wraps_key_client_construction_and_read_failures(
         "_validate_acquisition_authority_preflight",
         lambda **_kwargs: None,
     )
+    monkeypatch.setattr(
+        runtime_module,
+        "_require_pr99_conditioned_blob_contract",
+        lambda _contract: None,
+    )
     monkeypatch.setattr(runtime_module, "_utc_now_milliseconds", lambda: NOW)
     monkeypatch.setattr(
         runtime_module,
@@ -1765,6 +1944,80 @@ def test_job_wraps_key_client_construction_and_read_failures(
         match="Azure client or transport operation failed",
     ):
         runtime_module.run_wc028_monitoring_acquisition_job(configuration=configuration)
+
+
+def test_new_acquisition_recaptures_support_freshness_after_slow_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configuration = Wc028MonitoringAcquisitionJobConfiguration.model_validate(
+        _configuration_payload()
+    )
+    embedded = {
+        "PublishedMonitoringIntent": object(),
+        "PublishedMonitoringIntentAssetReference": object(),
+        "PublishedMonitoringIntentAttestation": object(),
+        "PublishedRuntimeContextBinding": SimpleNamespace(binding_digest=DIGEST_A),
+        "MonitoringCollectorContract": SimpleNamespace(
+            collector_identity_resource_id=COLLECTOR_ID.casefold(),
+            compute_artifact_digest_value=lambda: DIGEST_B,
+        ),
+        "ApprovedChangeScope": object(),
+        "MonitoringAcquisitionAuthority": object(),
+    }
+    monkeypatch.setattr(
+        runtime_module,
+        "_embedded_model",
+        lambda model, _payload: embedded[model.__name__],
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "_validate_acquisition_authority_preflight",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "_require_pr99_conditioned_blob_contract",
+        lambda _contract: None,
+    )
+    clock = {"now": NOW}
+
+    class _SlowEmptyStore:
+        read_count = 0
+
+        @classmethod
+        def read_current(cls, _request: object) -> object:
+            cls.read_count += 1
+            clock["now"] += timedelta(minutes=4)
+            raise ArtifactNotFoundError("synthetic Blob is absent")
+
+    monkeypatch.setattr(
+        runtime_module,
+        "AzureBlobChangeEvidenceReplayStore",
+        lambda **_kwargs: _SlowEmptyStore(),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "_utc_now_milliseconds",
+        lambda: clock["now"],
+    )
+
+    def reject_key_client(**_kwargs: object) -> object:
+        raise AssertionError("key clients must not be built with expired support RBAC")
+
+    monkeypatch.setattr(
+        runtime_module,
+        "KeyVaultRsaPublicKeyVerifier",
+        reject_key_client,
+    )
+
+    with pytest.raises(
+        MonitoringAcquisitionJobError,
+        match="support effective RBAC evidence is stale",
+    ):
+        runtime_module.run_wc028_monitoring_acquisition_job(configuration=configuration)
+
+    assert _SlowEmptyStore.read_count == 3
+    assert clock["now"] == NOW + timedelta(minutes=12)
 
 
 class _MemoryStore:
@@ -1854,17 +2107,54 @@ def persistence_case(monkeypatch: pytest.MonkeyPatch) -> _PersistenceCase:
     context_binding, _, _ = _authority()
     receipt = outcome.prepared.monitoring_bundle.acquisition_receipt
     assert receipt is not None
+    collector_contract = _acquisition_collector_contract()
+    subscription_id = SUBSCRIPTION_ID
+    support_identity_resource_id = SUPPORT_ID
+    registry_resource_id = REGISTRY_ID.casefold()
+    monitoring_intent_key_resource_id = MONITORING_INTENT_KEY_RESOURCE_ID.casefold()
+    support_inventory = (
+        runtime_module.MonitoringRuntimeSupportEffectiveRbacInventory.model_validate(
+            _runtime_support_rbac_inventory(
+                subscription_id=subscription_id,
+                tenant_id=cast(str, collector_contract.collector_tenant_id),
+                support_identity_resource_id=support_identity_resource_id,
+                registry_resource_id=registry_resource_id,
+                monitoring_intent_key_resource_id=monitoring_intent_key_resource_id,
+                collected_at=receipt.execution_started_at - timedelta(minutes=1),
+                expires_at=receipt.execution_completed_at + timedelta(minutes=10),
+            )
+        )
+    )
     return _PersistenceCase(
         prepared=outcome.prepared,
         context_binding=context_binding,
-        collector_contract=_acquisition_collector_contract(),
+        collector_contract=collector_contract,
         configuration=SimpleNamespace(
+            persistence_replay_key=PERSISTENCE_REPLAY_KEY,
             execution_id=EXECUTION_ID,
             expected_acquisition_authority_digest=(receipt.acquisition_authority_digest),
             legacy_collector_rbac_cleanup_digest=CLEANUP_DIGEST,
             incident_revision=1,
             trust_delay_seconds=60,
             request_lifetime_seconds=600,
+            runtime_support_effective_rbac_inventory=support_inventory,
+            runtime_support_identity_resource_id=(support_inventory.support_identity_resource_id),
+            runtime_support_identity_client_id=support_inventory.support_client_id,
+            runtime_support_identity_principal_id=(support_inventory.support_principal_id),
+            registry_resource_id=registry_resource_id,
+            runtime_support_acr_pull_role_definition_id=(ACR_PULL_ROLE_ID.casefold()),
+            monitoring_intent_signing_key_resource_id=(monitoring_intent_key_resource_id),
+            runtime_support_monitoring_intent_key_reader_role_definition_id=(
+                SUPPORT_KEY_READER_ROLE_ID.casefold()
+            ),
+            collector_identity_resource_id=(
+                collector_contract.collector_identity_resource_id.casefold()
+            ),
+            athena_context_identity_resource_id=cast(
+                str,
+                collector_contract.athena_context_identity_id,
+            ).casefold(),
+            managed_identity_client_id=(collector_contract.collector_identity_client_id),
         ),
     )
 
@@ -1913,23 +2203,78 @@ def _commit_port(
     )
 
 
+def _rehash_recovery_state_without_resigning(
+    state: runtime_module.MonitoringPersistenceRecoveryState,
+    **updates: object,
+) -> runtime_module.MonitoringPersistenceRecoveryState:
+    state = state.model_copy(update=updates)
+    state_digest = compute_artifact_digest(
+        state.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=True,
+            exclude={"state_digest", "collector_attestation"},
+        )
+    )
+    state = state.model_copy(update={"state_digest": state_digest})
+    signed_payload = state.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+        exclude={"collector_attestation"},
+    )
+    attestation = state.collector_attestation.model_copy(
+        update={
+            "signed_preimage_digest": compute_artifact_digest(
+                runtime_module._monitoring_recovery_state_preimage(signed_payload)
+            )
+        }
+    )
+    return state.model_copy(update={"collector_attestation": attestation})
+
+
 def test_commit_port_publishes_replay_manifest_last(
     persistence_case: _PersistenceCase,
 ) -> None:
     store = _MemoryStore(container_name="monitoring-evidence")
     prepared = persistence_case.prepared
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     prepared_digest = compute_artifact_digest(
         _monitoring_persistence_replay_payload(cast(Any, prepared))
     )
     replay_key = PERSISTENCE_REPLAY_KEY
     manifest_name = f"wc024-monitoring/commits/{replay_key.removeprefix('sha256:')}/manifest.json"
 
-    with _commit_port(store, persistence_case).transaction(prepared) as committed:
+    with _commit_port(
+        store,
+        persistence_case,
+        private_key=private_key,
+    ).transaction(prepared) as committed:
         assert manifest_name not in store.blobs
 
     written_names = [item.blob_name for item in store.create_requests]
     assert written_names[0].endswith("/recovery.json")
     assert written_names[-1] == manifest_name
+    recovery_state = runtime_module.MonitoringPersistenceRecoveryState.model_validate_json(
+        store.blobs[written_names[0]].payload
+    )
+    signed_payload = recovery_state.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+        exclude={"collector_attestation"},
+    )
+    private_key.public_key().verify(
+        base64.b64decode(
+            recovery_state.collector_attestation.signature,
+            validate=True,
+        ),
+        runtime_module.canonicalize_json(
+            runtime_module._monitoring_recovery_state_preimage(signed_payload)
+        ).encode("utf-8"),
+        padding.PKCS1v15(),
+        hashes.SHA256(),
+    )
     manifest = MonitoringPersistenceCommitManifest.model_validate_json(
         store.blobs[manifest_name].payload
     )
@@ -1950,6 +2295,46 @@ def test_commit_port_publishes_replay_manifest_last(
     )
     assert manifest.correlation_request_id == expected_correlation.request_id
     assert manifest.correlation_request_digest == expected_correlation.request_digest
+
+
+def test_recovery_state_and_manifest_reject_zero_startup_sentinels(
+    persistence_case: _PersistenceCase,
+) -> None:
+    store = _MemoryStore(container_name="monitoring-evidence")
+    with _commit_port(store, persistence_case).transaction(persistence_case.prepared):
+        pass
+    manifest_name, recovery_name, _ = runtime_module._monitoring_persistence_blob_names(
+        PERSISTENCE_REPLAY_KEY
+    )
+    state_payload = cast(
+        dict[str, object],
+        json.loads(store.blobs[recovery_name].payload),
+    )
+    state_payload["runtimeSupportIdentityPrincipalId"] = runtime_module._NIL_GUID
+    with pytest.raises(ValidationError, match="non-nil GUID"):
+        runtime_module.MonitoringPersistenceRecoveryState.model_validate_json(
+            runtime_module.canonicalize_json(state_payload)
+        )
+
+    state_payload = cast(
+        dict[str, object],
+        json.loads(store.blobs[recovery_name].payload),
+    )
+    state_payload["runtimeSupportEffectiveRbacInventoryDigest"] = f"sha256:{'0' * 64}"
+    with pytest.raises(ValidationError, match="non-zero SHA-256"):
+        runtime_module.MonitoringPersistenceRecoveryState.model_validate_json(
+            runtime_module.canonicalize_json(state_payload)
+        )
+
+    manifest_payload = cast(
+        dict[str, object],
+        json.loads(store.blobs[manifest_name].payload),
+    )
+    manifest_payload["executionId"] = f"wc028-execution-{'0' * 32}"
+    with pytest.raises(ValidationError, match="executionId must be non-zero"):
+        MonitoringPersistenceCommitManifest.model_validate_json(
+            runtime_module.canonicalize_json(manifest_payload)
+        )
 
 
 def test_commit_port_leaves_no_commit_marker_when_correlation_fails(
@@ -2083,7 +2468,10 @@ def test_commit_port_wraps_azure_signing_failure(
     store = _MemoryStore(container_name="monitoring-evidence")
 
     with (
-        pytest.raises(MonitoringAcquisitionJobError, match="handoff failed verification"),
+        pytest.raises(
+            MonitoringAcquisitionJobError,
+            match="recovery-state signing failed before persistence",
+        ),
         _commit_port(
             store,
             persistence_case,
@@ -2091,12 +2479,13 @@ def test_commit_port_wraps_azure_signing_failure(
         ).transaction(persistence_case.prepared),
     ):
         pass
+    assert store.blobs == {}
 
 
-@pytest.mark.parametrize("remove_recovery_state", (False, True))
-def test_restart_recovers_signed_evidence_without_reacquisition_byte_identically(
+@pytest.mark.parametrize("remove_evidence", (False, True))
+def test_restart_recovers_signed_state_without_reacquisition_byte_identically(
     persistence_case: _PersistenceCase,
-    remove_recovery_state: bool,
+    remove_evidence: bool,
 ) -> None:
     store = _MemoryStore(
         container_name="monitoring-evidence",
@@ -2120,8 +2509,8 @@ def test_restart_recovers_signed_evidence_without_reacquisition_byte_identically
     )
     assert manifest_name not in store.blobs
     assert evidence_name in store.blobs
-    if remove_recovery_state:
-        del store.blobs[recovery_name]
+    if remove_evidence:
+        del store.blobs[evidence_name]
 
     receipt = persistence_case.prepared.monitoring_bundle.acquisition_receipt
     assert receipt is not None
@@ -2154,10 +2543,116 @@ def test_restart_recovers_signed_evidence_without_reacquisition_byte_identically
     )
     assert manifest_name in store.blobs
     assert recovery_name in store.blobs
+    assert evidence_name in store.blobs
+
+
+def test_restart_uses_signed_original_support_inventory_after_current_refresh(
+    persistence_case: _PersistenceCase,
+) -> None:
+    store = _MemoryStore(
+        container_name="monitoring-evidence",
+        fail_once_on_suffix="/manifest.json",
+    )
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    first_committed = None
+    with (
+        pytest.raises(RuntimeError, match="staged persistence failure"),
+        _commit_port(
+            store,
+            persistence_case,
+            private_key=private_key,
+        ).transaction(persistence_case.prepared) as committed,
+    ):
+        first_committed = committed
+    assert first_committed is not None
+    original_inventory = persistence_case.configuration.runtime_support_effective_rbac_inventory
+    refreshed_inventory = (
+        runtime_module.MonitoringRuntimeSupportEffectiveRbacInventory.model_validate(
+            _runtime_support_rbac_inventory(
+                subscription_id=original_inventory.subscription_id,
+                tenant_id=original_inventory.tenant_id,
+                support_identity_resource_id=(original_inventory.support_identity_resource_id),
+                registry_resource_id=(persistence_case.configuration.registry_resource_id),
+                monitoring_intent_key_resource_id=(
+                    persistence_case.configuration.monitoring_intent_signing_key_resource_id
+                ),
+                collected_at=original_inventory.expires_at + timedelta(minutes=1),
+                expires_at=original_inventory.expires_at + timedelta(minutes=10),
+                collection_run_suffix="b" * 32,
+                source_manifest_digest=DIGEST_C,
+            )
+        )
+    )
+    refreshed_configuration = SimpleNamespace(
+        **{
+            **vars(persistence_case.configuration),
+            "runtime_support_effective_rbac_inventory": refreshed_inventory,
+        }
+    )
+    refreshed_case = replace(
+        persistence_case,
+        configuration=refreshed_configuration,
+    )
+
+    recovered = _commit_port(
+        store,
+        refreshed_case,
+        private_key=private_key,
+    ).recover(
+        runtime_module._probe_monitoring_persistence(
+            reader=store,
+            replay_key=PERSISTENCE_REPLAY_KEY,
+        )
+    )
+
+    assert recovered is not None
+    assert recovered.committed == first_committed
+    assert refreshed_inventory.inventory_digest != original_inventory.inventory_digest
+
+
+def test_restart_rejects_evidence_without_collector_signed_recovery_binding(
+    persistence_case: _PersistenceCase,
+) -> None:
+    store = _MemoryStore(
+        container_name="monitoring-evidence",
+        fail_once_on_suffix="/manifest.json",
+    )
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    with (
+        pytest.raises(RuntimeError, match="staged persistence failure"),
+        _commit_port(
+            store,
+            persistence_case,
+            private_key=private_key,
+        ).transaction(persistence_case.prepared),
+    ):
+        pass
+    manifest_name, recovery_name, evidence_name = runtime_module._monitoring_persistence_blob_names(
+        PERSISTENCE_REPLAY_KEY
+    )
+    del store.blobs[recovery_name]
+
+    with pytest.raises(
+        MonitoringAcquisitionJobError,
+        match="without its collector-signed recovery binding",
+    ):
+        _commit_port(
+            store,
+            persistence_case,
+            private_key=private_key,
+        ).recover(
+            runtime_module._probe_monitoring_persistence(
+                reader=store,
+                replay_key=PERSISTENCE_REPLAY_KEY,
+            )
+        )
+
+    assert evidence_name in store.blobs
+    assert manifest_name not in store.blobs
 
 
 @pytest.mark.parametrize("incident_override", ("alternate", "missing"))
-def test_restart_rejects_self_hashed_incident_observation_override(
+def test_restart_rejects_rehashed_unsigned_incident_observation_override(
     persistence_case: _PersistenceCase,
     incident_override: str,
 ) -> None:
@@ -2193,18 +2688,10 @@ def test_restart_rejects_self_hashed_incident_observation_override(
         replacement_observation_id = alternate_ids[0]
     else:
         replacement_observation_id = f"obs-{'f' * 32}"
-    recovery_state = recovery_state.model_copy(
-        update={"previous_health_observation_id": replacement_observation_id}
+    recovery_state = _rehash_recovery_state_without_resigning(
+        recovery_state,
+        previous_health_observation_id=replacement_observation_id,
     )
-    state_digest = compute_artifact_digest(
-        recovery_state.model_dump(
-            mode="json",
-            by_alias=True,
-            exclude_none=True,
-            exclude={"state_digest"},
-        )
-    )
-    recovery_state = recovery_state.model_copy(update={"state_digest": state_digest})
     tampered_state = recovery_state.canonical_bytes()
     store.blobs[recovery_name] = replace(
         store.blobs[recovery_name],
@@ -2215,7 +2702,91 @@ def test_restart_rejects_self_hashed_incident_observation_override(
 
     with pytest.raises(
         MonitoringAcquisitionJobError,
-        match="incident fields do not match signed evidence",
+        match="recovery-state attestation failed verification",
+    ):
+        _commit_port(
+            store,
+            persistence_case,
+            private_key=private_key,
+        ).recover(
+            runtime_module._probe_monitoring_persistence(
+                reader=store,
+                replay_key=PERSISTENCE_REPLAY_KEY,
+            )
+        )
+
+    assert manifest_name not in store.blobs
+
+
+@pytest.mark.parametrize(
+    "binding_field",
+    (
+        "execution",
+        "replay",
+        "cleanup",
+        "revision",
+        "timing",
+        "support-inventory",
+        "support-identity",
+    ),
+)
+def test_restart_rejects_rehashed_unsigned_recovery_binding_fields(
+    persistence_case: _PersistenceCase,
+    binding_field: str,
+) -> None:
+    store = _MemoryStore(
+        container_name="monitoring-evidence",
+        fail_once_on_suffix="/manifest.json",
+    )
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    with (
+        pytest.raises(RuntimeError, match="staged persistence failure"),
+        _commit_port(
+            store,
+            persistence_case,
+            private_key=private_key,
+        ).transaction(persistence_case.prepared),
+    ):
+        pass
+    manifest_name, recovery_name, _ = runtime_module._monitoring_persistence_blob_names(
+        PERSISTENCE_REPLAY_KEY
+    )
+    state = runtime_module.MonitoringPersistenceRecoveryState.model_validate_json(
+        store.blobs[recovery_name].payload
+    )
+    if binding_field == "execution":
+        updates: dict[str, object] = {"execution_id": f"wc028-execution-{'b' * 32}"}
+    elif binding_field == "replay":
+        updates = {
+            "replay_key": DIGEST_A,
+            "replay_preimage_digest": DIGEST_A,
+            "collection_id": (f"wc024-{DIGEST_A.removeprefix('sha256:')[:12]}"),
+        }
+    elif binding_field == "cleanup":
+        updates = {"legacy_collector_rbac_cleanup_digest": DIGEST_A}
+    elif binding_field == "revision":
+        updates = {"incident_revision": 2}
+    elif binding_field == "timing":
+        updates = {
+            "trusted_as_of": state.trusted_as_of + timedelta(seconds=1),
+            "expires_at": state.expires_at + timedelta(seconds=1),
+        }
+    elif binding_field == "support-inventory":
+        updates = {"runtime_support_effective_rbac_inventory_digest": DIGEST_A}
+    else:
+        updates = {"runtime_support_identity_client_id": ("abababab-abab-abab-abab-abababababab")}
+    tampered = _rehash_recovery_state_without_resigning(state, **updates)
+    tampered_bytes = tampered.canonical_bytes()
+    store.blobs[recovery_name] = replace(
+        store.blobs[recovery_name],
+        payload=tampered_bytes,
+        size_bytes=len(tampered_bytes),
+        payload_sha256=sha256_hex(tampered_bytes),
+    )
+
+    with pytest.raises(
+        MonitoringAcquisitionJobError,
+        match="recovery-state attestation failed verification",
     ):
         _commit_port(
             store,

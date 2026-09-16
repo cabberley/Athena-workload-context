@@ -32,14 +32,19 @@ wc024-monitoring/commits/{replayKey}/recovery.json
 wc024-monitoring/commits/{replayKey}/manifest.json
 ```
 
-Every start reads and validates the deterministic manifest name before monitoring-source or Key
-Vault I/O. A valid manifest recovers the committed handoff and exact correlation request directly.
-If only the immutable recovery state or evidence exists, the runtime verifies the signed acquisition
-receipt, recreates the same handoff and correlation bytes, and publishes the manifest without Azure
-source reacquisition. The recovery state is written before evidence and binds the receipt-derived
-request window, incident selection, prepared bundle, execution identity, and replay key. A caller
-failure leaves no commit marker. The current contract does not execute or persist supporting change
-controls.
+Every start probes the deterministic manifest, recovery-state, and evidence names before requiring
+current runtime-support RBAC freshness. A valid manifest recovers the committed handoff and exact
+correlation request directly. A collector-signed recovery state can recreate missing evidence and
+finish the same handoff, request, and manifest without Azure source reacquisition.
+
+Recovery state v2 is signed with the exact collector key before the first durable write. Its
+signature binds the complete replay-v3 execution, cleanup, incident revision, request window,
+prepared bundle, and the originally accepted support-inventory digest and lifetime. Rehashing any
+field without a new valid collector signature is rejected. Evidence without that signed state is
+rejected until PR #99 exposes the same complete recovery binding in the signed acquisition receipt.
+Current support-RBAC freshness is required only when no durable recovery artifact exists and the Job
+will perform new support-key, identity, or monitoring-source I/O. A caller failure leaves no commit
+marker. The current contract does not execute or persist supporting change controls.
 
 ## Runtime configuration
 
@@ -59,7 +64,9 @@ and approved change scope. It also binds:
   inventory;
 - the monitoring-intent and collector signing-key trust anchors; and
 - the active-context and acquisition-authority digests; and
-- a one-execution ID plus deterministic persistence replay key.
+- a non-zero one-execution ID plus deterministic persistence replay key. Refreshing the current
+  support inventory does not change the stable recovery path; the collector-signed recovery state
+  retains the original inventory digest and execution-time validity window.
 
 The runtime delegates managed-identity acquisition to the hardened production adapter. That
 adapter verifies the collector identity through the Athena-owned proof audience, creates every
@@ -74,8 +81,9 @@ IP Flow calls and no IP Flow RBAC.
 > **Provisional stack boundary:** the published collector contract v8 currently required by this
 > draft still encodes `Storage Blob Data Contributor` and `blobs/write`. It cannot truthfully
 > describe the narrow role below after cleanup. Do not deploy this draft until PR #99 publishes the
-> corresponding collector-contract and effective-RBAC revision and this branch is restacked on that
-> head.
+> corresponding conditioned read-plus-add collector contract, bootstrap, and effective-RBAC
+> revision and this branch is restacked on that head. Runtime startup also fails closed explicitly
+> on the currently published contract schema.
 
 ## Upgrade cleanup gate
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import os
 import re
 from collections.abc import Callable, Iterator
@@ -13,6 +14,9 @@ from urllib.parse import urlsplit
 
 from azure.core.exceptions import AzureError
 from azure.servicebus.exceptions import ServiceBusError
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from athena_context.artifacts import (
@@ -121,12 +125,15 @@ _RESOURCE_LOG_ALLOWED_OPERATIONS = (
 _RESOURCE_HEALTH_ALLOWED_OPERATIONS = (
     "Microsoft.ResourceHealth/AvailabilityStatuses/current/read",
 )
+_BLOCKED_PR99_CONTRACT_SCHEMA_VERSION = "athena.wc028MonitoringCollectorContract.v8"
 _ACR_PULL_ROLE_DEFINITION_GUID = "7f951dda-4ed3-4680-a7ca-43fe172d538d"
 _ACR_PULL_ROLE_NAME = "AcrPull"
 _ACR_PULL_ACTION = "Microsoft.ContainerRegistry/registries/pull/read"
 _MONITORING_INTENT_KEY_READER_ROLE_NAME = "Athena WC028 Monitoring Intent Key Reader"
 _MONITORING_INTENT_KEY_READ_DATA_ACTION = "Microsoft.KeyVault/vaults/keys/read"
 _ZERO_DIGEST = f"sha256:{'0' * 64}"
+_NIL_GUID = "00000000-0000-0000-0000-000000000000"
+_ZERO_EXECUTION_ID = f"wc028-execution-{'0' * 32}"
 _EXTERNAL_AZURE_FAILURES = (AzureError, ServiceBusError, OSError, TimeoutError)
 
 
@@ -146,12 +153,36 @@ def _canonical_resource_id(value: str) -> str:
     return value.casefold().rstrip("/")
 
 
+def _require_nonzero_guid(value: str, *, label: str) -> str:
+    normalized = value.casefold()
+    if _GUID_PATTERN.fullmatch(normalized) is None or normalized == _NIL_GUID:
+        raise ValueError(f"{label} must be one non-nil GUID")
+    return normalized
+
+
+def _require_nonzero_digest(value: str, *, label: str) -> str:
+    if re.fullmatch(r"sha256:[a-f0-9]{64}", value) is None or value == _ZERO_DIGEST:
+        raise ValueError(f"{label} must be one non-zero SHA-256 digest")
+    return value
+
+
+def _contains_forbidden_startup_sentinel(value: object) -> bool:
+    if isinstance(value, str):
+        return value.casefold() in {_NIL_GUID, _ZERO_DIGEST, _ZERO_EXECUTION_ID}
+    if isinstance(value, dict):
+        return any(_contains_forbidden_startup_sentinel(item) for item in value.values())
+    if isinstance(value, list | tuple):
+        return any(_contains_forbidden_startup_sentinel(item) for item in value)
+    return False
+
+
 def _subscription_id_from_resource_id(value: str) -> str:
     segments = _canonical_resource_id(value).strip("/").split("/")
     if (
         len(segments) < 2
         or segments[0] != "subscriptions"
         or _GUID_PATTERN.fullmatch(segments[1]) is None
+        or segments[1] == _NIL_GUID
     ):
         raise ValueError("runtime resource ID must identify one Azure subscription")
     return segments[1]
@@ -223,6 +254,10 @@ class MonitoringRuntimeTrustedKey(_StrictRuntimeModel):
     def validate_key(self) -> MonitoringRuntimeTrustedKey:
         anchor = self.anchor
         del anchor
+        _require_nonzero_digest(
+            self.public_key_fingerprint,
+            label="trusted public-key fingerprint",
+        )
         for value in (self.activated_at, self.expires_at):
             if value is not None and (
                 value.utcoffset() != UTC.utcoffset(value) or value.microsecond % 1000
@@ -356,7 +391,10 @@ class MonitoringRuntimeSupportEffectiveRbacInventory(_StrictRuntimeModel):
     )
     @classmethod
     def normalize_guid(cls, value: str) -> str:
-        return value.casefold()
+        return _require_nonzero_guid(
+            value,
+            label="runtime-support RBAC identity field",
+        )
 
     @field_validator("support_identity_resource_id", "attestor_identity_resource_id")
     @classmethod
@@ -400,7 +438,9 @@ class MonitoringRuntimeSupportEffectiveRbacInventory(_StrictRuntimeModel):
         if (
             normalized != tuple(sorted(normalized))
             or len(normalized) != len(set(normalized))
-            or any(_GUID_PATTERN.fullmatch(item) is None for item in normalized)
+            or any(
+                _GUID_PATTERN.fullmatch(item) is None or item == _NIL_GUID for item in normalized
+            )
         ):
             raise ValueError("runtime-support security-group IDs must be sorted UUIDs")
         return normalized
@@ -462,7 +502,10 @@ class MonitoringRuntimeSupportEffectiveRbacInventory(_StrictRuntimeModel):
         if (
             values != tuple(sorted(values))
             or len(values) != len(set(values))
-            or any(re.fullmatch(r"sha256:[a-f0-9]{64}", item) is None for item in values)
+            or any(
+                re.fullmatch(r"sha256:[a-f0-9]{64}", item) is None or item == _ZERO_DIGEST
+                for item in values
+            )
         ):
             raise ValueError("runtime-support raw page digests must be sorted and unique")
         return values
@@ -470,6 +513,91 @@ class MonitoringRuntimeSupportEffectiveRbacInventory(_StrictRuntimeModel):
     @model_validator(mode="after")
     def validate_inventory(self) -> MonitoringRuntimeSupportEffectiveRbacInventory:
         principal_evidence = self.support_principal_evidence
+        if self.collection_run_id == f"runtime-support-rbac-{'0' * 32}":
+            raise ValueError("runtime-support RBAC collection run ID must be non-zero")
+        if (
+            len(
+                {
+                    self.support_client_id,
+                    self.support_principal_id,
+                    self.attestor_client_id,
+                    self.attestor_principal_id,
+                }
+            )
+            != 4
+        ):
+            raise ValueError(
+                "runtime-support and attestor client/principal identities must be distinct"
+            )
+        nested_guid_values = (
+            *(
+                value
+                for item in self.support_grants
+                for value in (
+                    item.assigned_principal_id,
+                    item.effective_principal_id,
+                    item.role_definition_id.rsplit("/", maxsplit=1)[-1],
+                )
+            ),
+            *(
+                value
+                for item in self.role_definitions
+                for value in (item.role_definition_id.rsplit("/", maxsplit=1)[-1],)
+            ),
+            *(
+                value
+                for item in self.deny_assignments
+                for value in (
+                    item.deny_assignment_id.rsplit("/", maxsplit=1)[-1],
+                    *item.principal_ids,
+                    *item.excluded_principal_ids,
+                )
+            ),
+            *(
+                value
+                for item in self.active_pim_schedule_instances
+                for value in (
+                    item.schedule_instance_id.rsplit("/", maxsplit=1)[-1],
+                    item.principal_id,
+                    item.role_definition_id.rsplit("/", maxsplit=1)[-1],
+                )
+            ),
+        )
+        if any(value.casefold() == _NIL_GUID for value in nested_guid_values):
+            raise ValueError("runtime-support RBAC evidence contains a nil GUID")
+        digest_values = (
+            self.first_raw_snapshot_digest,
+            self.second_raw_snapshot_digest,
+            self.source_manifest_digest,
+            self.inventory_digest,
+            self.source_reference.content_digest,
+            principal_evidence.evidence_digest,
+            *principal_evidence.first_read_target_digests,
+            *principal_evidence.second_read_target_digests,
+            *principal_evidence.role_assignment_raw_page_digests,
+            *principal_evidence.transitive_group_raw_page_digests,
+            *self.role_definition_raw_page_digests,
+            *self.deny_assignment_raw_page_digests,
+            *self.pim_schedule_instance_raw_page_digests,
+            *(item.grant_digest for item in self.support_grants),
+            *(
+                digest
+                for item in self.role_definitions
+                for digest in (item.raw_definition_digest, item.definition_digest)
+            ),
+            *(
+                digest
+                for item in self.deny_assignments
+                for digest in (item.raw_assignment_digest, item.deny_assignment_digest)
+            ),
+            *(
+                digest
+                for item in self.active_pim_schedule_instances
+                for digest in (item.raw_instance_digest, item.instance_digest)
+            ),
+        )
+        if any(value == _ZERO_DIGEST for value in digest_values):
+            raise ValueError("runtime-support RBAC evidence digests must be non-zero")
         raw_snapshot_payload = {
             "supportPrincipalEvidenceDigest": principal_evidence.evidence_digest,
             "roleDefinitionRawPageDigests": list(self.role_definition_raw_page_digests),
@@ -603,6 +731,31 @@ class Wc028MonitoringAcquisitionJobConfiguration(_StrictRuntimeModel):
     )
 
     @field_validator(
+        "managed_identity_client_id",
+        "runtime_support_identity_client_id",
+        "runtime_support_identity_principal_id",
+    )
+    @classmethod
+    def validate_nonzero_identity_guid(cls, value: str) -> str:
+        return _require_nonzero_guid(value, label="runtime identity")
+
+    @field_validator(
+        "expected_active_context_authority_digest",
+        "expected_acquisition_authority_digest",
+        "persistence_replay_key",
+    )
+    @classmethod
+    def validate_nonzero_runtime_digest(cls, value: str) -> str:
+        return _require_nonzero_digest(value, label="runtime authority or replay digest")
+
+    @field_validator("execution_id")
+    @classmethod
+    def validate_execution_id(cls, value: str) -> str:
+        if value == _ZERO_EXECUTION_ID:
+            raise ValueError("executionId must be non-zero")
+        return value
+
+    @field_validator(
         "collector_identity_resource_id",
         "athena_context_identity_resource_id",
         "runtime_support_identity_resource_id",
@@ -648,16 +801,19 @@ class Wc028MonitoringAcquisitionJobConfiguration(_StrictRuntimeModel):
     @classmethod
     def validate_role_definition_id(cls, value: str) -> str:
         normalized = _canonical_resource_id(value)
-        if _ROLE_DEFINITION_ID_PATTERN.fullmatch(normalized) is None:
+        if _ROLE_DEFINITION_ID_PATTERN.fullmatch(normalized) is None or normalized.endswith(
+            f"/{_NIL_GUID}"
+        ):
             raise ValueError("runtime-support role definition ID is invalid")
         return normalized
 
     @field_validator("legacy_collector_rbac_cleanup_digest")
     @classmethod
     def reject_empty_cleanup_evidence(cls, value: str) -> str:
-        if value == _ZERO_DIGEST:
-            raise ValueError("legacyCollectorRbacCleanupDigest must be non-zero cleanup evidence")
-        return value
+        return _require_nonzero_digest(
+            value,
+            label="legacyCollectorRbacCleanupDigest cleanup evidence",
+        )
 
     @field_validator("evidence_blob_endpoint")
     @classmethod
@@ -679,6 +835,21 @@ class Wc028MonitoringAcquisitionJobConfiguration(_StrictRuntimeModel):
 
     @model_validator(mode="after")
     def validate_boundary(self) -> Wc028MonitoringAcquisitionJobConfiguration:
+        if any(
+            _contains_forbidden_startup_sentinel(payload)
+            for payload in (
+                self.monitoring_intent,
+                self.monitoring_intent_reference,
+                self.monitoring_intent_attestation,
+                self.context_binding,
+                self.acquisition_authority,
+                self.monitoring_collector_contract,
+                self.approved_change_scope,
+            )
+        ):
+            raise ValueError(
+                "WC-028 startup models contain a nil identity or zero evidence sentinel"
+            )
         if (
             len(
                 {
@@ -760,6 +931,37 @@ class Wc028MonitoringAcquisitionJobConfiguration(_StrictRuntimeModel):
         effective_rbac_inventory = contract.get("effectiveRbacInventory")
         if not isinstance(effective_rbac_inventory, dict):
             raise ValueError("collector contract omitted measured effective RBAC inventory")
+        for value, label in (
+            (self.monitoring_intent.get("intentDigest"), "monitoring intent digest"),
+            (
+                self.monitoring_intent_reference.get("referenceDigest"),
+                "monitoring intent reference digest",
+            ),
+            (self.context_binding.get("bindingDigest"), "context binding digest"),
+            (
+                effective_rbac_inventory.get("inventoryDigest"),
+                "collector effective RBAC inventory digest",
+            ),
+            (
+                effective_rbac_inventory.get("sourceManifestDigest"),
+                "collector effective RBAC source manifest digest",
+            ),
+        ):
+            if not isinstance(value, str):
+                raise ValueError(f"{label} is required")
+            _require_nonzero_digest(value, label=label)
+        collector_principal_id = _require_nonzero_guid(
+            collector_principal_id,
+            label="collector principal",
+        )
+        collector_tenant_id = _require_nonzero_guid(
+            collector_tenant_id,
+            label="collector tenant",
+        )
+        context_principal_id = _require_nonzero_guid(
+            context_principal_id,
+            label="Athena context principal",
+        )
         signal_read_scope_ids = _configuration_resource_ids(contract.get("signalReadScopeIds"))
         resource_log_read_scope_ids = _configuration_resource_ids(
             contract.get("resourceLogReadScopeIds")
@@ -1010,12 +1212,6 @@ class Wc028MonitoringAcquisitionJobConfiguration(_StrictRuntimeModel):
                 "contextBindingDigest": context_binding_digest,
                 "incidentRevision": self.incident_revision,
                 "legacyCollectorRbacCleanupDigest": (self.legacy_collector_rbac_cleanup_digest),
-                "runtimeSupportEffectiveRbacInventoryDigest": (
-                    self.runtime_support_effective_rbac_inventory.inventory_digest
-                ),
-                "runtimeSupportEffectiveRbacSourceManifestDigest": (
-                    self.runtime_support_effective_rbac_inventory.source_manifest_digest
-                ),
                 "trustDelaySeconds": self.trust_delay_seconds,
                 "requestLifetimeSeconds": self.request_lifetime_seconds,
             }
@@ -1027,19 +1223,19 @@ class Wc028MonitoringAcquisitionJobConfiguration(_StrictRuntimeModel):
             or self.persistence_replay_key != expected_replay_key
         ):
             raise ValueError("persistenceReplayKey does not bind the reviewed execution")
-        if (
-            _GUID_PATTERN.fullmatch(collector_principal_id) is None
-            or _GUID_PATTERN.fullmatch(collector_tenant_id) is None
-            or _GUID_PATTERN.fullmatch(context_principal_id) is None
-            or collector_principal_id == context_principal_id
-            or self.runtime_support_identity_client_id.casefold()
-            == self.managed_identity_client_id.casefold()
-            or self.runtime_support_identity_principal_id
-            in {collector_principal_id, context_principal_id}
-        ):
+        identity_guids = {
+            self.managed_identity_client_id.casefold(),
+            collector_principal_id,
+            context_principal_id,
+            self.runtime_support_identity_client_id.casefold(),
+            self.runtime_support_identity_principal_id,
+            self.runtime_support_effective_rbac_inventory.attestor_client_id,
+            self.runtime_support_effective_rbac_inventory.attestor_principal_id,
+        }
+        if len(identity_guids) != 7:
             raise ValueError(
-                "collector, support, and context client and principal identities "
-                "must be valid and separate"
+                "collector, support, context, and attestor client/principal identities "
+                "must be non-nil and pairwise separate"
             )
         _validate_runtime_support_effective_rbac(
             configuration=self,
@@ -1203,6 +1399,16 @@ def _validate_runtime_support_effective_rbac(
             inventory.support_principal_id,
             collector_principal_id,
             context_principal_id,
+            configuration.managed_identity_client_id.casefold(),
+            configuration.runtime_support_identity_client_id.casefold(),
+        }
+        or inventory.attestor_client_id
+        in {
+            inventory.support_client_id,
+            inventory.support_principal_id,
+            collector_principal_id,
+            context_principal_id,
+            configuration.managed_identity_client_id.casefold(),
         }
         or inventory.attestor_identity_resource_id
         in {
@@ -1434,11 +1640,24 @@ class RecoveredMonitoringAcquisitionJobOutcome:
     correlation_request: CorrelationRequest
 
 
+def _monitoring_recovery_state_preimage(
+    recovery_state_payload: dict[str, object],
+) -> dict[str, object]:
+    return {
+        "schemaVersion": "athena.wc028MonitoringPersistenceRecoveryBinding.v1",
+        "recoveryState": recovery_state_payload,
+    }
+
+
 class MonitoringPersistenceRecoveryState(_StrictRuntimeModel):
-    schema_version: Literal["athena.wc028MonitoringPersistenceRecoveryState.v1"] = Field(
+    schema_version: Literal["athena.wc028MonitoringPersistenceRecoveryState.v2"] = Field(
         alias="schemaVersion"
     )
     replay_key: str = Field(alias="replayKey", pattern=r"^sha256:[a-f0-9]{64}$")
+    replay_preimage_digest: str = Field(
+        alias="replayPreimageDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
     execution_id: str = Field(
         alias="executionId",
         pattern=r"^wc028-execution-[a-f0-9]{32}$",
@@ -1506,13 +1725,148 @@ class MonitoringPersistenceRecoveryState(_StrictRuntimeModel):
     current_health_state: Literal["degraded", "unhealthy", "unavailable"] = Field(
         alias="currentHealthState"
     )
+    runtime_support_identity_resource_id: str = Field(alias="runtimeSupportIdentityResourceId")
+    runtime_support_identity_client_id: str = Field(
+        alias="runtimeSupportIdentityClientId",
+        pattern=_GUID_PATTERN.pattern,
+    )
+    runtime_support_identity_principal_id: str = Field(
+        alias="runtimeSupportIdentityPrincipalId",
+        pattern=_GUID_PATTERN.pattern,
+    )
+    runtime_support_attestor_identity_resource_id: str = Field(
+        alias="runtimeSupportAttestorIdentityResourceId"
+    )
+    runtime_support_attestor_client_id: str = Field(
+        alias="runtimeSupportAttestorClientId",
+        pattern=_GUID_PATTERN.pattern,
+    )
+    runtime_support_attestor_principal_id: str = Field(
+        alias="runtimeSupportAttestorPrincipalId",
+        pattern=_GUID_PATTERN.pattern,
+    )
+    runtime_support_attestor_tenant_id: str = Field(
+        alias="runtimeSupportAttestorTenantId",
+        pattern=_GUID_PATTERN.pattern,
+    )
+    runtime_support_effective_rbac_inventory_digest: str = Field(
+        alias="runtimeSupportEffectiveRbacInventoryDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    runtime_support_effective_rbac_source_manifest_digest: str = Field(
+        alias="runtimeSupportEffectiveRbacSourceManifestDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    runtime_support_effective_rbac_collected_at: datetime = Field(
+        alias="runtimeSupportEffectiveRbacCollectedAt"
+    )
+    runtime_support_effective_rbac_expires_at: datetime = Field(
+        alias="runtimeSupportEffectiveRbacExpiresAt"
+    )
+    registry_resource_id: str = Field(alias="registryResourceId")
+    runtime_support_acr_pull_role_definition_id: str = Field(
+        alias="runtimeSupportAcrPullRoleDefinitionId"
+    )
+    monitoring_intent_signing_key_resource_id: str = Field(
+        alias="monitoringIntentSigningKeyResourceId"
+    )
+    runtime_support_monitoring_intent_key_reader_role_definition_id: str = Field(
+        alias="runtimeSupportMonitoringIntentKeyReaderRoleDefinitionId"
+    )
     state_digest: str = Field(alias="stateDigest", pattern=r"^sha256:[a-f0-9]{64}$")
+    collector_attestation: MonitoringEvidenceAttestation = Field(alias="collectorAttestation")
 
-    @field_validator("issued_at", "trusted_as_of", "expires_at")
+    @field_validator(
+        "issued_at",
+        "trusted_as_of",
+        "expires_at",
+        "runtime_support_effective_rbac_collected_at",
+        "runtime_support_effective_rbac_expires_at",
+    )
     @classmethod
     def validate_correlation_time(cls, value: datetime) -> datetime:
         if value.utcoffset() != UTC.utcoffset(value) or value.microsecond % 1000:
             raise ValueError("recovery correlation times must use millisecond UTC")
+        return value
+
+    @field_validator(
+        "runtime_support_identity_resource_id",
+        "runtime_support_attestor_identity_resource_id",
+    )
+    @classmethod
+    def validate_recovery_identity_resource_id(cls, value: str) -> str:
+        normalized = _canonical_resource_id(value)
+        if _IDENTITY_PATTERN.fullmatch(normalized) is None:
+            raise ValueError("recovery identity must be one user-assigned managed identity")
+        _subscription_id_from_resource_id(normalized)
+        return normalized
+
+    @field_validator(
+        "runtime_support_identity_client_id",
+        "runtime_support_identity_principal_id",
+        "runtime_support_attestor_client_id",
+        "runtime_support_attestor_principal_id",
+        "runtime_support_attestor_tenant_id",
+    )
+    @classmethod
+    def validate_recovery_identity_guid(cls, value: str) -> str:
+        return _require_nonzero_guid(value, label="recovery identity")
+
+    @field_validator("registry_resource_id")
+    @classmethod
+    def validate_recovery_registry_resource_id(cls, value: str) -> str:
+        normalized = _canonical_resource_id(value)
+        if _REGISTRY_ID_PATTERN.fullmatch(normalized) is None:
+            raise ValueError("recovery registry resource ID is invalid")
+        _subscription_id_from_resource_id(normalized)
+        return normalized
+
+    @field_validator("monitoring_intent_signing_key_resource_id")
+    @classmethod
+    def validate_recovery_key_resource_id(cls, value: str) -> str:
+        normalized = _canonical_resource_id(value)
+        if _KEY_RESOURCE_ID_PATTERN.fullmatch(normalized) is None:
+            raise ValueError("recovery monitoring-intent key resource ID is invalid")
+        _subscription_id_from_resource_id(normalized)
+        return normalized
+
+    @field_validator(
+        "runtime_support_acr_pull_role_definition_id",
+        "runtime_support_monitoring_intent_key_reader_role_definition_id",
+    )
+    @classmethod
+    def validate_recovery_role_definition_id(cls, value: str) -> str:
+        normalized = _canonical_resource_id(value)
+        if _ROLE_DEFINITION_ID_PATTERN.fullmatch(normalized) is None or normalized.endswith(
+            f"/{_NIL_GUID}"
+        ):
+            raise ValueError("recovery runtime-support role definition ID is invalid")
+        return normalized
+
+    @field_validator(
+        "replay_key",
+        "replay_preimage_digest",
+        "acquisition_authority_digest",
+        "legacy_collector_rbac_cleanup_digest",
+        "prepared_digest",
+        "intent_digest",
+        "context_binding_digest",
+        "collector_contract_digest",
+        "monitoring_bundle_digest",
+        "acquisition_receipt_digest",
+        "runtime_support_effective_rbac_inventory_digest",
+        "runtime_support_effective_rbac_source_manifest_digest",
+        "state_digest",
+    )
+    @classmethod
+    def validate_recovery_digest(cls, value: str) -> str:
+        return _require_nonzero_digest(value, label="recovery binding digest")
+
+    @field_validator("execution_id")
+    @classmethod
+    def validate_recovery_execution_id(cls, value: str) -> str:
+        if value == _ZERO_EXECUTION_ID:
+            raise ValueError("recovery executionId must be non-zero")
         return value
 
     @field_validator(
@@ -1525,16 +1879,37 @@ class MonitoringPersistenceRecoveryState(_StrictRuntimeModel):
             raise ValueError("recovery incident IDs must be sorted and unique")
         return values
 
-    @field_validator("legacy_collector_rbac_cleanup_digest")
-    @classmethod
-    def validate_cleanup_digest(cls, value: str) -> str:
-        if value == _ZERO_DIGEST:
-            raise ValueError("recovery state cannot bind empty cleanup evidence")
-        return value
-
     @model_validator(mode="after")
     def validate_state(self) -> MonitoringPersistenceRecoveryState:
         receipt = self.monitoring_bundle.acquisition_receipt
+        if receipt is None:
+            raise ValueError("recovery state requires a signed acquisition receipt")
+        resource_identities = {
+            self.runtime_support_identity_resource_id,
+            self.runtime_support_attestor_identity_resource_id,
+        }
+        principal_identities = {
+            self.runtime_support_identity_client_id,
+            self.runtime_support_identity_principal_id,
+            self.runtime_support_attestor_client_id,
+            self.runtime_support_attestor_principal_id,
+        }
+        subscription_ids = {
+            _subscription_id_from_resource_id(item)
+            for item in (
+                *resource_identities,
+                self.registry_resource_id,
+                self.monitoring_intent_signing_key_resource_id,
+            )
+        }
+        if (
+            len(resource_identities) != 2
+            or len(principal_identities) != 4
+            or len(subscription_ids) != 1
+        ):
+            raise ValueError(
+                "recovery support and attestor identity tuples overlap or cross subscriptions"
+            )
         replay_payload = {
             "intentId": self.intent_id,
             "intentDigest": self.intent_digest,
@@ -1544,8 +1919,8 @@ class MonitoringPersistenceRecoveryState(_StrictRuntimeModel):
             "acquisitionReceiptDigest": self.acquisition_receipt_digest,
         }
         if (
-            receipt is None
-            or self.collection_id != _monitoring_persistence_collection_id(self.replay_key)
+            self.collection_id != _monitoring_persistence_collection_id(self.replay_key)
+            or self.replay_preimage_digest != self.replay_key
             or self.monitoring_intent_reference.intent_id != self.intent_id
             or self.monitoring_intent_reference.intent_digest != self.intent_digest
             or self.monitoring_bundle.monitoring_contract_digest != self.collector_contract_digest
@@ -1557,6 +1932,21 @@ class MonitoringPersistenceRecoveryState(_StrictRuntimeModel):
             or receipt.collector_contract_digest != self.collector_contract_digest
             or receipt.acquisition_authority_digest != self.acquisition_authority_digest
             or receipt.execution_started_at != self.issued_at
+            or not self.runtime_support_effective_rbac_collected_at
+            <= receipt.execution_started_at
+            <= receipt.execution_completed_at
+            < self.runtime_support_effective_rbac_expires_at
+            or self.runtime_support_identity_resource_id
+            == self.runtime_support_attestor_identity_resource_id
+            or len(
+                {
+                    self.runtime_support_identity_client_id,
+                    self.runtime_support_identity_principal_id,
+                    self.runtime_support_attestor_client_id,
+                    self.runtime_support_attestor_principal_id,
+                }
+            )
+            != 4
             or not self.issued_at <= self.trusted_as_of <= self.expires_at
             or (self.expires_at - self.issued_at).total_seconds() > 900
             or self.prepared_digest != compute_artifact_digest(replay_payload)
@@ -1567,11 +1957,22 @@ class MonitoringPersistenceRecoveryState(_StrictRuntimeModel):
                 mode="json",
                 by_alias=True,
                 exclude_none=True,
-                exclude={"state_digest"},
+                exclude={"state_digest", "collector_attestation"},
             )
         )
         if self.state_digest != expected_state_digest:
             raise ValueError("stateDigest does not bind the persistence recovery state")
+        signed_payload = self.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=True,
+            exclude={"collector_attestation"},
+        )
+        expected_signed_preimage_digest = compute_artifact_digest(
+            _monitoring_recovery_state_preimage(signed_payload)
+        )
+        if self.collector_attestation.signed_preimage_digest != expected_signed_preimage_digest:
+            raise ValueError("collector attestation does not bind the complete recovery state")
         return self
 
     def canonical_bytes(self) -> bytes:
@@ -1597,7 +1998,7 @@ class MonitoringPersistenceRecoveryState(_StrictRuntimeModel):
 
 
 class MonitoringPersistenceCommitManifest(_StrictRuntimeModel):
-    schema_version: Literal["athena.wc028MonitoringPersistenceCommit.v2"] = Field(
+    schema_version: Literal["athena.wc028MonitoringPersistenceCommit.v3"] = Field(
         alias="schemaVersion"
     )
     replay_key: str = Field(alias="replayKey", pattern=r"^sha256:[a-f0-9]{64}$")
@@ -1640,6 +2041,28 @@ class MonitoringPersistenceCommitManifest(_StrictRuntimeModel):
     )
     manifest_digest: str = Field(alias="manifestDigest", pattern=r"^sha256:[a-f0-9]{64}$")
 
+    @field_validator(
+        "replay_key",
+        "prepared_digest",
+        "intent_digest",
+        "context_binding_digest",
+        "collector_contract_digest",
+        "monitoring_bundle_digest",
+        "acquisition_receipt_digest",
+        "correlation_request_digest",
+        "manifest_digest",
+    )
+    @classmethod
+    def validate_manifest_digest(cls, value: str) -> str:
+        return _require_nonzero_digest(value, label="persistence manifest digest")
+
+    @field_validator("execution_id")
+    @classmethod
+    def validate_manifest_execution_id(cls, value: str) -> str:
+        if value == _ZERO_EXECUTION_ID:
+            raise ValueError("persistence manifest executionId must be non-zero")
+        return value
+
     @model_validator(mode="after")
     def validate_manifest(self) -> MonitoringPersistenceCommitManifest:
         if (
@@ -1650,6 +2073,7 @@ class MonitoringPersistenceCommitManifest(_StrictRuntimeModel):
             or self.monitoring_handoff.collector_contract_digest != self.collector_contract_digest
             or self.monitoring_handoff.evidence.content_digest != self.monitoring_bundle_digest
             or self.monitoring_handoff.acquisition_receipt_digest != self.acquisition_receipt_digest
+            or self.recovery_state.content_digest == _ZERO_DIGEST
         ):
             raise ValueError("monitoring handoff does not bind the persistence commit")
         prepared_payload = {
@@ -1969,6 +2393,16 @@ def _validate_acquisition_authority_preflight(
         )
 
 
+def _require_pr99_conditioned_blob_contract(
+    collector_contract: MonitoringCollectorContract,
+) -> None:
+    if collector_contract.schema_version == _BLOCKED_PR99_CONTRACT_SCHEMA_VERSION:
+        raise MonitoringAcquisitionJobError(
+            "WC-028 deployment remains blocked until PR #99 publishes the conditioned "
+            "known-name Blob read and add/action collector contract and bootstrap"
+        )
+
+
 def _build_acquisition_receipt_verifier(
     *,
     acquisition_authority: MonitoringAcquisitionAuthority,
@@ -2157,9 +2591,11 @@ class MonitoringEvidenceCommitPort:
         trusted_as_of = issued_at + timedelta(seconds=self._configuration.trust_delay_seconds)
         expires_at = issued_at + timedelta(seconds=self._configuration.request_lifetime_seconds)
         replay_payload = _monitoring_persistence_replay_payload(prepared)
+        support_inventory = self._configuration.runtime_support_effective_rbac_inventory
         payload: dict[str, object] = {
-            "schemaVersion": "athena.wc028MonitoringPersistenceRecoveryState.v1",
+            "schemaVersion": "athena.wc028MonitoringPersistenceRecoveryState.v2",
             "replayKey": self._persistence_replay_key,
+            "replayPreimageDigest": self._persistence_replay_key,
             "executionId": self._configuration.execution_id,
             "acquisitionAuthorityDigest": (
                 self._configuration.expected_acquisition_authority_digest
@@ -2190,12 +2626,64 @@ class MonitoringEvidenceCommitPort:
             "previousHealthObservationId": prepared.previous_health_observation_id,
             "currentHealthObservationIds": list(prepared.current_health_observation_ids),
             "currentHealthState": prepared.current_health_state,
+            "runtimeSupportIdentityResourceId": (
+                self._configuration.runtime_support_identity_resource_id
+            ),
+            "runtimeSupportIdentityClientId": (
+                self._configuration.runtime_support_identity_client_id
+            ),
+            "runtimeSupportIdentityPrincipalId": (
+                self._configuration.runtime_support_identity_principal_id
+            ),
+            "runtimeSupportAttestorIdentityResourceId": (
+                support_inventory.attestor_identity_resource_id
+            ),
+            "runtimeSupportAttestorClientId": support_inventory.attestor_client_id,
+            "runtimeSupportAttestorPrincipalId": support_inventory.attestor_principal_id,
+            "runtimeSupportAttestorTenantId": support_inventory.attestor_tenant_id,
+            "runtimeSupportEffectiveRbacInventoryDigest": support_inventory.inventory_digest,
+            "runtimeSupportEffectiveRbacSourceManifestDigest": (
+                support_inventory.source_manifest_digest
+            ),
+            "runtimeSupportEffectiveRbacCollectedAt": support_inventory.collected_at,
+            "runtimeSupportEffectiveRbacExpiresAt": support_inventory.expires_at,
+            "registryResourceId": self._configuration.registry_resource_id,
+            "runtimeSupportAcrPullRoleDefinitionId": (
+                self._configuration.runtime_support_acr_pull_role_definition_id
+            ),
+            "monitoringIntentSigningKeyResourceId": (
+                self._configuration.monitoring_intent_signing_key_resource_id
+            ),
+            "runtimeSupportMonitoringIntentKeyReaderRoleDefinitionId": (
+                self._configuration.runtime_support_monitoring_intent_key_reader_role_definition_id
+            ),
         }
+        state_digest = compute_artifact_digest(payload)
+        signed_payload = {
+            **payload,
+            "stateDigest": state_digest,
+        }
+        preimage = _monitoring_recovery_state_preimage(signed_payload)
+        try:
+            signature = self._signer.sign_preimage(canonicalize_json(preimage).encode("utf-8"))
+        except (TypeError, ValueError, *_EXTERNAL_AZURE_FAILURES) as exc:
+            raise MonitoringAcquisitionJobError(
+                "collector recovery-state signing failed before persistence"
+            ) from exc
         return MonitoringPersistenceRecoveryState.model_validate_json(
             canonicalize_json(
                 {
-                    **payload,
-                    "stateDigest": compute_artifact_digest(payload),
+                    **signed_payload,
+                    "collectorAttestation": MonitoringEvidenceAttestation(
+                        signatureAlgorithm="RS256",
+                        trustAnchorRef=self._trusted_key.key_vault_key_id,
+                        signedPreimageDigest=compute_artifact_digest(preimage),
+                        signature=signature,
+                    ).model_dump(
+                        mode="json",
+                        by_alias=True,
+                        exclude_none=True,
+                    ),
                 }
             )
         )
@@ -2207,8 +2695,14 @@ class MonitoringEvidenceCommitPort:
         expected_collector_contract_digest = (
             self._reviewed_collector_contract.compute_artifact_digest_value()
         )
+        receipt = state.monitoring_bundle.acquisition_receipt
+        if receipt is None:
+            raise MonitoringAcquisitionJobError(
+                "recovered monitoring evidence omitted its signed acquisition receipt"
+            )
         if (
             state.replay_key != self._persistence_replay_key
+            or state.replay_preimage_digest != self._configuration.persistence_replay_key
             or state.execution_id != self._configuration.execution_id
             or state.acquisition_authority_digest
             != self._configuration.expected_acquisition_authority_digest
@@ -2224,9 +2718,43 @@ class MonitoringEvidenceCommitPort:
             or state.context_binding_digest != self._context_binding.binding_digest
             or state.collector_contract_digest != expected_collector_contract_digest
             or state.monitoring_intent_reference != self._monitoring_intent_reference
+            or state.runtime_support_identity_resource_id
+            != self._configuration.runtime_support_identity_resource_id
+            or state.runtime_support_identity_client_id.casefold()
+            != self._configuration.runtime_support_identity_client_id.casefold()
+            or state.runtime_support_identity_principal_id
+            != self._configuration.runtime_support_identity_principal_id
+            or state.registry_resource_id != self._configuration.registry_resource_id
+            or state.runtime_support_acr_pull_role_definition_id
+            != self._configuration.runtime_support_acr_pull_role_definition_id
+            or state.monitoring_intent_signing_key_resource_id
+            != self._configuration.monitoring_intent_signing_key_resource_id
+            or state.runtime_support_monitoring_intent_key_reader_role_definition_id
+            != (self._configuration.runtime_support_monitoring_intent_key_reader_role_definition_id)
+            or state.runtime_support_attestor_tenant_id
+            != self._reviewed_collector_contract.collector_tenant_id
         ):
             raise MonitoringAcquisitionJobError(
                 "recovered persistence state does not match the reviewed runtime configuration"
+            )
+        resource_identities = {
+            self._configuration.collector_identity_resource_id,
+            self._configuration.athena_context_identity_resource_id,
+            state.runtime_support_identity_resource_id,
+            state.runtime_support_attestor_identity_resource_id,
+        }
+        principal_identities = {
+            self._configuration.managed_identity_client_id.casefold(),
+            cast(str, self._reviewed_collector_contract.monitoring_reader_principal_id),
+            cast(str, self._reviewed_collector_contract.athena_context_principal_id),
+            state.runtime_support_identity_client_id,
+            state.runtime_support_identity_principal_id,
+            state.runtime_support_attestor_client_id,
+            state.runtime_support_attestor_principal_id,
+        }
+        if len(resource_identities) != 4 or len(principal_identities) != 7:
+            raise MonitoringAcquisitionJobError(
+                "recovered collector, context, support, and attestor identities overlap"
             )
         persisted_prepared = state.prepared_collection()
         derived_prepared = self._prepared_from_evidence_bundle(state.monitoring_bundle)
@@ -2261,6 +2789,51 @@ class MonitoringEvidenceCommitPort:
                 "recovered monitoring evidence omitted its signed acquisition receipt"
             )
         self._verify_receipt(receipt, as_of=state.trusted_as_of)
+
+    def _verify_recovery_state_attestation(
+        self,
+        state: MonitoringPersistenceRecoveryState,
+    ) -> None:
+        attestation = state.collector_attestation
+        signed_payload = state.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=True,
+            exclude={"collector_attestation"},
+        )
+        preimage = _monitoring_recovery_state_preimage(signed_payload)
+        try:
+            record = self._key_resolver(self._trusted_key.anchor)
+            if (
+                attestation.trust_anchor_ref != self._trusted_key.key_vault_key_id
+                or attestation.signed_preimage_digest != compute_artifact_digest(preimage)
+                or record is None
+                or record.anchor != self._trusted_key.anchor
+                or not record.enabled
+                or record.activated_at > state.issued_at
+                or (record.retired_at is not None and record.retired_at <= state.trusted_as_of)
+                or (record.expires_at is not None and record.expires_at <= state.trusted_as_of)
+                or not isinstance(record.public_key, rsa.RSAPublicKey)
+            ):
+                raise ValueError("collector recovery-state attestation key is not trusted")
+            signature = base64.b64decode(attestation.signature, validate=True)
+            record.public_key.verify(
+                signature,
+                canonicalize_json(preimage).encode("utf-8"),
+                padding.PKCS1v15(),
+                hashes.SHA256(),
+            )
+        except MonitoringAcquisitionJobError:
+            raise
+        except (
+            InvalidSignature,
+            TypeError,
+            ValueError,
+            *_EXTERNAL_AZURE_FAILURES,
+        ) as exc:
+            raise MonitoringAcquisitionJobError(
+                "collector recovery-state attestation failed verification"
+            ) from exc
 
     def _build_committed(
         self,
@@ -2407,7 +2980,7 @@ class MonitoringEvidenceCommitPort:
             "acquisitionReceiptDigest": state.acquisition_receipt_digest,
         }
         payload: dict[str, object] = {
-            "schemaVersion": "athena.wc028MonitoringPersistenceCommit.v2",
+            "schemaVersion": "athena.wc028MonitoringPersistenceCommit.v3",
             "replayKey": state.replay_key,
             "executionId": state.execution_id,
             "preparedDigest": state.prepared_digest,
@@ -2478,6 +3051,7 @@ class MonitoringEvidenceCommitPort:
                 raise MonitoringAcquisitionJobError(
                     "commit manifest exists without its exact recovery state and evidence"
                 )
+            self._verify_recovery_state_attestation(state)
             self._verify_acquisition_receipt(state)
             prepared = self._validate_recovery_state_binding(state)
             self._validate_recovery_reference(
@@ -2535,25 +3109,12 @@ class MonitoringEvidenceCommitPort:
             )
 
         if state is None:
-            if evidence_bundle is None:
-                raise MonitoringAcquisitionJobError(
-                    "persistence recovery probe returned no usable immutable artifact"
-                )
-            receipt = evidence_bundle.acquisition_receipt
-            if receipt is None:
-                raise MonitoringAcquisitionJobError(
-                    "recovered monitoring evidence omitted its signed acquisition receipt"
-                )
-            self._verify_receipt(
-                receipt,
-                as_of=receipt.execution_started_at
-                + timedelta(seconds=self._configuration.trust_delay_seconds),
+            raise MonitoringAcquisitionJobError(
+                "immutable evidence exists without its collector-signed recovery binding"
             )
-            prepared = self._prepared_from_evidence_bundle(evidence_bundle)
-            state = self._build_recovery_state(prepared)
-        else:
-            self._verify_acquisition_receipt(state)
-            prepared = self._validate_recovery_state_binding(state)
+        self._verify_recovery_state_attestation(state)
+        self._verify_acquisition_receipt(state)
+        prepared = self._validate_recovery_state_binding(state)
         if probe.recovery_state_result is None:
             state_reference = self._write(
                 writer=self._monitoring_writer,
@@ -2633,7 +3194,9 @@ class MonitoringEvidenceCommitPort:
                     probe.recovery_state_result,
                     expected_blob_name=recovery_blob_name,
                 )
-                if persisted_state.prepared_collection() != prepared:
+                self._verify_recovery_state_attestation(persisted_state)
+                self._verify_acquisition_receipt(persisted_state)
+                if self._validate_recovery_state_binding(persisted_state) != prepared:
                     raise MonitoringAcquisitionJobError(
                         "partial persistence state does not match reacquired transaction"
                     )
@@ -2658,6 +3221,7 @@ class MonitoringEvidenceCommitPort:
             yield recovered.committed
             return
         state = self._build_recovery_state(prepared)
+        self._verify_recovery_state_attestation(state)
         self._verify_acquisition_receipt(state)
         self._validate_recovery_state_binding(state)
         state_reference = self._write(
@@ -2834,12 +3398,7 @@ def run_wc028_monitoring_acquisition_job(
             context_binding=context_binding,
             monitoring_intent=monitoring_intent,
         )
-        startup_as_of = _utc_now_milliseconds()
-        _validate_runtime_support_effective_rbac(
-            configuration=configuration,
-            as_of=startup_as_of,
-        )
-
+        _require_pr99_conditioned_blob_contract(collector_contract)
         monitoring_evidence_store = AzureBlobChangeEvidenceReplayStore(
             blob_endpoint=configuration.evidence_blob_endpoint,
             container_name=configuration.evidence_container_name,
@@ -2907,6 +3466,11 @@ def run_wc028_monitoring_acquisition_job(
                 )
             return recovered
 
+        startup_as_of = _utc_now_milliseconds()
+        _validate_runtime_support_effective_rbac(
+            configuration=configuration,
+            as_of=startup_as_of,
+        )
         intent_verifier = KeyVaultRsaPublicKeyVerifier(
             trusted_key_anchor=configuration.monitoring_intent_trusted_key.anchor,
             managed_identity_client_id=configuration.runtime_support_identity_client_id,

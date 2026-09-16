@@ -136,7 +136,7 @@ Use scope-correct, reviewed parameters for every root:
 | WC-024 connectivity | Subscription | Reviewed copy of `main.example.bicepparam` |
 | WC-024 foundation | Subscription | Reviewed environment parameter artifact; examples are not deployable approval |
 | WC-025 change ingestion | Subscription | New reviewed parameter artifact containing the exact image, identities, resource allowlist, containers, and versioned signing key |
-| WC-028 monitoring acquisition | Runtime resource group | Fresh execution-specific parameter artifact containing the cleanup evidence digest, current effective-RBAC inventory, configuration v2 replay key, two exact identities, and digest-pinned image |
+| WC-028 monitoring acquisition | Runtime resource group | Fresh execution-specific parameter artifact containing the cleanup evidence digest, current effective-RBAC inventory, configuration v3 replay key, exact collector/support/attestor identity tuples, and digest-pinned image |
 | WC-029 monitoring prerequisites | Subscription | `infra/wc029-monitoring-prerequisites/main.preparation.bicepparam` with both extension gates false; enabling either requires a separately reviewed immutable copy |
 
 The release cannot proceed while any non-WC-013 root lacks its reviewed immutable parameter
@@ -186,21 +186,26 @@ template. Perform these steps in order:
    conditioned known-name-read/add-only writer. Stop if the contract still requires
    `Storage Blob Data Contributor` or `blobs/write`.
 5. Produce a one-execution runtime configuration v3 whose non-zero
-   `legacyCollectorRbacCleanupDigest`, runtime-support hierarchy-complete RBAC inventory, and
-   `persistenceReplayKey` bind the cleanup evidence, execution ID, authority, intent, context,
-   incident revision, and exact support-inventory/source-manifest digests.
+   `legacyCollectorRbacCleanupDigest` and stable `persistenceReplayKey` bind the execution ID,
+   authority, intent reference, context, incident revision, and request-window policy. Current
+   support-inventory refreshes must not change that recovery path. Before its first durable write,
+   the runtime creates recovery state v2 signed by the exact collector key; that signature binds the
+   originally accepted support-inventory/source-manifest digests and execution-time validity window.
 6. Run resource-group `validate` and `what-if` for
    `infra/wc028-monitoring-acquisition/main.bicep`. The only new assignments may be ACR pull and
    monitoring-intent key read for the distinct runtime-support identity plus the conditioned
    known-name-read/add-only monitoring-evidence role for the measured collector. The collector must
    retain no built-in Blob contributor assignment.
-7. Deploy the manual Job, remeasure both identities, and verify the collector inventory still
-   exactly matches contract v8 and the runtime-support identity has only direct `AcrPull` on the
-   reviewed registry plus the exact monitoring-intent key-read role before starting the Job.
+7. Do not deploy while the runtime's explicit PR #99 conditioned-Blob contract gate remains closed.
+   After the required PR #99 restack, deploy the manual Job, remeasure both identities, and verify
+   the collector inventory matches the new contract and the runtime-support identity has only
+   direct `AcrPull` on the reviewed registry plus the exact monitoring-intent key-read role before
+   any new acquisition.
 
-The Job uses `triggerType: Manual` and `replicaRetryLimit: 0`. Never reuse a stale configuration or
-start it on a timer; create a new execution ID, cleanup binding, collector and runtime-support
-effective-RBAC inventories, and replay key for every governed execution.
+The Job uses `triggerType: Manual` and `replicaRetryLimit: 0`. Never start it on a timer. Create a
+new execution ID, cleanup binding, collector inventory, and replay key for each governed execution.
+The current runtime-support inventory may be refreshed without changing the replay key; recovery
+must use the inventory digest and lifetime already bound by the collector-signed recovery state.
 
 ## Phase 3: effective RBAC
 
