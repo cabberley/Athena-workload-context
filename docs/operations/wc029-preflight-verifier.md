@@ -106,6 +106,9 @@ Partial snapshots recursively register only paths and values that are actually p
 omitted fields remain unknown, but every present dynamic descendant and object/array kind must agree
 with later delta evidence. An empty object at `ipRules`, an indexed `ipRules[0]`, and a scalar child
 cannot be combined into incompatible representations.
+Ancestor deltas are checked against stored container kinds at every resolved depth, so a nested
+partial object cannot be replaced by an array hidden inside a broader `properties` or
+`networkAcls` value.
 
 Each canonical path is limited to 4096 characters, and one evaluation has bounded aggregate
 generated-path count and character work. Nested path accumulation and wide generated snapshots fail
@@ -174,6 +177,18 @@ complete winner. Staging and reads use binary descriptors, so Windows newline tr
 expand a physically accepted record past 64 KiB. An existing consumption name proves prior use only
 when its JSON exactly matches the expected consumption record; empty, partial, malformed, or
 conflicting finals fail as ledger corruption.
+On Windows, publication uses no-replace `MoveFileExW` with `MOVEFILE_WRITE_THROUGH`, followed by an
+fsync of the securely reopened and inode-verified final record. The final name is rolled back if
+that post-publication barrier fails, and the CLI returns a bounded malformed-input error rather than
+success. Unsupported safe publication primitives fail closed.
+A persistent, securely opened `.wc029-ledger.lock` file holds an exclusive cross-process lock around
+the complete collection-binding, deployment-binding, and consumption transaction. Its bounded JSON
+state is fsynced to name each pending record before publication and is cleared only after the
+durability barrier succeeds. A barrier failure leaves the transaction pending even if rollback also
+fails. Existing records are compared only after the state is idle, so a concurrent or later
+invocation cannot accept an uncertain final.
+Rollback opens use nonblocking and no-follow flags before regular-file and inode checks; replacing a
+published path with a FIFO, socket, or symlink cannot block the lock holder.
 
 The ledger creates one immutable deployment binding and one create-only consumption record
 for each artifact kind. It also creates an immutable collection-run binding so one
@@ -328,6 +343,8 @@ membership, assignment, deny, collection, or page evidence invalidates the artif
 Every typed Graph `transitiveMemberOf` object is registered before non-group objects are excluded
 from the accepted security-group set, so an unfamiliar directory-object type cannot hide a later
 type conflict.
+The registry is pre-seeded with the all-zero All Principals identity as `SystemDefined`; policy,
+identity, membership, or assignment evidence cannot relabel it even when deny inventories are empty.
 Every normalized ARM or guarded Azure CLI role-assignment row also retains `arm_assignment_id` and
 a digest of its canonical identity-bearing body: principal, principal type, role definition, scope,
 condition, and condition version. Guarded CLI output must retain exact `id` and
@@ -351,6 +368,11 @@ complete transitive security-group IDs, All Principals, exclusions, scope inheri
 effective because the verifier does not evaluate Azure ABAC expressions. A deny that might
 invalidate any approved access blocks the gate; unrelated principals, excluded identities,
 non-inherited ancestor denies, and disjoint scopes do not.
+Deny evaluation builds the canonical management-group and subscription indexes once and a
+token-trie access-scope index once per effective principal. It does not rescan the ancestry tuple,
+materialize every tuple prefix, or compare every deny with every approved scope. Every deny
+principal/exclusion visit, scope token, and relationship lookup consumes one document-wide
+deterministic work budget; overflow is a bounded input failure.
 
 The RBAC envelope uses the same bounded timestamps, `collectionRunId`, `deploymentExecutionId`,
 `deploymentTarget`, independently reviewed manifest digest, and trusted release ledger as the

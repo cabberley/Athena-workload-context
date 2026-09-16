@@ -8,8 +8,8 @@ import re
 import stat
 import sys
 import uuid
-from collections.abc import Sequence
-from contextlib import suppress
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager, suppress
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -29,6 +29,7 @@ MAX_JSON_DECIMAL_EXPONENT = 1024
 MAX_VIOLATIONS = 256
 MAX_RENDER_BYTES = 1024 * 1024
 MAX_SEPARATION_RULE_WORK = 100000
+MAX_DENY_EVALUATION_WORK = 500000
 MAX_PROPERTY_PATH_LENGTH = 4096
 MAX_PROPERTY_PATH_ITEMS = 50000
 MAX_PROPERTY_PATH_CHARACTERS = 4 * 1024 * 1024
@@ -483,6 +484,40 @@ class _SeparationRuleWorkBudget:
             )
 
 
+@dataclass(slots=True)
+class _DenyEvaluationWorkBudget:
+    work: int = 0
+
+    def charge(self, amount: int = 1) -> None:
+        self.work += amount
+        if self.work > MAX_DENY_EVALUATION_WORK:
+            raise PreflightInputError(
+                "deny-assignment evaluation exceeds its deterministic work budget"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class _DenyScopeContext:
+    management_group_indexes: dict[str, int]
+    subscription_tokens: _ScopeTokens
+
+
+@dataclass(slots=True)
+class _ScopeTrieNode:
+    terminal: bool = False
+    has_terminal_descendant: bool = False
+    children: dict[str, _ScopeTrieNode] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class _DenyAccessScopeIndex:
+    scope_trie: _ScopeTrieNode
+    minimum_management_group_index: int | None
+    maximum_management_group_index: int | None
+    has_management_group_access: bool
+    has_subscription_access: bool
+
+
 @dataclass(frozen=True, slots=True)
 class RbacPolicy:
     allowed_broad_assignments: frozenset[BroadAssignmentAllowance]
@@ -498,6 +533,7 @@ class RbacPolicy:
 type PreflightKind = Literal["rbac", "what-if"]
 type PreflightOutputFormat = Literal["json", "text"]
 type PropertyPathToken = str | int
+type _ScopeTokens = tuple[str, ...]
 type _CanonicalPaginationRequestIdentity = tuple[
     str,
     str,
@@ -2918,6 +2954,17 @@ class _ProtectedPropertyEvidence:
             if descendant.presence is not None and exists != descendant.presence:
                 raise PreflightInputError(
                     f"protected path presence representations conflict below {canonical_path}"
+                )
+            if (
+                exists
+                and descendant.child_kind is not None
+                and not self._matches_container_kind(
+                    resolved,
+                    descendant.child_kind,
+                )
+            ):
+                raise PreflightInputError(
+                    f"protected path container representations conflict below {canonical_path}"
                 )
             if descendant.explicit_value is not _NO_EXPLICIT_VALUE and (
                 not exists
@@ -6189,35 +6236,117 @@ def _parse_arm_deny_assignment(
     )
 
 
+def _scope_tokens(scope: str) -> _ScopeTokens:
+    return () if scope == "/" else tuple(scope.strip("/").split("/"))
+
+
+def _build_deny_scope_context(
+    collection: RbacCollection,
+    *,
+    budget: _DenyEvaluationWorkBudget,
+) -> _DenyScopeContext:
+    management_group_indexes: dict[str, int] = {}
+    for index, scope in enumerate(collection.management_group_ancestry):
+        budget.charge()
+        management_group_indexes[scope] = index
+    subscription_tokens = _scope_tokens(collection.subscription_scope)
+    budget.charge(len(subscription_tokens) + 1)
+    return _DenyScopeContext(
+        management_group_indexes=management_group_indexes,
+        subscription_tokens=subscription_tokens,
+    )
+
+
+def _build_deny_access_scope_index(
+    access_scopes: frozenset[str],
+    *,
+    context: _DenyScopeContext,
+    budget: _DenyEvaluationWorkBudget,
+) -> _DenyAccessScopeIndex:
+    scope_trie = _ScopeTrieNode()
+    management_group_indexes: list[int] = []
+    has_subscription_access = False
+    for scope in sorted(access_scopes):
+        tokens = _scope_tokens(scope)
+        budget.charge()
+        node = scope_trie
+        node.has_terminal_descendant = True
+        for token in tokens:
+            budget.charge()
+            node = node.children.setdefault(
+                token,
+                _ScopeTrieNode(),
+            )
+            node.has_terminal_descendant = True
+        node.terminal = True
+        management_group_index = context.management_group_indexes.get(scope)
+        if management_group_index is not None:
+            management_group_indexes.append(management_group_index)
+        budget.charge()
+        has_subscription_access = has_subscription_access or (
+            tokens[: len(context.subscription_tokens)] == context.subscription_tokens
+        )
+    return _DenyAccessScopeIndex(
+        scope_trie=scope_trie,
+        minimum_management_group_index=(
+            min(management_group_indexes) if management_group_indexes else None
+        ),
+        maximum_management_group_index=(
+            max(management_group_indexes) if management_group_indexes else None
+        ),
+        has_management_group_access=bool(management_group_indexes),
+        has_subscription_access=has_subscription_access,
+    )
+
+
 def _deny_scope_might_invalidate_access(
     deny: DenyAssignment,
-    access_scope: str,
     *,
-    collection: RbacCollection,
+    access_index: _DenyAccessScopeIndex,
+    context: _DenyScopeContext,
+    budget: _DenyEvaluationWorkBudget,
 ) -> bool:
-    if deny.scope == access_scope or _scope_contains(access_scope, deny.scope):
+    deny_tokens = _scope_tokens(deny.scope)
+    budget.charge()
+    current_node = access_index.scope_trie
+    matched_node: _ScopeTrieNode | None = current_node
+    if current_node.terminal:
         return True
-    if _scope_contains(deny.scope, access_scope):
-        return not deny.do_not_apply_to_child_scopes
-    deny_management_group_index = (
-        collection.management_group_ancestry.index(deny.scope)
-        if deny.scope in collection.management_group_ancestry
-        else None
-    )
-    access_management_group_index = (
-        collection.management_group_ancestry.index(access_scope)
-        if access_scope in collection.management_group_ancestry
-        else None
-    )
+    for token in deny_tokens:
+        budget.charge()
+        next_node = current_node.children.get(token)
+        if next_node is None:
+            matched_node = None
+            break
+        current_node = next_node
+        matched_node = current_node
+        if current_node.terminal:
+            return True
+    budget.charge()
+    if (
+        not deny.do_not_apply_to_child_scopes
+        and matched_node is not None
+        and matched_node.has_terminal_descendant
+    ):
+        return True
+    deny_management_group_index = context.management_group_indexes.get(deny.scope)
     if deny_management_group_index is not None:
-        if access_management_group_index is not None:
-            if deny_management_group_index < access_management_group_index:
-                return True
-            return not deny.do_not_apply_to_child_scopes
-        if _scope_contains(collection.subscription_scope, access_scope):
-            return not deny.do_not_apply_to_child_scopes
-    return access_management_group_index is not None and _scope_contains(
-        collection.subscription_scope, deny.scope
+        budget.charge(3)
+        if (
+            access_index.maximum_management_group_index is not None
+            and deny_management_group_index < access_index.maximum_management_group_index
+        ):
+            return True
+        return not deny.do_not_apply_to_child_scopes and (
+            (
+                access_index.minimum_management_group_index is not None
+                and deny_management_group_index > access_index.minimum_management_group_index
+            )
+            or access_index.has_subscription_access
+        )
+    budget.charge(2)
+    return access_index.has_management_group_access and (
+        deny_tokens[: len(context.subscription_tokens)] == context.subscription_tokens
     )
 
 
@@ -6225,12 +6354,20 @@ def _deny_targets_effective_principal(
     deny: DenyAssignment,
     *,
     relevant_principal_ids: frozenset[str],
+    budget: _DenyEvaluationWorkBudget,
 ) -> bool:
-    if deny.excluded_principal_ids & relevant_principal_ids:
-        return False
-    return _ALL_PRINCIPALS_ID in deny.principal_ids or bool(
-        deny.principal_ids & relevant_principal_ids
-    )
+    for principal in deny.excluded_principals:
+        budget.charge()
+        if principal.principal_id in relevant_principal_ids:
+            return False
+    for principal in deny.principals:
+        budget.charge()
+        if (
+            principal.principal_id == _ALL_PRINCIPALS_ID
+            or principal.principal_id in relevant_principal_ids
+        ):
+            return True
+    return False
 
 
 def _parse_deny_assignment_evidence(
@@ -6357,8 +6494,9 @@ def _validate_deny_assignments_for_principal(
     *,
     effective_principal_id: str,
     security_group_ids: frozenset[str],
-    collection: RbacCollection,
-    approved_assignments: frozenset[RbacAssignment],
+    access_scopes: frozenset[str],
+    scope_context: _DenyScopeContext,
+    budget: _DenyEvaluationWorkBudget,
 ) -> None:
     relevant_principal_ids = frozenset(
         {
@@ -6366,27 +6504,23 @@ def _validate_deny_assignments_for_principal(
             *security_group_ids,
         }
     )
-    access_scopes = {
-        collection.resource_group_scope,
-        *(
-            assignment.scope
-            for assignment in approved_assignments
-            if assignment.effective_principal_id == effective_principal_id
-        ),
-    }
+    access_index = _build_deny_access_scope_index(
+        access_scopes,
+        context=scope_context,
+        budget=budget,
+    )
     for deny in assignments:
         if not _deny_targets_effective_principal(
             deny,
             relevant_principal_ids=relevant_principal_ids,
+            budget=budget,
         ):
             continue
-        if any(
-            _deny_scope_might_invalidate_access(
-                deny,
-                access_scope,
-                collection=collection,
-            )
-            for access_scope in access_scopes
+        if _deny_scope_might_invalidate_access(
+            deny,
+            access_index=access_index,
+            context=scope_context,
+            budget=budget,
         ):
             qualifier = " with a condition" if deny.condition is not None else ""
             raise PreflightInputError(
@@ -7111,7 +7245,21 @@ def _parse_rbac_evidence(
         management_group_ancestry=ancestry,
     )
     principal_registry = _PrincipalTypeRegistry()
+    principal_registry.register(
+        _ALL_PRINCIPALS_ID,
+        "systemdefined",
+        field_name="All Principals",
+    )
     assignment_registry = _ArmRoleAssignmentRegistry()
+    deny_evaluation_budget = _DenyEvaluationWorkBudget()
+    deny_scope_context = _build_deny_scope_context(
+        target,
+        budget=deny_evaluation_budget,
+    )
+    approved_access_scopes: dict[str, set[str]] = {
+        principal_id: {target.resource_group_scope}
+        for principal_id in policy.expected_principal_ids
+    }
     for expected_principal_id in policy.expected_principal_ids:
         principal_registry.register(
             _canonical_guid(
@@ -7127,6 +7275,10 @@ def _parse_rbac_evidence(
             principal_registry=principal_registry,
             field_name="approvedAssignments",
         )
+        approved_access_scopes.setdefault(
+            assignment.effective_principal_id,
+            {target.resource_group_scope},
+        ).add(assignment.scope)
     for allowance in policy.allowed_broad_assignments:
         _register_assignment_principal_types(
             allowance,
@@ -7251,8 +7403,14 @@ def _parse_rbac_evidence(
             deny_assignments,
             effective_principal_id=effective_principal_id,
             security_group_ids=security_group_ids,
-            collection=target,
-            approved_assignments=policy.approved_assignments,
+            access_scopes=frozenset(
+                approved_access_scopes.get(
+                    effective_principal_id,
+                    {target.resource_group_scope},
+                )
+            ),
+            scope_context=deny_scope_context,
+            budget=deny_evaluation_budget,
         )
     return (
         assignments,
@@ -7754,6 +7912,87 @@ def _validate_windows_file_descriptor(
         raise PreflightInputError("release ledger record escaped the securely opened directory")
 
 
+def _windows_move_file_no_replace_write_through(
+    source: Path,
+    target: Path,
+) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = vars(ctypes)["WinDLL"]("kernel32", use_last_error=True)
+    get_last_error = vars(ctypes)["get_last_error"]
+    move_file_ex = kernel32.MoveFileExW
+    move_file_ex.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+    ]
+    move_file_ex.restype = wintypes.BOOL
+    move_file_write_through = 0x00000008
+    if move_file_ex(
+        os.fspath(source),
+        os.fspath(target),
+        move_file_write_through,
+    ):
+        return
+    error = get_last_error()
+    if error in {80, 183}:
+        raise FileExistsError(error, "release ledger record already exists", target)
+    raise OSError(error, "MoveFileExW with MOVEFILE_WRITE_THROUGH failed", target)
+
+
+def _acquire_windows_file_lock(file_descriptor: int) -> Any:
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    class Overlapped(ctypes.Structure):
+        _fields_ = [
+            ("Internal", ctypes.c_size_t),
+            ("InternalHigh", ctypes.c_size_t),
+            ("Offset", wintypes.DWORD),
+            ("OffsetHigh", wintypes.DWORD),
+            ("hEvent", wintypes.HANDLE),
+        ]
+
+    kernel32 = vars(ctypes)["WinDLL"]("kernel32", use_last_error=True)
+    get_last_error = vars(ctypes)["get_last_error"]
+    handle = vars(msvcrt)["get_osfhandle"](file_descriptor)
+    overlapped = Overlapped()
+    lockfile_exclusive_lock = 0x00000002
+    if not kernel32.LockFileEx(
+        wintypes.HANDLE(handle),
+        lockfile_exclusive_lock,
+        0,
+        1,
+        0,
+        ctypes.byref(overlapped),
+    ):
+        raise OSError(get_last_error(), "LockFileEx failed")
+    return overlapped
+
+
+def _release_windows_file_lock(
+    file_descriptor: int,
+    overlapped: Any,
+) -> None:
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    kernel32 = vars(ctypes)["WinDLL"]("kernel32", use_last_error=True)
+    get_last_error = vars(ctypes)["get_last_error"]
+    handle = vars(msvcrt)["get_osfhandle"](file_descriptor)
+    if not kernel32.UnlockFileEx(
+        wintypes.HANDLE(handle),
+        0,
+        1,
+        0,
+        ctypes.byref(overlapped),
+    ):
+        raise OSError(get_last_error(), "UnlockFileEx failed")
+
+
 class _SecureLedgerDirectory:
     def __init__(self, ledger_path: Path, trusted_root: Path) -> None:
         self._requested_ledger_path = ledger_path
@@ -7763,6 +8002,7 @@ class _SecureLedgerDirectory:
         self._directory_fd: int | None = None
         self._windows_directory_handle: int | None = None
         self._windows_final_path: str | None = None
+        self._lock_fd: int | None = None
 
     def __enter__(self) -> _SecureLedgerDirectory:
         trusted_root, ledger_path = _validated_release_ledger_paths(
@@ -7848,6 +8088,238 @@ class _SecureLedgerDirectory:
             name=name,
         )
 
+    @staticmethod
+    def _lock_state_bytes(pending_record: str | None) -> bytes:
+        return _strict_utf8_bytes(
+            json.dumps(
+                {
+                    "pendingRecord": pending_record,
+                    "schemaVersion": "athena.wc029LedgerTransaction.v1",
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            )
+            + "\n",
+            field_name="release ledger transaction state",
+        )
+
+    def _write_lock_state(self, pending_record: str | None) -> None:
+        if self._lock_fd is None:
+            raise PreflightInputError("release ledger transaction lock is unavailable")
+        rendered = self._lock_state_bytes(pending_record)
+        os.lseek(self._lock_fd, 0, os.SEEK_SET)
+        os.ftruncate(self._lock_fd, 0)
+        offset = 0
+        while offset < len(rendered):
+            written = os.write(
+                self._lock_fd,
+                rendered[offset:],
+            )
+            if written <= 0:
+                raise OSError("release ledger transaction write did not make progress")
+            offset += written
+        os.fsync(self._lock_fd)
+
+    def _read_lock_state(self) -> str | None:
+        if self._lock_fd is None:
+            raise PreflightInputError("release ledger transaction lock is unavailable")
+        os.lseek(self._lock_fd, 0, os.SEEK_SET)
+        content = os.read(
+            self._lock_fd,
+            4097,
+        )
+        if not content:
+            self._write_lock_state(None)
+            return None
+        if len(content) > 4096:
+            raise PreflightInputError("release ledger transaction state exceeds its bound")
+        try:
+            document = json.loads(
+                content.decode("utf-8"),
+                parse_constant=_reject_json_constant,
+                parse_float=_parse_json_decimal,
+                parse_int=_parse_json_integer,
+                object_pairs_hook=_reject_ambiguous_object_pairs,
+            )
+        except (
+            UnicodeError,
+            json.JSONDecodeError,
+            RecursionError,
+            ValueError,
+        ) as exc:
+            raise PreflightInputError("release ledger transaction state is not valid JSON") from exc
+        state = _mapping(
+            document,
+            field_name="release ledger transaction state",
+        )
+        if {key.casefold() for key in state} != {
+            "pendingrecord",
+            "schemaversion",
+        }:
+            raise PreflightInputError("release ledger transaction state is malformed")
+        if _get_case_insensitive(state, "schemaVersion") != "athena.wc029LedgerTransaction.v1":
+            raise PreflightInputError("release ledger transaction state has the wrong schema")
+        pending_record = _get_case_insensitive(state, "pendingRecord")
+        if pending_record is None:
+            return None
+        pending_name = _require_exact_ascii_token(
+            pending_record,
+            field_name="release ledger pending record",
+            maximum_length=255,
+        )
+        if Path(pending_name).name != pending_name:
+            raise PreflightInputError("release ledger pending record name is invalid")
+        return pending_name
+
+    def _begin_record_publication(self, name: str) -> bool:
+        if self._lock_fd is None:
+            return False
+        if self._record_exists(name):
+            raise FileExistsError(name)
+        if self._read_lock_state() is not None:
+            raise PreflightInputError(
+                "release ledger contains an incomplete publication transaction"
+            )
+        self._write_lock_state(name)
+        return True
+
+    def _complete_record_publication(self, name: str) -> None:
+        if self._lock_fd is None:
+            return
+        if self._read_lock_state() != name:
+            raise PreflightInputError("release ledger transaction state changed unexpectedly")
+        self._write_lock_state(None)
+
+    def _record_exists(self, name: str) -> bool:
+        try:
+            if self._directory_fd is None:
+                os.lstat(
+                    self._fallback_file_path(
+                        name,
+                        require_existing=False,
+                    )
+                )
+            else:
+                os.stat(
+                    name,
+                    dir_fd=self._directory_fd,
+                    follow_symlinks=False,
+                )
+        except FileNotFoundError:
+            return False
+        return True
+
+    def _ensure_windows_lock_file(self, lock_name: str) -> None:
+        if self._record_exists(lock_name):
+            return
+        staging_name = f".wc029-lock-{uuid.uuid4().hex}.tmp"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        file_descriptor: int | None = None
+        try:
+            file_descriptor = self._open_record(
+                staging_name,
+                flags,
+                require_existing=False,
+            )
+            self._verify_file_descriptor(file_descriptor, staging_name)
+            rendered = self._lock_state_bytes(None)
+            offset = 0
+            while offset < len(rendered):
+                written = os.write(
+                    file_descriptor,
+                    rendered[offset:],
+                )
+                if written <= 0:
+                    raise OSError("release ledger lock write did not make progress")
+                offset += written
+            os.fsync(file_descriptor)
+            os.close(file_descriptor)
+            file_descriptor = None
+            with suppress(FileExistsError):
+                _windows_move_file_no_replace_write_through(
+                    self._fallback_file_path(
+                        staging_name,
+                        require_existing=True,
+                    ),
+                    self._fallback_file_path(
+                        lock_name,
+                        require_existing=False,
+                    ),
+                )
+        finally:
+            if file_descriptor is not None:
+                os.close(file_descriptor)
+            with suppress(
+                OSError,
+                PreflightInputError,
+            ):
+                self._unlink_record(staging_name)
+
+    @contextmanager
+    def exclusive_lock(self) -> Iterator[None]:
+        lock_name = ".wc029-ledger.lock"
+        if os.name == "nt":
+            self._ensure_windows_lock_file(lock_name)
+        flags = os.O_RDWR | getattr(os, "O_BINARY", 0)
+        if os.name != "nt":
+            flags |= os.O_CREAT
+        if hasattr(os, "O_NONBLOCK"):
+            flags |= os.O_NONBLOCK
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        file_descriptor = self._open_record(
+            lock_name,
+            flags,
+            require_existing=False,
+        )
+        windows_lock: Any = None
+        posix_locked = False
+        try:
+            self._verify_file_descriptor(file_descriptor, lock_name)
+            if not stat.S_ISREG(os.fstat(file_descriptor).st_mode):
+                raise PreflightInputError("release ledger lock must be a regular file")
+            if os.name == "nt":
+                windows_lock = _acquire_windows_file_lock(file_descriptor)
+            else:
+                import fcntl
+
+                vars(fcntl)["flock"](
+                    file_descriptor,
+                    vars(fcntl)["LOCK_EX"],
+                )
+                posix_locked = True
+            self._lock_fd = file_descriptor
+            pending_record = self._read_lock_state()
+            if pending_record is not None:
+                raise PreflightInputError(
+                    "release ledger contains an incomplete publication transaction"
+                )
+            if self._directory_fd is not None:
+                self._sync_directory()
+            yield
+        finally:
+            try:
+                self._lock_fd = None
+                if windows_lock is not None:
+                    _release_windows_file_lock(
+                        file_descriptor,
+                        windows_lock,
+                    )
+                elif posix_locked:
+                    import fcntl
+
+                    vars(fcntl)["flock"](
+                        file_descriptor,
+                        vars(fcntl)["LOCK_UN"],
+                    )
+            finally:
+                os.close(file_descriptor)
+
     def _open_record(
         self,
         name: str,
@@ -7893,6 +8365,18 @@ class _SecureLedgerDirectory:
     ) -> None:
         try:
             if self._directory_fd is None:
+                if os.name == "nt":
+                    _windows_move_file_no_replace_write_through(
+                        self._fallback_file_path(
+                            staging_name,
+                            require_existing=True,
+                        ),
+                        self._fallback_file_path(
+                            final_name,
+                            require_existing=False,
+                        ),
+                    )
+                    return
                 os.link(
                     self._fallback_file_path(
                         staging_name,
@@ -7931,13 +8415,24 @@ class _SecureLedgerDirectory:
                 "safe release-ledger directory synchronization is unsupported"
             )
 
+    @staticmethod
+    def _sync_published_record(
+        file_descriptor: int,
+    ) -> None:
+        try:
+            os.fsync(file_descriptor)
+        except OSError as exc:
+            raise PreflightInputError(
+                "release ledger published record could not be synchronized"
+            ) from exc
+
     def _verify_published_record(
         self,
         name: str,
         *,
         staging_stat: os.stat_result,
     ) -> None:
-        flags = os.O_RDONLY
+        flags = os.O_RDWR if os.name == "nt" else os.O_RDONLY
         if hasattr(os, "O_NONBLOCK"):
             flags |= os.O_NONBLOCK
         if hasattr(os, "O_NOFOLLOW"):
@@ -7960,8 +8455,45 @@ class _SecureLedgerDirectory:
                 raise PreflightInputError(
                     "release ledger publication did not preserve the staged record"
                 )
+            self._sync_published_record(file_descriptor)
         finally:
             os.close(file_descriptor)
+
+    def _rollback_published_record(
+        self,
+        name: str,
+        *,
+        staging_stat: os.stat_result,
+    ) -> None:
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+        if hasattr(os, "O_NONBLOCK"):
+            flags |= os.O_NONBLOCK
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        file_descriptor: int | None = None
+        try:
+            file_descriptor = self._open_record(
+                name,
+                flags,
+                require_existing=True,
+            )
+            self._verify_file_descriptor(file_descriptor, name)
+            if not os.path.samestat(
+                staging_stat,
+                os.fstat(file_descriptor),
+            ):
+                return
+        except OSError, PreflightInputError:
+            return
+        finally:
+            if file_descriptor is not None:
+                os.close(file_descriptor)
+        with suppress(
+            OSError,
+            PreflightInputError,
+        ):
+            self._unlink_record(name)
+            self._sync_directory()
 
     def create_json(self, name: str, payload: dict[str, object]) -> None:
         if Path(name).name != name:
@@ -7999,7 +8531,11 @@ class _SecureLedgerDirectory:
                 continue
         if file_descriptor is None:
             raise PreflightInputError("release ledger staging name could not be allocated")
+        journaled = False
+        published = False
+        staging_stat: os.stat_result | None = None
         try:
+            journaled = self._begin_record_publication(name)
             self._verify_file_descriptor(file_descriptor, staging_name)
             staging_stat = os.fstat(file_descriptor)
             if not stat.S_ISREG(staging_stat.st_mode):
@@ -8014,17 +8550,32 @@ class _SecureLedgerDirectory:
                     raise OSError("release ledger staging write did not make progress")
                 offset += written
             os.fsync(file_descriptor)
+            if os.name == "nt":
+                os.close(file_descriptor)
+                file_descriptor = None
             self._publish_staged_record(
                 staging_name,
                 name,
             )
+            published = True
             self._verify_published_record(
                 name,
                 staging_stat=staging_stat,
             )
             self._sync_directory()
+            self._complete_record_publication(name)
+        except BaseException:
+            if published and staging_stat is not None:
+                self._rollback_published_record(
+                    name,
+                    staging_stat=staging_stat,
+                )
+            elif journaled:
+                self._complete_record_publication(name)
+            raise
         finally:
-            os.close(file_descriptor)
+            if file_descriptor is not None:
+                os.close(file_descriptor)
             with suppress(
                 OSError,
                 PreflightInputError,
@@ -8145,7 +8696,10 @@ def _consume_release_ledger(
         "safe": safe,
     }
     try:
-        with _SecureLedgerDirectory(ledger_path, trusted_root) as secure_ledger:
+        with (
+            _SecureLedgerDirectory(ledger_path, trusted_root) as secure_ledger,
+            secure_ledger.exclusive_lock(),
+        ):
             for name, payload, mismatch_message, create_message in (
                 (
                     f"{manifest.collection_run_id}.collection.json",

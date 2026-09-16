@@ -4,6 +4,7 @@ import copy
 import json
 import os
 import socket
+import stat
 import subprocess
 import tempfile
 import uuid
@@ -12,7 +13,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from io import StringIO
 from pathlib import Path
-from threading import Barrier
+from threading import Barrier, Event
 from urllib.parse import urlencode
 
 import pytest
@@ -2080,6 +2081,44 @@ def test_attested_what_if_rejects_partial_snapshot_dynamic_value_conflict(
     with pytest.raises(
         PreflightInputError,
         match="representations conflict",
+    ):
+        _evaluate_attested_what_if(
+            _what_if(change),
+            allowed_change_ids=frozenset({_STORAGE_ID}),
+        )
+
+
+@pytest.mark.parametrize("snapshot_stage", ["before", "after"])
+@pytest.mark.parametrize("nested", [False, True])
+def test_attested_what_if_rejects_partial_snapshot_kind_conflict_from_ancestor_delta(
+    snapshot_stage: str,
+    nested: bool,
+) -> None:
+    snapshot_value: object = {"group": {"entries": {}}} if nested else {}
+    delta_value: object = {"ipRules": {"group": {"entries": []}}} if nested else {"ipRules": []}
+    change = {
+        "resourceId": _STORAGE_ID,
+        "changeType": "Modify",
+        snapshot_stage: {
+            "properties": {
+                "networkAcls": {
+                    "ipRules": snapshot_value,
+                }
+            }
+        },
+        "delta": [
+            {
+                "path": "properties.networkAcls",
+                "propertyChangeType": "Modify",
+                "before": delta_value,
+                "after": delta_value,
+            }
+        ],
+    }
+
+    with pytest.raises(
+        PreflightInputError,
+        match="container representations conflict below properties.networkacls",
     ):
         _evaluate_attested_what_if(
             _what_if(change),
@@ -6951,6 +6990,7 @@ def test_public_cli_consumes_shared_manifest_once_per_artifact_kind(
         for path in (tmp_path / "trusted-release-ledger-root" / "release-ledger").iterdir()
     )
     assert ledger_files == [
+        ".wc029-ledger.lock",
         f"{_COLLECTION_RUN_ID}.collection.json",
         f"{_DEPLOYMENT_EXECUTION_ID}.binding.json",
         f"{_DEPLOYMENT_EXECUTION_ID}.rbac.consumed.json",
@@ -7070,7 +7110,10 @@ def test_windows_release_ledger_detects_junction_swap_after_validation(
     stderr = StringIO()
     try:
         assert cli_main(arguments, stdout=StringIO(), stderr=stderr) == 3
-        assert "escaped the securely opened directory" in stderr.getvalue()
+        assert (
+            "escaped the securely opened directory" in stderr.getvalue()
+            or "symlink, junction, or reparse point" in stderr.getvalue()
+        )
     finally:
         if ledger_path.exists():
             os.rmdir(ledger_path)
@@ -7325,6 +7368,208 @@ def test_release_ledger_fsyncs_staging_before_atomic_publication(
     assert events[:2] == ["fsync", "publish"]
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows lock durability regression")
+def test_windows_release_ledger_durably_publishes_lock_before_use(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trusted_root = tmp_path / "trusted-root"
+    ledger_path = trusted_root / "ledger"
+    ledger_path.mkdir(parents=True)
+    published_targets: list[str] = []
+    original_publish = wc029_preflight_module._windows_move_file_no_replace_write_through
+
+    def tracked_publish(source: Path, target: Path) -> None:
+        published_targets.append(target.name)
+        original_publish(source, target)
+
+    monkeypatch.setattr(
+        wc029_preflight_module,
+        "_windows_move_file_no_replace_write_through",
+        tracked_publish,
+    )
+
+    with (
+        _SecureLedgerDirectory(ledger_path, trusted_root) as ledger,
+        ledger.exclusive_lock(),
+    ):
+        pass
+
+    assert published_targets == [".wc029-ledger.lock"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX lock durability regression")
+def test_posix_release_ledger_fsyncs_lock_directory_before_use(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trusted_root = tmp_path / "trusted-root"
+    ledger_path = trusted_root / "ledger"
+    ledger_path.mkdir(parents=True)
+    sync_calls = 0
+    original_sync = _SecureLedgerDirectory._sync_directory
+
+    def tracked_sync(ledger: _SecureLedgerDirectory) -> None:
+        nonlocal sync_calls
+        sync_calls += 1
+        original_sync(ledger)
+
+    monkeypatch.setattr(
+        _SecureLedgerDirectory,
+        "_sync_directory",
+        tracked_sync,
+    )
+
+    with (
+        _SecureLedgerDirectory(ledger_path, trusted_root) as ledger,
+        ledger.exclusive_lock(),
+    ):
+        assert sync_calls == 1
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows durability barrier regression")
+def test_windows_release_ledger_requires_post_publication_durability_event(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trusted_root = tmp_path / "trusted-root"
+    ledger_path = trusted_root / "ledger"
+    ledger_path.mkdir(parents=True)
+    events: list[str] = []
+    original_publish = wc029_preflight_module._windows_move_file_no_replace_write_through
+    original_sync = _SecureLedgerDirectory._sync_published_record
+
+    def tracked_publish(source: Path, target: Path) -> None:
+        events.append("publish")
+        original_publish(source, target)
+
+    def tracked_sync(file_descriptor: int) -> None:
+        assert events == ["publish"]
+        events.append("durability")
+        original_sync(file_descriptor)
+
+    monkeypatch.setattr(
+        wc029_preflight_module,
+        "_windows_move_file_no_replace_write_through",
+        tracked_publish,
+    )
+    monkeypatch.setattr(
+        _SecureLedgerDirectory,
+        "_sync_published_record",
+        staticmethod(tracked_sync),
+    )
+
+    with _SecureLedgerDirectory(ledger_path, trusted_root) as ledger:
+        ledger.create_json("durable-windows.json", {"value": "complete"})
+
+    assert events == ["publish", "durability"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows durability barrier regression")
+def test_windows_release_ledger_durability_failure_rolls_back_without_success(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trusted_root = tmp_path / "trusted-root"
+    ledger_path = trusted_root / "ledger"
+    ledger_path.mkdir(parents=True)
+    final_path = ledger_path / "durability-failure.json"
+    original_sync = _SecureLedgerDirectory._sync_published_record
+
+    def fail_sync(_file_descriptor: int) -> None:
+        raise PreflightInputError("release ledger published record could not be synchronized")
+
+    with _SecureLedgerDirectory(ledger_path, trusted_root) as ledger:
+        monkeypatch.setattr(
+            _SecureLedgerDirectory,
+            "_sync_published_record",
+            staticmethod(fail_sync),
+        )
+        with pytest.raises(
+            PreflightInputError,
+            match="published record could not be synchronized",
+        ):
+            ledger.create_json("durability-failure.json", {"value": "complete"})
+        assert not final_path.exists()
+        monkeypatch.setattr(
+            _SecureLedgerDirectory,
+            "_sync_published_record",
+            staticmethod(original_sync),
+        )
+        ledger.create_json("durability-failure.json", {"value": "complete"})
+        assert ledger.read_json("durability-failure.json") == {"value": "complete"}
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows durability concurrency regression")
+def test_windows_release_ledger_serializes_existing_acceptance_with_durability(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "what-if.json"
+    input_path.write_text(
+        json.dumps(_attested_what_if(_what_if(_change(_STORAGE_ID, "NoChange")))),
+        encoding="utf-8",
+    )
+    arguments = _what_if_cli_args(input_path)
+    first_barrier_entered = Event()
+    release_first_barrier = Event()
+    original_sync = _SecureLedgerDirectory._sync_published_record
+    sync_calls = 0
+
+    def fail_first_sync(file_descriptor: int) -> None:
+        nonlocal sync_calls
+        sync_calls += 1
+        if sync_calls == 1:
+            first_barrier_entered.set()
+            if not release_first_barrier.wait(timeout=10):
+                raise AssertionError("timed out waiting to release durability barrier")
+            raise PreflightInputError("release ledger published record could not be synchronized")
+        original_sync(file_descriptor)
+
+    monkeypatch.setattr(
+        _SecureLedgerDirectory,
+        "_sync_published_record",
+        staticmethod(fail_first_sync),
+    )
+    monkeypatch.setattr(
+        _SecureLedgerDirectory,
+        "_rollback_published_record",
+        lambda *_args, **_kwargs: None,
+    )
+
+    def run_check() -> tuple[int, str, str]:
+        stdout = StringIO()
+        stderr = StringIO()
+        return (
+            cli_main(
+                list(arguments),
+                stdout=stdout,
+                stderr=stderr,
+            ),
+            stdout.getvalue(),
+            stderr.getvalue(),
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(run_check)
+        assert first_barrier_entered.wait(timeout=10)
+        second = executor.submit(run_check)
+        Event().wait(0.2)
+        assert not second.done()
+        release_first_barrier.set()
+        first_result = first.result(timeout=20)
+        second_result = second.result(timeout=20)
+
+    assert first_result[0] == 3
+    assert second_result[0] == 3
+    assert first_result[1] == ""
+    assert second_result[1] == ""
+    assert "published record could not be synchronized" in first_result[2]
+    assert "incomplete publication transaction" in second_result[2]
+    ledger_path = tmp_path / "trusted-release-ledger-root" / "release-ledger"
+    assert any(path.name.endswith(".collection.json") for path in ledger_path.iterdir())
+
+
 def test_release_ledger_publication_failure_does_not_poison_retry(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
@@ -7382,7 +7627,14 @@ def test_release_ledger_fails_closed_when_safe_publication_is_unsupported(
         raise NotImplementedError
 
     with _SecureLedgerDirectory(ledger_path, trusted_root) as ledger:
-        monkeypatch.setattr(os, "link", unsupported_link)
+        if os.name == "nt":
+            monkeypatch.setattr(
+                wc029_preflight_module,
+                "_windows_move_file_no_replace_write_through",
+                unsupported_link,
+            )
+        else:
+            monkeypatch.setattr(os, "link", unsupported_link)
         with pytest.raises(
             PreflightInputError,
             match="safe no-overwrite ledger publication is unsupported",
@@ -7428,6 +7680,44 @@ def test_posix_release_ledger_does_not_follow_poisoned_staging_path(
 
     assert not (ledger_path / "poisoned.json").exists()
     assert outside.read_text(encoding="utf-8") == "unchanged"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX rollback special-file regression")
+def test_posix_release_ledger_rollback_rejects_substituted_fifo_without_blocking(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trusted_root = tmp_path / "trusted-root"
+    ledger_path = trusted_root / "ledger"
+    ledger_path.mkdir(parents=True)
+
+    def substitute_fifo(
+        ledger: _SecureLedgerDirectory,
+        name: str,
+        *,
+        staging_stat: os.stat_result,
+    ) -> None:
+        del staging_stat
+        ledger._unlink_record(name)
+        os.mkfifo(ledger_path / name)
+        raise PreflightInputError("synthetic post-publication verification failure")
+
+    monkeypatch.setattr(
+        _SecureLedgerDirectory,
+        "_verify_published_record",
+        substitute_fifo,
+    )
+
+    with (
+        _SecureLedgerDirectory(ledger_path, trusted_root) as ledger,
+        pytest.raises(
+            PreflightInputError,
+            match="synthetic post-publication verification failure",
+        ),
+    ):
+        ledger.create_json("rollback-fifo.json", {"value": "complete"})
+
+    assert stat.S_ISFIFO(os.lstat(ledger_path / "rollback-fifo.json").st_mode)
 
 
 def test_release_ledger_concurrent_writers_publish_one_complete_record(
@@ -10056,6 +10346,128 @@ def test_guarded_rbac_honors_non_inherited_and_unrelated_denies() -> None:
     )
 
 
+def test_deny_evaluation_linearizes_500_by_500_with_512_ancestor_indexes() -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    collection = wc029_preflight_module.RbacCollection(
+        tenant_id=_TENANT_ID,
+        subscription_id=_SUBSCRIPTION_ID,
+        subscription_scope=_SUBSCRIPTION_SCOPE,
+        resource_group_scope=_RG_SCOPE,
+        management_group_ancestry=tuple(
+            f"/providers/microsoft.management/managementgroups/synthetic-{index:03d}"
+            for index in range(512)
+        ),
+        effective_principal_ids=frozenset({principal_id}),
+    )
+    access_scopes = frozenset(
+        f"{_SUBSCRIPTION_SCOPE}/resourcegroups/access-{index:03d}" for index in range(500)
+    )
+    principal = wc029_preflight_module._TypedPrincipalClaim(
+        principal_id=principal_id,
+        principal_type="serviceprincipal",
+    )
+    denies = tuple(
+        wc029_preflight_module.DenyAssignment(
+            assignment_id=(
+                f"{_SUBSCRIPTION_SCOPE}/resourcegroups/deny-{index:03d}/providers/"
+                "microsoft.authorization/denyassignments/"
+                f"{index:08d}-0000-0000-0000-000000000000"
+            ),
+            scope=f"{_SUBSCRIPTION_SCOPE}/resourcegroups/deny-{index:03d}",
+            do_not_apply_to_child_scopes=False,
+            principals=(principal,),
+            excluded_principals=(),
+            condition=None,
+            condition_version=None,
+        )
+        for index in range(500)
+    )
+    budget = wc029_preflight_module._DenyEvaluationWorkBudget()
+    context = wc029_preflight_module._build_deny_scope_context(
+        collection,
+        budget=budget,
+    )
+
+    wc029_preflight_module._validate_deny_assignments_for_principal(
+        denies,
+        effective_principal_id=principal_id,
+        security_group_ids=frozenset(),
+        access_scopes=access_scopes,
+        scope_context=context,
+        budget=budget,
+    )
+
+    assert budget.work < 50_000
+
+
+def test_deny_scope_trie_processes_deep_scope_tokens_linearly() -> None:
+    deep_scope = wc029_preflight_module._canonical_scope(
+        _SUBSCRIPTION_SCOPE + "/resourcegroups/deep" + "/providers/m/t/n" * 200
+    )
+    collection = wc029_preflight_module.RbacCollection(
+        tenant_id=_TENANT_ID,
+        subscription_id=_SUBSCRIPTION_ID,
+        subscription_scope=_SUBSCRIPTION_SCOPE,
+        resource_group_scope=_RG_SCOPE,
+        management_group_ancestry=(),
+        effective_principal_ids=frozenset(),
+    )
+    budget = wc029_preflight_module._DenyEvaluationWorkBudget()
+    context = wc029_preflight_module._build_deny_scope_context(
+        collection,
+        budget=budget,
+    )
+    access_index = wc029_preflight_module._build_deny_access_scope_index(
+        frozenset({deep_scope}),
+        context=context,
+        budget=budget,
+    )
+    deny = wc029_preflight_module.DenyAssignment(
+        assignment_id=(
+            f"{deep_scope}/providers/microsoft.authorization/denyassignments/"
+            "00000000-0000-0000-0000-000000000001"
+        ),
+        scope=deep_scope,
+        do_not_apply_to_child_scopes=False,
+        principals=(),
+        excluded_principals=(),
+        condition=None,
+        condition_version=None,
+    )
+    token_count = len(wc029_preflight_module._scope_tokens(deep_scope))
+
+    assert wc029_preflight_module._deny_scope_might_invalidate_access(
+        deny,
+        access_index=access_index,
+        context=context,
+        budget=budget,
+    )
+    assert budget.work < token_count * 3 + 32
+
+
+def test_deny_evaluation_fails_at_one_document_aggregate_work_bound() -> None:
+    budget = wc029_preflight_module._DenyEvaluationWorkBudget(
+        work=wc029_preflight_module.MAX_DENY_EVALUATION_WORK - 1,
+    )
+    collection = wc029_preflight_module.RbacCollection(
+        tenant_id=_TENANT_ID,
+        subscription_id=_SUBSCRIPTION_ID,
+        subscription_scope=_SUBSCRIPTION_SCOPE,
+        resource_group_scope=_RG_SCOPE,
+        management_group_ancestry=(),
+        effective_principal_ids=frozenset(),
+    )
+
+    with pytest.raises(
+        PreflightInputError,
+        match="deny-assignment evaluation exceeds its deterministic work budget",
+    ):
+        wc029_preflight_module._build_deny_scope_context(
+            collection,
+            budget=budget,
+        )
+
+
 @pytest.mark.parametrize(
     ("evidence_kind", "query_suffix", "message"),
     [
@@ -10690,6 +11102,35 @@ def test_guarded_rbac_rejects_tenant_wide_identity_membership_type_conflict(
                 first_principal_id,
                 second_principal_id,
                 expected_assignments=assignments,
+            ),
+        )
+
+
+@pytest.mark.parametrize("claim_kind", ["effective", "group"])
+def test_guarded_rbac_reserves_all_principals_zero_guid_as_system_defined(
+    claim_kind: str,
+) -> None:
+    effective_principal_id = (
+        _SUBSCRIPTION_ID if claim_kind == "effective" else "11111111-1111-1111-1111-111111111111"
+    )
+    assignment = _guarded_assignment(
+        principal_id=(_SUBSCRIPTION_ID if claim_kind == "group" else effective_principal_id),
+        effective_principal_id=effective_principal_id,
+        principal_type=("Group" if claim_kind == "group" else "ServicePrincipal"),
+        role_name="AcrPull",
+        scope=_RG_SCOPE,
+    )
+    evidence = _guarded_evidence([assignment])
+
+    with pytest.raises(
+        PreflightInputError,
+        match="tenant-wide principal type systemdefined",
+    ):
+        _evaluate_guarded_rbac(
+            evidence,
+            _production_policy(
+                effective_principal_id,
+                expected_assignments=[assignment],
             ),
         )
 
