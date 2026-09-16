@@ -122,6 +122,8 @@ WORKSPACE_ID = (
     "providers/Microsoft.OperationalInsights/workspaces/athena-hackathon-law"
 )
 EVIDENCE_CONTAINER_ID = f"{EVIDENCE_STORAGE_ID}/blobServices/default/containers/monitoring-evidence"
+EVIDENCE_BLOB_SERVICE_ID = f"{EVIDENCE_STORAGE_ID}/blobServices/default"
+EVIDENCE_IMMUTABILITY_POLICY_ID = f"{EVIDENCE_CONTAINER_ID}/immutabilityPolicies/default"
 RESOURCE_LOG_ROLE_ID = (
     f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg-athena-demo-workload/"
     "providers/Microsoft.Authorization/roleDefinitions/"
@@ -167,6 +169,83 @@ def _with_digest(payload: dict[str, object], field_name: str) -> dict[str, objec
         **payload,
         field_name: compute_artifact_digest(_digest_json_value(payload)),
     }
+
+
+def _storage_readiness_payload() -> dict[str, object]:
+    payload: dict[str, object] = {
+        "schemaVersion": "athena.wc028MonitoringEvidenceStorageReadiness.v1",
+        "storageAccountResourceId": EVIDENCE_STORAGE_ID.casefold(),
+        "blobServiceResourceId": EVIDENCE_BLOB_SERVICE_ID.casefold(),
+        "containerResourceId": EVIDENCE_CONTAINER_ID.casefold(),
+        "immutabilityPolicyResourceId": EVIDENCE_IMMUTABILITY_POLICY_ID.casefold(),
+        "versioningEnabled": True,
+        "containerPublicAccess": "None",
+        "immutabilityPolicyState": "Locked",
+        "immutabilityRetentionDays": 30,
+        "allowProtectedAppendWrites": False,
+        "allowProtectedAppendWritesAll": False,
+    }
+    readiness_preimage = runtime_module._monitoring_evidence_storage_readiness_preimage(
+        storage_account_resource_id=cast(
+            str,
+            payload["storageAccountResourceId"],
+        ),
+        blob_service_resource_id=cast(str, payload["blobServiceResourceId"]),
+        container_resource_id=cast(str, payload["containerResourceId"]),
+        immutability_policy_resource_id=cast(
+            str,
+            payload["immutabilityPolicyResourceId"],
+        ),
+        container_public_access=cast(str, payload["containerPublicAccess"]),
+        immutability_policy_state=cast(
+            str,
+            payload["immutabilityPolicyState"],
+        ),
+        immutability_retention_days=cast(
+            int,
+            payload["immutabilityRetentionDays"],
+        ),
+    )
+    payload["readbackBindingId"] = runtime_module._arm_template_guid(readiness_preimage)
+    payload["readinessDigest"] = sha256_hex(readiness_preimage.encode("utf-8"))
+    return payload
+
+
+def _refresh_storage_readiness(
+    readiness: dict[str, object],
+) -> dict[str, object]:
+    refreshed = copy.deepcopy(readiness)
+    refreshed.pop("readinessDigest", None)
+    readiness_preimage = runtime_module._monitoring_evidence_storage_readiness_preimage(
+        storage_account_resource_id=cast(
+            str,
+            refreshed["storageAccountResourceId"],
+        ),
+        blob_service_resource_id=cast(
+            str,
+            refreshed["blobServiceResourceId"],
+        ),
+        container_resource_id=cast(str, refreshed["containerResourceId"]),
+        immutability_policy_resource_id=cast(
+            str,
+            refreshed["immutabilityPolicyResourceId"],
+        ),
+        container_public_access=cast(
+            str,
+            refreshed["containerPublicAccess"],
+        ),
+        immutability_policy_state=cast(
+            str,
+            refreshed["immutabilityPolicyState"],
+        ),
+        immutability_retention_days=cast(
+            int,
+            refreshed["immutabilityRetentionDays"],
+        ),
+    )
+    refreshed["readbackBindingId"] = runtime_module._arm_template_guid(readiness_preimage)
+    refreshed["readinessDigest"] = sha256_hex(readiness_preimage.encode("utf-8"))
+    return refreshed
 
 
 def _runtime_support_rbac_inventory(
@@ -412,6 +491,7 @@ def _refresh_support_rbac_inventory(
 
 
 _SUPPORT_RBAC_INVENTORY = _runtime_support_rbac_inventory()
+_STORAGE_READINESS = _storage_readiness_payload()
 PERSISTENCE_REPLAY_KEY = compute_artifact_digest(
     {
         "schemaVersion": "athena.wc028MonitoringPersistenceReplay.v3",
@@ -422,6 +502,7 @@ PERSISTENCE_REPLAY_KEY = compute_artifact_digest(
         "contextBindingDigest": DIGEST_A,
         "incidentRevision": 1,
         "legacyCollectorRbacCleanupDigest": CLEANUP_DIGEST,
+        "monitoringEvidenceStorageReadinessDigest": (_STORAGE_READINESS["readinessDigest"]),
         "trustDelaySeconds": 60,
         "requestLifetimeSeconds": 600,
     }
@@ -448,6 +529,10 @@ def _refresh_configuration_replay_key(payload: dict[str, object]) -> None:
             "contextBindingDigest": context_binding["bindingDigest"],
             "incidentRevision": payload["incidentRevision"],
             "legacyCollectorRbacCleanupDigest": payload["legacyCollectorRbacCleanupDigest"],
+            "monitoringEvidenceStorageReadinessDigest": cast(
+                dict[str, object],
+                payload["monitoringEvidenceStorageReadiness"],
+            )["readinessDigest"],
             "trustDelaySeconds": payload["trustDelaySeconds"],
             "requestLifetimeSeconds": payload["requestLifetimeSeconds"],
         }
@@ -458,7 +543,7 @@ def _refresh_configuration_replay_key(payload: dict[str, object]) -> None:
 def _configuration_payload() -> dict[str, object]:
     support_rbac_inventory = copy.deepcopy(_SUPPORT_RBAC_INVENTORY)
     payload: dict[str, object] = {
-        "schemaVersion": "athena.wc028MonitoringAcquisitionJobConfiguration.v3",
+        "schemaVersion": "athena.wc028MonitoringAcquisitionJobConfiguration.v4",
         "managedIdentityClientId": CLIENT_ID,
         "collectorIdentityResourceId": COLLECTOR_ID,
         "athenaContextIdentityResourceId": CONTEXT_ID,
@@ -474,6 +559,7 @@ def _configuration_payload() -> dict[str, object]:
         "evidenceStorageAccountResourceId": EVIDENCE_STORAGE_ID,
         "evidenceBlobEndpoint": "https://athenamonitoring.blob.core.windows.net",
         "evidenceContainerName": "monitoring-evidence",
+        "monitoringEvidenceStorageReadiness": copy.deepcopy(_STORAGE_READINESS),
         "monitoringIntentTrustedKey": {
             "keyVaultKeyId": INTENT_KEY_ID,
             "publicKeyFingerprint": DIGEST_A,
@@ -713,6 +799,70 @@ def test_configuration_rejects_zero_cleanup_evidence() -> None:
 
     with pytest.raises(ValidationError, match="non-zero SHA-256 digest"):
         Wc028MonitoringAcquisitionJobConfiguration.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    (
+        ("versioningEnabled", False),
+        ("containerPublicAccess", "Blob"),
+        ("immutabilityPolicyState", "Disabled"),
+        ("immutabilityRetentionDays", 0),
+        ("allowProtectedAppendWrites", True),
+        ("allowProtectedAppendWritesAll", True),
+    ),
+)
+def test_configuration_rejects_unprotected_monitoring_evidence_storage(
+    field_name: str,
+    value: object,
+) -> None:
+    payload = _configuration_payload()
+    readiness = cast(
+        dict[str, object],
+        payload["monitoringEvidenceStorageReadiness"],
+    )
+    readiness[field_name] = value
+    payload["monitoringEvidenceStorageReadiness"] = _refresh_storage_readiness(readiness)
+    _refresh_configuration_replay_key(payload)
+
+    with pytest.raises(ValidationError):
+        Wc028MonitoringAcquisitionJobConfiguration.model_validate(payload)
+
+
+def test_configuration_rejects_storage_readiness_boundary_or_digest_substitution() -> None:
+    substituted_container = _configuration_payload()
+    readiness = cast(
+        dict[str, object],
+        substituted_container["monitoringEvidenceStorageReadiness"],
+    )
+    readiness["containerResourceId"] = (
+        f"{EVIDENCE_BLOB_SERVICE_ID}/containers/unreviewed".casefold()
+    )
+    substituted_container["monitoringEvidenceStorageReadiness"] = _refresh_storage_readiness(
+        readiness
+    )
+    _refresh_configuration_replay_key(substituted_container)
+    with pytest.raises(ValidationError, match="exact WC-024 evidence resources"):
+        Wc028MonitoringAcquisitionJobConfiguration.model_validate(substituted_container)
+
+    substituted_digest = _configuration_payload()
+    readiness = cast(
+        dict[str, object],
+        substituted_digest["monitoringEvidenceStorageReadiness"],
+    )
+    readiness["readinessDigest"] = DIGEST_A
+    _refresh_configuration_replay_key(substituted_digest)
+    with pytest.raises(ValidationError, match="readinessDigest"):
+        Wc028MonitoringAcquisitionJobConfiguration.model_validate(substituted_digest)
+
+    substituted_binding = _configuration_payload()
+    readiness = cast(
+        dict[str, object],
+        substituted_binding["monitoringEvidenceStorageReadiness"],
+    )
+    readiness["readbackBindingId"] = "abababab-abab-abab-abab-abababababab"
+    with pytest.raises(ValidationError, match="readbackBindingId"):
+        Wc028MonitoringAcquisitionJobConfiguration.model_validate(substituted_binding)
 
 
 @pytest.mark.parametrize(
@@ -2138,6 +2288,11 @@ def persistence_case(monkeypatch: pytest.MonkeyPatch) -> _PersistenceCase:
             trust_delay_seconds=60,
             request_lifetime_seconds=600,
             runtime_support_effective_rbac_inventory=support_inventory,
+            monitoring_evidence_storage_readiness=(
+                runtime_module.MonitoringEvidenceStorageReadiness.model_validate(_STORAGE_READINESS)
+            ),
+            evidence_storage_account_resource_id=EVIDENCE_STORAGE_ID.casefold(),
+            evidence_container_name="monitoring-evidence",
             runtime_support_identity_resource_id=(support_inventory.support_identity_resource_id),
             runtime_support_identity_client_id=support_inventory.support_client_id,
             runtime_support_identity_principal_id=(support_inventory.support_principal_id),
@@ -2295,6 +2450,39 @@ def test_commit_port_publishes_replay_manifest_last(
     )
     assert manifest.correlation_request_id == expected_correlation.request_id
     assert manifest.correlation_request_digest == expected_correlation.request_digest
+
+
+def test_first_durable_write_revalidates_storage_protection(
+    persistence_case: _PersistenceCase,
+) -> None:
+    unsafe_readiness = (
+        persistence_case.configuration.monitoring_evidence_storage_readiness.model_copy(
+            update={"versioning_enabled": False}
+        )
+    )
+    unsafe_configuration = SimpleNamespace(
+        **{
+            **vars(persistence_case.configuration),
+            "monitoring_evidence_storage_readiness": unsafe_readiness,
+        }
+    )
+    unsafe_case = replace(
+        persistence_case,
+        configuration=unsafe_configuration,
+    )
+    store = _MemoryStore(container_name="monitoring-evidence")
+
+    with (
+        pytest.raises(
+            MonitoringAcquisitionJobError,
+            match="storage readiness failed runtime revalidation",
+        ),
+        _commit_port(store, unsafe_case).transaction(unsafe_case.prepared),
+    ):
+        pass
+
+    assert store.create_requests == []
+    assert store.blobs == {}
 
 
 def test_recovery_state_and_manifest_reject_zero_startup_sentinels(
@@ -2610,6 +2798,121 @@ def test_restart_uses_signed_original_support_inventory_after_current_refresh(
     assert refreshed_inventory.inventory_digest != original_inventory.inventory_digest
 
 
+def test_partial_recovery_rejects_changed_storage_readiness_before_write(
+    persistence_case: _PersistenceCase,
+) -> None:
+    store = _MemoryStore(
+        container_name="monitoring-evidence",
+        fail_once_on_suffix="/manifest.json",
+    )
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    with (
+        pytest.raises(RuntimeError, match="staged persistence failure"),
+        _commit_port(
+            store,
+            persistence_case,
+            private_key=private_key,
+        ).transaction(persistence_case.prepared),
+    ):
+        pass
+    manifest_name, _, evidence_name = runtime_module._monitoring_persistence_blob_names(
+        PERSISTENCE_REPLAY_KEY
+    )
+    del store.blobs[evidence_name]
+    readiness_payload = _storage_readiness_payload()
+    readiness_payload["immutabilityRetentionDays"] = 31
+    changed_readiness = runtime_module.MonitoringEvidenceStorageReadiness.model_validate(
+        _refresh_storage_readiness(readiness_payload)
+    )
+    changed_configuration = SimpleNamespace(
+        **{
+            **vars(persistence_case.configuration),
+            "monitoring_evidence_storage_readiness": changed_readiness,
+        }
+    )
+    changed_case = replace(
+        persistence_case,
+        configuration=changed_configuration,
+    )
+
+    with pytest.raises(
+        MonitoringAcquisitionJobError,
+        match="does not match the reviewed runtime configuration",
+    ):
+        _commit_port(
+            store,
+            changed_case,
+            private_key=private_key,
+        ).recover(
+            runtime_module._probe_monitoring_persistence(
+                reader=store,
+                replay_key=PERSISTENCE_REPLAY_KEY,
+            )
+        )
+
+    assert evidence_name not in store.blobs
+    assert manifest_name not in store.blobs
+
+
+@pytest.mark.parametrize("manifest_on_reconcile", (False, True))
+def test_probe_reconciles_concurrent_state_and_manifest_publication(
+    persistence_case: _PersistenceCase,
+    manifest_on_reconcile: bool,
+) -> None:
+    store = _MemoryStore(container_name="monitoring-evidence")
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    with _commit_port(
+        store,
+        persistence_case,
+        private_key=private_key,
+    ).transaction(persistence_case.prepared):
+        pass
+    manifest_name, recovery_name, evidence_name = runtime_module._monitoring_persistence_blob_names(
+        PERSISTENCE_REPLAY_KEY
+    )
+
+    class _InterleavedReader:
+        def __init__(self) -> None:
+            self.requests: list[str] = []
+            self.manifest_reads = 0
+            self.state_reads = 0
+
+        def read_current(self, request: Any) -> ArtifactReadResult:
+            self.requests.append(request.blob_name)
+            if request.blob_name == manifest_name:
+                self.manifest_reads += 1
+                if self.manifest_reads == 1 or not manifest_on_reconcile:
+                    raise ArtifactNotFoundError("synthetic manifest is not visible yet")
+            elif request.blob_name == recovery_name:
+                self.state_reads += 1
+                if self.state_reads == 1:
+                    raise ArtifactNotFoundError("synthetic state is not visible yet")
+            return store.blobs[request.blob_name]
+
+    reader = _InterleavedReader()
+    probe = runtime_module._probe_monitoring_persistence(
+        reader=reader,
+        replay_key=PERSISTENCE_REPLAY_KEY,
+    )
+
+    assert probe.recovery_state_result == store.blobs[recovery_name]
+    assert probe.evidence_result == store.blobs[evidence_name]
+    assert probe.manifest_result == (store.blobs[manifest_name] if manifest_on_reconcile else None)
+    assert reader.requests == [
+        manifest_name,
+        recovery_name,
+        evidence_name,
+        manifest_name,
+        recovery_name,
+    ]
+    recovered = _commit_port(
+        store,
+        persistence_case,
+        private_key=private_key,
+    ).recover(probe)
+    assert recovered is not None
+
+
 def test_restart_rejects_evidence_without_collector_signed_recovery_binding(
     persistence_case: _PersistenceCase,
 ) -> None:
@@ -2631,6 +2934,7 @@ def test_restart_rejects_evidence_without_collector_signed_recovery_binding(
         PERSISTENCE_REPLAY_KEY
     )
     del store.blobs[recovery_name]
+    store.read_requests.clear()
 
     with pytest.raises(
         MonitoringAcquisitionJobError,
@@ -2649,6 +2953,15 @@ def test_restart_rejects_evidence_without_collector_signed_recovery_binding(
 
     assert evidence_name in store.blobs
     assert manifest_name not in store.blobs
+    assert [item.blob_name for item in store.read_requests] == [
+        manifest_name,
+        recovery_name,
+        evidence_name,
+        manifest_name,
+        recovery_name,
+        manifest_name,
+        recovery_name,
+    ]
 
 
 @pytest.mark.parametrize("incident_override", ("alternate", "missing"))
@@ -2727,6 +3040,7 @@ def test_restart_rejects_rehashed_unsigned_incident_observation_override(
         "revision",
         "timing",
         "support-inventory",
+        "storage-readiness",
         "support-identity",
     ),
 )
@@ -2773,6 +3087,8 @@ def test_restart_rejects_rehashed_unsigned_recovery_binding_fields(
         }
     elif binding_field == "support-inventory":
         updates = {"runtime_support_effective_rbac_inventory_digest": DIGEST_A}
+    elif binding_field == "storage-readiness":
+        updates = {"monitoring_evidence_storage_readiness_digest": DIGEST_A}
     else:
         updates = {"runtime_support_identity_client_id": ("abababab-abab-abab-abab-abababababab")}
     tampered = _rehash_recovery_state_without_resigning(state, **updates)

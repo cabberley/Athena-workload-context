@@ -12,6 +12,9 @@ param monitoringEvidenceStorageAccountResourceId string
 @description('Existing WC-024 monitoring evidence container resource ID.')
 param monitoringEvidenceContainerResourceId string
 
+@description('Validated WC-024 storage-readiness digest that gates evidence writer RBAC.')
+param monitoringEvidenceStorageReadinessDigest string
+
 @description('Exact monitoring-intent signing key resource ID whose public key may be read.')
 param monitoringIntentSigningKeyResourceId string
 
@@ -134,7 +137,7 @@ resource monitoringIntentKeyReaderRole 'Microsoft.Authorization/roleDefinitions@
 }
 
 module collectorMonitoringEvidenceWriter 'monitoring-evidence-writer-assignment.bicep' = {
-  name: 'wc028-monitoring-evidence-writer-assignment'
+  name: 'wc028-monitoring-evidence-writer-${substring(replace(monitoringEvidenceStorageReadinessDigest, 'sha256:', ''), 0, 8)}'
   scope: evidenceStorageResourceGroup
   params: {
     principalId: collectorPrincipalId

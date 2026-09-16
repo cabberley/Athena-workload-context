@@ -11,6 +11,7 @@ from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any, Literal, Protocol, cast
 from urllib.parse import urlsplit
+from uuid import UUID, uuid5
 
 from azure.core.exceptions import AzureError
 from azure.servicebus.exceptions import ServiceBusError
@@ -113,6 +114,7 @@ _ROLE_DEFINITION_ID_PATTERN = re.compile(
 )
 _GUID_PATTERN = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 _MAX_CONFIGURATION_BYTES = 512 * 1024
+_MAX_PERSISTENCE_RECONCILIATION_PASSES = 2
 _RESOURCE_LOG_READER_ROLE_DEFINITION_GUID = "f33a4363-5d9a-5d50-9871-c08582234978"
 _RESOURCE_HEALTH_ROLE_DEFINITION_GUID = "0790d6f2-9553-5b63-84ac-56596b7e4072"
 _RESOURCE_LOG_ALLOWED_OPERATIONS = (
@@ -134,6 +136,7 @@ _MONITORING_INTENT_KEY_READ_DATA_ACTION = "Microsoft.KeyVault/vaults/keys/read"
 _ZERO_DIGEST = f"sha256:{'0' * 64}"
 _NIL_GUID = "00000000-0000-0000-0000-000000000000"
 _ZERO_EXECUTION_ID = f"wc028-execution-{'0' * 32}"
+_ARM_TEMPLATE_GUID_NAMESPACE = UUID("11fb06fb-712d-4ddd-98c7-e71bbd588830")
 _EXTERNAL_AZURE_FAILURES = (AzureError, ServiceBusError, OSError, TimeoutError)
 
 
@@ -273,6 +276,127 @@ class MonitoringRuntimeTrustedKey(_StrictRuntimeModel):
             self.key_vault_key_id,
             public_key_fingerprint=self.public_key_fingerprint,
         )
+
+
+def _monitoring_evidence_storage_readiness_preimage(
+    *,
+    storage_account_resource_id: str,
+    blob_service_resource_id: str,
+    container_resource_id: str,
+    immutability_policy_resource_id: str,
+    container_public_access: str,
+    immutability_policy_state: str,
+    immutability_retention_days: int,
+) -> str:
+    return "|".join(
+        (
+            "athena.wc028MonitoringEvidenceStorageReadiness.v1",
+            _canonical_resource_id(storage_account_resource_id),
+            _canonical_resource_id(blob_service_resource_id),
+            _canonical_resource_id(container_resource_id),
+            _canonical_resource_id(immutability_policy_resource_id),
+            "true",
+            container_public_access,
+            immutability_policy_state,
+            str(immutability_retention_days),
+            "false",
+            "false",
+        )
+    )
+
+
+def _arm_template_guid(*values: str) -> str:
+    if not values or any(not value for value in values):
+        raise ValueError("ARM guid inputs must be non-empty")
+    return str(uuid5(_ARM_TEMPLATE_GUID_NAMESPACE, "-".join(values)))
+
+
+class MonitoringEvidenceStorageReadiness(_StrictRuntimeModel):
+    """Reviewed WC-024 Blob versioning and container immutability readback."""
+
+    schema_version: Literal["athena.wc028MonitoringEvidenceStorageReadiness.v1"] = Field(
+        alias="schemaVersion"
+    )
+    storage_account_resource_id: str = Field(alias="storageAccountResourceId")
+    blob_service_resource_id: str = Field(alias="blobServiceResourceId")
+    container_resource_id: str = Field(alias="containerResourceId")
+    immutability_policy_resource_id: str = Field(alias="immutabilityPolicyResourceId")
+    versioning_enabled: Literal[True] = Field(alias="versioningEnabled")
+    container_public_access: Literal["None"] = Field(alias="containerPublicAccess")
+    immutability_policy_state: Literal["Locked", "Unlocked"] = Field(
+        alias="immutabilityPolicyState"
+    )
+    immutability_retention_days: int = Field(
+        alias="immutabilityRetentionDays",
+        ge=1,
+        le=365000,
+    )
+    allow_protected_append_writes: Literal[False] = Field(alias="allowProtectedAppendWrites")
+    allow_protected_append_writes_all: Literal[False] = Field(alias="allowProtectedAppendWritesAll")
+    readback_binding_id: str = Field(
+        alias="readbackBindingId",
+        pattern=_GUID_PATTERN.pattern,
+    )
+    readiness_digest: str = Field(
+        alias="readinessDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+
+    @field_validator(
+        "storage_account_resource_id",
+        "blob_service_resource_id",
+        "container_resource_id",
+        "immutability_policy_resource_id",
+    )
+    @classmethod
+    def normalize_storage_resource_id(cls, value: str) -> str:
+        normalized = _canonical_resource_id(value)
+        _subscription_id_from_resource_id(normalized)
+        return normalized
+
+    @field_validator("readiness_digest")
+    @classmethod
+    def validate_readiness_digest(cls, value: str) -> str:
+        return _require_nonzero_digest(
+            value,
+            label="monitoring evidence storage readiness digest",
+        )
+
+    @field_validator("readback_binding_id")
+    @classmethod
+    def validate_readback_binding_id(cls, value: str) -> str:
+        return _require_nonzero_guid(
+            value,
+            label="monitoring evidence storage readback binding",
+        )
+
+    @model_validator(mode="after")
+    def validate_readiness(self) -> MonitoringEvidenceStorageReadiness:
+        expected_blob_service_id = f"{self.storage_account_resource_id}/blobservices/default"
+        expected_container_id = f"{expected_blob_service_id}/containers/monitoring-evidence"
+        expected_policy_id = f"{expected_container_id}/immutabilitypolicies/default"
+        if (
+            _STORAGE_ID_PATTERN.fullmatch(self.storage_account_resource_id) is None
+            or self.blob_service_resource_id != expected_blob_service_id
+            or self.container_resource_id != expected_container_id
+            or self.immutability_policy_resource_id != expected_policy_id
+        ):
+            raise ValueError("storage readiness does not bind the exact WC-024 evidence resources")
+        readiness_preimage = _monitoring_evidence_storage_readiness_preimage(
+            storage_account_resource_id=self.storage_account_resource_id,
+            blob_service_resource_id=self.blob_service_resource_id,
+            container_resource_id=self.container_resource_id,
+            immutability_policy_resource_id=self.immutability_policy_resource_id,
+            container_public_access=self.container_public_access,
+            immutability_policy_state=self.immutability_policy_state,
+            immutability_retention_days=self.immutability_retention_days,
+        )
+        if self.readback_binding_id != _arm_template_guid(readiness_preimage):
+            raise ValueError("readbackBindingId does not bind live WC-024 storage protection")
+        expected_digest = sha256_hex(readiness_preimage.encode("utf-8"))
+        if self.readiness_digest != expected_digest:
+            raise ValueError("readinessDigest does not bind WC-024 storage protection readback")
+        return self
 
 
 class MonitoringRuntimeSupportEffectiveRbacInventory(_StrictRuntimeModel):
@@ -656,7 +780,7 @@ class MonitoringRuntimeSupportEffectiveRbacInventory(_StrictRuntimeModel):
 
 
 class Wc028MonitoringAcquisitionJobConfiguration(_StrictRuntimeModel):
-    schema_version: Literal["athena.wc028MonitoringAcquisitionJobConfiguration.v3"] = Field(
+    schema_version: Literal["athena.wc028MonitoringAcquisitionJobConfiguration.v4"] = Field(
         alias="schemaVersion"
     )
     managed_identity_client_id: str = Field(
@@ -691,6 +815,9 @@ class Wc028MonitoringAcquisitionJobConfiguration(_StrictRuntimeModel):
     evidence_storage_account_resource_id: str = Field(alias="evidenceStorageAccountResourceId")
     evidence_blob_endpoint: str = Field(alias="evidenceBlobEndpoint")
     evidence_container_name: Literal["monitoring-evidence"] = Field(alias="evidenceContainerName")
+    monitoring_evidence_storage_readiness: MonitoringEvidenceStorageReadiness = Field(
+        alias="monitoringEvidenceStorageReadiness"
+    )
     monitoring_intent_trusted_key: MonitoringRuntimeTrustedKey = Field(
         alias="monitoringIntentTrustedKey"
     )
@@ -914,6 +1041,19 @@ class Wc028MonitoringAcquisitionJobConfiguration(_StrictRuntimeModel):
             != f"{expected_storage_account_name}.blob.core.windows.net"
         ):
             raise ValueError("evidence Blob endpoint does not match the reviewed storage account")
+        expected_evidence_container_id = (
+            f"{self.evidence_storage_account_resource_id}/blobservices/default/"
+            f"containers/{self.evidence_container_name}"
+        )
+        if (
+            self.monitoring_evidence_storage_readiness.storage_account_resource_id
+            != self.evidence_storage_account_resource_id
+            or self.monitoring_evidence_storage_readiness.container_resource_id
+            != expected_evidence_container_id
+        ):
+            raise ValueError(
+                "storage readiness does not match the configured monitoring evidence boundary"
+            )
         contract = self.monitoring_collector_contract
         authority = self.acquisition_authority
         collector_principal_id = str(contract.get("monitoringReaderPrincipalId", "")).casefold()
@@ -1212,6 +1352,9 @@ class Wc028MonitoringAcquisitionJobConfiguration(_StrictRuntimeModel):
                 "contextBindingDigest": context_binding_digest,
                 "incidentRevision": self.incident_revision,
                 "legacyCollectorRbacCleanupDigest": (self.legacy_collector_rbac_cleanup_digest),
+                "monitoringEvidenceStorageReadinessDigest": (
+                    self.monitoring_evidence_storage_readiness.readiness_digest
+                ),
                 "trustDelaySeconds": self.trust_delay_seconds,
                 "requestLifetimeSeconds": self.request_lifetime_seconds,
             }
@@ -1311,6 +1454,10 @@ class Wc028MonitoringAcquisitionJobConfiguration(_StrictRuntimeModel):
             (
                 "ATHENA_WC028_DEPLOYED_EVIDENCE_CONTAINER_RESOURCE_ID",
                 evidence_container_resource_id,
+            ),
+            (
+                "ATHENA_WC028_DEPLOYED_MONITORING_EVIDENCE_STORAGE_READINESS_DIGEST",
+                self.monitoring_evidence_storage_readiness.readiness_digest,
             ),
             (
                 "ATHENA_WC028_DEPLOYED_COLLECTOR_SIGNING_KEY_ID",
@@ -1523,6 +1670,37 @@ def _validate_runtime_support_effective_rbac(
         )
         if denies_acr_pull or denies_key_read:
             raise ValueError("runtime-support deny assignment removes an exact required permission")
+
+
+def _revalidate_monitoring_evidence_storage_readiness(
+    *,
+    configuration: Wc028MonitoringAcquisitionJobConfiguration,
+    expected_signed_digest: str | None = None,
+) -> MonitoringEvidenceStorageReadiness:
+    try:
+        readiness = MonitoringEvidenceStorageReadiness.model_validate_json(
+            configuration.monitoring_evidence_storage_readiness.model_dump_json(by_alias=True)
+        )
+    except ValueError as exc:
+        raise MonitoringAcquisitionJobError(
+            "monitoring evidence storage readiness failed runtime revalidation"
+        ) from exc
+    if (
+        readiness.storage_account_resource_id != configuration.evidence_storage_account_resource_id
+        or readiness.container_resource_id
+        != (
+            f"{configuration.evidence_storage_account_resource_id}/"
+            f"blobservices/default/containers/{configuration.evidence_container_name}"
+        )
+        or (
+            expected_signed_digest is not None
+            and readiness.readiness_digest != expected_signed_digest
+        )
+    ):
+        raise MonitoringAcquisitionJobError(
+            "monitoring evidence storage readiness changed before writer access"
+        )
+    return readiness
 
 
 def load_wc028_monitoring_acquisition_job_configuration(
@@ -1757,6 +1935,10 @@ class MonitoringPersistenceRecoveryState(_StrictRuntimeModel):
         alias="runtimeSupportEffectiveRbacSourceManifestDigest",
         pattern=r"^sha256:[a-f0-9]{64}$",
     )
+    monitoring_evidence_storage_readiness_digest: str = Field(
+        alias="monitoringEvidenceStorageReadinessDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
     runtime_support_effective_rbac_collected_at: datetime = Field(
         alias="runtimeSupportEffectiveRbacCollectedAt"
     )
@@ -1856,6 +2038,7 @@ class MonitoringPersistenceRecoveryState(_StrictRuntimeModel):
         "acquisition_receipt_digest",
         "runtime_support_effective_rbac_inventory_digest",
         "runtime_support_effective_rbac_source_manifest_digest",
+        "monitoring_evidence_storage_readiness_digest",
         "state_digest",
     )
     @classmethod
@@ -2245,6 +2428,29 @@ def _probe_monitoring_persistence(
         reader,
         blob_name=evidence_blob_name,
     )
+    if evidence_result is not None and recovery_state_result is None:
+        for _ in range(_MAX_PERSISTENCE_RECONCILIATION_PASSES):
+            refreshed_manifest = _read_current_if_present(
+                reader,
+                blob_name=manifest_blob_name,
+            )
+            if refreshed_manifest is not None:
+                _parse_commit_manifest_result(
+                    refreshed_manifest,
+                    expected_blob_name=manifest_blob_name,
+                )
+                manifest_result = refreshed_manifest
+            refreshed_state = _read_current_if_present(
+                reader,
+                blob_name=recovery_blob_name,
+            )
+            if refreshed_state is not None:
+                _parse_recovery_state_result(
+                    refreshed_state,
+                    expected_blob_name=recovery_blob_name,
+                )
+                recovery_state_result = refreshed_state
+                break
     return _MonitoringPersistenceProbe(
         manifest_result=manifest_result,
         recovery_state_result=recovery_state_result,
@@ -2645,6 +2851,9 @@ class MonitoringEvidenceCommitPort:
             "runtimeSupportEffectiveRbacSourceManifestDigest": (
                 support_inventory.source_manifest_digest
             ),
+            "monitoringEvidenceStorageReadinessDigest": (
+                self._configuration.monitoring_evidence_storage_readiness.readiness_digest
+            ),
             "runtimeSupportEffectiveRbacCollectedAt": support_inventory.collected_at,
             "runtimeSupportEffectiveRbacExpiresAt": support_inventory.expires_at,
             "registryResourceId": self._configuration.registry_resource_id,
@@ -2733,6 +2942,8 @@ class MonitoringEvidenceCommitPort:
             != (self._configuration.runtime_support_monitoring_intent_key_reader_role_definition_id)
             or state.runtime_support_attestor_tenant_id
             != self._reviewed_collector_contract.collector_tenant_id
+            or state.monitoring_evidence_storage_readiness_digest
+            != self._configuration.monitoring_evidence_storage_readiness.readiness_digest
         ):
             raise MonitoringAcquisitionJobError(
                 "recovered persistence state does not match the reviewed runtime configuration"
@@ -3115,6 +3326,10 @@ class MonitoringEvidenceCommitPort:
         self._verify_recovery_state_attestation(state)
         self._verify_acquisition_receipt(state)
         prepared = self._validate_recovery_state_binding(state)
+        _revalidate_monitoring_evidence_storage_readiness(
+            configuration=self._configuration,
+            expected_signed_digest=(state.monitoring_evidence_storage_readiness_digest),
+        )
         if probe.recovery_state_result is None:
             state_reference = self._write(
                 writer=self._monitoring_writer,
@@ -3224,6 +3439,10 @@ class MonitoringEvidenceCommitPort:
         self._verify_recovery_state_attestation(state)
         self._verify_acquisition_receipt(state)
         self._validate_recovery_state_binding(state)
+        _revalidate_monitoring_evidence_storage_readiness(
+            configuration=self._configuration,
+            expected_signed_digest=(state.monitoring_evidence_storage_readiness_digest),
+        )
         state_reference = self._write(
             writer=self._monitoring_writer,
             current_reader=self._monitoring_current_reader,
@@ -3399,6 +3618,9 @@ def run_wc028_monitoring_acquisition_job(
             monitoring_intent=monitoring_intent,
         )
         _require_pr99_conditioned_blob_contract(collector_contract)
+        _revalidate_monitoring_evidence_storage_readiness(
+            configuration=configuration,
+        )
         monitoring_evidence_store = AzureBlobChangeEvidenceReplayStore(
             blob_endpoint=configuration.evidence_blob_endpoint,
             container_name=configuration.evidence_container_name,
@@ -3597,6 +3819,7 @@ def run_wc028_monitoring_acquisition_job(
 __all__ = [
     "MonitoringAcquisitionJobError",
     "MonitoringAcquisitionJobOutcome",
+    "MonitoringEvidenceStorageReadiness",
     "MonitoringEvidenceCommitPort",
     "MonitoringPersistenceCommitManifest",
     "MonitoringPersistenceRecoveryState",

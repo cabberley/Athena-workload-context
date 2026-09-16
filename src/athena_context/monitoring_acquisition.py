@@ -36,6 +36,7 @@ from athena_context.contracts import (
     LogQueryMonitoringSignal,
     MonitoringAcquisitionExchange,
     MonitoringAcquisitionReceipt,
+    MonitoringAcquisitionWireAttempt,
     MonitoringCollectorContract,
     MonitoringEvidenceAttestation,
     MonitoringIdentityProof,
@@ -1487,6 +1488,39 @@ class _AzureJsonResponse:
     response_bytes: int
 
 
+@dataclass(frozen=True, slots=True)
+class _AzureWireRequestToken:
+    sequence: int
+    exchange_sequence: int
+    attempt: int
+    source: AcquisitionSource
+    logical_request_digest: str
+    wire_request_digest: str
+    requested_at: datetime
+
+
+class _AzureWireRequestGuard(Protocol):
+    def before_wire_request(
+        self,
+        *,
+        source: AcquisitionSource,
+        logical_request_digest: str,
+        method: Literal["GET", "POST"],
+        url: str,
+        headers: Mapping[str, str],
+        body: bytes | None,
+    ) -> _AzureWireRequestToken: ...
+
+    def complete_wire_request(
+        self,
+        token: _AzureWireRequestToken,
+        *,
+        response_status: int,
+        response_headers: Mapping[str, str],
+        response_body: bytes,
+    ) -> None: ...
+
+
 class _AzureJsonPipeline:
     """Bounded Azure SDK pipeline with one fixed endpoint and token audience."""
 
@@ -1511,10 +1545,19 @@ class _AzureJsonPipeline:
             transport=self._transport,
             policies=[BearerTokenCredentialPolicy(credential, scope)],
         )
+        self._request_guard: _AzureWireRequestGuard | None = None
+
+    def set_request_guard(
+        self,
+        guard: _AzureWireRequestGuard,
+    ) -> None:
+        self._request_guard = guard
 
     def request_json(
         self,
         *,
+        source: AcquisitionSource,
+        logical_request_digest: str,
         method: Literal["GET", "POST"],
         path: str,
         max_bytes: int,
@@ -1550,6 +1593,19 @@ class _AzureJsonPipeline:
             headers=request_headers,
             data=data,
         )
+        request_guard = self._request_guard
+        request_token = (
+            None
+            if request_guard is None
+            else request_guard.before_wire_request(
+                source=source,
+                logical_request_digest=logical_request_digest,
+                method=method,
+                url=request.url,
+                headers=request_headers,
+                body=data,
+            )
+        )
         try:
             pipeline_response = self._pipeline.run(request, stream=True)
             response = pipeline_response.http_response
@@ -1573,6 +1629,13 @@ class _AzureJsonPipeline:
             str(name).casefold(): str(value) for name, value in response.headers.items()
         }
         raw = b"".join(chunks)
+        if request_token is not None and request_guard is not None:
+            request_guard.complete_wire_request(
+                request_token,
+                response_status=response.status_code,
+                response_headers=response_headers,
+                response_body=raw,
+            )
         if not raw:
             if allow_empty:
                 return _AzureJsonResponse(
@@ -1849,6 +1912,12 @@ class _AzureAcquisitionClientBase:
             scope=scope,
             transport=transport,
         )
+
+    def _set_request_guard(
+        self,
+        guard: _AzureWireRequestGuard,
+    ) -> None:
+        self._http.set_request_guard(guard)
 
     def _require_request_contract(self, request: _AcquisitionRequest) -> None:
         if (
@@ -2188,6 +2257,8 @@ class AzureLogAnalyticsAcquisitionClient(_AzureAcquisitionClientBase):
                 "Log Analytics request escaped the reviewed table or resource scope"
             )
         response = self._http.request_json(
+            source="logAnalytics",
+            logical_request_digest=request.request_digest,
             method="POST",
             path=(
                 f"/{_LOG_ANALYTICS_API_VERSION}"
@@ -2361,6 +2432,8 @@ class AzureActivityLogAcquisitionClient(_AzureAcquisitionClientBase):
                 quote_via=quote,
             )
             response = self._http.request_json(
+                source="activityLog",
+                logical_request_digest=request.request_digest,
                 method="GET",
                 path=(
                     f"/subscriptions/{subscription_id}/providers/Microsoft.Insights/"
@@ -2517,6 +2590,8 @@ class AzureResourceGraphAcquisitionClient(_AzureAcquisitionClientBase):
                 "Resource Graph generated query exceeded its reviewed byte bound"
             )
         response = self._http.request_json(
+            source="resourceGraph",
+            logical_request_digest=request.request_digest,
             method="POST",
             path=(
                 "/providers/Microsoft.ResourceGraph/resources"
@@ -2711,6 +2786,8 @@ class AzureResourceHealthAcquisitionClient(_AzureAcquisitionClientBase):
         truncated = False
         for resource_id in request.resource_ids:
             response = self._http.request_json(
+                source="resourceHealth",
+                logical_request_digest=request.request_digest,
                 method="GET",
                 path=(
                     f"{quote(resource_id, safe='/')}/providers/"
@@ -2834,6 +2911,8 @@ class AzureIpFlowVerifyAcquisitionClient(_AzureAcquisitionClientBase):
         }
         response_bytes = 0
         response = self._http.request_json(
+            source="ipFlowVerify",
+            logical_request_digest=request.request_digest,
             method="POST",
             path=(f"{quote(watcher_id, safe='/')}/ipFlowVerify?api-version={_NETWORK_API_VERSION}"),
             body=body,
@@ -2868,6 +2947,8 @@ class AzureIpFlowVerifyAcquisitionClient(_AzureAcquisitionClientBase):
                 raise MonitoringAcquisitionError("IP Flow Verify polling exceeded its time bound")
             self._http.sleep(retry_after)
             response = self._http.request_json(
+                source="ipFlowVerify",
+                logical_request_digest=request.request_digest,
                 method="GET",
                 path=_arm_poll_path(location, subscription_id=subscription_id),
                 max_bytes=_remaining_response_bytes(request.max_bytes, response_bytes),
@@ -3150,6 +3231,20 @@ class _AzureMonitoringClients:
     resource_health: MonitoringResourceHealthClient
     ip_flow_verify: MonitoringIpFlowVerifyClient
 
+    def bind_request_guard(
+        self,
+        guard: _AzureWireRequestGuard,
+    ) -> None:
+        for client in (
+            self.log_analytics,
+            self.activity_log,
+            self.resource_graph,
+            self.resource_health,
+            self.ip_flow_verify,
+        ):
+            if isinstance(client, _AzureAcquisitionClientBase):
+                client._set_request_guard(guard)
+
 
 type _AzureMonitoringClientFactory = Callable[
     [ManagedIdentityCredential, MonitoringCollectorContract],
@@ -3218,6 +3313,16 @@ class AzureMonitoringAdapter:
 
     def utc_now(self) -> datetime:
         return _trusted_runtime_time(_system_utc_now())
+
+    def bind_request_guard(
+        self,
+        guard: _AzureWireRequestGuard,
+    ) -> None:
+        if self._clients is None or self._identity_proof is None:
+            raise MonitoringAcquisitionError(
+                "Azure monitoring identity must be verified before request guard binding"
+            )
+        self._clients.bind_request_guard(guard)
 
     def verify_identity(self) -> MonitoringIdentityProof:
         self._identity_proof = None
@@ -3289,14 +3394,34 @@ class _AcquisitionExecution:
     identity_proof: MonitoringIdentityProof
     max_calls: int
     max_freshness_seconds: int
+    effective_rbac_collected_at: datetime
+    effective_rbac_expires_at: datetime
+    effective_rbac_max_freshness_seconds: int
     started_at: datetime
     exchanges: list[MonitoringAcquisitionExchange]
+    wire_attempts: list[MonitoringAcquisitionWireAttempt]
+
+    def _validate_effective_rbac_time(
+        self,
+        value: datetime,
+        *,
+        label: str,
+    ) -> None:
+        if (
+            value < self.effective_rbac_collected_at
+            or value >= self.effective_rbac_expires_at
+            or (value - self.effective_rbac_collected_at).total_seconds()
+            > self.effective_rbac_max_freshness_seconds
+        ):
+            raise MonitoringAcquisitionError(
+                f"effective RBAC inventory is expired or stale at {label}"
+            )
 
     def _capture_call_start(
         self,
         requested_at_override: datetime | None,
     ) -> datetime:
-        if len(self.exchanges) >= self.max_calls:
+        if len(self.wire_attempts) >= self.max_calls:
             raise MonitoringAcquisitionError(
                 "monitoring acquisition exceeded its total call budget"
             )
@@ -3309,6 +3434,10 @@ class _AcquisitionExecution:
             raise MonitoringAcquisitionError(
                 "verified monitoring credential is stale before Azure source I/O"
             )
+        self._validate_effective_rbac_time(
+            requested_at,
+            label="Azure source request start",
+        )
         if (
             requested_at_override is not None
             and _trusted_runtime_time(requested_at_override) != requested_at
@@ -3317,6 +3446,106 @@ class _AcquisitionExecution:
                 "caller-supplied acquisition time does not equal live call start"
             )
         return requested_at
+
+    def before_wire_request(
+        self,
+        *,
+        source: AcquisitionSource,
+        logical_request_digest: str,
+        method: Literal["GET", "POST"],
+        url: str,
+        headers: Mapping[str, str],
+        body: bytes | None,
+    ) -> _AzureWireRequestToken:
+        if len(self.wire_attempts) >= self.max_calls:
+            raise MonitoringAcquisitionError(
+                "monitoring acquisition exceeded its total call budget"
+            )
+        requested_at = self.adapter.utc_now()
+        if (
+            requested_at < self.started_at
+            or requested_at >= self.identity_proof.expires_at
+            or (requested_at - self.started_at).total_seconds() > self.max_freshness_seconds
+        ):
+            raise MonitoringAcquisitionError(
+                "verified monitoring credential is stale before Azure source I/O"
+            )
+        self._validate_effective_rbac_time(
+            requested_at,
+            label="Azure wire request start",
+        )
+        exchange_sequence = len(self.exchanges) + 1
+        attempt = (
+            sum(item.exchange_sequence == exchange_sequence for item in self.wire_attempts) + 1
+        )
+        sequence = len(self.wire_attempts) + 1
+        request_payload = {
+            "schemaVersion": "athena.wc028MonitoringWireRequest.v1",
+            "sequence": sequence,
+            "exchangeSequence": exchange_sequence,
+            "attempt": attempt,
+            "source": source,
+            "logicalRequestDigest": logical_request_digest,
+            "method": method,
+            "url": url,
+            "headers": {
+                str(name).casefold(): str(value) for name, value in sorted(headers.items())
+            },
+            "bodyDigest": sha256_hex(body or b""),
+            "bodyBytes": len(body or b""),
+        }
+        return _AzureWireRequestToken(
+            sequence=sequence,
+            exchange_sequence=exchange_sequence,
+            attempt=attempt,
+            source=source,
+            logical_request_digest=logical_request_digest,
+            wire_request_digest=compute_artifact_digest(request_payload),
+            requested_at=requested_at,
+        )
+
+    def complete_wire_request(
+        self,
+        token: _AzureWireRequestToken,
+        *,
+        response_status: int,
+        response_headers: Mapping[str, str],
+        response_body: bytes,
+    ) -> None:
+        completed_at = self.adapter.utc_now()
+        if completed_at < token.requested_at or completed_at >= self.identity_proof.expires_at:
+            raise MonitoringAcquisitionError(
+                "collector runtime returned invalid wire request completion time"
+            )
+        self._validate_effective_rbac_time(
+            completed_at,
+            label="Azure wire request completion",
+        )
+        response_payload = {
+            "schemaVersion": "athena.wc028MonitoringWireResponse.v1",
+            "sequence": token.sequence,
+            "status": response_status,
+            "headers": {
+                str(name).casefold(): str(value) for name, value in sorted(response_headers.items())
+            },
+            "bodyDigest": sha256_hex(response_body),
+            "bodyBytes": len(response_body),
+        }
+        self.wire_attempts.append(
+            MonitoringAcquisitionWireAttempt(
+                sequence=token.sequence,
+                exchangeSequence=token.exchange_sequence,
+                attempt=token.attempt,
+                source=token.source,
+                logicalRequestDigest=token.logical_request_digest,
+                wireRequestDigest=token.wire_request_digest,
+                wireResponseDigest=compute_artifact_digest(response_payload),
+                requestedAt=token.requested_at,
+                completedAt=completed_at,
+                responseStatus=response_status,
+                responseBytes=len(response_body),
+            )
+        )
 
     def _invoke_at[
         RequestT: _AcquisitionRequest,
@@ -3333,11 +3562,46 @@ class _AcquisitionExecution:
             raise MonitoringAcquisitionError(
                 "IP Flow checkedAt must equal the collector-owned call start"
             )
+        wire_attempt_start = len(self.wire_attempts)
         result = operation(request)
         received_at = self.adapter.utc_now()
         if received_at < requested_at:
             raise MonitoringAcquisitionError("collector runtime returned non-monotonic time")
+        self._validate_effective_rbac_time(
+            received_at,
+            label="Azure source request completion",
+        )
         source = cast(AcquisitionSource, request.source)
+        if len(self.wire_attempts) == wire_attempt_start:
+            sequence = len(self.wire_attempts) + 1
+            response_bytes = result.canonical_bytes()
+            self.wire_attempts.append(
+                MonitoringAcquisitionWireAttempt(
+                    sequence=sequence,
+                    exchangeSequence=len(self.exchanges) + 1,
+                    attempt=1,
+                    source=source,
+                    logicalRequestDigest=request.request_digest,
+                    wireRequestDigest=compute_artifact_digest(
+                        {
+                            "schemaVersion": ("athena.wc028SyntheticMonitoringWireRequest.v1"),
+                            "sequence": sequence,
+                            "logicalRequestDigest": request.request_digest,
+                        }
+                    ),
+                    wireResponseDigest=compute_artifact_digest(
+                        {
+                            "schemaVersion": ("athena.wc028SyntheticMonitoringWireResponse.v1"),
+                            "sequence": sequence,
+                            "resultDigest": sha256_hex(response_bytes),
+                        }
+                    ),
+                    requestedAt=requested_at,
+                    completedAt=received_at,
+                    responseStatus=200,
+                    responseBytes=len(response_bytes),
+                )
+            )
         self.exchanges.append(
             MonitoringAcquisitionExchange(
                 sequence=len(self.exchanges) + 1,
@@ -4066,6 +4330,10 @@ class MonitoringAcquisitionCoordinator:
             or receipt_issued_at < execution_completed_at
         ):
             raise MonitoringAcquisitionError("collector runtime returned non-monotonic time")
+        execution._validate_effective_rbac_time(
+            execution_completed_at,
+            label="collector execution completion",
+        )
         identity_proof = execution.identity_proof
         payload: dict[str, object] = {
             "schemaVersion": MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION,
@@ -4098,6 +4366,7 @@ class MonitoringAcquisitionCoordinator:
             "executionCompletedAt": execution_completed_at,
             "receiptIssuedAt": receipt_issued_at,
             "exchanges": tuple(execution.exchanges),
+            "wireAttempts": tuple(execution.wire_attempts),
             "identityProof": identity_proof,
         }
         receipt_digest = compute_artifact_digest(_json_value(payload))
@@ -4224,12 +4493,16 @@ class MonitoringAcquisitionCoordinator:
             MonitoringEffectiveRbacInventory,
             self._collector_contract.effective_rbac_inventory,
         )
+        effective_rbac_freshness_seconds = min(
+            self._acquisition_authority.max_freshness_seconds,
+            self._collector_contract.maximum_evidence_age_seconds,
+        )
         inventory_checked_at = self._acquisition_adapter.utc_now()
         if (
             effective_rbac_inventory.collected_at > inventory_checked_at
             or effective_rbac_inventory.expires_at <= inventory_checked_at
             or (inventory_checked_at - effective_rbac_inventory.collected_at).total_seconds()
-            > self._acquisition_authority.max_freshness_seconds
+            > effective_rbac_freshness_seconds
         ):
             raise MonitoringAcquisitionError(
                 "effective RBAC inventory is stale or invalid before credential acquisition"
@@ -4278,9 +4551,14 @@ class MonitoringAcquisitionCoordinator:
             identity_proof=identity_proof,
             max_calls=cast(int, self._acquisition_authority.max_acquisition_calls),
             max_freshness_seconds=self._acquisition_authority.max_freshness_seconds,
+            effective_rbac_collected_at=effective_rbac_inventory.collected_at,
+            effective_rbac_expires_at=effective_rbac_inventory.expires_at,
+            effective_rbac_max_freshness_seconds=(effective_rbac_freshness_seconds),
             started_at=collected_at,
             exchanges=[],
+            wire_attempts=[],
         )
+        self._acquisition_adapter.bind_request_guard(execution)
 
         records: list[MonitoringCollectionRecord] = []
         coverage: list[MonitoringCoverageRecord] = []

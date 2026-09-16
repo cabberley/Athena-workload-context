@@ -68,6 +68,22 @@ param runtimeSupportEffectiveRbacInventoryDigest string
 @maxLength(71)
 param runtimeSupportEffectiveRbacSourceManifestDigest string
 
+@description('Digest of exact WC-024 Blob versioning and monitoring-evidence immutability readback.')
+@minLength(71)
+@maxLength(71)
+param monitoringEvidenceStorageReadinessDigest string
+
+@description('Exact reviewed WC-024 monitoring-evidence immutability policy state.')
+@allowed([
+  'Locked'
+  'Unlocked'
+])
+param monitoringEvidenceImmutabilityPolicyState string
+
+@description('Exact reviewed WC-024 monitoring-evidence immutability retention.')
+@minValue(1)
+param monitoringEvidenceImmutabilityRetentionDays int
+
 @secure()
 @description('Reviewed WC-028 runtime configuration. It contains no credentials and is secret-backed to avoid command-line or plain environment disclosure.')
 param acquisitionRuntimeConfigurationJson string
@@ -75,6 +91,8 @@ param acquisitionRuntimeConfigurationJson string
 @description('Tags applied to the WC-028 job.')
 param tags object = {}
 
+var parsedRuntimeConfiguration = json(acquisitionRuntimeConfigurationJson)
+var configuredStorageReadiness = parsedRuntimeConfiguration.monitoringEvidenceStorageReadiness
 var registrySegments = split(registryResourceId, '/')
 var registryResourceGroupName = length(registrySegments) == 9 && toLower(
   registrySegments[1]
@@ -186,6 +204,22 @@ var validatedEvidenceContainerResourceId = startsWith(
 ) && endsWith(toLower(monitoringEvidenceContainerResourceId), '/monitoring-evidence')
   ? monitoringEvidenceContainerResourceId
   : fail('WC-028 must reuse the WC-024 monitoring-evidence container')
+var expectedEvidenceBlobServiceResourceId = '${validatedEvidenceStorageAccountResourceId}/blobServices/default'
+var expectedEvidenceImmutabilityPolicyResourceId = '${validatedEvidenceContainerResourceId}/immutabilityPolicies/default'
+var nilGuid = '00000000-0000-0000-0000-000000000000'
+var validatedConfiguredStorageReadiness = parsedRuntimeConfiguration.schemaVersion == 'athena.wc028MonitoringAcquisitionJobConfiguration.v4' && configuredStorageReadiness.schemaVersion == 'athena.wc028MonitoringEvidenceStorageReadiness.v1' && toLower(
+  string(configuredStorageReadiness.storageAccountResourceId)
+) == toLower(validatedEvidenceStorageAccountResourceId) && toLower(
+  string(configuredStorageReadiness.blobServiceResourceId)
+) == toLower(expectedEvidenceBlobServiceResourceId) && toLower(
+  string(configuredStorageReadiness.containerResourceId)
+) == toLower(validatedEvidenceContainerResourceId) && toLower(
+  string(configuredStorageReadiness.immutabilityPolicyResourceId)
+) == toLower(expectedEvidenceImmutabilityPolicyResourceId) && configuredStorageReadiness.versioningEnabled == true && configuredStorageReadiness.containerPublicAccess == 'None' && configuredStorageReadiness.immutabilityPolicyState == monitoringEvidenceImmutabilityPolicyState && configuredStorageReadiness.immutabilityRetentionDays == monitoringEvidenceImmutabilityRetentionDays && configuredStorageReadiness.allowProtectedAppendWrites == false && configuredStorageReadiness.allowProtectedAppendWritesAll == false && configuredStorageReadiness.readinessDigest == monitoringEvidenceStorageReadinessDigest && length(
+  string(configuredStorageReadiness.readbackBindingId)
+) == 36 && toLower(string(configuredStorageReadiness.readbackBindingId)) != nilGuid
+  ? configuredStorageReadiness
+  : fail('runtime configuration storage readiness does not match the exact reviewed WC-024 readback inputs')
 var validatedSigningKeyUri = contains(
   toLower(monitoringCollectorSigningKeyUriWithVersion),
   '/keys/monitoring-evidence-signing/'
@@ -306,6 +340,7 @@ var resourceTags = union(tags, {
   legacyCollectorRbacCleanupDigest: validatedLegacyCollectorRbacCleanupDigest
   runtimeSupportEffectiveRbacInventoryDigest: validatedRuntimeSupportRbacInventoryDigest
   runtimeSupportEffectiveRbacSourceManifestDigest: validatedRuntimeSupportRbacSourceManifestDigest
+  monitoringEvidenceStorageReadinessDigest: monitoringEvidenceStorageReadinessDigest
   evidenceStorageAccountResourceId: validatedEvidenceStorageAccountResourceId
   evidenceContainerResourceId: validatedEvidenceContainerResourceId
   signingKeyUri: validatedSigningKeyUri
@@ -330,6 +365,19 @@ var validatedRegistryResourceId = toLower(registry.id) == toLower(registryResour
   ? registry.id
   : fail('registryResourceId does not resolve to the reviewed ACR')
 
+module storageReadiness 'modules/storage-readiness.bicep' = {
+  name: 'wc028-monitoring-evidence-storage-readiness'
+  scope: subscription()
+  params: {
+    storageAccountResourceId: validatedEvidenceStorageAccountResourceId
+    containerResourceId: validatedEvidenceContainerResourceId
+    expectedImmutabilityPolicyState: string(validatedConfiguredStorageReadiness.immutabilityPolicyState)
+    expectedImmutabilityRetentionDays: int(validatedConfiguredStorageReadiness.immutabilityRetentionDays)
+    storageReadinessDigest: string(validatedConfiguredStorageReadiness.readinessDigest)
+    expectedReadbackBindingId: string(validatedConfiguredStorageReadiness.readbackBindingId)
+  }
+}
+
 module acquisitionRbac 'modules/acquisition-rbac.bicep' = {
   name: 'wc028-monitoring-acquisition-rbac'
   scope: subscription()
@@ -338,6 +386,7 @@ module acquisitionRbac 'modules/acquisition-rbac.bicep' = {
     runtimeSupportPrincipalId: runtimeSupportIdentity.properties.principalId
     monitoringEvidenceStorageAccountResourceId: validatedEvidenceStorageAccountResourceId
     monitoringEvidenceContainerResourceId: validatedEvidenceContainerResourceId
+    monitoringEvidenceStorageReadinessDigest: storageReadiness.outputs.validatedStorageReadinessDigest
     monitoringIntentSigningKeyResourceId: validatedMonitoringIntentSigningKeyResourceId
   }
 }
@@ -352,6 +401,9 @@ module runtimeSupportImagePull 'modules/acr-pull-assignment.bicep' = {
     runtimeSupportIdentityResourceId: validatedRuntimeSupportIdentityResourceId
     acrPullRoleDefinitionId: acrPullRoleDefinitionId
   }
+  dependsOn: [
+    storageReadiness
+  ]
 }
 
 resource acquisitionJob 'Microsoft.App/jobs@2025-01-01' = {
@@ -467,6 +519,10 @@ resource acquisitionJob 'Microsoft.App/jobs@2025-01-01' = {
             {
               name: 'ATHENA_WC028_DEPLOYED_EVIDENCE_CONTAINER_RESOURCE_ID'
               value: validatedEvidenceContainerResourceId
+            }
+            {
+              name: 'ATHENA_WC028_DEPLOYED_MONITORING_EVIDENCE_STORAGE_READINESS_DIGEST'
+              value: storageReadiness.outputs.validatedStorageReadinessDigest
             }
             {
               name: 'ATHENA_WC028_DEPLOYED_COLLECTOR_SIGNING_KEY_ID'

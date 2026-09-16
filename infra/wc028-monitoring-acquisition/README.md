@@ -18,6 +18,9 @@ Container Apps secret and is accepted only when its exact raw bytes match
 - the private Container Apps managed environment and digest-pinned runtime image;
 - the WC-024 collector identity, versioned `monitoring-evidence-signing` key, storage account,
   immutable `monitoring-evidence` container, and current measured RBAC inventory;
+- exact deployment-time WC-024 storage readback proving Blob versioning, no public container
+  access, and the reviewed immutability policy state, retention, and disabled protected-append
+  exceptions;
 - the separate runtime-support identity plus fresh hierarchy-complete effective-RBAC evidence
   proving that it has only direct `AcrPull` and exact monitoring-intent key-read access;
 - the exact versioned monitoring-intent signing key whose public material is required for local
@@ -33,9 +36,11 @@ wc024-monitoring/commits/{replayKey}/manifest.json
 ```
 
 Every start probes the deterministic manifest, recovery-state, and evidence names before requiring
-current runtime-support RBAC freshness. A valid manifest recovers the committed handoff and exact
-correlation request directly. A collector-signed recovery state can recreate missing evidence and
-finish the same handoff, request, and manifest without Azure source reacquisition.
+current runtime-support RBAC freshness. If evidence appears after an initial state miss, the reader
+performs bounded manifest/state reconciliation before declaring a true orphan. A valid manifest
+recovers the committed handoff and exact correlation request directly. A collector-signed recovery
+state can recreate missing evidence and finish the same handoff, request, and manifest without
+Azure source reacquisition.
 
 Recovery state v2 is signed with the exact collector key before the first durable write. Its
 signature binds the complete replay-v3 execution, cleanup, incident revision, request window,
@@ -49,7 +54,7 @@ marker. The current contract does not execute or persist supporting change contr
 ## Runtime configuration
 
 `acquisitionRuntimeConfigurationJson` uses
-`athena.wc028MonitoringAcquisitionJobConfiguration.v3`. It embeds the exact signed monitoring
+`athena.wc028MonitoringAcquisitionJobConfiguration.v4`. It embeds the exact signed monitoring
 intent and references, published runtime binding, acquisition authority v5, collector contract v8,
 and approved change scope. It also binds:
 
@@ -60,6 +65,7 @@ and approved change scope. It also binds:
   assignments, transitive groups, active PIM schedules, conditions, and deny assignments;
 - the separate Athena context resource and principal identities;
 - the monitoring-evidence storage endpoint and container;
+- the non-zero storage-readiness digest and exact versioning/immutability readback;
 - the resource-context Log Analytics workspace, exact VM scopes, and measured effective RBAC
   inventory;
 - the monitoring-intent and collector signing-key trust anchors; and
@@ -69,10 +75,17 @@ and approved change scope. It also binds:
   retains the original inventory digest and execution-time validity window.
 
 The runtime delegates managed-identity acquisition to the hardened production adapter. That
-adapter verifies the collector identity through the Athena-owned proof audience, creates every
-Azure source client from the same verified `ManagedIdentityCredential`, binds resource-context Log
-Analytics request v3 and permission evidence to the authority-selected VM scope, and persists the
-selected incident in acquisition receipt v5 and correlation request v4.
+adapter verifies the collector identity through the Athena-owned proof audience, carries the
+collector effective-RBAC inventory window into every acquisition execution, and checks live trusted
+time immediately before and after every Azure source call. Receipt verification proves every
+logical exchange, every nested wire-attempt request/completion, and the collector execution
+completion remained inside the signed inventory lifetime and effective minimum freshness bound.
+Each actual HTTP request—including per-resource Activity Log/Resource Health calls and ARM polling—
+consumes the reviewed call budget and contributes exact request/response digests to the signed
+receipt. The adapter creates every Azure source client from the same verified
+`ManagedIdentityCredential`, binds resource-context Log Analytics request v3 and permission evidence
+to the authority-selected VM scope, and persists the selected incident in acquisition receipt v5
+and correlation request v4.
 
 Traffic Analytics and Connection Monitor workspace-table acquisition are explicitly unsupported in
 the current contract. Those controls produce deterministic unavailable coverage with zero Logs or
@@ -98,7 +111,7 @@ definitions, verifies every reviewed binding and definition is absent, and emits
 `cleanupEvidenceDigest`.
 
 Pass that digest as both `legacyCollectorRbacCleanupDigest` and the matching field in runtime
-configuration v3. All-zero cleanup evidence is rejected. Measure and embed fresh collector and
+configuration v4. All-zero cleanup evidence is rejected. Measure and embed fresh collector and
 runtime-support effective-RBAC inventories only after cleanup. The Job is
 manual with no replica retry, so every execution requires a newly reviewed configuration, cleanup
 evidence binding, execution ID, and replay key.
@@ -113,6 +126,15 @@ The deployment adds only:
 - exact known-name Blob reads plus add-only Blob creation for the collector on the existing
   `monitoring-evidence` container. The assignment condition explicitly denies the `Blob.List`
   suboperation.
+
+The storage-readiness module must first read back the exact WC-024 storage account, Blob service,
+container, and immutability policy. Its validated digest is passed into the evidence-writer RBAC
+module name and the Job environment. The module computes an ARM `guid()` binding from the live
+resource IDs and protection values and requires it to equal the binding embedded in the same parsed
+runtime configuration. A mismatched versioning, public-access, policy-state, retention,
+protected-append, binding-ID, or readiness-digest claim prevents role assignment and Job deployment.
+Runtime recomputes the SHA-256 readiness digest and revalidates the same protection contract before
+any durable writer call.
 
 It adds no built-in Reader, Contributor, Owner, Blob overwrite/delete/list, diagnostic-setting,
 alert-rule, or Connection Monitor mutation permission. Existing WC-024 grants continue to

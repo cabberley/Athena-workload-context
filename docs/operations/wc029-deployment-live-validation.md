@@ -136,7 +136,7 @@ Use scope-correct, reviewed parameters for every root:
 | WC-024 connectivity | Subscription | Reviewed copy of `main.example.bicepparam` |
 | WC-024 foundation | Subscription | Reviewed environment parameter artifact; examples are not deployable approval |
 | WC-025 change ingestion | Subscription | New reviewed parameter artifact containing the exact image, identities, resource allowlist, containers, and versioned signing key |
-| WC-028 monitoring acquisition | Runtime resource group | Fresh execution-specific parameter artifact containing the cleanup evidence digest, current effective-RBAC inventory, configuration v3 replay key, exact collector/support/attestor identity tuples, and digest-pinned image |
+| WC-028 monitoring acquisition | Runtime resource group | Fresh execution-specific parameter artifact containing the cleanup evidence digest, current effective-RBAC inventory, configuration v4 replay key, exact WC-024 storage-readiness digest, collector/support/attestor identity tuples, and digest-pinned image |
 | WC-029 monitoring prerequisites | Subscription | `infra/wc029-monitoring-prerequisites/main.preparation.bicepparam` with both extension gates false; enabling either requires a separately reviewed immutable copy |
 
 The release cannot proceed while any non-WC-013 root lacks its reviewed immutable parameter
@@ -185,18 +185,24 @@ template. Perform these steps in order:
 4. Produce a fresh collector contract and authority from the PR #99 revision that recognizes the
    conditioned known-name-read/add-only writer. Stop if the contract still requires
    `Storage Blob Data Contributor` or `blobs/write`.
-5. Produce a one-execution runtime configuration v3 whose non-zero
+5. Produce a one-execution runtime configuration v4 whose non-zero
    `legacyCollectorRbacCleanupDigest` and stable `persistenceReplayKey` bind the execution ID,
    authority, intent reference, context, incident revision, and request-window policy. Current
    support-inventory refreshes must not change that recovery path. Before its first durable write,
    the runtime creates recovery state v2 signed by the exact collector key; that signature binds the
    originally accepted support-inventory/source-manifest digests and execution-time validity window.
-6. Run resource-group `validate` and `what-if` for
+6. Read back the exact WC-024 evidence storage account, Blob service, `monitoring-evidence`
+   container, and default immutability policy. Stop unless Blob versioning is enabled, container
+   public access is `None`, policy state and retention exactly match review, and both protected
+   append-write flags are false. Embed the resulting non-zero readiness digest and ARM `guid()`
+   readback binding in runtime configuration v4. The deployment must parse that same configuration
+   and compare the live binding before releasing any role assignment or Job resource.
+7. Run resource-group `validate` and `what-if` for
    `infra/wc028-monitoring-acquisition/main.bicep`. The only new assignments may be ACR pull and
    monitoring-intent key read for the distinct runtime-support identity plus the conditioned
    known-name-read/add-only monitoring-evidence role for the measured collector. The collector must
    retain no built-in Blob contributor assignment.
-7. Do not deploy while the runtime's explicit PR #99 conditioned-Blob contract gate remains closed.
+8. Do not deploy while the runtime's explicit PR #99 conditioned-Blob contract gate remains closed.
    After the required PR #99 restack, deploy the manual Job, remeasure both identities, and verify
    the collector inventory matches the new contract and the runtime-support identity has only
    direct `AcrPull` on the reviewed registry plus the exact monitoring-intent key-read role before
@@ -206,6 +212,10 @@ The Job uses `triggerType: Manual` and `replicaRetryLimit: 0`. Never start it on
 new execution ID, cleanup binding, collector inventory, and replay key for each governed execution.
 The current runtime-support inventory may be refreshed without changing the replay key; recovery
 must use the inventory digest and lifetime already bound by the collector-signed recovery state.
+During a new acquisition, every actual HTTP request and response interval—not only the logical
+source operation—must consume the call budget and remain inside the collector inventory lifetime
+and effective minimum freshness bound. The signed receipt must retain the nested wire-attempt
+digests and timestamps for later verification.
 
 ## Phase 3: effective RBAC
 

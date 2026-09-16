@@ -8,6 +8,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 INFRA = ROOT / "infra" / "wc028-monitoring-acquisition"
 BICEP = INFRA / "main.bicep"
+STORAGE_READINESS = INFRA / "modules" / "storage-readiness.bicep"
 
 
 def test_wc028_job_reuses_wc024_identity_key_and_evidence_boundary() -> None:
@@ -37,6 +38,9 @@ def test_wc028_job_reuses_wc024_identity_key_and_evidence_boundary() -> None:
         "runtimeSupportIdentity.properties.principalId",
         "monitoringEvidenceStorageAccountResourceId",
         "monitoringEvidenceContainerResourceId",
+        "monitoringEvidenceStorageReadinessDigest",
+        "monitoringEvidenceImmutabilityPolicyState",
+        "monitoringEvidenceImmutabilityRetentionDays",
         "monitoringCollectorSigningKeyUriWithVersion",
         "monitoringIntentSigningKeyResourceId",
         "monitoringIntentSigningKeyUriWithVersion",
@@ -59,10 +63,13 @@ def test_wc028_job_reuses_wc024_identity_key_and_evidence_boundary() -> None:
         "ATHENA_WC028_DEPLOYED_SOURCE_STORAGE_ACCOUNT_RESOURCE_ID",
         "ATHENA_WC028_DEPLOYED_EVIDENCE_STORAGE_ACCOUNT_RESOURCE_ID",
         "ATHENA_WC028_DEPLOYED_EVIDENCE_CONTAINER_RESOURCE_ID",
+        "ATHENA_WC028_DEPLOYED_MONITORING_EVIDENCE_STORAGE_READINESS_DIGEST",
         "ATHENA_WC028_DEPLOYED_COLLECTOR_SIGNING_KEY_ID",
         "ATHENA_WC028_DEPLOYED_MONITORING_INTENT_SIGNING_KEY_ID",
         "ATHENA_WC028_DEPLOYED_WORKLOAD_RESOURCE_GROUP_ID",
         "modules/acquisition-rbac.bicep",
+        "modules/storage-readiness.bicep",
+        "storageReadiness.outputs.validatedStorageReadinessDigest",
         "legacyCollectorRbacCleanupDigest",
         "runtimeSupportEffectiveRbacInventoryDigest",
         "runtimeSupportEffectiveRbacSourceManifestDigest",
@@ -166,6 +173,57 @@ def test_runtime_iac_adds_only_exact_create_and_known_name_read_storage_grant() 
     assert "Microsoft.Insights/" not in role_source
     assert "Microsoft.ResourceGraph/" not in role_source
     assert "Microsoft.Resources/changes/read" not in role_source
+    assert "monitoringEvidenceStorageReadinessDigest" in role_source
+    assert "wc028-monitoring-evidence-writer-${substring(" in role_source
+
+
+def test_storage_readiness_gates_writer_rbac_and_job_on_exact_wc024_readback() -> None:
+    source = STORAGE_READINESS.read_text(encoding="utf-8")
+    main = BICEP.read_text(encoding="utf-8")
+
+    for expected in (
+        "Microsoft.Storage/storageAccounts@2025-06-01",
+        "Microsoft.Storage/storageAccounts/blobServices@2025-06-01",
+        "Microsoft.Storage/storageAccounts/blobServices/containers@2025-06-01",
+        (
+            "Microsoft.Storage/storageAccounts/blobServices/containers/"
+            "immutabilityPolicies@2025-06-01"
+        ),
+        "blobService.properties.isVersioningEnabled == true",
+        "monitoringEvidenceContainer.properties.publicAccess == 'None'",
+        "monitoringEvidenceImmutability.properties.state == expectedImmutabilityPolicyState",
+        (
+            "monitoringEvidenceImmutability.properties."
+            "immutabilityPeriodSinceCreationInDays == expectedImmutabilityRetentionDays"
+        ),
+        "monitoringEvidenceImmutability.properties.allowProtectedAppendWrites == false",
+        "monitoringEvidenceImmutability.properties.allowProtectedAppendWritesAll == false",
+        "storageReadinessDigest != rejectedDigest",
+        "var readinessPreimage = ",
+        "var computedReadbackBindingId = guid(readinessPreimage)",
+        "expectedReadbackBindingId == computedReadbackBindingId",
+        "output validatedStorageReadinessDigest string",
+    ):
+        assert expected in source
+
+    assert (
+        "monitoringEvidenceStorageReadinessDigest: "
+        "storageReadiness.outputs.validatedStorageReadinessDigest"
+    ) in main
+    assert ("value: storageReadiness.outputs.validatedStorageReadinessDigest") in main
+    assert "dependsOn: [\n    storageReadiness\n  ]" in main
+    assert "json(acquisitionRuntimeConfigurationJson)" in main
+    assert "configuredStorageReadiness.readbackBindingId" in main
+    assert (
+        "runtime configuration storage readiness does not match the exact reviewed "
+        "WC-024 readback inputs"
+    ) in main
+    assert (
+        "configuredStorageReadiness.readinessDigest == monitoringEvidenceStorageReadinessDigest"
+    ) in main
+    assert (
+        "expectedReadbackBindingId: string(validatedConfiguredStorageReadiness.readbackBindingId)"
+    ) in main
 
 
 def test_upgrade_cleanup_targets_only_exact_legacy_collector_bindings() -> None:

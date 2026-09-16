@@ -257,11 +257,7 @@ class _ReceiptSigner:
 def _permission_evidence(
     request: LogAnalyticsQueryRequest,
 ) -> MonitoringLogPermissionEvidence:
-    workspace_id = (
-        _acquisition_collector_contract()
-        .workspace_resource_id.casefold()
-        .rstrip("/")
-    )
+    workspace_id = _acquisition_collector_contract().workspace_resource_id.casefold().rstrip("/")
     resources = (
         MonitoringLogPermissionResource(
             resourceId=request.query_target_resource_id,
@@ -1183,10 +1179,7 @@ def test_acquisition_derives_strict_requests_and_commits_one_batch() -> None:
         "Connection Monitor table acquisition is unsupported" in item
         for item in outcome.manual_investigation_reasons
     )
-    assert not any(
-        isinstance(item, NetworkWatcherFlowRecord)
-        for item in outcome.batch.records
-    )
+    assert not any(isinstance(item, NetworkWatcherFlowRecord) for item in outcome.batch.records)
     assert not any(isinstance(item, IpFlowVerifyRequest) for item in port.requests)
     assert all(
         item.log_permission_evidence is not None
@@ -1243,6 +1236,11 @@ def test_acquisition_derives_strict_requests_and_commits_one_batch() -> None:
     assert manifest.normalized_evidence_digest == receipt.normalized_evidence_digest
     assert manifest.exchanges == receipt.exchanges
     assert len(receipt.exchanges) == len(port.requests)
+    assert receipt.wire_attempts is not None
+    assert len(receipt.wire_attempts) == len(port.requests)
+    assert tuple(item.exchange_sequence for item in receipt.wire_attempts) == tuple(
+        item.sequence for item in receipt.exchanges
+    )
     assert all(
         item.identity_proof_digest == receipt.identity_proof.proof_digest
         for item in receipt.exchanges
@@ -1421,9 +1419,7 @@ def test_correlation_revalidates_persisted_observation_contract_scope() -> None:
     outcome, _, intent = _execute(_AcquisitionPort())
     bundle = outcome.prepared.monitoring_bundle
     heartbeat = next(
-        item
-        for item in bundle.observations
-        if isinstance(item, GuestSignalObservation)
+        item for item in bundle.observations if isinstance(item, GuestSignalObservation)
     )
     tampered_heartbeat = heartbeat.model_copy(
         update={"subject_resource_id": OUT_OF_SCOPE_ID.casefold()}
@@ -1580,6 +1576,74 @@ def test_identity_proof_time_follows_token_jwks_signature_and_claim_validation()
     )
 
 
+def test_each_source_call_rechecks_live_effective_rbac_start_time() -> None:
+    clock = {"now": NOW}
+
+    class _ClockAdapter:
+        @staticmethod
+        def utc_now() -> datetime:
+            return clock["now"]
+
+    class _IdentityProof:
+        expires_at = NOW + timedelta(minutes=10)
+        proof_digest = "sha256:" + "a" * 64
+
+    execution = monitoring_acquisition_module._AcquisitionExecution(
+        adapter=_ClockAdapter(),
+        identity_proof=_IdentityProof(),
+        max_calls=2,
+        max_freshness_seconds=600,
+        effective_rbac_collected_at=NOW - timedelta(minutes=1),
+        effective_rbac_expires_at=NOW + timedelta(seconds=1),
+        effective_rbac_max_freshness_seconds=600,
+        started_at=NOW,
+        exchanges=[],
+        wire_attempts=[],
+    )
+
+    assert execution._capture_call_start(None) == NOW
+    clock["now"] = NOW + timedelta(seconds=1)
+    with pytest.raises(
+        monitoring_acquisition_module.MonitoringAcquisitionError,
+        match="expired or stale at Azure source request start",
+    ):
+        execution._capture_call_start(None)
+
+
+def test_source_completion_after_effective_rbac_expiry_fails_closed() -> None:
+    payload = _acquisition_collector_contract().model_dump(
+        mode="python",
+        by_alias=True,
+    )
+    inventory = payload["effectiveRbacInventory"]
+    assert isinstance(inventory, dict)
+    inventory.update(
+        {
+            "collectedAt": NOW - timedelta(minutes=1),
+            "expiresAt": NOW + timedelta(seconds=5),
+        }
+    )
+    inventory.pop("inventoryDigest")
+    inventory["inventoryDigest"] = compute_artifact_digest(
+        monitoring_acquisition_module._json_value(inventory)
+    )
+    contract = MonitoringCollectorContract(**payload)
+
+    class _SlowPort(_AcquisitionPort):
+        def _record_request(self, request: object) -> None:
+            super()._record_request(request)
+            _SyntheticClock.now += timedelta(seconds=10)
+
+    port = _SlowPort()
+    with pytest.raises(
+        monitoring_acquisition_module.MonitoringAcquisitionError,
+        match="expired or stale at Azure source request completion",
+    ):
+        _execute(port, collector_contract=contract)
+
+    assert len(port.requests) == 1
+
+
 def test_ambiguous_vm_mapping_and_truncation_degrade_coverage() -> None:
     outcome, commit, _ = _execute(
         _AcquisitionPort(
@@ -1706,16 +1770,11 @@ def test_flow_table_control_is_unavailable_without_log_or_ip_flow_calls() -> Non
     port = _AcquisitionPort(mismatched_ip_flow=True)
     outcome, commit, _ = _execute(port)
 
-    flow_coverage = next(
-        item
-        for item in outcome.batch.coverage
-        if item.family == "networkFlow"
-    )
+    flow_coverage = next(item for item in outcome.batch.coverage if item.family == "networkFlow")
     assert commit.calls == 1
     assert port.ip_flow_calls == 0
     assert not any(
-        isinstance(item, LogAnalyticsQueryRequest)
-        and item.table == "NTANetAnalytics"
+        isinstance(item, LogAnalyticsQueryRequest) and item.table == "NTANetAnalytics"
         for item in port.requests
     )
     assert flow_coverage.status == "unavailable"
@@ -1723,7 +1782,7 @@ def test_flow_table_control_is_unavailable_without_log_or_ip_flow_calls() -> Non
     assert (
         flow_coverage.detail is not None
         and "ABAC-isolated workspace/table boundary" in flow_coverage.detail
-        )
+    )
 
 
 def test_healthy_guest_signal_does_not_block_endpoint_incident() -> None:
@@ -1746,10 +1805,7 @@ def test_optional_change_controls_are_not_executed_or_attributed() -> None:
         isinstance(request, (ActivityLogQueryRequest, ResourceGraphChangeQueryRequest))
         for request in port.requests
     )
-    assert not any(
-        isinstance(item, NetworkWatcherFlowRecord)
-        for item in outcome.batch.records
-    )
+    assert not any(isinstance(item, NetworkWatcherFlowRecord) for item in outcome.batch.records)
     assert any(
         "supporting control has no required coverage scope and was not executed" in item
         for item in outcome.manual_investigation_reasons
@@ -2647,11 +2703,14 @@ def test_ip_flow_result_paths_are_never_invoked_without_flow_boundary(
 
     assert commit.calls == 1
     assert port.ip_flow_calls == 0
-    assert not any(item.source == "ipFlowVerify" for item in (
-        outcome.prepared.monitoring_bundle.acquisition_receipt.exchanges
-        if outcome.prepared.monitoring_bundle.acquisition_receipt is not None
-        else ()
-    ))
+    assert not any(
+        item.source == "ipFlowVerify"
+        for item in (
+            outcome.prepared.monitoring_bundle.acquisition_receipt.exchanges
+            if outcome.prepared.monitoring_bundle.acquisition_receipt is not None
+            else ()
+        )
+    )
 
 
 def test_unproven_empty_aggregate_is_unavailable_not_healthy() -> None:
@@ -2813,15 +2872,13 @@ def test_traffic_analytics_cardinality_is_not_queried_without_flow_boundary() ->
     assert commit.calls == 1
     assert port.ip_flow_calls == 0
     assert not any(
-        isinstance(item, LogAnalyticsQueryRequest)
-        and item.table == "NTANetAnalytics"
+        isinstance(item, LogAnalyticsQueryRequest) and item.table == "NTANetAnalytics"
         for item in port.requests
     )
-    assert next(
-        item
-        for item in outcome.batch.coverage
-        if item.family == "networkFlow"
-    ).status == "unavailable"
+    assert (
+        next(item for item in outcome.batch.coverage if item.family == "networkFlow").status
+        == "unavailable"
+    )
 
 
 def test_empty_traffic_analytics_emits_no_ip_flow_exchange_or_orphan_proof() -> None:
@@ -2878,9 +2935,7 @@ def test_persisted_log_permission_evidence_rejects_silent_exclusions(
         exclude_none=True,
     )
     coverage_payload = next(
-        item
-        for item in bundle_payload["coverage"]
-        if item.get("logPermissionEvidence") is not None
+        item for item in bundle_payload["coverage"] if item.get("logPermissionEvidence") is not None
     )
     permission_payload = coverage_payload["logPermissionEvidence"]
     permission_payload[permission_section][0]["denyTables"] = ["Heartbeat"]
@@ -2892,9 +2947,7 @@ def test_persisted_log_permission_evidence_rejects_silent_exclusions(
 def test_production_bundle_requires_persisted_log_permission_evidence() -> None:
     outcome, _, _ = _execute(_AcquisitionPort())
     bundle = outcome.prepared.monitoring_bundle
-    selected = next(
-        item for item in bundle.coverage if item.log_permission_evidence is not None
-    )
+    selected = next(item for item in bundle.coverage if item.log_permission_evidence is not None)
     tampered = selected.model_copy(update={"log_permission_evidence": None})
     tampered_bundle = bundle.model_copy(
         update={
