@@ -95,7 +95,9 @@ if TYPE_CHECKING:
 
 _GUID_CLAIMS = ("tid", "oid", "sub")
 _JWT_REQUIRED_CLAIMS = ("aud", "exp", "iat", "iss", "nbf", "oid", "sub", "tid")
-_BLOB_CONTAINER_PATTERN = re.compile(r"[a-z0-9](?:[a-z0-9-]{1,61}[a-z0-9])?")
+_BLOB_CONTAINER_PATTERN = re.compile(
+    r"[a-z0-9](?:[a-z0-9-]{1,61}[a-z0-9])?"
+)
 type _KeyVaultRequestGuard = Callable[[], AbstractContextManager[None]]
 type _AzureHttpTransport = HttpTransport[HttpRequest, HttpResponse]
 
@@ -178,7 +180,9 @@ def production_managed_identity_credential(
 ) -> DefaultAzureCredential:
     """Build the production managed-identity-only credential chain."""
 
-    return _production_credential(managed_identity_client_id=managed_identity_client_id)
+    return _production_credential(
+        managed_identity_client_id=managed_identity_client_id
+    )
 
 
 def _minimum_datetime(
@@ -206,7 +210,8 @@ def _validate_blob_endpoint(blob_endpoint: str) -> None:
         or parsed.fragment
         or parsed.path not in ("", "/")
         or hostname is None
-        or re.fullmatch(r"[a-z0-9]{3,24}\.blob\.core\.windows\.net", hostname) is None
+        or re.fullmatch(r"[a-z0-9]{3,24}\.blob\.core\.windows\.net", hostname)
+        is None
     ):
         raise ValueError("blob_endpoint must be an Azure public-cloud Blob HTTPS origin")
 
@@ -234,7 +239,9 @@ class KeyVaultRsaSigner:
         managed_identity_client_id: str,
     ) -> None:
         self._trusted_key_anchor = trusted_key_anchor
-        credential = _production_credential(managed_identity_client_id=managed_identity_client_id)
+        credential = _production_credential(
+            managed_identity_client_id=managed_identity_client_id
+        )
         self._client = CryptographyClient(
             trusted_key_anchor.key_vault_key_id,
             credential,
@@ -269,7 +276,7 @@ class KeyVaultRsaSigner:
             signature = base64.urlsafe_b64decode(
                 detached_signature + "=" * (-len(detached_signature) % 4)
             )
-        except TypeError, ValueError:
+        except (TypeError, ValueError):
             return False
         if not signature:
             return False
@@ -294,7 +301,9 @@ class KeyVaultRsaPublicKeyVerifier:
         request_guard: _KeyVaultRequestGuard | None = None,
     ) -> None:
         vault_url = trusted_key_anchor.key_vault_key_id.split("/keys/", maxsplit=1)[0]
-        credential = _production_credential(managed_identity_client_id=managed_identity_client_id)
+        credential = _production_credential(
+            managed_identity_client_id=managed_identity_client_id
+        )
         key = _key_vault_client(
             vault_url=vault_url,
             credential=credential,
@@ -303,7 +312,10 @@ class KeyVaultRsaPublicKeyVerifier:
             trusted_key_anchor.key_name,
             trusted_key_anchor.key_version,
         )
-        if str(key.id) != trusted_key_anchor.key_vault_key_id or key.properties.enabled is False:
+        if (
+            str(key.id) != trusted_key_anchor.key_vault_key_id
+            or key.properties.enabled is False
+        ):
             raise ValueError("Key Vault verification key is not the pinned enabled version")
         key_material = cast(Any, key.key)
         modulus = key_material.n
@@ -340,7 +352,7 @@ class KeyVaultRsaPublicKeyVerifier:
                 padding.PKCS1v15(),
                 hashes.SHA256(),
             )
-        except InvalidSignature, TypeError, ValueError:
+        except (InvalidSignature, TypeError, ValueError):
             return False
         return True
 
@@ -364,7 +376,9 @@ class KeyVaultTrustedKeyResolver:
         self._expected_record = expected_record
         anchor = expected_record.anchor
         vault_url = anchor.key_vault_key_id.split("/keys/", maxsplit=1)[0]
-        credential = _production_credential(managed_identity_client_id=managed_identity_client_id)
+        credential = _production_credential(
+            managed_identity_client_id=managed_identity_client_id
+        )
         self._client = _key_vault_client(
             vault_url=vault_url,
             credential=credential,
@@ -431,7 +445,9 @@ class AzureTableAttemptReplayGuard:
         partition_key: str,
         managed_identity_client_id: str,
     ) -> None:
-        credential = _production_credential(managed_identity_client_id=managed_identity_client_id)
+        credential = _production_credential(
+            managed_identity_client_id=managed_identity_client_id
+        )
         self._table = TableServiceClient(
             endpoint=endpoint,
             credential=credential,
@@ -440,7 +456,9 @@ class AzureTableAttemptReplayGuard:
 
     def reserve(self, attempt_id: str, request_digest: str) -> bool:
         attempt_key = "attempt-" + hashlib.sha256(attempt_id.encode("utf-8")).hexdigest()
-        request_key = "request-" + hashlib.sha256(request_digest.encode("utf-8")).hexdigest()
+        request_key = "request-" + hashlib.sha256(
+            request_digest.encode("utf-8")
+        ).hexdigest()
         operations = [
             (
                 "create",
@@ -492,7 +510,9 @@ class AzureBlobCreateOnlyArtifactWriter:
             raise ValueError(
                 f"max_payload_bytes must be between 1 and {MAX_ARTIFACT_TRANSFER_BYTES}"
             )
-        credential = _production_credential(managed_identity_client_id=managed_identity_client_id)
+        credential = _production_credential(
+            managed_identity_client_id=managed_identity_client_id
+        )
         service = BlobServiceClient(
             account_url=blob_endpoint,
             credential=credential,
@@ -588,7 +608,9 @@ class AzureBlobPresentationAssetPublisher:
         request: PresentationPublicationRequest,
     ) -> PresentationPublicationReceipt:
         if type(request) is not PresentationPublicationRequest:
-            raise TypeError("request must be an exact PresentationPublicationRequest")
+            raise TypeError(
+                "request must be an exact PresentationPublicationRequest"
+            )
         for asset in request.assets:
             blob = self._container.get_blob_client(asset.blob_name)
             try:
@@ -599,7 +621,9 @@ class AzureBlobPresentationAssetPublisher:
                     metadata={"payload_sha256": asset.payload_sha256},
                     overwrite=False,
                     match_condition=MatchConditions.IfMissing,
-                    content_settings=ContentSettings(content_type="application/json"),
+                    content_settings=ContentSettings(
+                        content_type="application/json"
+                    ),
                 )
             except ResourceExistsError as exc:
                 error_code = getattr(exc, "error_code", None)
@@ -624,7 +648,8 @@ class AzureBlobPresentationAssetPublisher:
                 if (
                     size != len(asset.payload)
                     or existing_payload != asset.payload
-                    or getattr(content_settings, "content_type", None) != "application/json"
+                    or getattr(content_settings, "content_type", None)
+                    != "application/json"
                     or type(metadata) is not dict
                     or metadata.get("payload_sha256") != asset.payload_sha256
                 ):
@@ -647,7 +672,6 @@ class AzureBlobPresentationAssetPublisher:
             manifest_blob_name="runtime-manifest.json",
             manifest_sha256=manifest_sha256,
         )
-
 
 class AzureBlobPresentationAssetReader:
     """Read current blobs only from the private presentation-assets container."""
@@ -723,10 +747,15 @@ class AzureBlobPresentationAssetReader:
             or any(segment in {"", ".", ".."} for segment in blob_name.split("/"))
         ):
             raise ValueError("blob_name is not a bounded relative path")
-        if type(maximum_bytes) is not int or not 1 <= maximum_bytes <= (
-            MAX_ARTIFACT_PAYLOAD_BYTES
-            if version_id is None
-            else MAX_PRESENTATION_VERSION_PINNED_ASSET_BYTES
+        if (
+            type(maximum_bytes) is not int
+            or not 1
+            <= maximum_bytes
+            <= (
+                MAX_ARTIFACT_PAYLOAD_BYTES
+                if version_id is None
+                else MAX_PRESENTATION_VERSION_PINNED_ASSET_BYTES
+            )
         ):
             raise ValueError("maximum_bytes is outside the presentation bound")
         blob = (
@@ -746,10 +775,14 @@ class AzureBlobPresentationAssetReader:
             properties = downloader.properties
             response_version_id = getattr(properties, "version_id", None)
             if version_id is not None and response_version_id != version_id:
-                raise PresentationAssetUnavailableError("presentation asset version is invalid")
+                raise PresentationAssetUnavailableError(
+                    "presentation asset version is invalid"
+                )
             size = getattr(downloader, "size", None)
             if type(size) is not int or not 1 <= size <= maximum_bytes:
-                raise PresentationAssetUnavailableError("presentation asset size is invalid")
+                raise PresentationAssetUnavailableError(
+                    "presentation asset size is invalid"
+                )
             content_settings = getattr(properties, "content_settings", None)
             if getattr(content_settings, "content_type", None) != "application/json":
                 raise PresentationAssetUnavailableError(
@@ -757,7 +790,9 @@ class AzureBlobPresentationAssetReader:
                 )
             payload = downloader.readall()
             if type(payload) is not bytes or not 1 <= len(payload) <= maximum_bytes:
-                raise PresentationAssetUnavailableError("presentation asset transfer is invalid")
+                raise PresentationAssetUnavailableError(
+                    "presentation asset transfer is invalid"
+                )
             payload_sha256 = sha256_hex(payload)
             metadata = getattr(properties, "metadata", None)
             if (
@@ -772,9 +807,13 @@ class AzureBlobPresentationAssetReader:
                     "presentation asset metadata digest is invalid"
                 )
         except ResourceNotFoundError as exc:
-            raise PresentationAssetUnavailableError("presentation asset is unavailable") from exc
+            raise PresentationAssetUnavailableError(
+                "presentation asset is unavailable"
+            ) from exc
         except HttpResponseError as exc:
-            raise PresentationAssetUnavailableError("presentation asset is unavailable") from exc
+            raise PresentationAssetUnavailableError(
+                "presentation asset is unavailable"
+            ) from exc
         return PresentationAssetReadResult(
             blob_name=blob_name,
             payload=payload,
@@ -803,7 +842,9 @@ class AzureBlobIncidentAssetPublisher:
         if (
             not signing_key_id
             or not signing_key_vault_key_id
-            or not re.fullmatch(r"sha256:[a-f0-9]{64}", signing_key_fingerprint)
+            or not re.fullmatch(
+            r"sha256:[a-f0-9]{64}", signing_key_fingerprint
+            )
         ):
             raise ValueError("incident signing trust anchor is invalid")
         credential = production_managed_identity_credential(
@@ -834,7 +875,9 @@ class AzureBlobIncidentAssetPublisher:
         except ResourceNotFoundError:
             return None
         except HttpResponseError as exc:
-            raise PresentationAssetUnavailableError("active incident index is unavailable") from exc
+            raise PresentationAssetUnavailableError(
+                "active incident index is unavailable"
+            ) from exc
         if not 1 <= len(payload) <= MAX_INCIDENT_STATE_BYTES:
             raise PresentationAssetUnavailableError(
                 "active incident index is outside its byte bound"
@@ -866,7 +909,9 @@ class AzureBlobIncidentAssetPublisher:
                 "active incident index attestation is outside its byte bound"
             )
         try:
-            attestation = ActiveIncidentIndexAttestation.model_validate_json(attestation_payload)
+            attestation = ActiveIncidentIndexAttestation.model_validate_json(
+                attestation_payload
+            )
         except ValueError as exc:
             raise PresentationAssetUnavailableError(
                 "active incident index attestation is invalid"
@@ -880,7 +925,9 @@ class AzureBlobIncidentAssetPublisher:
                 attestation.detached_signature,
             )
         ):
-            raise PresentationAssetUnavailableError("active incident index signature is invalid")
+            raise PresentationAssetUnavailableError(
+                "active incident index signature is invalid"
+            )
         return ActiveIncidentIndexSnapshot(
             index=index,
             payload_sha256=sha256_hex(payload),
@@ -903,7 +950,9 @@ class AzureBlobIncidentAssetPublisher:
         try:
             pointer = IncidentFeedPointer.model_validate_json(pointer_payload)
         except ValueError as exc:
-            raise PresentationAssetUnavailableError("current incident pointer is invalid") from exc
+            raise PresentationAssetUnavailableError(
+                "current incident pointer is invalid"
+            ) from exc
         if (
             pointer_payload != pointer.canonical_bytes()
             or pointer.incident_id != incident_id
@@ -914,11 +963,14 @@ class AzureBlobIncidentAssetPublisher:
                 "current incident pointer trust binding is invalid"
             )
         pointer_blob_name = (
-            pointer.state_path.removesuffix("/state.json").removeprefix("./") + "/pointer.json"
+            pointer.state_path.removesuffix("/state.json").removeprefix("./")
+            + "/pointer.json"
         )
-        immutable_pointer_payload, pointer_version = self._read_immutable_incident_json_blob(
-            pointer_blob_name,
-            maximum_bytes=MAX_INCIDENT_FEED_POINTER_BYTES,
+        immutable_pointer_payload, pointer_version = (
+            self._read_immutable_incident_json_blob(
+                pointer_blob_name,
+                maximum_bytes=MAX_INCIDENT_FEED_POINTER_BYTES,
+            )
         )
         (
             pointer_attestation_payload,
@@ -927,9 +979,11 @@ class AzureBlobIncidentAssetPublisher:
             pointer.pointer_attestation_path.removeprefix("./"),
             maximum_bytes=MAX_PRESENTATION_ATTESTATION_BYTES,
         )
-        state_payload, state_version_id = self._read_immutable_incident_json_blob(
-            pointer.state_path.removeprefix("./"),
-            maximum_bytes=MAX_INCIDENT_STATE_BYTES,
+        state_payload, state_version_id = (
+            self._read_immutable_incident_json_blob(
+                pointer.state_path.removeprefix("./"),
+                maximum_bytes=MAX_INCIDENT_STATE_BYTES,
+            )
         )
         (
             state_attestation_payload,
@@ -947,7 +1001,9 @@ class AzureBlobIncidentAssetPublisher:
                 state_attestation_payload
             )
         except ValueError as exc:
-            raise PresentationAssetUnavailableError("current incident state is invalid") from exc
+            raise PresentationAssetUnavailableError(
+                "current incident state is invalid"
+            ) from exc
         unsigned_state = state.model_dump(
             mode="json",
             by_alias=True,
@@ -959,9 +1015,11 @@ class AzureBlobIncidentAssetPublisher:
         ).removesuffix("/state.json")
         if (
             immutable_pointer_payload != pointer_payload
-            or pointer_attestation_payload != pointer_attestation.canonical_bytes()
+            or
+            pointer_attestation_payload != pointer_attestation.canonical_bytes()
             or pointer_attestation.pointer_digest != sha256_hex(pointer_payload)
-            or pointer_attestation.key_vault_key_id != self._signing_key_vault_key_id
+            or pointer_attestation.key_vault_key_id
+            != self._signing_key_vault_key_id
             or not self._signature_verifier(
                 pointer_payload,
                 pointer_attestation.detached_signature,
@@ -974,7 +1032,8 @@ class AzureBlobIncidentAssetPublisher:
             or state_attestation_payload != state_attestation.canonical_bytes()
             or pointer.attestation_sha256 != sha256_hex(state_attestation_payload)
             or state_attestation.result_digest != state.result_digest
-            or state_attestation.key_vault_key_id != self._signing_key_vault_key_id
+            or state_attestation.key_vault_key_id
+            != self._signing_key_vault_key_id
             or not self._signature_verifier(
                 state_preimage,
                 state_attestation.detached_signature,
@@ -1029,15 +1088,20 @@ class AzureBlobIncidentAssetPublisher:
         if (
             request.pointer.key_id != self._signing_key_id
             or request.pointer.key_fingerprint != self._signing_key_fingerprint
-            or request.pointer_attestation.key_vault_key_id != self._signing_key_vault_key_id
+            or request.pointer_attestation.key_vault_key_id
+            != self._signing_key_vault_key_id
             or request.active_index.key_id != self._signing_key_id
-            or request.active_index.key_fingerprint != self._signing_key_fingerprint
-            or request.active_index_attestation.key_vault_key_id != self._signing_key_vault_key_id
+            or request.active_index.key_fingerprint
+            != self._signing_key_fingerprint
+            or request.active_index_attestation.key_vault_key_id
+            != self._signing_key_vault_key_id
         ):
             raise ValueError("incident publication trust anchor is invalid")
         build_incident_occurrence_receipt(
             IncidentState.model_validate_json(request.state.payload),
-            IncidentStateAttestation.model_validate_json(request.attestation.payload),
+            IncidentStateAttestation.model_validate_json(
+                request.attestation.payload
+            ),
             request.pointer,
             request.pointer_attestation,
             state_reference=VersionPinnedBlobReference(
@@ -1058,19 +1122,29 @@ class AzureBlobIncidentAssetPublisher:
             pointer_attestation_reference=VersionPinnedBlobReference(
                 name=request.pointer_attestation_asset.blob_name,
                 version="preflight",
-                contentDigest=(request.pointer_attestation_asset.payload_sha256),
+                contentDigest=(
+                    request.pointer_attestation_asset.payload_sha256
+                ),
             ),
         )
         state_reference = self._upload_immutable(request.state)
-        state_attestation_reference = self._upload_immutable(request.attestation)
-        pointer_reference = self._upload_immutable(request.pointer_asset)
-        pointer_attestation_reference = self._upload_immutable(request.pointer_attestation_asset)
+        state_attestation_reference = self._upload_immutable(
+            request.attestation
+        )
+        pointer_reference = self._upload_immutable(
+            request.pointer_asset
+        )
+        pointer_attestation_reference = self._upload_immutable(
+            request.pointer_attestation_asset
+        )
         self._upload_immutable(request.active_index_attestation_asset)
         self._publish_current_pointer(request)
         self._publish_active_index(request)
         occurrence = build_incident_occurrence_receipt(
             IncidentState.model_validate_json(request.state.payload),
-            IncidentStateAttestation.model_validate_json(request.attestation.payload),
+            IncidentStateAttestation.model_validate_json(
+                request.attestation.payload
+            ),
             request.pointer,
             request.pointer_attestation,
             state_reference=state_reference,
@@ -1090,11 +1164,15 @@ class AzureBlobIncidentAssetPublisher:
         request: ActiveIncidentIndexPublicationRequest,
     ) -> ActiveIncidentIndexSnapshot:
         if type(request) is not ActiveIncidentIndexPublicationRequest:
-            raise TypeError("request must be an exact ActiveIncidentIndexPublicationRequest")
+            raise TypeError(
+                "request must be an exact ActiveIncidentIndexPublicationRequest"
+            )
         if (
             request.active_index.key_id != self._signing_key_id
-            or request.active_index.key_fingerprint != self._signing_key_fingerprint
-            or request.active_index_attestation.key_vault_key_id != self._signing_key_vault_key_id
+            or request.active_index.key_fingerprint
+            != self._signing_key_fingerprint
+            or request.active_index_attestation.key_vault_key_id
+            != self._signing_key_vault_key_id
         ):
             raise ValueError("active incident index trust anchor is invalid")
         self._upload_immutable(request.active_index_attestation_asset)
@@ -1111,7 +1189,11 @@ class AzureBlobIncidentAssetPublisher:
             if isinstance(value, dict)
             else getattr(value, "version_id", None)
         )
-        return candidate if isinstance(candidate, str) and candidate else None
+        return (
+            candidate
+            if isinstance(candidate, str) and candidate
+            else None
+        )
 
     def _recover_immutable_reference(
         self,
@@ -1137,13 +1219,15 @@ class AzureBlobIncidentAssetPublisher:
         version_id = self._version_id(properties)
         if (
             existing_payload != asset.payload
-            or getattr(content_settings, "content_type", None) != "application/json"
+            or getattr(content_settings, "content_type", None)
+            != "application/json"
             or type(metadata) is not dict
             or metadata.get("payload_sha256") != asset.payload_sha256
             or version_id is None
         ):
             raise PresentationAssetAlreadyExistsError(
-                "an immutable incident asset already exists with different or unversioned content"
+                "an immutable incident asset already exists with different "
+                "or unversioned content"
             ) from cause
         return VersionPinnedBlobReference(
             name=asset.blob_name,
@@ -1187,7 +1271,9 @@ class AzureBlobIncidentAssetPublisher:
             return self._recover_immutable_reference(
                 blob,
                 asset,
-                cause=ValueError("upload response omitted the Blob version ID"),
+                cause=ValueError(
+                    "upload response omitted the Blob version ID"
+                ),
             )
         return VersionPinnedBlobReference(
             name=asset.blob_name,
@@ -1230,7 +1316,9 @@ class AzureBlobIncidentAssetPublisher:
             or type(metadata) is not dict
             or metadata.get("payload_sha256") != sha256_hex(payload)
         ):
-            raise PresentationAssetUnavailableError("current incident asset metadata is invalid")
+            raise PresentationAssetUnavailableError(
+                "current incident asset metadata is invalid"
+            )
         return payload
 
     def _read_immutable_incident_json_blob(
@@ -1258,7 +1346,8 @@ class AzureBlobIncidentAssetPublisher:
         if (
             type(payload) is not bytes
             or not 1 <= len(payload) <= maximum_bytes
-            or getattr(content_settings, "content_type", None) != "application/json"
+            or getattr(content_settings, "content_type", None)
+            != "application/json"
             or type(metadata) is not dict
             or metadata.get("payload_sha256") != sha256_hex(payload)
             or version_id is None
@@ -1294,7 +1383,9 @@ class AzureBlobIncidentAssetPublisher:
             or type(metadata) is not dict
             or metadata.get("payload_sha256") != sha256_hex(current_bytes)
         ):
-            raise PresentationAssetAlreadyExistsError("current incident pointer is invalid")
+            raise PresentationAssetAlreadyExistsError(
+                "current incident pointer is invalid"
+            )
         if current_bytes == asset.payload:
             return
         try:
@@ -1442,7 +1533,9 @@ class AzureBlobVersionPinnedArtifactReader:
             raise ValueError(
                 f"max_payload_bytes must be between 1 and {MAX_ARTIFACT_TRANSFER_BYTES}"
             )
-        credential = _production_credential(managed_identity_client_id=managed_identity_client_id)
+        credential = _production_credential(
+            managed_identity_client_id=managed_identity_client_id
+        )
         service = BlobServiceClient(
             account_url=blob_endpoint,
             credential=credential,
@@ -1521,7 +1614,11 @@ class AzureBlobVersionPinnedArtifactReader:
                     "Blob version content type is not exactly application/json"
                 )
             metadata = getattr(properties, "metadata", None)
-            metadata_digest = metadata.get("payload_sha256") if type(metadata) is dict else None
+            metadata_digest = (
+                metadata.get("payload_sha256")
+                if type(metadata) is dict
+                else None
+            )
             if (
                 type(metadata_digest) is not str
                 or metadata_digest != request.expected_payload_sha256
@@ -1543,7 +1640,10 @@ class AzureBlobVersionPinnedArtifactReader:
                 "Blob download length does not match the bounded response metadata"
             )
         computed_digest = sha256_hex(payload)
-        if computed_digest != request.expected_payload_sha256 or computed_digest != metadata_digest:
+        if (
+            computed_digest != request.expected_payload_sha256
+            or computed_digest != metadata_digest
+        ):
             raise ArtifactVerificationError(
                 "Blob payload bytes do not match the expected SHA-256 digest"
             )
@@ -1553,7 +1653,9 @@ class AzureBlobVersionPinnedArtifactReader:
                 parse_constant=_reject_non_json_constant,
             )
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
-            raise ArtifactVerificationError("Blob payload is not valid UTF-8 JSON") from exc
+            raise ArtifactVerificationError(
+                "Blob payload is not valid UTF-8 JSON"
+            ) from exc
         return ArtifactReadResult(
             container_name=self._container_name,
             blob_name=request.blob_name,
@@ -1563,6 +1665,7 @@ class AzureBlobVersionPinnedArtifactReader:
             content_type="application/json",
             payload_sha256=computed_digest,
         )
+
 
     def read_current(self, request: ArtifactCurrentReadRequest) -> ArtifactReadResult:
         """Recover one known current Blob version only after bounded integrity validation."""
@@ -1598,9 +1701,15 @@ class AzureBlobVersionPinnedArtifactReader:
                     "Blob version content type is not exactly application/json"
                 )
             metadata = getattr(properties, "metadata", None)
-            metadata_digest = metadata.get("payload_sha256") if type(metadata) is dict else None
+            metadata_digest = (
+                metadata.get("payload_sha256")
+                if type(metadata) is dict
+                else None
+            )
             if type(metadata_digest) is not str:
-                raise ArtifactVerificationError("Blob payload hash metadata is missing or invalid")
+                raise ArtifactVerificationError(
+                    "Blob payload hash metadata is missing or invalid"
+                )
             payload = downloader.readall()
         except ResourceNotFoundError as exc:
             self._raise_if_blob_not_found(exc)
@@ -1625,7 +1734,9 @@ class AzureBlobVersionPinnedArtifactReader:
                 parse_constant=_reject_non_json_constant,
             )
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
-            raise ArtifactVerificationError("Blob payload is not valid UTF-8 JSON") from exc
+            raise ArtifactVerificationError(
+                "Blob payload is not valid UTF-8 JSON"
+            ) from exc
         return ArtifactReadResult(
             container_name=self._container_name,
             blob_name=request.blob_name,
@@ -1701,7 +1812,9 @@ class DefaultAzureCredentialTrustedIngestionSigner:
             or trust.managed_identity_client_id != self._evidence_identity_client_id
         ):
             raise ValueError("trusted ingestion identity or signing anchor changed")
-        token = self._credential.get_token(f"{trust.ingestion_audience.rstrip('/')}/.default").token
+        token = self._credential.get_token(
+            f"{trust.ingestion_audience.rstrip('/')}/.default"
+        ).token
         verified = self._verify_token(
             token,
             tenant_id=trust.tenant_id,
@@ -1798,7 +1911,9 @@ class DefaultAzureCredentialTrustedIngestionSigner:
                 "trustAnchorRef": anchor.key_vault_key_id,
             },
         }
-        identity["identityEvidenceDigest"] = compute_collector_identity_evidence_digest(identity)
+        identity["identityEvidenceDigest"] = compute_collector_identity_evidence_digest(
+            identity
+        )
         return CollectorIdentityEvidence.model_validate(identity)
 
     @staticmethod
@@ -1886,7 +2001,9 @@ class DefaultAzureCredentialTrustedIngestionSigner:
             "verifiedClaimsDigest": claims_digest,
             "jtiDigest": verified_claims["jtiDigest"],
         }
-        verification["tokenVerificationDigest"] = compute_token_verification_digest(verification)
+        verification["tokenVerificationDigest"] = compute_token_verification_digest(
+            verification
+        )
         return {
             "token_hash": sha256_hex(token.encode("utf-8")),
             "header": {"alg": "RS256", "kid": kid, "typ": "JWT"},
