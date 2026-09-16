@@ -246,6 +246,14 @@ The gate fails on:
   federated credential, Microsoft Graph app-role/delegated-permission/credential grant, equivalent
   identity-granting resource, or any `Microsoft.Resources/deploymentScripts` mutation, even if its
   resource ID is allowlisted, until post-deployment effects are fully evaluated;
+- any Key Vault change that enables `enabledForTemplateDeployment`, `enabledForDeployment`, or
+  `enabledForDiskEncryption`; exact boolean `false` is the only accepted value when one of these
+  properties changes;
+- any Create, Modify, or Delete of `Microsoft.Resources/deploymentStacks` or
+  `Microsoft.Storage/storageAccounts/localUsers`, including stack
+  `denySettings`/`actionOnUnmanage` and local-user SSH key, password, shared-key, ACL, or
+  `permissionScopes` changes, until their downstream deny/delete/credential/data-permission effects
+  are evaluated;
 - an unapproved `Create` or `Modify`;
 - changes to VNet, subnet, NSG, load balancer, Key Vault, Storage network rules, AMPLS, private DNS,
   or role assignments that are absent from the reviewed change set;
@@ -257,6 +265,13 @@ The gate fails on:
   identity assignment; management-group roles still undergo descendant separation checks; or
 - overlap between context, evidence, presentation, collector, publication, and notification
   identities.
+
+Subscription-scope what-if may report a resource group itself with the exact ID
+`/subscriptions/{subscriptionId}/resourceGroups/{resourceGroupName}` and type
+`Microsoft.Resources/resourceGroups`. The verifier accepts that provider-less ARM ID only in this
+exact shape. Create and Modify still require the reviewed allowlist and meaningful full-resource
+evidence; NoChange still requires identical complete snapshots. Every row remains bound to the
+reviewed subscription and resource-group boundary.
 
 ARM resource and role-definition IDs, scopes, reviewed allowlist values, and request URLs must
 remain ASCII. Do not normalize or transliterate Unicode lookalikes; Kelvin sign `K`, long-s `ſ`, and

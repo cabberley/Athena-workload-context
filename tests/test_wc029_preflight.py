@@ -69,7 +69,9 @@ _KEY_VAULT_ID = (
     "rg-athena-wc013-live/providers/Microsoft.KeyVault/vaults/"
     "athena-synthetic-kv"
 )
+_DEPLOYMENT_STACK_ID = f"{_RG_SCOPE}/providers/Microsoft.Resources/deploymentStacks/synthetic-stack"
 _STORAGE_CONTAINER_ID = f"{_STORAGE_ID}/blobServices/default/containers/evidence"
+_STORAGE_LOCAL_USER_ID = f"{_STORAGE_ID}/localUsers/synthetic-user"
 _KEY_VAULT_KEY_ID = f"{_KEY_VAULT_ID}/keys/report-signing"
 _WC013_RG_SCOPE = f"/subscriptions/{_SUBSCRIPTION_ID}/resourceGroups/rg-athena-wc013-live"
 _ROLE_DEFINITION_PREFIX = (
@@ -478,6 +480,30 @@ def _evaluate_guarded_rbac(
     )
 
 
+def _evaluate_attested_what_if(
+    document: object,
+    *,
+    allowed_change_ids: frozenset[str] = frozenset(),
+    deployment_target: dict[str, object] | None = None,
+) -> tuple[PreflightViolation, ...]:
+    artifact = _attested_what_if(
+        document,
+        allowed_change_ids=allowed_change_ids,
+        deployment_target=deployment_target,
+    )
+    return evaluate_what_if(
+        artifact,
+        allowed_change_ids=allowed_change_ids,
+        require_attestation=True,
+        expected_collection_run_id=_COLLECTION_RUN_ID,
+        expected_deployment_execution_id=_DEPLOYMENT_EXECUTION_ID,
+        attestation_manifest_digest=_json_digest(artifact["manifest"]),
+        deployment_digest=_DEPLOYMENT_DIGEST,
+        template_digest=_TEMPLATE_DIGEST,
+        parameters_digest=_PARAMETERS_DIGEST,
+    )
+
+
 def _what_if(*changes: object) -> dict[str, object]:
     return {
         "status": "Succeeded",
@@ -487,6 +513,12 @@ def _what_if(*changes: object) -> dict[str, object]:
 
 def _resource_type_for_test(resource_id: str) -> str:
     segments = resource_id.strip("/").split("/")
+    if (
+        len(segments) == 4
+        and segments[0].casefold() == "subscriptions"
+        and segments[2].casefold() == "resourcegroups"
+    ):
+        return "Microsoft.Resources/resourceGroups"
     provider_index = max(
         index for index, segment in enumerate(segments) if segment.casefold() == "providers"
     )
@@ -1684,6 +1716,74 @@ def test_what_if_fails_closed_on_authorization_mutations(
 @pytest.mark.parametrize(
     ("change_type", "path", "after"),
     [
+        ("Create", "properties.denySettings.mode", "denyWriteAndDelete"),
+        ("Create", "properties.actionOnUnmanage.resources", "delete"),
+        ("Modify", "properties.denySettings.excludedPrincipals", []),
+        ("Modify", "properties.actionOnUnmanage.resourceGroups", "delete"),
+        ("Delete", "properties.denySettings.mode", "none"),
+        ("Delete", "properties.actionOnUnmanage.resources", "detach"),
+    ],
+)
+def test_attested_what_if_unconditionally_blocks_deployment_stacks(
+    change_type: str,
+    path: str,
+    after: object,
+) -> None:
+    violations = _evaluate_attested_what_if(
+        _what_if(
+            _change(
+                _DEPLOYMENT_STACK_ID,
+                change_type,
+                path=path,
+                after=after,
+            )
+        ),
+        allowed_change_ids=frozenset({_DEPLOYMENT_STACK_ID}),
+    )
+
+    assert "authorization-change-unsupported" in {violation.code for violation in violations}
+    assert ("delete" in {violation.code for violation in violations}) == (change_type == "Delete")
+
+
+@pytest.mark.parametrize(
+    ("path", "after"),
+    [
+        (
+            "properties.sshAuthorizedKeys[0].key",
+            "ssh-ed25519 SYNTHETIC-KEY",
+        ),
+        ("properties.hasSshPassword", True),
+        ("properties.permissionScopes[0].permissions", "rwlc"),
+    ],
+)
+@pytest.mark.parametrize(
+    "change_type",
+    ["Create", "Modify", "Delete"],
+)
+def test_attested_what_if_unconditionally_blocks_storage_local_users(
+    change_type: str,
+    path: str,
+    after: object,
+) -> None:
+    violations = _evaluate_attested_what_if(
+        _what_if(
+            _change(
+                _STORAGE_LOCAL_USER_ID,
+                change_type,
+                path=path,
+                after=after,
+            )
+        ),
+        allowed_change_ids=frozenset({_STORAGE_LOCAL_USER_ID}),
+    )
+
+    assert "authorization-change-unsupported" in {violation.code for violation in violations}
+    assert ("delete" in {violation.code for violation in violations}) == (change_type == "Delete")
+
+
+@pytest.mark.parametrize(
+    ("change_type", "path", "after"),
+    [
         (
             "Modify",
             "properties.accessPolicies",
@@ -1775,6 +1875,158 @@ def test_what_if_fails_closed_on_partial_key_vault_authorization_snapshot() -> N
     )
 
     assert "authorization-change-unsupported" in {violation.code for violation in violations}
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "enabledForDeployment",
+        "enabledForDiskEncryption",
+        "enabledForTemplateDeployment",
+    ],
+)
+@pytest.mark.parametrize(
+    "change_type",
+    ["Create", "Modify"],
+)
+def test_attested_key_vault_deployment_access_enablement_delta_fails(
+    field_name: str,
+    change_type: str,
+) -> None:
+    violations = _evaluate_attested_what_if(
+        _what_if(
+            _change(
+                _KEY_VAULT_ID,
+                change_type,
+                path=f"properties.{field_name}",
+                after=True,
+            )
+        ),
+        allowed_change_ids=frozenset({_KEY_VAULT_ID}),
+    )
+
+    assert "authorization-change-unsupported" in {violation.code for violation in violations}
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "enabledForDeployment",
+        "enabledForDiskEncryption",
+        "enabledForTemplateDeployment",
+    ],
+)
+@pytest.mark.parametrize(
+    "change_type",
+    ["Create", "Modify"],
+)
+def test_attested_key_vault_deployment_access_enablement_snapshot_fails(
+    field_name: str,
+    change_type: str,
+) -> None:
+    safe_properties: dict[str, object] = {
+        "publicNetworkAccess": "Disabled",
+        "networkAcls": {"defaultAction": "Deny"},
+        field_name: False,
+    }
+    before = _resource_snapshot(
+        _KEY_VAULT_ID,
+        properties=copy.deepcopy(safe_properties),
+    )
+    after = _resource_snapshot(
+        _KEY_VAULT_ID,
+        properties={
+            **safe_properties,
+            field_name: True,
+        },
+    )
+    change: dict[str, object] = {
+        "resourceId": _KEY_VAULT_ID,
+        "changeType": change_type,
+        "after": after,
+    }
+    if change_type == "Modify":
+        change["before"] = before
+
+    violations = _evaluate_attested_what_if(
+        _what_if(change),
+        allowed_change_ids=frozenset({_KEY_VAULT_ID}),
+    )
+
+    assert {violation.code for violation in violations} == {"authorization-change-unsupported"}
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "enabledForDeployment",
+        "enabledForDiskEncryption",
+        "enabledForTemplateDeployment",
+    ],
+)
+@pytest.mark.parametrize(
+    "change_type",
+    ["Create", "Modify"],
+)
+def test_attested_key_vault_deployment_access_disablement_is_allowed(
+    field_name: str,
+    change_type: str,
+) -> None:
+    safe_properties: dict[str, object] = {
+        "publicNetworkAccess": "Disabled",
+        "networkAcls": {"defaultAction": "Deny"},
+        field_name: False,
+    }
+    after = _resource_snapshot(
+        _KEY_VAULT_ID,
+        properties=copy.deepcopy(safe_properties),
+    )
+    change: dict[str, object] = {
+        "resourceId": _KEY_VAULT_ID,
+        "changeType": change_type,
+        "after": after,
+    }
+    if change_type == "Modify":
+        change["before"] = _resource_snapshot(
+            _KEY_VAULT_ID,
+            properties={
+                **safe_properties,
+                field_name: True,
+            },
+        )
+
+    assert (
+        _evaluate_attested_what_if(
+            _what_if(change),
+            allowed_change_ids=frozenset({_KEY_VAULT_ID}),
+        )
+        == ()
+    )
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "enabledForDeployment",
+        "enabledForDiskEncryption",
+        "enabledForTemplateDeployment",
+    ],
+)
+def test_attested_key_vault_deployment_access_requires_boolean(
+    field_name: str,
+) -> None:
+    with pytest.raises(PreflightInputError, match="must be boolean"):
+        _evaluate_attested_what_if(
+            _what_if(
+                _change(
+                    _KEY_VAULT_ID,
+                    "Modify",
+                    path=f"properties.{field_name}",
+                    after="true",
+                )
+            ),
+            allowed_change_ids=frozenset({_KEY_VAULT_ID}),
+        )
 
 
 def test_what_if_allows_unchanged_key_vault_authorization_mode() -> None:
@@ -2127,6 +2379,138 @@ def test_storage_create_requires_explicit_safe_defaults() -> None:
         )
         == ()
     )
+
+
+def test_attested_what_if_accepts_exact_resource_group_no_change() -> None:
+    assert (
+        _evaluate_attested_what_if(
+            _what_if(
+                _change(
+                    _RG_SCOPE,
+                    "NoChange",
+                )
+            )
+        )
+        == ()
+    )
+
+
+@pytest.mark.parametrize(
+    "change_type",
+    ["Create", "Modify"],
+)
+def test_attested_what_if_accepts_allowlisted_resource_group_changes(
+    change_type: str,
+) -> None:
+    before = _resource_snapshot(
+        _RG_SCOPE,
+        properties={},
+        location="australiaeast",
+        tags={"release": "before"},
+    )
+    after = _resource_snapshot(
+        _RG_SCOPE,
+        properties={},
+        location="australiaeast",
+        tags={"release": "after"},
+    )
+    change: dict[str, object] = {
+        "resourceId": _RG_SCOPE,
+        "changeType": change_type,
+        "after": after,
+    }
+    if change_type == "Modify":
+        change["before"] = before
+
+    assert (
+        _evaluate_attested_what_if(
+            _what_if(change),
+            allowed_change_ids=frozenset({_RG_SCOPE}),
+        )
+        == ()
+    )
+
+
+def test_attested_what_if_applies_resource_group_allowlist_and_delta_checks() -> None:
+    before = _resource_snapshot(
+        _RG_SCOPE,
+        properties={},
+        location="australiaeast",
+        tags={"release": "same"},
+    )
+    unchanged = copy.deepcopy(before)
+
+    unapproved = _evaluate_attested_what_if(
+        _what_if(
+            {
+                "resourceId": _RG_SCOPE,
+                "changeType": "Modify",
+                "before": before,
+                "after": _resource_snapshot(
+                    _RG_SCOPE,
+                    properties={},
+                    location="australiaeast",
+                    tags={"release": "different"},
+                ),
+            }
+        )
+    )
+    uninspectable = _evaluate_attested_what_if(
+        _what_if(
+            {
+                "resourceId": _RG_SCOPE,
+                "changeType": "Modify",
+                "before": before,
+                "after": unchanged,
+            }
+        ),
+        allowed_change_ids=frozenset({_RG_SCOPE}),
+    )
+
+    assert {violation.code for violation in unapproved} == {"unapproved-change"}
+    assert {violation.code for violation in uninspectable} == {"uninspectable-change"}
+
+
+def test_attested_what_if_rejects_resource_group_outside_reviewed_boundary() -> None:
+    with pytest.raises(
+        PreflightInputError,
+        match="outside the reviewed deployment resource-group boundary",
+    ):
+        _evaluate_attested_what_if(
+            _what_if(
+                {
+                    "resourceId": _SIBLING_RG_SCOPE,
+                    "changeType": "Create",
+                    "after": _resource_snapshot(
+                        _SIBLING_RG_SCOPE,
+                        properties={},
+                        location="australiaeast",
+                    ),
+                }
+            ),
+            allowed_change_ids=frozenset({_SIBLING_RG_SCOPE}),
+        )
+
+
+def test_attested_what_if_rejects_resource_group_snapshot_type_mismatch() -> None:
+    change = _change(
+        _RG_SCOPE,
+        "NoChange",
+    )
+    before = change["before"]
+    after = change["after"]
+    assert isinstance(before, dict)
+    assert isinstance(after, dict)
+    before["type"] = "Microsoft.Resources/subscriptions"
+    after["type"] = "Microsoft.Resources/subscriptions"
+
+    with pytest.raises(
+        PreflightInputError,
+        match="type does not match resourceId",
+    ):
+        _evaluate_attested_what_if(
+            _what_if(change),
+        )
 
 
 def test_resource_group_named_providers_cannot_bypass_type_checks() -> None:

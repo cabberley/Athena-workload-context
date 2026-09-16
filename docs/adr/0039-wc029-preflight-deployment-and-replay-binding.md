@@ -42,6 +42,15 @@ The next exact-SHA review reproduced five additional fail-open paths:
 - the Management Groups subscription tenant field was still retrieved case-insensitively; and
 - input size validation performed a pathname `stat` followed by a separate pathname read.
 
+The following exact-SHA review found three remaining resource-classification gaps:
+
+- deployment stacks and storage local users could change downstream deny/delete behavior,
+  credentials, and scoped data permissions without the dedicated post-deployment evaluators;
+- Key Vault VM, disk-encryption, and template-deployment secret-access flags were not classified as
+  authorization-affecting enablement; and
+- exact resource-group IDs have no `providers` segment and were rejected before otherwise complete
+  FullResourcePayloads rows could be evaluated.
+
 Freshness does not prove single use, and the pure what-if evaluator does not yet derive the
 post-deployment principal, role, condition, and inherited scope needed to apply the reviewed
 separation policy to an authorization mutation.
@@ -89,7 +98,11 @@ Use the following guarded preflight contract:
    `accessPolicies`/`enableRbacAuthorization` property mutations; managed-identity federated
    credentials; equivalent app-role, delegated-permission, or identity-credential grants; and
    `Microsoft.Resources/deploymentScripts` remain blocked until their post-deployment effects are
-   fully evaluated.
+   fully evaluated. Every Create, Modify, or Delete of `Microsoft.Resources/deploymentStacks` and
+   `Microsoft.Storage/storageAccounts/localUsers` also blocks until stack deny/delete behavior and
+   local-user SSH/password/permission effects are evaluated. Key Vault changes that enable
+   `enabledForTemplateDeployment`, `enabledForDeployment`, or `enabledForDiskEncryption` block;
+   exact boolean `false` remains an accepted tightening.
 9. Paged evidence uses endpoint-exact fields and cursors. ARM pages require literal `nextLink` and
    exactly one non-empty `$skipToken` on continuation URLs. Graph pages require literal
    `@odata.nextLink` and exactly one non-empty `$skiptoken`; `$skip` is not accepted. Cross-endpoint
@@ -132,6 +145,11 @@ Use the following guarded preflight contract:
     available. The verifier requires a regular file by `fstat`, reads no more than the configured
     bound plus one byte from that descriptor, rejects overflow or concurrent descriptor metadata
     change, and performs strict UTF-8 decoding only after the bounded read.
+20. The exact provider-less resource-group ID
+    `/subscriptions/{subscriptionId}/resourceGroups/{resourceGroupName}` maps to
+    `Microsoft.Resources/resourceGroups`. Its Create, Modify, and NoChange rows undergo the same
+    manifest boundary, subscription, snapshot identity/type, allowlist, meaningful-delta, and
+    deletion controls as provider resource IDs.
 
 The pure evaluators remain free of storage I/O. One-time consumption belongs to the production CLI
 boundary after parsing, policy evaluation, and bounded rendering succeed but before success or
@@ -168,6 +186,10 @@ blocked output is returned.
   contracts rather than generic aliases.
 - Evidence path replacement cannot redirect an already opened descriptor, while growth beyond the
   bound and POSIX symlink or special-file inputs fail deterministically.
+- Deployment-stack and storage-local-user changes remain unavailable rather than bypassing deny,
+  deletion, credential, or scoped data-permission analysis.
+- Resource-group rows are evaluable without weakening their reviewed target boundary or allowlist
+  requirements.
 - The legacy module entry point remains available for compatibility but is not the guarded
   deployment gate.
 - Authorization mutations remain deliberately unavailable rather than being accepted without
@@ -216,3 +238,7 @@ invalid UTF-8 collection/binding records, POSIX FIFO/socket rejection, and symme
 bounds. Scope regressions cover parent/child management groups and management-group-to-resource
 matching in both directions. Token tests cover whitespace and Unicode aliases, lone surrogates,
 single-dash values, and exact deployment/file grammars.
+Fully attested resource-family regressions additionally cover deployment-stack
+`denySettings`/`actionOnUnmanage`, storage local-user SSH/password/permission scopes, all three Key
+Vault privileged deployment-access flags across deltas and full snapshots, safe disablement, and
+exact resource-group Create/Modify/NoChange, allowlist, delta, snapshot-type, and boundary behavior.

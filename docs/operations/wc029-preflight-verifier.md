@@ -52,10 +52,14 @@ assignment/eligibility schedule requests and Lighthouse registration assignments
 `Microsoft.KeyVault/vaults/accessPolicies`, changes to a vault's `properties.accessPolicies` or
 `properties.enableRbacAuthorization`, `Microsoft.ManagedIdentity/.../federatedIdentityCredentials`,
 Microsoft Graph directory grants and credential resources, and equivalent federated identity,
-app-role, or delegated-permission grant types also block. `Microsoft.Resources/deploymentScripts`
-and descendants block as unsupported imperative execution. These changes remain blocked even when
-allowlisted because the gate does not yet derive their full post-deployment authorization,
-credential, or execution effects.
+app-role, or delegated-permission grant types also block. Key Vault changes that enable
+`enabledForTemplateDeployment`, `enabledForDeployment`, or `enabledForDiskEncryption` block even
+when allowlisted; exact boolean `false` remains an accepted tightening. Every Create, Modify, or
+Delete for `Microsoft.Resources/deploymentStacks` and
+`Microsoft.Storage/storageAccounts/localUsers` blocks because deployment-stack
+`denySettings`/`actionOnUnmanage` and local-user SSH keys, passwords, and permission scopes can
+change downstream deny, delete, credential, or data permissions. `Microsoft.Resources/deploymentScripts`
+and descendants remain unsupported imperative execution.
 `NoChange` is accepted only with complete, object-valued, type-exact, structurally identical
 `before` and `after` snapshots and no effective delta. Each snapshot must contain matching `id`,
 `name`, `type`, and object-valued `properties`. Every `NoEffect` entry must contain both `before`
@@ -97,6 +101,13 @@ derived delta.
 `Remove` under any non-`Delete` top-level change is still a deletion and always blocks, even when a
 separate `after` snapshot appears safe. A root `after` value must be an object, and root deltas are
 treated as ancestors of every protected property.
+
+An exact `/subscriptions/{subscriptionId}/resourceGroups/{resourceGroupName}` ID is recognized as
+the canonical `Microsoft.Resources/resourceGroups` resource type even though its ID has no
+`providers` segment. Resource-group Create, Modify, and NoChange rows still undergo the same
+manifest subscription/resource-group boundary, snapshot identity/type, reviewed allowlist,
+meaningful-delta, and deletion checks as provider resources. Malformed or out-of-boundary
+resource-group IDs continue to fail closed.
 
 Production what-if evidence is an attested envelope containing `whatIf` and the versioned
 `athena.wc029PreflightManifest.v1` manifest. The manifest contains `collectionRunId`, an immutable

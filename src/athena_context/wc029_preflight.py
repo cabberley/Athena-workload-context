@@ -101,6 +101,14 @@ _UNSUPPORTED_AUTHORIZATION_RESOURCE_TYPES = frozenset(
     {
         "microsoft.keyvault/vaults/accesspolicies",
         "microsoft.managedidentity/userassignedidentities/federatedidentitycredentials",
+        "microsoft.resources/deploymentstacks",
+        "microsoft.storage/storageaccounts/localusers",
+    }
+)
+_UNCONDITIONALLY_BLOCKED_DELETE_TYPES = frozenset(
+    {
+        "microsoft.resources/deploymentstacks",
+        "microsoft.storage/storageaccounts/localusers",
     }
 )
 _UNSUPPORTED_IDENTITY_CREDENTIAL_TYPE_SEGMENTS = frozenset(
@@ -403,6 +411,8 @@ def _optional_normalized_ascii_token(
 def _resource_type(resource_id: str) -> str:
     canonical_resource_id = _canonical_scope(resource_id)
     segments = [segment for segment in canonical_resource_id.strip("/").split("/") if segment]
+    if len(segments) == 4 and segments[0] == "subscriptions" and segments[2] == "resourcegroups":
+        return "microsoft.resources/resourcegroups"
     if len(segments) >= 5 and segments[0] == "subscriptions":
         initial_provider_index = 4 if segments[2] == "resourcegroups" else 2
     elif segments and segments[0] == "providers":
@@ -2251,6 +2261,11 @@ def _unsafe_property_violations(
             "properties.accesspolicies",
             "properties.enablerbacauthorization",
         )
+        deployment_access_targets = (
+            "properties.enabledfordeployment",
+            "properties.enabledfordiskencryption",
+            "properties.enabledfortemplatedeployment",
+        )
         authorization_mutation = any(
             _property_path_contains(
                 (path := _canonical_property_path(raw_path)),
@@ -2303,14 +2318,28 @@ def _unsafe_property_violations(
                         )
                     )
                 )
-        if authorization_mutation:
+        deployment_access_candidates = (
+            snapshot_delta_candidates if complete_snapshots else candidates
+        )
+        unsafe_deployment_access = False
+        for raw_path, after, property_change_type in deployment_access_candidates:
+            path = _canonical_property_path(raw_path)
+            if path not in deployment_access_targets or property_change_type in {
+                "delete",
+                "remove",
+            }:
+                continue
+            if type(after) is not bool:
+                raise PreflightInputError(f"{path} must be boolean when supplied")
+            unsafe_deployment_access = unsafe_deployment_access or after
+        if authorization_mutation or unsafe_deployment_access:
             violations.append(
                 PreflightViolation(
                     code="authorization-change-unsupported",
                     subject=resource_id,
                     detail=(
-                        "Key Vault access-policy or RBAC-mode mutations require "
-                        "a future separation-aware evaluator"
+                        "Key Vault access-policy, RBAC-mode, or privileged deployment "
+                        "access mutations require a future separation-aware evaluator"
                     ),
                 )
             )
@@ -2867,6 +2896,18 @@ def evaluate_what_if(
             )
             continue
         if change_type == "delete":
+            resource_type = _resource_type(canonical_resource_id)
+            if resource_type in _UNCONDITIONALLY_BLOCKED_DELETE_TYPES:
+                violations.append(
+                    PreflightViolation(
+                        code="authorization-change-unsupported",
+                        subject=resource_id,
+                        detail=(
+                            "planned deployment-stack or storage-local-user deletion "
+                            "requires downstream effect evaluation"
+                        ),
+                    )
+                )
             violations.append(
                 PreflightViolation(
                     code="delete",
@@ -2893,7 +2934,8 @@ def evaluate_what_if(
                 )
             )
             continue
-        if _is_unsupported_authorization_or_imperative_type(_resource_type(canonical_resource_id)):
+        resource_type = _resource_type(canonical_resource_id)
+        if _is_unsupported_authorization_or_imperative_type(resource_type):
             violations.append(
                 PreflightViolation(
                     code="authorization-change-unsupported",
