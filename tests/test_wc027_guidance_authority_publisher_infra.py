@@ -13,6 +13,9 @@ TABLE_CAS = (
 KEY_SIGNER = (
     ROOT / "infra" / "wc027-guidance-authority-publisher" / "modules" / "key-signer-rbac.bicep"
 )
+ACR_PULL = (
+    ROOT / "infra" / "wc027-enrichment-feed-runtime" / "modules" / "acr-pull-rbac.bicep"
+)
 
 
 def test_publisher_is_private_idempotent_and_uses_separated_authorities() -> None:
@@ -122,6 +125,31 @@ def test_publisher_data_plane_roles_are_exact_and_non_destructive() -> None:
         assert forbidden not in signer
     assert "scope: key" in signer
     assert "12338af0-0e69-4776-bea7-57ae8d297424" not in signer
+
+
+def test_publisher_acr_pull_uses_exact_registry_scope_and_principal_seed() -> None:
+    source = PUBLISHER.read_text(encoding="utf-8")
+    module = ACR_PULL.read_text(encoding="utf-8")
+
+    for expected in (
+        "param brokerIdentityPrincipalId string",
+        "brokerIdentity.properties.principalId == brokerIdentityPrincipalId",
+        "scope: resourceGroup(registrySubscriptionId, registryResourceGroupName)",
+        "registryResourceId: registryResourceId",
+        "identityPrincipalId: validatedBrokerIdentityPrincipalId",
+        "registryRoleAssignmentMode: registryRoleAssignmentMode",
+        "guid(registryScopedResourceId, brokerIdentityPrincipalId, registryPullRoleDefinitionId)",
+        "publisherImagePull.outputs.registryResourceId",
+        "publisherImagePull.outputs.roleAssignmentMode",
+        "publisherImagePull.outputs.roleDefinitionResourceId",
+        "publisherImagePull.outputs.roleAssignmentResourceId",
+    ):
+        assert expected in source
+    assert "guid(registry.id, brokerIdentity.id" not in source
+    assert (
+        "guid(registry.id, identityPrincipalId, pullRoleDefinitionResourceId)"
+        in module
+    )
 
 
 def test_runtime_requires_current_activation_and_logical_binding_key() -> None:

@@ -307,7 +307,30 @@ def test_controller_identity_oidc_and_workflow_are_closed_and_separate() -> None
     controller_pull = orchestration[controller_pull_start:controller_pull_end]
     assert "collectorControllerIdentity.outputs.principalId" in controller_pull
     assert "acceptanceImageRegistryResourceId" in controller_pull
-    assert "7f951dda-4ed3-4680-a7ca-43fe172d538d" in acr_pull
+    assert "acceptanceImageRegistryRoleAssignmentMode" in controller_pull
+    assert (
+        orchestration.count(
+            "registryResourceId: acceptanceImageRegistryResourceId"
+        )
+        == 6
+    )
+    assert (
+        orchestration.count(
+            "registryRoleAssignmentMode: acceptanceImageRegistryRoleAssignmentMode"
+        )
+        == 6
+    )
+    for expected in (
+        "7f951dda-4ed3-4680-a7ca-43fe172d538d",
+        "b93aa761-3e63-49ed-ac28-beffa264f7ac",
+        "reference(registry.id, '2025-04-01', 'Full')",
+        "guid(registry.id, identityPrincipalId, pullRoleDefinitionResourceId)",
+        "principalType: 'ServicePrincipal'",
+        "roleDefinitionId: guardedPullRoleDefinitionResourceId",
+        "output registryResourceId string = runtimeRegistryResourceId",
+    ):
+        assert expected in acr_pull
+    assert "identityName" not in acr_pull
 
     assert "environment: athena-live" in workflow
     assert "github.ref == 'refs/heads/main'" in workflow

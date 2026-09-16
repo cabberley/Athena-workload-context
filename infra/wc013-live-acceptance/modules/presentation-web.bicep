@@ -29,6 +29,13 @@ param presentationImageRegistryServer string
 @maxLength(2048)
 param presentationImageRegistryResourceId string
 
+@description('Reviewed role-assignment permissions mode for the presentation image registry.')
+@allowed([
+  'LegacyRegistryPermissions'
+  'AbacRepositoryPermissions'
+])
+param presentationImageRegistryRoleAssignmentMode string
+
 @description('Digest-pinned WC-013 delivery image used by the presentation asset gateway sidecar.')
 @minLength(1)
 @maxLength(2048)
@@ -75,7 +82,6 @@ param presentationIdentityPrincipalId string
 param tags object = {}
 
 var presentationName = '${namePrefix}-presentation'
-var presentationIdentityName = last(split(presentationIdentityResourceId, '/'))
 var rejectedImageDigestSuffix = '@sha256:0000000000000000000000000000000000000000000000000000000000000000'
 var expectedPresentationImageRegistryServer = '${toLower(last(split(presentationImageRegistryResourceId, '/')))}.azurecr.io'
 var validatedPresentationImageRegistryServer = presentationImageRegistryServer == toLower(presentationImageRegistryServer) && presentationImageRegistryServer == expectedPresentationImageRegistryServer
@@ -139,9 +145,9 @@ module presentationImagePull './acr-pull-rbac.bicep' = {
     split(presentationImageRegistryResourceId, '/')[4]
   )
   params: {
-    registryName: last(split(presentationImageRegistryResourceId, '/'))
-    identityName: presentationIdentityName
+    registryResourceId: presentationImageRegistryResourceId
     identityPrincipalId: presentationIdentityPrincipalId
+    registryRoleAssignmentMode: presentationImageRegistryRoleAssignmentMode
   }
 }
 

@@ -17,6 +17,9 @@ KEY_SIGN_VERIFY_RBAC = (
 PRIVATE_CONTAINER = (
     ROOT / "infra" / "wc027-enrichment-feed-runtime" / "modules" / "private-container.bicep"
 )
+ACR_PULL_RBAC = (
+    ROOT / "infra" / "wc027-enrichment-feed-runtime" / "modules" / "acr-pull-rbac.bicep"
+)
 
 STORAGE_BLOB_DATA_CONTRIBUTOR_ROLE_ID = "ba92f5b4-2d11-453d-a403-e96b0029c9fe"
 
@@ -55,6 +58,7 @@ def test_wc027_runtime_uses_derived_identities_and_key_scopes() -> None:
     # client-id/principal-id/runtime-identity arrays.
     for param in (
         "param brokerIdentityResourceId string",
+        "param brokerIdentityPrincipalId string",
         "param incidentReaderIdentityResourceId string",
         "param feedV2ProducerReaderIdentityResourceId string",
         "param feedV2WriterIdentityResourceId string",
@@ -71,7 +75,6 @@ def test_wc027_runtime_uses_derived_identities_and_key_scopes() -> None:
 
     for removed in (
         "param brokerIdentityClientId",
-        "param brokerIdentityPrincipalId",
         "param runtimeIdentityResourceIds",
         "param runtimeIdentityClientIds",
         "param incidentReaderPrincipalId",
@@ -84,6 +87,16 @@ def test_wc027_runtime_uses_derived_identities_and_key_scopes() -> None:
     ):
         assert removed not in source
 
+    assert (
+        "brokerIdentity.properties.principalId == brokerIdentityPrincipalId"
+        in source
+    )
+    assert (
+        "guid(registryScopedResourceId, brokerIdentityPrincipalId, "
+        "registryPullRoleDefinitionId)"
+        in source
+    )
+
     for module_name in (
         "reportSignerRbac",
         "guidanceSignerRbac",
@@ -95,6 +108,42 @@ def test_wc027_runtime_uses_derived_identities_and_key_scopes() -> None:
     assert "keyVaultCryptoUserRoleDefinitionId" not in source
     assert "module producerImagePull" in source
     assert "attached runtime identity resource IDs must be distinct" in source
+
+
+def test_wc027_acr_pull_is_mode_aware_principal_seeded_and_cross_scope() -> None:
+    source = RUNTIME.read_text(encoding="utf-8")
+    module = ACR_PULL_RBAC.read_text(encoding="utf-8")
+
+    for expected in (
+        "param registryResourceId string",
+        "param identityPrincipalId string",
+        "param registryRoleAssignmentMode string",
+        "reference(registry.id, '2025-04-01', 'Full')",
+        "registryRuntime.properties.roleAssignmentMode == registryRoleAssignmentMode",
+        "guardedPullRoleDefinitionResourceId",
+        "roleDefinitionId: guardedPullRoleDefinitionResourceId",
+        "b93aa761-3e63-49ed-ac28-beffa264f7ac",
+        "7f951dda-4ed3-4680-a7ca-43fe172d538d",
+        "guid(registry.id, identityPrincipalId, pullRoleDefinitionResourceId)",
+        "principalType: 'ServicePrincipal'",
+        "output registryResourceId string = runtimeRegistryResourceId",
+        "output roleAssignmentMode string = validatedRoleAssignmentMode",
+    ):
+        assert expected in module
+    assert "param identityResourceId string" not in module
+    assert "guid(registry.id, identity.id" not in module
+
+    for expected in (
+        "scope: resourceGroup(",
+        "split(registryResourceId, '/')[2]",
+        "split(registryResourceId, '/')[4]",
+        "identityPrincipalId: validatedBrokerIdentityPrincipalId",
+        "registryRoleAssignmentMode: registryRoleAssignmentMode",
+        "registryPullRoleAssignmentId",
+        "producerImagePull.outputs.registryResourceId",
+    ):
+        assert expected in source
+    assert "guid(registry.id, brokerIdentity.id" not in source
 
 
 def test_wc027_producer_never_receives_blob_data_contributor_on_v1_incident_assets() -> None:

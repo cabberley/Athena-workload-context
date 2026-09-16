@@ -73,19 +73,22 @@ MAX_GRAPH_MEMBERSHIP_PAGES = 128
 MAX_APPROVED_TRIGGER_QUEUE_TRANSITION_ASSIGNMENTS = 4
 MAX_APPROVED_ROTATION_TRANSITION_ASSIGNMENTS = 32
 MAX_LEGACY_CRYPTO_USER_MIGRATION_ASSIGNMENTS = 5
+MAX_LEGACY_ACR_PULL_MIGRATION_ASSIGNMENTS = 16
 MAX_AUTHORITY_CHECKPOINT_VERSIONS = 4096
 MAX_AUTHORITY_CHECKPOINT_CONTENT_BYTES = 64 * 1024 * 1024
 MAX_REVIEWED_ARTIFACT_BYTES = 64 * 1024 * 1024
 READBACK_MAX_ATTEMPTS = 8
 READBACK_RETRY_SECONDS = 5.0
+IMAGE_PULL_EXECUTION_POLL_ATTEMPTS = 24
 MINIMUM_RSA_KEY_SIZE_BITS = 2048
 REVIEWED_RSA_KEY_SIZE_BITS = 3072
 REVIEWED_RSA_KEY_OPERATIONS = frozenset({"sign", "verify"})
 PREFLIGHT_PATH = ROOT / "src" / "athena_context" / "wc029_preflight.py"
 PLAN_SCHEMA_VERSION = "athena.wc029DeploymentPlan.v6"
-HANDOFF_SCHEMA_VERSION = "athena.wc029DeploymentHandoff.v3"
-RECEIPT_SCHEMA_VERSION = "athena.wc029DeploymentReceipt.v2"
+HANDOFF_SCHEMA_VERSION = "athena.wc029DeploymentHandoff.v4"
+RECEIPT_SCHEMA_VERSION = "athena.wc029DeploymentReceipt.v3"
 AUTHORITY_BLOB_INVENTORY_SCHEMA_VERSION = "athena.wc029AuthorityBlobInventory.v2"
+IMAGE_PULL_EVIDENCE_SCHEMA_VERSION = "athena.wc029ImagePullEvidence.v1"
 HANDOFF_FIELDS = frozenset(
     {
         "schemaVersion",
@@ -106,6 +109,8 @@ HANDOFF_FIELDS = frozenset(
         "deployedTemplateSha256",
         "authorityBlobInventory",
         "authorityBlobInventorySha256",
+        "imagePullEvidence",
+        "imagePullEvidenceSha256",
     }
 )
 PLAN_FIELDS = frozenset(
@@ -131,6 +136,7 @@ PLAN_FIELDS = frozenset(
         "allowedChangeResourceIds",
         "rotationTransitionAssignments",
         "legacyCryptoUserMigrationAssignmentIds",
+        "legacyAcrPullMigrationAssignments",
         "authorityBlobInventory",
         "authorityBlobInventorySha256",
         "requiredAuthorityCheckpointSha256s",
@@ -172,6 +178,7 @@ RECEIPT_FIELDS = frozenset(
         "deploymentRecordSha256",
         "deployedTemplateSha256",
         "authorityBlobInventorySha256",
+        "imagePullEvidenceSha256",
     }
 )
 FOUNDATION_OUTPUT_FIELDS = frozenset(
@@ -293,6 +300,10 @@ PRODUCER_OUTPUT_FIELDS = frozenset(
         "triggerQueueResourceId",
         "notificationQueueName",
         "notificationQueueResourceId",
+        "registryResourceId",
+        "registryRoleAssignmentMode",
+        "registryPullRoleDefinitionId",
+        "registryPullRoleAssignmentResourceId",
         "namespaceHostName",
     }
 )
@@ -314,6 +325,10 @@ PUBLISHER_OUTPUT_FIELDS = frozenset(
         "bindingLogicalKeyId",
         "bindingKeyResourceId",
         "bindingKeyVaultKeyId",
+        "registryResourceId",
+        "registryRoleAssignmentMode",
+        "registryPullRoleDefinitionId",
+        "registryPullRoleAssignmentResourceId",
     }
 )
 PRODUCER_BINDING_FIELDS = frozenset(
@@ -321,12 +336,14 @@ PRODUCER_BINDING_FIELDS = frozenset(
         "correlationSourceStorageAccountResourceId",
         "correlationBindingKeyResourceId",
         "changeKeyResourceId",
+        "brokerIdentityPrincipalId",
         "feedV2ReaderIdentityResourceId",
         "guidanceBindingKeyResourceId",
         "managedEnvironmentResourceId",
         "monitoringCollectorKeyResourceId",
         "monitoringIntentKeyResourceId",
         "registryResourceId",
+        "registryRoleAssignmentMode",
         "serviceBusNamespaceName",
         "triggerSubmitterIdentityResourceIds",
     }
@@ -335,10 +352,12 @@ PUBLISHER_BINDING_FIELDS = frozenset(
     {
         "authorityStorageAccountResourceId",
         "activationStorageAccountResourceId",
+        "brokerIdentityPrincipalId",
         "bindingTrustReaderIdentityResourceId",
         "bindingKeyResourceId",
         "managedEnvironmentResourceId",
         "registryResourceId",
+        "registryRoleAssignmentMode",
         "requestSubmitterIdentityResourceIds",
         "requestKeyResourceId",
         "serviceBusNamespaceName",
@@ -1244,6 +1263,40 @@ def _load_handoff(
         raise OrchestrationError(
             "handoff authority Blob checkpoint digest does not match"
         )
+    image_pull_evidence = _validated_image_pull_evidence(
+        handoff.get("imagePullEvidence"),
+        stage=expected_stage,
+        subscription_id=handoff_subscription,
+    )
+    image_pull_evidence_digest = handoff.get("imagePullEvidenceSha256")
+    if expected_stage == "foundation":
+        if image_pull_evidence_digest is not None:
+            raise OrchestrationError(
+                "foundation handoff cannot carry image-pull evidence"
+            )
+    elif (
+        image_pull_evidence is None
+        or _sha256_digest(
+            image_pull_evidence_digest,
+            field="handoff.imagePullEvidenceSha256",
+        )
+        != _image_pull_evidence_sha256(image_pull_evidence)
+    ):
+        raise OrchestrationError("handoff image-pull evidence digest does not match")
+    if expected_stage in {"producer", "publisher"}:
+        if image_pull_evidence is None:
+            raise OrchestrationError(
+                f"{expected_stage} handoff is missing image-pull evidence"
+            )
+        _verify_image_pull_evidence_matches_outputs(
+            image_pull_evidence,
+            kind=expected_stage,
+            outputs=outputs,
+            principal_id=_string(
+                parameter_bindings.get("brokerIdentityPrincipalId"),
+                field=f"{expected_stage} handoff broker principal ID",
+            ),
+        )
     if expected_stage == "foundation":
         _foundation_outputs(handoff, require_exact=True)
     elif expected_stage == "producer":
@@ -1527,6 +1580,15 @@ def _load_plan_manifest(
         legacy_crypto_user_migration_assignments
     ):
         raise OrchestrationError("plan legacy Crypto User migration assignment IDs must be sorted")
+    legacy_acr_pull_migrations = _canonical_legacy_acr_pull_migration_assignments(
+        manifest.get("legacyAcrPullMigrationAssignments"),
+        subscription_id=subscription_id,
+        field="plan legacy ACR pull migration assignments",
+    )
+    if manifest.get("legacyAcrPullMigrationAssignments") != legacy_acr_pull_migrations:
+        raise OrchestrationError(
+            "plan legacy ACR pull migration assignments must be sorted"
+        )
     authority_blob_inventory = _validated_authority_blob_inventory(
         manifest.get("authorityBlobInventory"),
         subscription_id=subscription_id,
@@ -1734,15 +1796,23 @@ def _load_verified_predecessor(
     receipt_authority_inventory_sha256 = receipt.get(
         "authorityBlobInventorySha256"
     )
+    receipt_image_pull_evidence_sha256 = receipt.get("imagePullEvidenceSha256")
     if expected_stage == "foundation":
-        if receipt_authority_inventory_sha256 is not None:
+        if (
+            receipt_authority_inventory_sha256 is not None
+            or receipt_image_pull_evidence_sha256 is not None
+        ):
             raise OrchestrationError(
-                "foundation receipt cannot carry authority Blob inventory"
+                "foundation receipt cannot carry WC-027 readiness evidence"
             )
     else:
         receipt_authority_inventory_sha256 = _sha256_digest(
             receipt_authority_inventory_sha256,
             field=f"{expected_stage} receipt authority inventory SHA-256",
+        )
+        receipt_image_pull_evidence_sha256 = _sha256_digest(
+            receipt_image_pull_evidence_sha256,
+            field=f"{expected_stage} receipt image-pull evidence SHA-256",
         )
     plan_path = Path(
         _string(
@@ -1836,6 +1906,8 @@ def _load_verified_predecessor(
         != receipt_deployed_template_sha256
         or handoff.get("authorityBlobInventorySha256")
         != receipt_authority_inventory_sha256
+        or handoff.get("imagePullEvidenceSha256")
+        != receipt_image_pull_evidence_sha256
     ):
         raise OrchestrationError(
             f"{expected_stage} receipt deployment attestation chain does not match"
@@ -1861,6 +1933,41 @@ def _load_verified_predecessor(
                 and planned_inventory.get("containerExists") is False
             ),
         )
+    if expected_stage == "live-acceptance":
+        image_pull_evidence = _validated_image_pull_evidence(
+            handoff.get("imagePullEvidence"),
+            stage=expected_stage,
+            subscription_id=receipt_subscription,
+        )
+        if image_pull_evidence is None:
+            raise OrchestrationError(
+                "live-acceptance receipt is missing image-pull evidence"
+            )
+        for predecessor in ("producer", "publisher"):
+            predecessor_handoff = _load_handoff(
+                Path(
+                    _string(
+                        plan.get(f"{predecessor}HandoffPath"),
+                        field=f"live-acceptance {predecessor} handoff path",
+                    )
+                ),
+                expected_stage=predecessor,
+                artifact_reader=reader,
+            )
+            _verify_image_pull_evidence_matches_outputs(
+                image_pull_evidence,
+                kind=predecessor,
+                outputs=_mapping(
+                    predecessor_handoff.get("outputs"),
+                    field=f"live-acceptance {predecessor} outputs",
+                ),
+                principal_id=_string(
+                    _handoff_bindings(predecessor_handoff).get(
+                        "brokerIdentityPrincipalId"
+                    ),
+                    field=f"live-acceptance {predecessor} principal ID",
+                ),
+            )
     receipt_predecessors = _mapping(
         receipt.get("predecessorReceiptSha256s"),
         field=f"{expected_stage} receipt predecessor hashes",
@@ -1984,6 +2091,10 @@ def _load_verified_prior_stage_inventory(
     receipt_authority_inventory_sha256 = _sha256_digest(
         receipt.get("authorityBlobInventorySha256"),
         field="prior stage receipt authority inventory SHA-256",
+    )
+    receipt_image_pull_evidence_sha256 = _sha256_digest(
+        receipt.get("imagePullEvidenceSha256"),
+        field="prior stage receipt image-pull evidence SHA-256",
     )
     receipt_predecessors = _mapping(
         receipt.get("predecessorReceiptSha256s"),
@@ -2157,6 +2268,15 @@ def _load_verified_prior_stage_inventory(
     ):
         raise OrchestrationError(
             "prior stage plan legacy Crypto User migration assignment IDs must be sorted"
+        )
+    legacy_acr_pull_migrations = _canonical_legacy_acr_pull_migration_assignments(
+        plan.get("legacyAcrPullMigrationAssignments"),
+        subscription_id=subscription_id,
+        field="prior stage plan legacy ACR pull migration assignments",
+    )
+    if plan.get("legacyAcrPullMigrationAssignments") != legacy_acr_pull_migrations:
+        raise OrchestrationError(
+            "prior stage plan legacy ACR pull migration assignments must be sorted"
         )
     planned_handoff_paths = {
         predecessor: (
@@ -2335,6 +2455,8 @@ def _load_verified_prior_stage_inventory(
         != receipt_deployed_template_sha256
         or handoff.get("authorityBlobInventorySha256")
         != receipt_authority_inventory_sha256
+        or handoff.get("imagePullEvidenceSha256")
+        != receipt_image_pull_evidence_sha256
     ):
         raise OrchestrationError(
             "prior stage deployment attestation chain does not match"
@@ -2507,6 +2629,39 @@ def _predecessor_rotation_transition_assignments(
             item["assignmentResourceId"].casefold(),
             item["retiredPrincipalId"],
         )
+    )
+
+
+def _predecessor_legacy_acr_pull_migration_assignments(
+    verified: Mapping[str, Mapping[str, object]],
+    *,
+    subscription_id: str,
+) -> list[dict[str, str]]:
+    migrations: dict[str, dict[str, str]] = {}
+    for predecessor, record in verified.items():
+        plan = _mapping(
+            record.get("plan"),
+            field=f"verified {predecessor} plan",
+        )
+        for migration in _canonical_legacy_acr_pull_migration_assignments(
+            plan.get("legacyAcrPullMigrationAssignments"),
+            subscription_id=subscription_id,
+            field=f"{predecessor} legacy ACR pull migrations",
+        ):
+            normalized_id = migration["assignmentResourceId"].casefold()
+            existing = migrations.get(normalized_id)
+            if existing is not None and existing != migration:
+                raise OrchestrationError(
+                    "predecessor legacy ACR migration binds one assignment "
+                    "to conflicting principals"
+                )
+            migrations[normalized_id] = migration
+    return sorted(
+        migrations.values(),
+        key=lambda item: (
+            item["assignmentResourceId"].casefold(),
+            item["principalId"],
+        ),
     )
 
 
@@ -2815,6 +2970,8 @@ def _producer_outputs(handoff: Mapping[str, object]) -> dict[str, Any]:
         "feedRegistryTableResourceId",
         "guidanceActivationTableResourceId",
         "guidanceAuthoritySourceContainerResourceId",
+        "registryResourceId",
+        "registryPullRoleAssignmentResourceId",
     )
     for name in resource_outputs:
         _azure_resource_id(outputs.get(name), field=f"producer output {name}")
@@ -2851,6 +3008,14 @@ def _producer_outputs(handoff: Mapping[str, object]) -> dict[str, Any]:
             raise OrchestrationError(
                 f"producer output {name} does not match the deployed configuration"
             )
+    _acr_role_assignment_mode(
+        outputs.get("registryRoleAssignmentMode"),
+        field="producer registry role-assignment mode",
+    )
+    _string(
+        outputs.get("registryPullRoleDefinitionId"),
+        field="producer registry pull role definition",
+    )
     return outputs
 
 
@@ -2981,6 +3146,8 @@ def _publisher_outputs(handoff: Mapping[str, object]) -> dict[str, Any]:
         "authorityContainerResourceId",
         "activationTableResourceId",
         "bindingKeyResourceId",
+        "registryResourceId",
+        "registryPullRoleAssignmentResourceId",
     ):
         _azure_resource_id(outputs.get(name), field=f"publisher output {name}")
     namespace_name = _string(
@@ -3010,6 +3177,14 @@ def _publisher_outputs(handoff: Mapping[str, object]) -> dict[str, Any]:
             raise OrchestrationError(
                 f"publisher output {name} does not match the deployed configuration"
             )
+    _acr_role_assignment_mode(
+        outputs.get("registryRoleAssignmentMode"),
+        field="publisher registry role-assignment mode",
+    )
+    _string(
+        outputs.get("registryPullRoleDefinitionId"),
+        field="publisher registry pull role definition",
+    )
     return outputs
 
 
@@ -3253,6 +3428,19 @@ def _publisher_parameters(
         "enrichmentRuntimeConfigurationDigest",
         outputs["deployedRuntimeConfigurationDigest"],
     )
+    _set_parameter(
+        parameters,
+        "registryRoleAssignmentMode",
+        outputs["registryRoleAssignmentMode"],
+    )
+    _set_parameter(
+        parameters,
+        "registryResourceId",
+        _azure_resource_id(
+            producer_bindings.get("registryResourceId"),
+            field="producer registry resource binding",
+        ),
+    )
     return parameters
 
 
@@ -3407,6 +3595,45 @@ def _build_effective_parameters_from_documents(
             publisher,
         )
     raise OrchestrationError(f"unsupported deployment stage: {stage}")
+
+
+def _bind_broker_identity_principal(
+    *,
+    stage: str,
+    effective_parameters: dict[str, dict[str, object]],
+    subscription_id: str,
+) -> None:
+    if stage not in {"producer", "publisher"}:
+        return
+    identity_resource_id = _canonical_subscription_resource_id(
+        _parameter_value(
+            effective_parameters,
+            "brokerIdentityResourceId",
+        ),
+        subscription_id=subscription_id,
+        field=f"{stage} broker identity resource ID",
+    )
+    identity = _get_resource(
+        identity_resource_id,
+        subscription_id=subscription_id,
+    )
+    _require_resource_id_equal(
+        identity.get("id"),
+        identity_resource_id,
+        field=f"{stage} broker identity runtime readback",
+    )
+    properties = _mapping(
+        identity.get("properties"),
+        field=f"{stage} broker identity properties",
+    )
+    _set_parameter(
+        effective_parameters,
+        "brokerIdentityPrincipalId",
+        _canonical_directory_object_id(
+            properties.get("principalId"),
+            field=f"{stage} broker identity principal ID",
+        ),
+    )
 
 
 def _parameter_document(parameters: Mapping[str, object]) -> dict[str, object]:
@@ -3816,6 +4043,79 @@ def _verify_resource(resource_id: str, *, subscription_id: str) -> None:
         resource_id,
         field="Azure resource readback",
     )
+
+
+def _verify_acr_pull_binding(
+    outputs: Mapping[str, object],
+    *,
+    effective_parameters: Mapping[str, Mapping[str, object]],
+    principal_id: str,
+    subscription_id: str,
+    field: str,
+) -> str:
+    registry_resource_id = _canonical_subscription_resource_id(
+        outputs.get("registryResourceId"),
+        subscription_id=subscription_id,
+        field=f"{field} registry resource ID",
+    )
+    _require_subscription_resource_id_equal(
+        registry_resource_id,
+        _parameter_value(effective_parameters, "registryResourceId"),
+        subscription_id=subscription_id,
+        field=f"{field} registry resource ID",
+    )
+    registry = _get_resource(
+        registry_resource_id,
+        subscription_id=subscription_id,
+    )
+    _require_resource_id_equal(
+        registry.get("id"),
+        registry_resource_id,
+        field=f"{field} registry runtime readback",
+    )
+    properties = _mapping(
+        registry.get("properties"),
+        field=f"{field} registry properties",
+    )
+    role_assignment_mode = _acr_role_assignment_mode(
+        properties.get("roleAssignmentMode"),
+        field=f"{field} live registry role-assignment mode",
+    )
+    _require_equal(
+        outputs.get("registryRoleAssignmentMode"),
+        role_assignment_mode,
+        field=f"{field} registry role-assignment mode output",
+    )
+    _require_equal(
+        _parameter_value(
+            effective_parameters,
+            "registryRoleAssignmentMode",
+        ),
+        role_assignment_mode,
+        field=f"{field} reviewed registry role-assignment mode",
+    )
+    expected_role_definition_id = _acr_pull_role_definition_id(
+        role_assignment_mode=role_assignment_mode,
+        subscription_id=subscription_id,
+    )
+    _require_subscription_resource_id_equal(
+        outputs.get("registryPullRoleDefinitionId"),
+        expected_role_definition_id,
+        subscription_id=subscription_id,
+        field=f"{field} registry pull role definition",
+    )
+    expected_assignment_id = _deterministic_principal_role_assignment_id(
+        registry_resource_id,
+        principal_id,
+        expected_role_definition_id,
+    )
+    _require_subscription_resource_id_equal(
+        outputs.get("registryPullRoleAssignmentResourceId"),
+        expected_assignment_id,
+        subscription_id=subscription_id,
+        field=f"{field} registry pull assignment",
+    )
+    return expected_role_definition_id
 
 
 def _verify_private_storage_account(
@@ -4606,6 +4906,9 @@ def _resource_group_scope(resource_id: str) -> str:
 
 
 ACR_PULL_ROLE_ID = "7f951dda-4ed3-4680-a7ca-43fe172d538d"
+ACR_REPOSITORY_READER_ROLE_ID = "b93aa761-3e63-49ed-ac28-beffa264f7ac"
+ACR_LEGACY_ROLE_ASSIGNMENT_MODE = "LegacyRegistryPermissions"
+ACR_ABAC_ROLE_ASSIGNMENT_MODE = "AbacRepositoryPermissions"
 SERVICE_BUS_DATA_RECEIVER_ROLE_ID = "4f6c0938-94ea-4d52-8e5a-2e02b7ef8e7d"
 SERVICE_BUS_DATA_SENDER_ROLE_ID = "69a216fc-b8fb-44d8-bc22-1f3c2cd27a39"
 BLOB_DATA_READER_ROLE_ID = "2a2b9908-6ea1-4ae2-8e65-a410df84e7d1"
@@ -4630,6 +4933,7 @@ KEY_SIGN_DATA_ACTION = "Microsoft.KeyVault/vaults/keys/sign/action"
 BUILT_IN_DATA_ROLE_IDS = frozenset(
     {
         ACR_PULL_ROLE_ID,
+        ACR_REPOSITORY_READER_ROLE_ID,
         SERVICE_BUS_DATA_RECEIVER_ROLE_ID,
         SERVICE_BUS_DATA_SENDER_ROLE_ID,
         BLOB_DATA_READER_ROLE_ID,
@@ -4675,7 +4979,12 @@ APPROVED_CUSTOM_ROLE_PERMISSION_PROFILES = frozenset(
     }
 )
 ALLOWED_BUILT_IN_ROLES_BY_SCOPE_TYPE = {
-    "microsoft.containerregistry/registries": frozenset({ACR_PULL_ROLE_ID}),
+    "microsoft.containerregistry/registries": frozenset(
+        {
+            ACR_PULL_ROLE_ID,
+            ACR_REPOSITORY_READER_ROLE_ID,
+        }
+    ),
     "microsoft.servicebus/namespaces/queues": frozenset(
         {
             SERVICE_BUS_DATA_RECEIVER_ROLE_ID,
@@ -4826,6 +5135,48 @@ def _deterministic_role_assignment_id(
         role_id,
     )
     return f"{scope}/providers/Microsoft.Authorization/roleAssignments/{assignment_name}"
+
+
+def _deterministic_principal_role_assignment_id(
+    scope: str,
+    principal_id: str,
+    role_definition_id: str,
+) -> str:
+    assignment_name = _arm_guid(
+        scope,
+        _canonical_directory_object_id(
+            principal_id,
+            field="role assignment principal ID",
+        ),
+        role_definition_id,
+    )
+    return f"{scope}/providers/Microsoft.Authorization/roleAssignments/{assignment_name}"
+
+
+def _acr_role_assignment_mode(value: object, *, field: str) -> str:
+    mode = _string(value, field=field)
+    if mode not in {
+        ACR_LEGACY_ROLE_ASSIGNMENT_MODE,
+        ACR_ABAC_ROLE_ASSIGNMENT_MODE,
+    }:
+        raise OrchestrationError(
+            f"{field} must be {ACR_LEGACY_ROLE_ASSIGNMENT_MODE} "
+            f"or {ACR_ABAC_ROLE_ASSIGNMENT_MODE}"
+        )
+    return mode
+
+
+def _acr_pull_role_definition_id(
+    *,
+    role_assignment_mode: str,
+    subscription_id: str,
+) -> str:
+    role_id = (
+        ACR_PULL_ROLE_ID
+        if role_assignment_mode == ACR_LEGACY_ROLE_ASSIGNMENT_MODE
+        else ACR_REPOSITORY_READER_ROLE_ID
+    )
+    return _built_in_role_definition_id(subscription_id, role_id)
 
 
 def _built_in_role_definition_id(subscription_id: str, role_id: str) -> str:
@@ -5041,8 +5392,27 @@ def _producer_expected_rbac_assignments(
         field="producer notification queue resource ID",
     )
     registry_id = _azure_resource_id(
+        outputs.get("registryResourceId"),
+        field="producer registry resource ID output",
+    )
+    _require_resource_id_equal(
+        registry_id,
         _parameter_value(effective_parameters, "registryResourceId"),
         field="producer registry resource ID",
+    )
+    registry_role_assignment_mode = _acr_role_assignment_mode(
+        outputs.get("registryRoleAssignmentMode"),
+        field="producer registry role-assignment mode",
+    )
+    registry_pull_role_definition_id = _acr_pull_role_definition_id(
+        role_assignment_mode=registry_role_assignment_mode,
+        subscription_id=subscription_id,
+    )
+    _require_subscription_resource_id_equal(
+        outputs.get("registryPullRoleDefinitionId"),
+        registry_pull_role_definition_id,
+        subscription_id=subscription_id,
+        field="producer registry pull role definition",
     )
     feed_container_id = _azure_resource_id(
         outputs.get("feedV2ContainerResourceId"),
@@ -5143,10 +5513,7 @@ def _producer_expected_rbac_assignments(
         "condition": BLOB_LIST_DENY_CONDITION,
     }
     built_in_roles = {
-        "acr_pull": _built_in_role_definition_id(
-            subscription_id,
-            ACR_PULL_ROLE_ID,
-        ),
+        "acr_pull": registry_pull_role_definition_id,
         "service_bus_receiver": _built_in_role_definition_id(
             subscription_id,
             SERVICE_BUS_DATA_RECEIVER_ROLE_ID,
@@ -5791,8 +6158,27 @@ def _publisher_expected_rbac_assignments(
         field="publisher binding key resource ID",
     )
     registry_id = _azure_resource_id(
+        outputs.get("registryResourceId"),
+        field="publisher registry resource ID output",
+    )
+    _require_resource_id_equal(
+        registry_id,
         _parameter_value(effective_parameters, "registryResourceId"),
         field="publisher registry resource ID",
+    )
+    registry_role_assignment_mode = _acr_role_assignment_mode(
+        outputs.get("registryRoleAssignmentMode"),
+        field="publisher registry role-assignment mode",
+    )
+    registry_pull_role_definition_id = _acr_pull_role_definition_id(
+        role_assignment_mode=registry_role_assignment_mode,
+        subscription_id=subscription_id,
+    )
+    _require_subscription_resource_id_equal(
+        outputs.get("registryPullRoleDefinitionId"),
+        registry_pull_role_definition_id,
+        subscription_id=subscription_id,
+        field="publisher registry pull role definition",
     )
 
     blob_condition = {
@@ -5800,10 +6186,7 @@ def _publisher_expected_rbac_assignments(
         "condition": BLOB_LIST_DENY_CONDITION,
     }
     built_in_roles = {
-        "acr_pull": _built_in_role_definition_id(
-            subscription_id,
-            ACR_PULL_ROLE_ID,
-        ),
+        "acr_pull": registry_pull_role_definition_id,
         "service_bus_receiver": _built_in_role_definition_id(
             subscription_id,
             SERVICE_BUS_DATA_RECEIVER_ROLE_ID,
@@ -6202,6 +6585,205 @@ def _verify_legacy_crypto_user_migration(
         )
 
 
+def _reviewed_acr_registry_scopes(
+    *,
+    stage: str,
+    effective_parameters: Mapping[str, Mapping[str, object]],
+    subscription_id: str,
+) -> set[str]:
+    parameter_names = (
+        (
+            "acceptanceImageRegistryResourceId",
+            "presentationImageRegistryResourceId",
+        )
+        if stage in {"foundation", "live-acceptance"}
+        else ("registryResourceId",)
+    )
+    return {
+        _canonical_subscription_resource_id(
+            _parameter_value(effective_parameters, name),
+            subscription_id=subscription_id,
+            field=f"{stage} reviewed ACR scope {name}",
+        )
+        for name in parameter_names
+    }
+
+
+def _verify_legacy_acr_pull_migration(
+    reviewed_assignments: object,
+    *,
+    migration_state: str,
+    stage: str,
+    effective_parameters: Mapping[str, Mapping[str, object]],
+    subscription_id: str,
+    allow_reviewed_assignment_scopes: bool = False,
+) -> None:
+    if migration_state not in {"present", "absent"}:
+        raise OrchestrationError("legacy ACR pull migration state is invalid")
+    assignments = _canonical_legacy_acr_pull_migration_assignments(
+        reviewed_assignments,
+        subscription_id=subscription_id,
+        field="legacy ACR pull migration assignments",
+    )
+    if not assignments:
+        return
+    reviewed_scopes = (
+        {
+            _role_assignment_scope(
+                assignment["assignmentResourceId"]
+            ).casefold(): _role_assignment_scope(
+                assignment["assignmentResourceId"]
+            )
+            for assignment in assignments
+        }
+        if allow_reviewed_assignment_scopes
+        else {
+            scope.casefold(): scope
+            for scope in _reviewed_acr_registry_scopes(
+                stage=stage,
+                effective_parameters=effective_parameters,
+                subscription_id=subscription_id,
+            )
+        }
+    )
+    if any(
+        _resource_type(scope) != "microsoft.containerregistry/registries"
+        for scope in reviewed_scopes.values()
+    ):
+        raise OrchestrationError(
+            "legacy ACR pull migration scope must identify a container registry"
+        )
+    assignments_by_scope: dict[str, list[dict[str, str]]] = {}
+    for assignment in assignments:
+        scope = _role_assignment_scope(assignment["assignmentResourceId"])
+        if scope.casefold() not in reviewed_scopes:
+            raise OrchestrationError(
+                "legacy ACR pull migration assignment is outside the reviewed registry scopes"
+            )
+        assignments_by_scope.setdefault(scope.casefold(), []).append(assignment)
+
+    observed_resource_ids: dict[str, str] = {}
+    for normalized_scope, scoped_assignments in assignments_by_scope.items():
+        scope = reviewed_scopes[normalized_scope]
+        observed = _merge_effective_role_assignment_documents(
+            [
+                _run_json(
+                    [
+                        "az",
+                        "role",
+                        "assignment",
+                        "list",
+                        "--subscription",
+                        subscription_id,
+                        "--scope",
+                        scope,
+                        "--only-show-errors",
+                        "--output",
+                        "json",
+                    ],
+                    field=f"legacy ACR pull assignments at {scope}",
+                )
+            ],
+            field=f"legacy ACR pull assignments at {scope}",
+        )
+        observed_at_scope = {
+            _string(
+                item.get("id"),
+                field="legacy ACR pull assignment ID",
+            ).casefold(): _string(
+                item.get("id"),
+                field="legacy ACR pull assignment ID",
+            )
+            for item in observed
+        }
+        for assignment in scoped_assignments:
+            normalized_id = assignment["assignmentResourceId"].casefold()
+            if normalized_id in observed_at_scope:
+                observed_resource_ids[normalized_id] = observed_at_scope[
+                    normalized_id
+                ]
+
+    reviewed_by_id = {
+        item["assignmentResourceId"].casefold(): item for item in assignments
+    }
+    observed_ids = set(observed_resource_ids)
+    if migration_state == "absent":
+        if observed_ids:
+            raise OrchestrationError(
+                "legacy ACR pull assignments require controlled revocation "
+                "before deployment or readiness"
+            )
+        return
+    if observed_ids != set(reviewed_by_id):
+        raise OrchestrationError(
+            "legacy ACR pull migration evidence does not exactly match "
+            "the reviewed assignment IDs"
+        )
+    expected_role_definition_id = _built_in_role_definition_id(
+        subscription_id,
+        ACR_PULL_ROLE_ID,
+    )
+    for assignment_id in sorted(observed_ids):
+        reviewed = reviewed_by_id[assignment_id]
+        original_assignment_id = observed_resource_ids[assignment_id]
+        if assignment_id == _deterministic_principal_role_assignment_id(
+            _role_assignment_scope(original_assignment_id),
+            reviewed["principalId"],
+            expected_role_definition_id,
+        ).casefold():
+            raise OrchestrationError(
+                "current principal-seeded ACR assignment cannot be classified as legacy"
+            )
+        resource = _get_resource(
+            original_assignment_id,
+            subscription_id=subscription_id,
+        )
+        _require_resource_id_equal(
+            resource.get("id"),
+            original_assignment_id,
+            field="legacy ACR pull assignment readback",
+        )
+        properties = _mapping(
+            resource.get("properties"),
+            field="legacy ACR pull assignment properties",
+        )
+        if (
+            _canonical_directory_object_id(
+                properties.get("principalId"),
+                field="legacy ACR pull principal ID",
+            )
+            != reviewed["principalId"]
+            or properties.get("principalType") != "ServicePrincipal"
+        ):
+            raise OrchestrationError(
+                "legacy ACR pull assignment principal does not match review"
+            )
+        _require_subscription_resource_id_equal(
+            properties.get("roleDefinitionId"),
+            expected_role_definition_id,
+            subscription_id=subscription_id,
+            field="legacy ACR pull role definition",
+        )
+        _require_resource_id_equal(
+            _role_assignment_scope(original_assignment_id),
+            _role_assignment_scope(reviewed["assignmentResourceId"]),
+            field="legacy ACR pull scope",
+        )
+        if properties.get("scope") is not None:
+            _require_resource_id_equal(
+                properties.get("scope"),
+                _role_assignment_scope(reviewed["assignmentResourceId"]),
+                field="legacy ACR pull scope property",
+            )
+        if (
+            properties.get("conditionVersion") is not None
+            or properties.get("condition") is not None
+        ):
+            raise OrchestrationError(
+                "legacy ACR pull assignment must not contain a condition"
+            )
+
+
 def _verify_complete_trigger_queue_assignment_set(
     *,
     current_expected_assignments: Mapping[str, _ExpectedRoleAssignment],
@@ -6540,6 +7122,87 @@ def _canonical_legacy_crypto_user_migration_assignments(
     if len(assignments) > MAX_LEGACY_CRYPTO_USER_MIGRATION_ASSIGNMENTS:
         raise OrchestrationError(f"{field} exceeds the bounded maximum")
     return sorted(assignments)
+
+
+def _canonical_legacy_acr_pull_migration_assignments(
+    values: object,
+    *,
+    subscription_id: str,
+    field: str,
+) -> list[dict[str, str]]:
+    if not isinstance(values, list):
+        raise OrchestrationError(f"{field} must be an array")
+    canonical: list[dict[str, str]] = []
+    for index, raw_value in enumerate(values):
+        value = _mapping(raw_value, field=f"{field}[{index}]")
+        _require_exact_fields(
+            value,
+            frozenset({"assignmentResourceId", "principalId"}),
+            field=f"{field}[{index}]",
+        )
+        assignment_resource_id = _canonical_subscription_resource_id(
+            value.get("assignmentResourceId"),
+            subscription_id=subscription_id,
+            field=f"{field}[{index}].assignmentResourceId",
+        )
+        if (
+            "/providers/microsoft.authorization/roleassignments/"
+            not in assignment_resource_id.casefold()
+        ):
+            raise OrchestrationError(
+                f"{field}[{index}] must identify one ACR role assignment"
+            )
+        canonical.append(
+            {
+                "assignmentResourceId": assignment_resource_id,
+                "principalId": _canonical_directory_object_id(
+                    value.get("principalId"),
+                    field=f"{field}[{index}].principalId",
+                ),
+            }
+        )
+    if len(
+        {item["assignmentResourceId"].casefold() for item in canonical}
+    ) != len(canonical):
+        raise OrchestrationError(
+            f"{field} must contain distinct assignment resource IDs"
+        )
+    if len(canonical) > MAX_LEGACY_ACR_PULL_MIGRATION_ASSIGNMENTS:
+        raise OrchestrationError(f"{field} exceeds the bounded maximum")
+    return sorted(
+        canonical,
+        key=lambda item: (
+            item["assignmentResourceId"].casefold(),
+            item["principalId"],
+        ),
+    )
+
+
+def _merge_legacy_acr_pull_migration_assignments(
+    *sources: object,
+    subscription_id: str,
+) -> list[dict[str, str]]:
+    merged: dict[str, dict[str, str]] = {}
+    for source_index, source in enumerate(sources):
+        for migration in _canonical_legacy_acr_pull_migration_assignments(
+            source,
+            subscription_id=subscription_id,
+            field=f"legacy ACR pull migration source {source_index}",
+        ):
+            normalized_id = migration["assignmentResourceId"].casefold()
+            existing = merged.get(normalized_id)
+            if existing is not None and existing != migration:
+                raise OrchestrationError(
+                    "one legacy ACR assignment is bound to conflicting principals"
+                )
+            merged[normalized_id] = migration
+    return sorted(
+        merged.values(),
+        key=lambda item: (
+            item["assignmentResourceId"].casefold(),
+            item["principalId"],
+        ),
+    )
 
 
 def _rotation_transition_assignments_by_id(
@@ -7519,6 +8182,441 @@ def _verify_job_behavior(
     )
 
 
+def _image_pull_evidence_sha256(
+    value: Mapping[str, object] | None,
+) -> str | None:
+    if value is None:
+        return None
+    return _sha256_bytes(_canonical_json_bytes(value))
+
+
+def _validated_image_pull_evidence(
+    value: object,
+    *,
+    stage: str,
+    subscription_id: str,
+) -> dict[str, object] | None:
+    if value is None:
+        if stage != "foundation":
+            raise OrchestrationError(
+                f"{stage} handoff is missing digest-pinned image-pull evidence"
+            )
+        return None
+    evidence = _mapping(value, field="image-pull evidence")
+    _require_exact_fields(
+        evidence,
+        frozenset({"schemaVersion", "executions"}),
+        field="image-pull evidence",
+    )
+    if evidence.get("schemaVersion") != IMAGE_PULL_EVIDENCE_SCHEMA_VERSION:
+        raise OrchestrationError("image-pull evidence schema is unsupported")
+    executions = evidence.get("executions")
+    if not isinstance(executions, list):
+        raise OrchestrationError("image-pull evidence executions must be an array")
+    expected_count = 2 if stage == "live-acceptance" else 1
+    if stage == "foundation" or len(executions) != expected_count:
+        raise OrchestrationError(
+            f"{stage} image-pull evidence has an unexpected execution count"
+        )
+    for index, raw_execution in enumerate(executions):
+        execution = _mapping(
+            raw_execution,
+            field=f"image-pull execution {index}",
+        )
+        _require_exact_fields(
+            execution,
+            frozenset(
+                {
+                    "kind",
+                    "jobResourceId",
+                    "executionName",
+                    "image",
+                    "containerName",
+                    "registryResourceId",
+                    "principalId",
+                    "registryRoleAssignmentMode",
+                    "registryPullRoleDefinitionId",
+                    "registryPullRoleAssignmentResourceId",
+                    "status",
+                }
+            ),
+            field=f"image-pull execution {index}",
+        )
+        kind = _string(
+            execution.get("kind"),
+            field=f"image-pull execution {index} kind",
+        )
+        if kind not in {"producer", "publisher"}:
+            raise OrchestrationError(
+                f"image-pull execution {index} kind is unsupported"
+            )
+        _canonical_subscription_resource_id(
+            execution.get("jobResourceId"),
+            subscription_id=subscription_id,
+            field=f"image-pull execution {index} job",
+        )
+        _string(
+            execution.get("executionName"),
+            field=f"image-pull execution {index} name",
+        )
+        _digest_pinned_image(
+            execution.get("image"),
+            field=f"image-pull execution {index} image",
+        )
+        _string(
+            execution.get("containerName"),
+            field=f"image-pull execution {index} container",
+        )
+        _canonical_subscription_resource_id(
+            execution.get("registryResourceId"),
+            subscription_id=subscription_id,
+            field=f"image-pull execution {index} registry",
+        )
+        principal_id = _canonical_directory_object_id(
+            execution.get("principalId"),
+            field=f"image-pull execution {index} principal ID",
+        )
+        role_assignment_mode = _acr_role_assignment_mode(
+            execution.get("registryRoleAssignmentMode"),
+            field=f"image-pull execution {index} registry mode",
+        )
+        expected_role_definition_id = _acr_pull_role_definition_id(
+            role_assignment_mode=role_assignment_mode,
+            subscription_id=subscription_id,
+        )
+        _require_subscription_resource_id_equal(
+            execution.get("registryPullRoleDefinitionId"),
+            expected_role_definition_id,
+            subscription_id=subscription_id,
+            field=f"image-pull execution {index} role definition",
+        )
+        _canonical_subscription_resource_id(
+            execution.get("registryPullRoleAssignmentResourceId"),
+            subscription_id=subscription_id,
+            field=f"image-pull execution {index} role assignment",
+        )
+        _require_subscription_resource_id_equal(
+            execution.get("registryPullRoleAssignmentResourceId"),
+            _deterministic_principal_role_assignment_id(
+                _string(
+                    execution.get("registryResourceId"),
+                    field=f"image-pull execution {index} registry",
+                ),
+                principal_id,
+                expected_role_definition_id,
+            ),
+            subscription_id=subscription_id,
+            field=f"image-pull execution {index} deterministic role assignment",
+        )
+        _require_equal(
+            execution.get("status"),
+            "Succeeded",
+            field=f"image-pull execution {index} status",
+        )
+    if executions != sorted(
+        executions,
+        key=lambda item: str(item["jobResourceId"]).casefold(),
+    ):
+        raise OrchestrationError("image-pull evidence executions must be sorted")
+    expected_kinds = {
+        "producer",
+        "publisher",
+    } if stage == "live-acceptance" else {stage}
+    if {str(item["kind"]) for item in executions} != expected_kinds:
+        raise OrchestrationError(
+            f"{stage} image-pull evidence does not contain its exact job kinds"
+        )
+    return evidence
+
+
+def _verify_digest_pinned_job_image_pull(
+    *,
+    job_resource_id: str,
+    image: str,
+    container_name: str,
+    registry_resource_id: str,
+    principal_id: str,
+    registry_role_assignment_mode: str,
+    registry_pull_role_definition_id: str,
+    registry_pull_role_assignment_resource_id: str,
+    subscription_id: str,
+) -> dict[str, object]:
+    job_id = _job_resource_id(job_resource_id, field="image-pull probe job")
+    _, resource_group = _resource_subscription_and_group(job_id)
+    job_name = _resource_name(job_id)
+    expected_image = _digest_pinned_image(image, field="image-pull probe image")
+    last_error: OrchestrationError | None = None
+    for attempt in range(1, READBACK_MAX_ATTEMPTS + 1):
+        try:
+            start = _mapping(
+                _run_json(
+                    [
+                        "az",
+                        "containerapp",
+                        "job",
+                        "start",
+                        "--subscription",
+                        subscription_id,
+                        "--resource-group",
+                        resource_group,
+                        "--name",
+                        job_name,
+                        "--container-name",
+                        container_name,
+                        "--image",
+                        expected_image,
+                        "--cpu",
+                        "1",
+                        "--memory",
+                        "2Gi",
+                        "--command",
+                        "/bin/sh",
+                        "--args",
+                        "-c",
+                        "exit 0",
+                        "--only-show-errors",
+                        "--output",
+                        "json",
+                    ],
+                    field="digest-pinned image-pull probe start",
+                ),
+                field="digest-pinned image-pull probe start",
+            )
+            execution_name = _string(
+                start.get("name"),
+                field="digest-pinned image-pull execution name",
+            )
+            for poll in range(1, IMAGE_PULL_EXECUTION_POLL_ATTEMPTS + 1):
+                execution = _mapping(
+                    _run_json(
+                        [
+                            "az",
+                            "containerapp",
+                            "job",
+                            "execution",
+                            "show",
+                            "--subscription",
+                            subscription_id,
+                            "--resource-group",
+                            resource_group,
+                            "--name",
+                            job_name,
+                            "--job-execution-name",
+                            execution_name,
+                            "--only-show-errors",
+                            "--output",
+                            "json",
+                        ],
+                        field="digest-pinned image-pull execution",
+                    ),
+                    field="digest-pinned image-pull execution",
+                )
+                properties = _mapping(
+                    execution.get("properties"),
+                    field="digest-pinned image-pull execution properties",
+                )
+                status = _string(
+                    properties.get("status"),
+                    field="digest-pinned image-pull execution status",
+                )
+                if status == "Succeeded":
+                    template = _mapping(
+                        properties.get("template"),
+                        field="digest-pinned image-pull execution template",
+                    )
+                    containers = template.get("containers")
+                    if not isinstance(containers, list) or len(containers) != 1:
+                        raise OrchestrationError(
+                            "image-pull execution must contain one exact container"
+                        )
+                    container = _mapping(
+                        containers[0],
+                        field="digest-pinned image-pull execution container",
+                    )
+                    _require_equal(
+                        container.get("name"),
+                        container_name,
+                        field="image-pull execution container name",
+                    )
+                    _require_equal(
+                        container.get("image"),
+                        expected_image,
+                        field="image-pull execution image",
+                    )
+                    _require_equal(
+                        container.get("command"),
+                        ["/bin/sh"],
+                        field="image-pull execution command",
+                    )
+                    _require_equal(
+                        container.get("args"),
+                        ["-c", "exit 0"],
+                        field="image-pull execution arguments",
+                    )
+                    return {
+                        "jobResourceId": job_id,
+                        "executionName": execution_name,
+                        "image": expected_image,
+                        "containerName": container_name,
+                        "registryResourceId": registry_resource_id,
+                        "principalId": principal_id,
+                        "registryRoleAssignmentMode": registry_role_assignment_mode,
+                        "registryPullRoleDefinitionId": registry_pull_role_definition_id,
+                        "registryPullRoleAssignmentResourceId": (
+                            registry_pull_role_assignment_resource_id
+                        ),
+                        "status": "Succeeded",
+                    }
+                if status == "Failed":
+                    raise OrchestrationError(
+                        "digest-pinned image-pull execution failed"
+                    )
+                if poll < IMAGE_PULL_EXECUTION_POLL_ATTEMPTS:
+                    time.sleep(READBACK_RETRY_SECONDS)
+            raise OrchestrationError(
+                "digest-pinned image-pull execution did not reach a terminal state"
+            )
+        except OrchestrationError as exc:
+            last_error = exc
+            if attempt < READBACK_MAX_ATTEMPTS:
+                time.sleep(READBACK_RETRY_SECONDS)
+    if last_error is None:
+        raise OrchestrationError("digest-pinned image-pull probe failed without an error")
+    raise OrchestrationError(
+        "digest-pinned image pull did not succeed after bounded RBAC propagation"
+    ) from last_error
+
+
+def _image_pull_probe_from_outputs(
+    outputs: Mapping[str, object],
+    *,
+    kind: str,
+    principal_id: str,
+    subscription_id: str,
+) -> dict[str, object]:
+    if kind == "producer":
+        return {
+            "kind": kind,
+            **_verify_digest_pinned_job_image_pull(
+            job_resource_id=_string(
+                outputs.get("producerJobResourceId"),
+                field="producer image-pull job",
+            ),
+            image=_string(outputs.get("producerImage"), field="producer image"),
+            container_name="wc027-enrichment-feed-producer",
+            registry_resource_id=_string(
+                outputs.get("registryResourceId"),
+                field="producer registry resource ID",
+            ),
+            principal_id=principal_id,
+            registry_role_assignment_mode=_string(
+                outputs.get("registryRoleAssignmentMode"),
+                field="producer registry role-assignment mode",
+            ),
+            registry_pull_role_definition_id=_string(
+                outputs.get("registryPullRoleDefinitionId"),
+                field="producer registry pull role definition",
+            ),
+            registry_pull_role_assignment_resource_id=_string(
+                outputs.get("registryPullRoleAssignmentResourceId"),
+                field="producer registry pull role assignment",
+            ),
+            subscription_id=subscription_id,
+            ),
+        }
+    if kind == "publisher":
+        return {
+            "kind": kind,
+            **_verify_digest_pinned_job_image_pull(
+            job_resource_id=_string(
+                outputs.get("publisherJobResourceId"),
+                field="publisher image-pull job",
+            ),
+            image=_string(outputs.get("publisherImage"), field="publisher image"),
+            container_name="wc027-guidance-authority-publisher",
+            registry_resource_id=_string(
+                outputs.get("registryResourceId"),
+                field="publisher registry resource ID",
+            ),
+            principal_id=principal_id,
+            registry_role_assignment_mode=_string(
+                outputs.get("registryRoleAssignmentMode"),
+                field="publisher registry role-assignment mode",
+            ),
+            registry_pull_role_definition_id=_string(
+                outputs.get("registryPullRoleDefinitionId"),
+                field="publisher registry pull role definition",
+            ),
+            registry_pull_role_assignment_resource_id=_string(
+                outputs.get("registryPullRoleAssignmentResourceId"),
+                field="publisher registry pull role assignment",
+            ),
+            subscription_id=subscription_id,
+            ),
+        }
+    raise OrchestrationError(f"unsupported image-pull probe kind: {kind}")
+
+
+def _expected_image_pull_binding(
+    outputs: Mapping[str, object],
+    *,
+    kind: str,
+    principal_id: str,
+) -> dict[str, object]:
+    prefix = "producer" if kind == "producer" else "publisher"
+    return {
+        "kind": kind,
+        "jobResourceId": outputs[f"{prefix}JobResourceId"],
+        "image": outputs[f"{prefix}Image"],
+        "containerName": (
+            "wc027-enrichment-feed-producer"
+            if kind == "producer"
+            else "wc027-guidance-authority-publisher"
+        ),
+        "registryResourceId": outputs["registryResourceId"],
+        "principalId": principal_id,
+        "registryRoleAssignmentMode": outputs["registryRoleAssignmentMode"],
+        "registryPullRoleDefinitionId": outputs[
+            "registryPullRoleDefinitionId"
+        ],
+        "registryPullRoleAssignmentResourceId": outputs[
+            "registryPullRoleAssignmentResourceId"
+        ],
+        "status": "Succeeded",
+    }
+
+
+def _verify_image_pull_evidence_matches_outputs(
+    evidence: Mapping[str, object],
+    *,
+    kind: str,
+    outputs: Mapping[str, object],
+    principal_id: str,
+) -> None:
+    executions = evidence.get("executions")
+    if not isinstance(executions, list):
+        raise OrchestrationError("image-pull evidence executions must be an array")
+    matches = [
+        _mapping(item, field=f"{kind} image-pull evidence")
+        for item in executions
+        if isinstance(item, dict) and item.get("kind") == kind
+    ]
+    if len(matches) != 1:
+        raise OrchestrationError(
+            f"image-pull evidence must contain one exact {kind} execution"
+        )
+    actual = dict(matches[0])
+    actual.pop("executionName", None)
+    if actual != _expected_image_pull_binding(
+        outputs,
+        kind=kind,
+        principal_id=principal_id,
+    ):
+        raise OrchestrationError(
+            f"{kind} image-pull evidence does not match reviewed outputs"
+        )
+
+
 def _verify_service_bus_queue(
     *,
     job_resource_id: str,
@@ -8039,6 +9137,17 @@ def _verify_producer_resources(
         subscription_id=subscription_id,
     )
     allowed_principal_ids = set(identity_principal_ids.values())
+    _verify_acr_pull_binding(
+        validated_outputs,
+        effective_parameters=effective_parameters,
+        principal_id=_principal_for_identity(
+            identity_principal_ids,
+            broker_identity_resource_id,
+            field="producer broker identity",
+        ),
+        subscription_id=subscription_id,
+        field="producer",
+    )
     _verify_legacy_crypto_user_migration(
         _producer_legacy_crypto_user_assignments(
             configuration=configuration,
@@ -8439,6 +9548,17 @@ def _verify_publisher_resources(
         subscription_id=subscription_id,
     )
     allowed_principal_ids = set(identity_principal_ids.values())
+    _verify_acr_pull_binding(
+        validated_outputs,
+        effective_parameters=effective_parameters,
+        principal_id=_principal_for_identity(
+            identity_principal_ids,
+            broker_identity_resource_id,
+            field="publisher broker identity",
+        ),
+        subscription_id=subscription_id,
+        field="publisher",
+    )
     expected_assignments = _publisher_expected_rbac_assignments(
         binding,
         configuration=configuration,
@@ -8657,6 +9777,7 @@ def _parameter_bindings(
         return {"foundationParametersSha256": _foundation_parameter_digest(effective_parameters)}
     names = {
         "producer": (
+            "brokerIdentityPrincipalId",
             "correlationSourceStorageAccountResourceId",
             "correlationBindingKeyResourceId",
             "changeKeyResourceId",
@@ -8666,16 +9787,19 @@ def _parameter_bindings(
             "monitoringCollectorKeyResourceId",
             "monitoringIntentKeyResourceId",
             "registryResourceId",
+            "registryRoleAssignmentMode",
             "serviceBusNamespaceName",
             "triggerSubmitterIdentityResourceIds",
         ),
         "publisher": (
             "authorityStorageAccountResourceId",
             "activationStorageAccountResourceId",
+            "brokerIdentityPrincipalId",
             "bindingTrustReaderIdentityResourceId",
             "bindingKeyResourceId",
             "managedEnvironmentResourceId",
             "registryResourceId",
+            "registryRoleAssignmentMode",
             "requestSubmitterIdentityResourceIds",
             "requestKeyResourceId",
             "serviceBusNamespaceName",
@@ -9222,11 +10346,13 @@ def _verify_deployed_stage_state(
     publisher: Mapping[str, object] | None,
     effective_parameters: Mapping[str, Mapping[str, object]],
     reviewed_transitions: object,
+    legacy_acr_pull_migrations: object,
     authority_container_id: str | None,
     reviewed_authority_inventory: Mapping[str, object] | None,
     subscription_id: str,
-) -> dict[str, object] | None:
+) -> tuple[dict[str, object] | None, dict[str, object] | None]:
     handled_transition_ids: set[str] = set()
+    image_pull_executions: list[dict[str, object]] = []
     _validate_subscription_boundary(
         outputs,
         subscription_id=subscription_id,
@@ -9237,6 +10363,14 @@ def _verify_deployed_stage_state(
         outputs,
         producer=producer,
         publisher=publisher,
+    )
+    _verify_legacy_acr_pull_migration(
+        legacy_acr_pull_migrations,
+        migration_state="absent",
+        stage=stage,
+        effective_parameters=effective_parameters,
+        subscription_id=subscription_id,
+        allow_reviewed_assignment_scopes=True,
     )
     if stage == "foundation":
         _verify_foundation_resources(
@@ -9255,6 +10389,20 @@ def _verify_deployed_stage_state(
             require_transition_revoked=True,
             handled_transition_ids=handled_transition_ids,
         )
+        image_pull_executions.append(
+            _image_pull_probe_from_outputs(
+                outputs,
+                kind="producer",
+                principal_id=_string(
+                    _parameter_value(
+                        effective_parameters,
+                        "brokerIdentityPrincipalId",
+                    ),
+                    field="producer broker principal ID",
+                ),
+                subscription_id=subscription_id,
+            )
+        )
     elif stage == "live-acceptance":
         if foundation is None or producer is None or publisher is None:
             raise OrchestrationError("live-acceptance plan lost required handoffs")
@@ -9264,6 +10412,32 @@ def _verify_deployed_stage_state(
             publisher=publisher,
             subscription_id=subscription_id,
             rotation_transitions=reviewed_transitions,
+        )
+        image_pull_executions.extend(
+            [
+                _image_pull_probe_from_outputs(
+                    _mapping(producer["outputs"], field="producer outputs"),
+                    kind="producer",
+                    principal_id=_string(
+                        _handoff_bindings(producer).get(
+                            "brokerIdentityPrincipalId"
+                        ),
+                        field="producer broker principal ID",
+                    ),
+                    subscription_id=subscription_id,
+                ),
+                _image_pull_probe_from_outputs(
+                    _mapping(publisher["outputs"], field="publisher outputs"),
+                    kind="publisher",
+                    principal_id=_string(
+                        _handoff_bindings(publisher).get(
+                            "brokerIdentityPrincipalId"
+                        ),
+                        field="publisher broker principal ID",
+                    ),
+                    subscription_id=subscription_id,
+                ),
+            ]
         )
     elif stage == "publisher":
         if foundation is None or producer is None:
@@ -9289,6 +10463,20 @@ def _verify_deployed_stage_state(
             require_transition_revoked=True,
             handled_transition_ids=handled_transition_ids,
         )
+        image_pull_executions.append(
+            _image_pull_probe_from_outputs(
+                outputs,
+                kind="publisher",
+                principal_id=_string(
+                    _parameter_value(
+                        effective_parameters,
+                        "brokerIdentityPrincipalId",
+                    ),
+                    field="publisher broker principal ID",
+                ),
+                subscription_id=subscription_id,
+            )
+        )
     if stage in {"producer", "publisher"}:
         _verify_unmatched_rotation_transitions_absent(
             reviewed_transitions,
@@ -9300,7 +10488,7 @@ def _verify_deployed_stage_state(
             raise OrchestrationError(
                 "foundation deployment cannot carry authority Blob inventory"
             )
-        return None
+        return None, None
     if reviewed_authority_inventory is None:
         raise OrchestrationError(
             "WC-027 deployment is missing its reviewed authority checkpoint"
@@ -9315,7 +10503,21 @@ def _verify_deployed_stage_state(
         reviewed_inventory=reviewed_authority_inventory,
         current_inventory=current_inventory,
     )
-    return current_inventory
+    image_pull_executions.sort(
+        key=lambda item: str(item["jobResourceId"]).casefold()
+    )
+    image_pull_evidence = {
+        "schemaVersion": IMAGE_PULL_EVIDENCE_SCHEMA_VERSION,
+        "executions": image_pull_executions,
+    }
+    validated_image_pull_evidence = _validated_image_pull_evidence(
+        image_pull_evidence,
+        stage=stage,
+        subscription_id=subscription_id,
+    )
+    if validated_image_pull_evidence is None:
+        raise OrchestrationError("image-pull evidence unexpectedly vanished")
+    return current_inventory, validated_image_pull_evidence
 
 
 def plan(args: argparse.Namespace) -> Path:
@@ -9398,9 +10600,34 @@ def plan(args: argparse.Namespace) -> Path:
         subscription_id=subscription_id,
         field="legacy Crypto User migration assignments",
     )
+    raw_legacy_acr_migrations = list(
+        getattr(args, "legacy_acr_pull_migration_assignment", [])
+    )
+    legacy_acr_pull_migrations = _canonical_legacy_acr_pull_migration_assignments(
+        [
+            {
+                "assignmentResourceId": pair[0],
+                "principalId": pair[1],
+            }
+            for pair in raw_legacy_acr_migrations
+            if isinstance(pair, list | tuple) and len(pair) == 2
+        ],
+        subscription_id=subscription_id,
+        field="legacy ACR pull migration assignments",
+    )
+    if len(legacy_acr_pull_migrations) != len(raw_legacy_acr_migrations):
+        raise OrchestrationError(
+            "each legacy ACR pull migration requires an assignment ID and principal ID"
+        )
     predecessor_rotation_transitions = _predecessor_rotation_transition_assignments(
         verified_predecessors,
         subscription_id=subscription_id,
+    )
+    predecessor_legacy_acr_migrations = (
+        _predecessor_legacy_acr_pull_migration_assignments(
+            verified_predecessors,
+            subscription_id=subscription_id,
+        )
     )
     if args.stage in {"foundation", "live-acceptance"} and rotation_transition_assignments:
         raise OrchestrationError(
@@ -9462,6 +10689,11 @@ def plan(args: argparse.Namespace) -> Path:
             for predecessor, record in verified_predecessors.items()
         },
     )
+    _bind_broker_identity_principal(
+        stage=args.stage,
+        effective_parameters=effective,
+        subscription_id=subscription_id,
+    )
     _validate_effective_parameter_subscription_boundary(
         effective,
         subscription_id=subscription_id,
@@ -9475,6 +10707,23 @@ def plan(args: argparse.Namespace) -> Path:
             stage=args.stage,
         ),
     )
+    if predecessor_legacy_acr_migrations:
+        _verify_legacy_acr_pull_migration(
+            predecessor_legacy_acr_migrations,
+            migration_state="absent",
+            stage=args.stage,
+            effective_parameters=effective,
+            subscription_id=subscription_id,
+            allow_reviewed_assignment_scopes=True,
+        )
+    if legacy_acr_pull_migrations:
+        _verify_legacy_acr_pull_migration(
+            legacy_acr_pull_migrations,
+            migration_state="present",
+            stage=args.stage,
+            effective_parameters=effective,
+            subscription_id=subscription_id,
+        )
     if args.stage in {"producer", "publisher"}:
         current_principal_ids = _current_principal_ids_from_effective_parameters(
             effective,
@@ -9725,6 +10974,7 @@ def plan(args: argparse.Namespace) -> Path:
         "allowedChangeResourceIds": sorted(allowed_changes),
         "rotationTransitionAssignments": rotation_transition_assignments,
         "legacyCryptoUserMigrationAssignmentIds": (legacy_crypto_user_migration_assignments),
+        "legacyAcrPullMigrationAssignments": legacy_acr_pull_migrations,
         "authorityBlobInventory": authority_blob_inventory,
         "authorityBlobInventorySha256": _authority_checkpoint_sha256(
             authority_blob_inventory
@@ -9894,6 +11144,11 @@ def apply(args: argparse.Namespace) -> Path:
             field="legacy Crypto User migration assignments",
         )
     )
+    legacy_acr_pull_migrations = _canonical_legacy_acr_pull_migration_assignments(
+        manifest.get("legacyAcrPullMigrationAssignments"),
+        subscription_id=subscription_id,
+        field="legacy ACR pull migration assignments",
+    )
     reviewed_authority_blob_inventory = _validated_authority_blob_inventory(
         manifest.get("authorityBlobInventory"),
         subscription_id=subscription_id,
@@ -10013,6 +11268,12 @@ def apply(args: argparse.Namespace) -> Path:
         verified_predecessors,
         subscription_id=subscription_id,
     )
+    predecessor_legacy_acr_migrations = (
+        _predecessor_legacy_acr_pull_migration_assignments(
+            verified_predecessors,
+            subscription_id=subscription_id,
+        )
+    )
     if stage in {"foundation", "live-acceptance"} and rotation_transition_assignments:
         raise OrchestrationError(f"{stage} does not accept new rotation transition assignments")
     if stage != "producer" and legacy_crypto_user_migration_assignment_ids:
@@ -10021,6 +11282,13 @@ def apply(args: argparse.Namespace) -> Path:
         rotation_transition_assignments,
         predecessor_rotation_transitions,
         subscription_id=subscription_id,
+    )
+    reviewed_legacy_acr_migrations = (
+        _merge_legacy_acr_pull_migration_assignments(
+            legacy_acr_pull_migrations,
+            predecessor_legacy_acr_migrations,
+            subscription_id=subscription_id,
+        )
     )
     effective_parameters = _load_parameter_document(
         effective_parameter_artifact.document
@@ -10048,6 +11316,11 @@ def apply(args: argparse.Namespace) -> Path:
             for predecessor, record in verified_predecessors.items()
         },
     )
+    _bind_broker_identity_principal(
+        stage=stage,
+        effective_parameters=recomputed_effective_parameters,
+        subscription_id=subscription_id,
+    )
     if (
         effective_parameters != recomputed_effective_parameters
         or effective_parameter_artifact.raw_bytes
@@ -10060,6 +11333,14 @@ def apply(args: argparse.Namespace) -> Path:
         )
     if what_if_artifact.raw_bytes != _canonical_json_file_bytes(what_if):
         raise OrchestrationError("reviewed what-if artifact is not canonical")
+    _verify_legacy_acr_pull_migration(
+        reviewed_legacy_acr_migrations,
+        migration_state="absent",
+        stage=stage,
+        effective_parameters=effective_parameters,
+        subscription_id=subscription_id,
+        allow_reviewed_assignment_scopes=True,
+    )
     authority_container_id = _authority_container_resource_id_for_stage(
         stage=stage,
         effective_parameters=effective_parameters,
@@ -10309,7 +11590,10 @@ def apply(args: argparse.Namespace) -> Path:
         compiled_template=compiled_template,
         compiled_template_sha256=compiled_template_sha256,
     )
-    post_deployment_authority_inventory = _retry_eventually_consistent(
+    (
+        post_deployment_authority_inventory,
+        image_pull_evidence,
+    ) = _retry_eventually_consistent(
         lambda: _verify_deployed_stage_state(
             stage=stage,
             outputs=outputs,
@@ -10318,6 +11602,7 @@ def apply(args: argparse.Namespace) -> Path:
             publisher=publisher,
             effective_parameters=effective_parameters,
             reviewed_transitions=reviewed_rotation_transitions,
+            legacy_acr_pull_migrations=reviewed_legacy_acr_migrations,
             authority_container_id=authority_container_id,
             reviewed_authority_inventory=reviewed_authority_blob_inventory,
             subscription_id=subscription_id,
@@ -10348,6 +11633,10 @@ def apply(args: argparse.Namespace) -> Path:
         "authorityBlobInventorySha256": _authority_checkpoint_sha256(
             post_deployment_authority_inventory
         ),
+        "imagePullEvidence": image_pull_evidence,
+        "imagePullEvidenceSha256": _image_pull_evidence_sha256(
+            image_pull_evidence
+        ),
     }
     handoff_raw_bytes = _canonical_json_file_bytes(handoff)
     handoff_sha256 = _sha256_bytes(handoff_raw_bytes)
@@ -10371,6 +11660,9 @@ def apply(args: argparse.Namespace) -> Path:
         "deployedTemplateSha256": deployed_template_sha256,
         "authorityBlobInventorySha256": _authority_checkpoint_sha256(
             post_deployment_authority_inventory
+        ),
+        "imagePullEvidenceSha256": _image_pull_evidence_sha256(
+            image_pull_evidence
         ),
     }
     _write_new_bytes(receipt_path, _canonical_json_file_bytes(receipt))
@@ -10413,6 +11705,13 @@ def _parser() -> argparse.ArgumentParser:
     plan_parser.add_argument(
         "--legacy-crypto-user-migration-assignment",
         action="append",
+        default=[],
+    )
+    plan_parser.add_argument(
+        "--legacy-acr-pull-migration-assignment",
+        action="append",
+        nargs=2,
+        metavar=("ASSIGNMENT_RESOURCE_ID", "PRINCIPAL_ID"),
         default=[],
     )
     plan_parser.add_argument("--prior-stage-handoff", type=Path)

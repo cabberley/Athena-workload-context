@@ -20,6 +20,13 @@ PRODUCER_ROOT = ROOT / "infra" / "wc027-enrichment-feed-runtime" / "main.bicep"
 PUBLISHER_ROOT = ROOT / "infra" / "wc027-guidance-authority-publisher" / "main.bicep"
 SUBSCRIPTION_ID = "00000000-0000-0000-0000-000000000001"
 RUNTIME_RESOURCE_GROUP = "rg"
+PRODUCER_BROKER_PRINCIPAL_ID = "10101010-1111-4111-8111-111111111111"
+PUBLISHER_BROKER_PRINCIPAL_ID = "20202020-2222-4222-8222-222222222222"
+REGISTRY_RESOURCE_ID = (
+    f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/"
+    "rg-athena-platform-dev/providers/Microsoft.ContainerRegistry/registries/athena"
+)
+REGISTRY_ROLE_ASSIGNMENT_MODE = orchestration.ACR_LEGACY_ROLE_ASSIGNMENT_MODE
 SYNTHETIC_COMPILED_TEMPLATE: dict[str, object] = {"parameters": {}}
 SYNTHETIC_COMPILED_TEMPLATE_SHA256 = orchestration._sha256_bytes(
     orchestration._canonical_json_bytes(SYNTHETIC_COMPILED_TEMPLATE)
@@ -153,6 +160,48 @@ def _synthetic_authority_checkpoint_with_pair(
     }
 
 
+def _synthetic_image_pull_evidence(
+    *executions: tuple[dict[str, object], str],
+) -> dict[str, object]:
+    values: list[dict[str, object]] = []
+    for outputs, kind in executions:
+        prefix = "producer" if kind == "producer" else "publisher"
+        values.append(
+            {
+                "kind": kind,
+                "jobResourceId": outputs[f"{prefix}JobResourceId"],
+                "executionName": f"synthetic-{prefix}-pull",
+                "image": outputs[f"{prefix}Image"],
+                "containerName": (
+                    "wc027-enrichment-feed-producer"
+                    if kind == "producer"
+                    else "wc027-guidance-authority-publisher"
+                ),
+                "registryResourceId": outputs["registryResourceId"],
+                "principalId": (
+                    PRODUCER_BROKER_PRINCIPAL_ID
+                    if kind == "producer"
+                    else PUBLISHER_BROKER_PRINCIPAL_ID
+                ),
+                "registryRoleAssignmentMode": outputs[
+                    "registryRoleAssignmentMode"
+                ],
+                "registryPullRoleDefinitionId": outputs[
+                    "registryPullRoleDefinitionId"
+                ],
+                "registryPullRoleAssignmentResourceId": outputs[
+                    "registryPullRoleAssignmentResourceId"
+                ],
+                "status": "Succeeded",
+            }
+        )
+    values.sort(key=lambda item: str(item["jobResourceId"]).casefold())
+    return {
+        "schemaVersion": orchestration.IMAGE_PULL_EVIDENCE_SCHEMA_VERSION,
+        "executions": values,
+    }
+
+
 def _foundation_parameter_bindings(
     values: dict[str, object],
 ) -> dict[str, object]:
@@ -170,12 +219,17 @@ def _write_handoff(
     plan_manifest_sha256: str | None = None,
     effective_parameter_sha256: str | None = None,
     authority_inventory: dict[str, object] | None = None,
+    image_pull_evidence: dict[str, object] | None = None,
 ) -> None:
     bindings = {} if parameter_bindings is None else parameter_bindings
     if stage != "foundation" and authority_inventory is None:
         authority_inventory = _empty_authority_inventory(
             container_exists=True,
             previous_checkpoint_sha256=f"sha256:{'d' * 64}",
+        )
+    if stage in {"producer", "publisher"} and image_pull_evidence is None:
+        image_pull_evidence = _synthetic_image_pull_evidence(
+            (outputs, stage)
         )
     predecessor_hashes = (
         {
@@ -219,6 +273,12 @@ def _write_handoff(
                 "authorityBlobInventorySha256": (
                     orchestration._authority_checkpoint_sha256(
                         authority_inventory
+                    )
+                ),
+                "imagePullEvidence": image_pull_evidence,
+                "imagePullEvidenceSha256": (
+                    orchestration._image_pull_evidence_sha256(
+                        image_pull_evidence
                     )
                 ),
             }
@@ -269,6 +329,7 @@ def _write_plan(
         "allowedChangeResourceIds": [],
         "rotationTransitionAssignments": [],
         "legacyCryptoUserMigrationAssignmentIds": [],
+        "legacyAcrPullMigrationAssignments": [],
         "authorityBlobInventory": authority_inventory,
         "authorityBlobInventorySha256": (
             orchestration._authority_checkpoint_sha256(authority_inventory)
@@ -334,6 +395,9 @@ def _write_receipt(
                 "authorityBlobInventorySha256": json.loads(
                     handoff_path.read_text(encoding="utf-8")
                 )["authorityBlobInventorySha256"],
+                "imagePullEvidenceSha256": json.loads(
+                    handoff_path.read_text(encoding="utf-8")
+                )["imagePullEvidenceSha256"],
             }
         ),
         encoding="utf-8",
@@ -670,6 +734,17 @@ def _producer_outputs() -> dict[str, object]:
         },
     }
     configuration_json = json.dumps(configuration, separators=(",", ":"))
+    registry_role_definition_id = orchestration._acr_pull_role_definition_id(
+        role_assignment_mode=REGISTRY_ROLE_ASSIGNMENT_MODE,
+        subscription_id=SUBSCRIPTION_ID,
+    )
+    registry_role_assignment_id = (
+        orchestration._deterministic_principal_role_assignment_id(
+            REGISTRY_RESOURCE_ID,
+            PRODUCER_BROKER_PRINCIPAL_ID,
+            registry_role_definition_id,
+        )
+    )
     return {
         "producerJobResourceId": (
             "/subscriptions/00000000-0000-0000-0000-000000000001/"
@@ -706,12 +781,17 @@ def _producer_outputs() -> dict[str, object]:
         "triggerQueueResourceId": (f"{service_bus_id}/queues/wc027-enrichment-feed-requests"),
         "notificationQueueName": "incident-notification-outbox",
         "notificationQueueResourceId": (f"{service_bus_id}/queues/incident-notification-outbox"),
+        "registryResourceId": REGISTRY_RESOURCE_ID,
+        "registryRoleAssignmentMode": REGISTRY_ROLE_ASSIGNMENT_MODE,
+        "registryPullRoleDefinitionId": registry_role_definition_id,
+        "registryPullRoleAssignmentResourceId": registry_role_assignment_id,
         "namespaceHostName": "athena-wc016-events.servicebus.windows.net",
     }
 
 
 def _producer_parameter_bindings() -> dict[str, object]:
     return {
+        "brokerIdentityPrincipalId": PRODUCER_BROKER_PRINCIPAL_ID,
         "correlationSourceStorageAccountResourceId": (
             f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
             "Microsoft.Storage/storageAccounts/athenacorrelation"
@@ -741,11 +821,8 @@ def _producer_parameter_bindings() -> dict[str, object]:
             f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
             "Microsoft.KeyVault/vaults/athena/keys/monitoring-intent"
         ),
-        "registryResourceId": (
-            f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/"
-            "rg-athena-platform-dev/providers/"
-            "Microsoft.ContainerRegistry/registries/athena"
-        ),
+        "registryResourceId": REGISTRY_RESOURCE_ID,
+        "registryRoleAssignmentMode": REGISTRY_ROLE_ASSIGNMENT_MODE,
         "serviceBusNamespaceName": "athena-wc016-events",
         "triggerSubmitterIdentityResourceIds": [
             f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
@@ -857,6 +934,17 @@ def _publisher_outputs(producer: dict[str, object]) -> dict[str, object]:
         },
     }
     configuration_json = json.dumps(configuration, separators=(",", ":"))
+    registry_role_definition_id = orchestration._acr_pull_role_definition_id(
+        role_assignment_mode=REGISTRY_ROLE_ASSIGNMENT_MODE,
+        subscription_id=SUBSCRIPTION_ID,
+    )
+    registry_role_assignment_id = (
+        orchestration._deterministic_principal_role_assignment_id(
+            REGISTRY_RESOURCE_ID,
+            PUBLISHER_BROKER_PRINCIPAL_ID,
+            registry_role_definition_id,
+        )
+    )
     return {
         "publisherJobResourceId": (
             "/subscriptions/00000000-0000-0000-0000-000000000001/"
@@ -885,11 +973,16 @@ def _publisher_outputs(producer: dict[str, object]) -> dict[str, object]:
         "bindingLogicalKeyId": "synthetic-key://athena/wc027-guidance-binding",
         "bindingKeyResourceId": binding_key_resource_id,
         "bindingKeyVaultKeyId": runtime_binding_key["keyVaultKeyId"],
+        "registryResourceId": REGISTRY_RESOURCE_ID,
+        "registryRoleAssignmentMode": REGISTRY_ROLE_ASSIGNMENT_MODE,
+        "registryPullRoleDefinitionId": registry_role_definition_id,
+        "registryPullRoleAssignmentResourceId": registry_role_assignment_id,
     }
 
 
 def _publisher_parameter_bindings() -> dict[str, object]:
     return {
+        "brokerIdentityPrincipalId": PUBLISHER_BROKER_PRINCIPAL_ID,
         "authorityStorageAccountResourceId": (
             f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
             "Microsoft.Storage/storageAccounts/athenacorrelation"
@@ -907,11 +1000,8 @@ def _publisher_parameter_bindings() -> dict[str, object]:
             "Microsoft.ManagedIdentity/userAssignedIdentities/trust"
         ),
         "managedEnvironmentResourceId": _foundation_outputs()["managedEnvironmentResourceId"],
-        "registryResourceId": (
-            f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/"
-            "rg-athena-platform-dev/providers/"
-            "Microsoft.ContainerRegistry/registries/athena"
-        ),
+        "registryResourceId": REGISTRY_RESOURCE_ID,
+        "registryRoleAssignmentMode": REGISTRY_ROLE_ASSIGNMENT_MODE,
         "requestSubmitterIdentityResourceIds": [
             f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
             "Microsoft.ManagedIdentity/userAssignedIdentities/request-submitter"
@@ -997,6 +1087,14 @@ def _write_stage_bundle(
             ),
         )
     )
+    image_pull_evidence = (
+        _synthetic_image_pull_evidence(
+            (predecessors["producer"]["outputs"], "producer"),
+            (predecessors["publisher"]["outputs"], "publisher"),
+        )
+        if stage == "live-acceptance"
+        else None
+    )
     _write_handoff(
         handoff_path,
         stage,
@@ -1006,6 +1104,7 @@ def _write_stage_bundle(
         plan_manifest_sha256=orchestration._sha256_file(plan_path),
         effective_parameter_sha256=orchestration._sha256_file(parameter_path),
         authority_inventory=handoff_authority_inventory,
+        image_pull_evidence=image_pull_evidence,
     )
     receipt_path = stage_directory / f"{stage}.receipt.json"
     _write_receipt(
@@ -1021,6 +1120,7 @@ def _write_stage_bundle(
         "receiptPath": receipt_path,
         "receiptSha256": orchestration._sha256_file(receipt_path),
         "authorityInventory": handoff_authority_inventory,
+        "outputs": outputs,
     }
 
 
@@ -4056,6 +4156,354 @@ def test_cross_subscription_resource_is_rejected_before_azure_read(
         )
 
 
+@pytest.mark.parametrize(
+    ("mode", "role_id"),
+    (
+        (
+            orchestration.ACR_LEGACY_ROLE_ASSIGNMENT_MODE,
+            orchestration.ACR_PULL_ROLE_ID,
+        ),
+        (
+            orchestration.ACR_ABAC_ROLE_ASSIGNMENT_MODE,
+            orchestration.ACR_REPOSITORY_READER_ROLE_ID,
+        ),
+    ),
+)
+def test_acr_pull_role_matches_registry_permission_mode(
+    mode: str,
+    role_id: str,
+) -> None:
+    assert orchestration._acr_pull_role_definition_id(
+        role_assignment_mode=mode,
+        subscription_id=SUBSCRIPTION_ID,
+    ) == (
+        f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+        f"Microsoft.Authorization/roleDefinitions/{role_id}"
+    )
+
+
+def test_acr_readiness_binds_live_mode_principal_seed_and_server_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outputs = _producer_outputs()
+    parameters = {
+        name: {"value": value}
+        for name, value in _producer_parameter_bindings().items()
+    }
+    live_mode = REGISTRY_ROLE_ASSIGNMENT_MODE
+    monkeypatch.setattr(
+        orchestration,
+        "_get_resource",
+        lambda resource_id, *, subscription_id: {
+            "id": resource_id,
+            "properties": {"roleAssignmentMode": live_mode},
+        },
+    )
+    role_definition_id = orchestration._verify_acr_pull_binding(
+        outputs,
+        effective_parameters=parameters,
+        principal_id=PRODUCER_BROKER_PRINCIPAL_ID,
+        subscription_id=SUBSCRIPTION_ID,
+        field="producer",
+    )
+    assert role_definition_id == outputs["registryPullRoleDefinitionId"]
+    recreated_assignment_id = (
+        orchestration._deterministic_principal_role_assignment_id(
+            REGISTRY_RESOURCE_ID,
+            "10101010-9999-4999-8999-999999999999",
+            role_definition_id,
+        )
+    )
+    assert recreated_assignment_id != outputs[
+        "registryPullRoleAssignmentResourceId"
+    ]
+
+    live_mode = orchestration.ACR_ABAC_ROLE_ASSIGNMENT_MODE
+    with pytest.raises(orchestration.OrchestrationError, match="role-assignment mode"):
+        orchestration._verify_acr_pull_binding(
+            outputs,
+            effective_parameters=parameters,
+            principal_id=PRODUCER_BROKER_PRINCIPAL_ID,
+            subscription_id=SUBSCRIPTION_ID,
+            field="producer",
+        )
+
+    abac_outputs = dict(outputs)
+    abac_outputs["registryRoleAssignmentMode"] = live_mode
+    abac_role_definition_id = orchestration._acr_pull_role_definition_id(
+        role_assignment_mode=live_mode,
+        subscription_id=SUBSCRIPTION_ID,
+    )
+    abac_outputs["registryPullRoleDefinitionId"] = abac_role_definition_id
+    abac_outputs["registryPullRoleAssignmentResourceId"] = (
+        orchestration._deterministic_principal_role_assignment_id(
+            REGISTRY_RESOURCE_ID,
+            PRODUCER_BROKER_PRINCIPAL_ID,
+            abac_role_definition_id,
+        )
+    )
+    parameters["registryRoleAssignmentMode"] = {"value": live_mode}
+    orchestration._verify_acr_pull_binding(
+        abac_outputs,
+        effective_parameters=parameters,
+        principal_id=PRODUCER_BROKER_PRINCIPAL_ID,
+        subscription_id=SUBSCRIPTION_ID,
+        field="producer",
+    )
+
+    abac_outputs["registryPullRoleAssignmentResourceId"] = (
+        orchestration._deterministic_role_assignment_id(
+            REGISTRY_RESOURCE_ID,
+            (
+                f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
+                "Microsoft.ManagedIdentity/userAssignedIdentities/broker"
+            ),
+            orchestration.ACR_REPOSITORY_READER_ROLE_ID,
+        )
+    )
+    with pytest.raises(orchestration.OrchestrationError, match="pull assignment"):
+        orchestration._verify_acr_pull_binding(
+            abac_outputs,
+            effective_parameters=parameters,
+            principal_id=PRODUCER_BROKER_PRINCIPAL_ID,
+            subscription_id=SUBSCRIPTION_ID,
+            field="producer",
+        )
+
+
+def test_legacy_acr_assignment_requires_reviewed_manual_revocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    principal_id = PRODUCER_BROKER_PRINCIPAL_ID
+    assignment_id = (
+        f"{REGISTRY_RESOURCE_ID}/providers/Microsoft.Authorization/roleAssignments/"
+        "30303030-3333-4333-8333-333333333333"
+    )
+    role_definition_id = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+        "Microsoft.Authorization/roleDefinitions/"
+        f"{orchestration.ACR_PULL_ROLE_ID}"
+    )
+    assignment_present = True
+
+    def run_json(command: object, *, field: str) -> object:
+        return (
+            [{"id": assignment_id, "scope": REGISTRY_RESOURCE_ID}]
+            if assignment_present
+            else []
+        )
+
+    monkeypatch.setattr(orchestration, "_run_json", run_json)
+    monkeypatch.setattr(
+        orchestration,
+        "_get_resource",
+        lambda resource_id, *, subscription_id: {
+            "id": resource_id,
+            "properties": {
+                "principalId": principal_id,
+                "principalType": "ServicePrincipal",
+                "roleDefinitionId": role_definition_id,
+                "scope": REGISTRY_RESOURCE_ID,
+            },
+        },
+    )
+    parameters = {
+        "registryResourceId": {"value": REGISTRY_RESOURCE_ID},
+    }
+    migration = {
+        "assignmentResourceId": assignment_id,
+        "principalId": principal_id,
+    }
+    orchestration._verify_legacy_acr_pull_migration(
+        [migration],
+        migration_state="present",
+        stage="producer",
+        effective_parameters=parameters,
+        subscription_id=SUBSCRIPTION_ID,
+    )
+    with pytest.raises(orchestration.OrchestrationError, match="controlled revocation"):
+        orchestration._verify_legacy_acr_pull_migration(
+            [migration],
+            migration_state="absent",
+            stage="producer",
+            effective_parameters=parameters,
+            subscription_id=SUBSCRIPTION_ID,
+        )
+
+    assignment_present = False
+    orchestration._verify_legacy_acr_pull_migration(
+        [migration],
+        migration_state="absent",
+        stage="producer",
+        effective_parameters=parameters,
+        subscription_id=SUBSCRIPTION_ID,
+    )
+
+
+def test_foundation_legacy_acr_migration_is_limited_to_reviewed_registries() -> None:
+    reviewed_registry = REGISTRY_RESOURCE_ID
+    outside_registry = reviewed_registry.replace("/registries/athena", "/registries/outside")
+    assignment_id = (
+        f"{outside_registry}/providers/Microsoft.Authorization/roleAssignments/"
+        "40404040-4444-4444-8444-444444444444"
+    )
+    with pytest.raises(orchestration.OrchestrationError, match="reviewed registry scopes"):
+        orchestration._verify_legacy_acr_pull_migration(
+            [
+                {
+                    "assignmentResourceId": assignment_id,
+                    "principalId": PRODUCER_BROKER_PRINCIPAL_ID,
+                }
+            ],
+            migration_state="present",
+            stage="foundation",
+            effective_parameters={
+                "acceptanceImageRegistryResourceId": {
+                    "value": reviewed_registry
+                },
+                "presentationImageRegistryResourceId": {
+                    "value": reviewed_registry
+                },
+            },
+            subscription_id=SUBSCRIPTION_ID,
+        )
+
+
+def test_digest_pinned_job_pull_probe_retries_without_implicit_role_creation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outputs = _producer_outputs()
+    start_attempts = 0
+    execution_polls = 0
+    sleeps: list[float] = []
+
+    def run_json(command: object, *, field: str) -> object:
+        nonlocal start_attempts, execution_polls
+        arguments = list(command)
+        if arguments[:4] == ["az", "containerapp", "job", "start"]:
+            start_attempts += 1
+            assert "--registry-identity" not in arguments
+            assert arguments[arguments.index("--image") + 1] == outputs[
+                "producerImage"
+            ]
+            if start_attempts == 1:
+                raise orchestration.OrchestrationError(
+                    "synthetic RBAC propagation delay"
+                )
+            return {"name": "wc027-producer-pull-proof"}
+        execution_polls += 1
+        status = "Running" if execution_polls == 1 else "Succeeded"
+        return {
+            "properties": {
+                "status": status,
+                "template": {
+                    "containers": [
+                        {
+                            "name": "wc027-enrichment-feed-producer",
+                            "image": outputs["producerImage"],
+                            "command": ["/bin/sh"],
+                            "args": ["-c", "exit 0"],
+                        }
+                    ]
+                },
+            }
+        }
+
+    monkeypatch.setattr(orchestration, "_run_json", run_json)
+    monkeypatch.setattr(
+        orchestration.time,
+        "sleep",
+        lambda seconds: sleeps.append(seconds),
+    )
+    evidence = orchestration._verify_digest_pinned_job_image_pull(
+        job_resource_id=str(outputs["producerJobResourceId"]),
+        image=str(outputs["producerImage"]),
+        container_name="wc027-enrichment-feed-producer",
+        registry_resource_id=str(outputs["registryResourceId"]),
+        principal_id=PRODUCER_BROKER_PRINCIPAL_ID,
+        registry_role_assignment_mode=str(outputs["registryRoleAssignmentMode"]),
+        registry_pull_role_definition_id=str(
+            outputs["registryPullRoleDefinitionId"]
+        ),
+        registry_pull_role_assignment_resource_id=str(
+            outputs["registryPullRoleAssignmentResourceId"]
+        ),
+        subscription_id=SUBSCRIPTION_ID,
+    )
+    assert evidence["status"] == "Succeeded"
+    assert evidence["executionName"] == "wc027-producer-pull-proof"
+    assert start_attempts == 2
+    assert execution_polls == 2
+    assert sleeps == [
+        orchestration.READBACK_RETRY_SECONDS,
+        orchestration.READBACK_RETRY_SECONDS,
+    ]
+
+
+def test_image_pull_evidence_rejects_legacy_role_in_abac_mode() -> None:
+    outputs = _producer_outputs()
+    evidence = _synthetic_image_pull_evidence((outputs, "producer"))
+    execution = evidence["executions"][0]
+    execution["registryRoleAssignmentMode"] = (
+        orchestration.ACR_ABAC_ROLE_ASSIGNMENT_MODE
+    )
+    with pytest.raises(orchestration.OrchestrationError, match="role definition"):
+        orchestration._validated_image_pull_evidence(
+            evidence,
+            stage="producer",
+            subscription_id=SUBSCRIPTION_ID,
+        )
+
+
+def test_image_pull_evidence_is_bound_to_exact_jobs_and_distinct_kinds() -> None:
+    producer = _producer_outputs()
+    publisher = _publisher_outputs(producer)
+    evidence = _synthetic_image_pull_evidence(
+        (producer, "producer"),
+        (publisher, "publisher"),
+    )
+    orchestration._validated_image_pull_evidence(
+        evidence,
+        stage="live-acceptance",
+        subscription_id=SUBSCRIPTION_ID,
+    )
+    orchestration._verify_image_pull_evidence_matches_outputs(
+        evidence,
+        kind="producer",
+        outputs=producer,
+        principal_id=PRODUCER_BROKER_PRINCIPAL_ID,
+    )
+    orchestration._verify_image_pull_evidence_matches_outputs(
+        evidence,
+        kind="publisher",
+        outputs=publisher,
+        principal_id=PUBLISHER_BROKER_PRINCIPAL_ID,
+    )
+
+    duplicate_producer = json.loads(json.dumps(evidence))
+    duplicate_producer["executions"][1] = dict(
+        duplicate_producer["executions"][0]
+    )
+    with pytest.raises(orchestration.OrchestrationError, match="exact job kinds"):
+        orchestration._validated_image_pull_evidence(
+            duplicate_producer,
+            stage="live-acceptance",
+            subscription_id=SUBSCRIPTION_ID,
+        )
+
+    wrong_image = json.loads(json.dumps(evidence))
+    wrong_image["executions"][0]["image"] = (
+        "athena.azurecr.io/athena/unreviewed@sha256:" + "f" * 64
+    )
+    with pytest.raises(orchestration.OrchestrationError, match="reviewed outputs"):
+        orchestration._verify_image_pull_evidence_matches_outputs(
+            wrong_image,
+            kind="producer",
+            outputs=producer,
+            principal_id=PRODUCER_BROKER_PRINCIPAL_ID,
+        )
+
+
 def test_identity_reads_preserve_original_canonical_arm_ids(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5411,12 +5859,15 @@ def test_apply_is_bound_to_external_digest_and_fresh_what_if() -> None:
     assert '--producer-reviewed-receipt-sha256"' in source
     assert '--publisher-reviewed-receipt-sha256"' in source
     assert "athena.wc029DeploymentPlan.v6" in source
-    assert "athena.wc029DeploymentReceipt.v2" in source
+    assert "athena.wc029DeploymentReceipt.v3" in source
+    assert "athena.wc029DeploymentHandoff.v4" in source
     assert "predecessorReceiptSha256s" in source
     assert "--rotation-transition-assignment" in source
     assert "rotationTransitionAssignments" in source
     assert "--legacy-crypto-user-migration-assignment" in source
     assert "legacyCryptoUserMigrationAssignmentIds" in source
+    assert "--legacy-acr-pull-migration-assignment" in source
+    assert "legacyAcrPullMigrationAssignments" in source
     assert "authorityBlobInventory" in source
     assert "authorityBlobInventorySha256" in source
     assert "requiredAuthorityCheckpointSha256s" in source
@@ -5474,7 +5925,7 @@ def test_authority_blob_inventory_gates_plan_apply_and_handoff() -> None:
     pre_inventory = apply_source.index("current_authority_blob_inventory =")
     deployment_execute = apply_source.index("_execute_reviewed_deployment(")
     post_inventory = apply_source.index(
-        "post_deployment_authority_inventory =",
+        "post_deployment_authority_inventory,",
         deployment_execute,
     )
     handoff = apply_source.index("handoff = {", post_inventory)

@@ -100,7 +100,9 @@ correlation reader identities/storage domains, and reused producer signing keys 
 - one custom exact-key sign-and-verify role for each report, guidance, enrichment, feed, and
   notification signer, with no key read, encrypt, decrypt, wrap, unwrap, release, update, or
   delete actions; and
-- ACR pull for the broker identity.
+- the mode-compatible ACR pull role for the broker identity: legacy `AcrPull` only for
+  `LegacyRegistryPermissions`, or `Container Registry Repository Reader` for
+  `AbacRepositoryPermissions`.
 
 Supply the referenced resource IDs/names (user-assigned identities, replay storage account,
 correlation source storage account, Service Bus namespace, and Key Vault keys); the module derives
@@ -191,9 +193,9 @@ publisher:
 - the `Wc027GuidanceActivation` Table;
 - one event-triggered Container Apps Job with distinct broker, authority reader/writer,
   activation writer, request-trust reader, binding-trust reader, and binding-signer identities;
-- publisher ACR pull deployed in the exact registry resource group derived from
-  `registryResourceId` (`rg-athena-platform-dev` in the fixed topology), rather than in the runtime
-  resource group;
+- publisher image-pull RBAC deployed in the exact registry subscription/resource group derived
+  from `registryResourceId` (`rg-athena-platform-dev` in the fixed topology), rather than in the
+  runtime resource group, using the role compatible with the live ACR permission mode;
 - a create-only authority Blob identity plus a separate exact-version readback identity;
 - Table entity read/add/update RBAC for activation CAS with no entity-delete permission;
 - exact-key public-key read/verify RBAC and exact-key sign-only binding RBAC; and
@@ -293,7 +295,10 @@ single container, command, arguments, scaler, registry, deployed configuration v
 tag, derived broker identity, exact attached user-assigned identities, and RBAC evidence tag all
 match. Init containers, volumes, probes, secret-backed environment or registry/scaler
 authentication, workload profiles, alternate triggers, and unreviewed identity settings are
-rejected. The publisher must be ready and the WC-016 runtime must be enabled.
+rejected. Readiness then starts a bounded no-op Container Apps Job execution using the exact
+digest-pinned image and existing registry identity, and requires the execution to report
+`Succeeded`; the probe overrides the command with `/bin/sh -c "exit 0"` and never runs the
+producer/publisher entry point. The publisher must be ready and the WC-016 runtime must be enabled.
 
 ## Failure and retry
 
@@ -326,6 +331,10 @@ rejected. The publisher must be ready and the WC-016 runtime must be enabled.
   deterministically reuses the assignment ID, it is accepted only for the exact current principal,
   role, scope, type, condition, and custom permissions. The orchestrator performs no automatic RBAC
   deletion and allows no broad publisher exemption.
+- The principal-seeded ACR assignment intentionally has a different GUID from earlier
+  resource-ID/name-seeded assignments. Supply every old assignment and its exact principal through
+  `--legacy-acr-pull-migration-assignment`; planning verifies it, an operator revokes it manually,
+  and apply/readiness require it to remain absent before creating or accepting the new assignment.
 
 Never delete partial immutable assets to retry. They are undiscoverable until the signed feed-v2
 head includes the exact pointer.

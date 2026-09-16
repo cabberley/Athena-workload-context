@@ -324,6 +324,16 @@ signer grants use the distinct
 `--legacy-crypto-user-migration-assignment <exact-role-assignment-id>` option because those
 assignments remain bound to the current signer principals while their role profile changes.
 
+Upgrading from an earlier ACR module requires a separate reviewed migration because the corrected
+principal-object-ID seed intentionally produces a new role-assignment GUID. Record each old
+assignment with `--legacy-acr-pull-migration-assignment <old-assignment-id>
+<exact-principal-id>`. Planning requires every listed legacy assignment to be present with its
+exact ACR scope, `AcrPull` role, service-principal type, and absent condition. A controlled
+operator action must revoke all listed assignments before apply; apply and post-deployment
+readiness require continued absence. This boundary covers the producer, publisher, and all WC-013
+acceptance, evidence, controller, detector, orchestrator, notification, and presentation pull
+assignments. The orchestrator never deletes them.
+
 ```powershell
 $Orchestrator = '.\scripts\wc029_deployment_orchestration.py'
 
@@ -376,8 +386,8 @@ parameter artifact, evidence directory, and explicit `--allow-change` entry for 
 create or modify. WC-027 resource-group stages additionally require
 `--resource-group rg-athena-wc013-live`. Do not treat these abbreviated placeholders as executable
 approval; record the complete reviewed commands and plan-file SHA-256 values separately in the
-evidence bundle. `apply` writes the immutable `athena.wc029DeploymentHandoff.v3` handoff and a separate
-`athena.wc029DeploymentReceipt.v2`, then prints the receipt path. Independently record the receipt
+evidence bundle. `apply` writes the immutable `athena.wc029DeploymentHandoff.v4` handoff and a separate
+`athena.wc029DeploymentReceipt.v3`, then prints the receipt path. Independently record the receipt
 SHA-256 before using it in a later stage. Each later `plan` loads the predecessor receipt, its
 referenced plan, effective parameters, what-if, handoff, and earlier receipt chain; a handoff's
 self-computed hashes alone are never approval evidence. The evidence directory must be outside the
@@ -408,9 +418,24 @@ Active, non-forwarding, non-auto-deleting stage profile; a noncanonical/cross-su
 ID before validation or what-if; and any final WC-013 readiness readback that differs from the two
 accepted WC-027 handoffs.
 
-The publisher ACR pull module is deployed at the exact subscription and resource group parsed from
+Every ACR pull module is deployed at the exact subscription and resource group parsed from
 `registryResourceId`; for the fixed topology this is `rg-athena-platform-dev`, not the WC-027
-runtime resource group. Producer verification also models the publisher transition explicitly.
+runtime resource group. The role-assignment GUID is seeded with the canonical registry ID, the
+server-returned service-principal object ID, and the full role-definition ID, so deleting and
+recreating a same-name UAMI produces a new legal assignment. Each assignment sets
+`principalType: ServicePrincipal`. The module explicitly calls guarded
+`reference(registry.id, '2025-04-01', 'Full')` and exports that server-returned ID; a constructed
+`existing.id` alone is never treated as runtime evidence.
+
+Readiness compares the reviewed mode with the live ACR `roleAssignmentMode`.
+`LegacyRegistryPermissions` requires `AcrPull`; `AbacRepositoryPermissions` requires
+`Container Registry Repository Reader` because an ABAC-enabled registry does not honor legacy
+`AcrPull`. After exact RBAC verification, readiness starts a bounded no-op Container Apps Job
+execution with the digest-pinned image, waits for `Succeeded`, validates the execution image and
+command override, and records the execution in digest-bound handoff/receipt evidence. The probe
+does not pass `--registry-identity`, create RBAC, or invoke the production job entry point.
+
+Producer verification also models the publisher transition explicitly.
 Before a publisher exists, no extra sender assignment is required. During partial recovery,
 publisher retry, or a later producer upgrade, only the deterministic assignment ID produced by
 `guid(triggerQueue.id, brokerIdentity.id, serviceBusDataSenderRoleDefinitionId)` is accepted, and
@@ -439,6 +464,11 @@ identity transitions. Producer planning carries them in the separately bounded
 exact key scopes, and requires the reviewed set to match the assignments still present. They must
 be manually revoked before create; apply and every later producer dependency check require all
 five IDs to remain absent.
+
+Legacy ACR pull assignments are likewise tracked separately in the bounded
+`legacyAcrPullMigrationAssignments` plan field with both assignment and principal IDs. They cannot
+be placed in the identity-rotation list or retained alongside the new principal-seeded,
+mode-compatible assignment.
 
 Publisher verification re-queries effective RBAC for the union of publisher principals and every
 producer principal proven by the independently approved producer binding. Separated producer-only

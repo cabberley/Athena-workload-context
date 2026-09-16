@@ -145,6 +145,13 @@ param acceptanceImageRegistryServer string
 @maxLength(2048)
 param acceptanceImageRegistryResourceId string
 
+@description('Reviewed role-assignment permissions mode for the acceptance image registry.')
+@allowed([
+  'LegacyRegistryPermissions'
+  'AbacRepositoryPermissions'
+])
+param acceptanceImageRegistryRoleAssignmentMode string
+
 @description('Digest-pinned controller image executed only by the protected GitHub workflow.')
 @minLength(1)
 @maxLength(2048)
@@ -292,6 +299,13 @@ param presentationImageRegistryServer string
 @minLength(1)
 @maxLength(2048)
 param presentationImageRegistryResourceId string
+
+@description('Reviewed role-assignment permissions mode for the presentation image registry.')
+@allowed([
+  'LegacyRegistryPermissions'
+  'AbacRepositoryPermissions'
+])
+param presentationImageRegistryRoleAssignmentMode string
 
 @description('Reviewed Azure MCP release. Only the existing pinned implementation accepts this value.')
 @allowed([
@@ -1097,6 +1111,7 @@ module presentationWeb 'modules/presentation-web.bicep' = {
     presentationImage: validatedPresentationImage
     presentationImageRegistryServer: validatedPresentationDeliveryRegistryServer
     presentationImageRegistryResourceId: presentationImageRegistryResourceId
+    presentationImageRegistryRoleAssignmentMode: presentationImageRegistryRoleAssignmentMode
     deliveryImage: validatedAcceptanceImage
     presentationAssetBlobEndpoint: presentationAssetBlobEndpoint
     presentationAssetContainerName: presentationAssetContainerName
@@ -1172,9 +1187,9 @@ module acceptanceImagePull 'modules/acr-pull-rbac.bicep' = {
     azureMcp
   ]
   params: {
-    registryName: last(split(acceptanceImageRegistryResourceId, '/'))
-    identityName: '${namePrefix}-context-id'
+    registryResourceId: acceptanceImageRegistryResourceId
     identityPrincipalId: acceptanceJobIdentity.properties.principalId
+    registryRoleAssignmentMode: acceptanceImageRegistryRoleAssignmentMode
   }
 }
 
@@ -1188,9 +1203,9 @@ module evidenceCollectorImagePull 'modules/acr-pull-rbac.bicep' = {
     azureMcp
   ]
   params: {
-    registryName: last(split(acceptanceImageRegistryResourceId, '/'))
-    identityName: '${namePrefix}-mcp-evidence-id'
+    registryResourceId: acceptanceImageRegistryResourceId
     identityPrincipalId: evidenceIdentity.properties.principalId
+    registryRoleAssignmentMode: acceptanceImageRegistryRoleAssignmentMode
   }
 }
 
@@ -1201,9 +1216,9 @@ module collectorControllerImagePull 'modules/acr-pull-rbac.bicep' = {
     split(acceptanceImageRegistryResourceId, '/')[4]
   )
   params: {
-    registryName: last(split(acceptanceImageRegistryResourceId, '/'))
-    identityName: '${namePrefix}-collector-controller-id'
+    registryResourceId: acceptanceImageRegistryResourceId
     identityPrincipalId: collectorControllerIdentity.outputs.principalId
+    registryRoleAssignmentMode: acceptanceImageRegistryRoleAssignmentMode
   }
 }
 
@@ -1214,9 +1229,9 @@ module wc016DetectorImagePull 'modules/acr-pull-rbac.bicep' = if (validatedWc016
     split(acceptanceImageRegistryResourceId, '/')[4]
   )
   params: {
-    registryName: last(split(acceptanceImageRegistryResourceId, '/'))
-    identityName: '${namePrefix}-wc016-detector-v2-id'
+    registryResourceId: acceptanceImageRegistryResourceId
     identityPrincipalId: wc016DetectorIdentity.outputs.principalId
+    registryRoleAssignmentMode: acceptanceImageRegistryRoleAssignmentMode
   }
 }
 
@@ -1227,9 +1242,9 @@ module wc016OrchestratorImagePull 'modules/acr-pull-rbac.bicep' = if (validatedW
     split(acceptanceImageRegistryResourceId, '/')[4]
   )
   params: {
-    registryName: last(split(acceptanceImageRegistryResourceId, '/'))
-    identityName: '${namePrefix}-wc016-orchestrator-v2-id'
+    registryResourceId: acceptanceImageRegistryResourceId
     identityPrincipalId: wc016OrchestratorIdentity.outputs.principalId
+    registryRoleAssignmentMode: acceptanceImageRegistryRoleAssignmentMode
   }
 }
 
@@ -1240,9 +1255,9 @@ module wc016NotificationImagePull 'modules/acr-pull-rbac.bicep' = if (validatedW
     split(acceptanceImageRegistryResourceId, '/')[4]
   )
   params: {
-    registryName: last(split(acceptanceImageRegistryResourceId, '/'))
-    identityName: '${namePrefix}-wc016-notification-v2-id'
+    registryResourceId: acceptanceImageRegistryResourceId
     identityPrincipalId: wc016NotificationIdentity.outputs.principalId
+    registryRoleAssignmentMode: acceptanceImageRegistryRoleAssignmentMode
   }
 }
 

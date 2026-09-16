@@ -23,6 +23,13 @@ param registryServer string
 @description('Existing Azure Container Registry resource ID.')
 param registryResourceId string
 
+@description('Reviewed ACR role-assignment permissions mode.')
+@allowed([
+  'LegacyRegistryPermissions'
+  'AbacRepositoryPermissions'
+])
+param registryRoleAssignmentMode string
+
 @description('Existing private Premium Service Bus namespace name.')
 param serviceBusNamespaceName string
 
@@ -36,6 +43,9 @@ param triggerSubmitterIdentityResourceIds array
 
 @description('Broker identity resource ID attached to the Job and used by the scaler, ACR pull, and queue RBAC.')
 param brokerIdentityResourceId string
+
+@description('Server-returned service-principal object ID for the broker identity.')
+param brokerIdentityPrincipalId string
 
 @description('Producer identity resource ID that reads v1 incident-assets read-only without list access.')
 param incidentReaderIdentityResourceId string
@@ -222,11 +232,31 @@ var triggerQueueName = 'wc027-enrichment-feed-requests'
 var serviceBusDataReceiverRoleDefinitionId = '4f6c0938-94ea-4d52-8e5a-2e02b7ef8e7d'
 var serviceBusDataSenderRoleDefinitionId = '69a216fc-b8fb-44d8-bc22-1f3c2cd27a39'
 var acrPullRoleDefinitionId = '7f951dda-4ed3-4680-a7ca-43fe172d538d'
+var acrRepositoryReaderRoleDefinitionId = 'b93aa761-3e63-49ed-ac28-beffa264f7ac'
+var registryScopedResourceId = resourceId(
+  split(registryResourceId, '/')[2],
+  split(registryResourceId, '/')[4],
+  'Microsoft.ContainerRegistry/registries',
+  last(split(registryResourceId, '/'))
+)
+var registryPullRoleDefinitionGuid = registryRoleAssignmentMode == 'LegacyRegistryPermissions'
+  ? acrPullRoleDefinitionId
+  : acrRepositoryReaderRoleDefinitionId
+var registryPullRoleDefinitionId = subscriptionResourceId(
+  split(registryResourceId, '/')[2],
+  'Microsoft.Authorization/roleDefinitions',
+  registryPullRoleDefinitionGuid
+)
+var registryPullRoleAssignmentId = extensionResourceId(
+  registryScopedResourceId,
+  'Microsoft.Authorization/roleAssignments',
+  guid(registryScopedResourceId, brokerIdentityPrincipalId, registryPullRoleDefinitionId)
+)
 var storageBlobDataReaderRoleDefinitionId = '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1'
 var storageTableDataContributorRoleDefinitionId = '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3'
 var storageTableDataReaderRoleDefinitionId = '76199698-9eea-4c19-bc75-cec21354c6b6'
 
-var expectedRegistryServer = '${toLower(registry.name)}.azurecr.io'
+var expectedRegistryServer = '${toLower(last(split(registryResourceId, '/')))}.azurecr.io'
 var imagePrefix = '${expectedRegistryServer}/athena/wc027-enrichment-feed-producer@sha256:'
 var imageDigest = replace(producerImage, imagePrefix, '')
 var imageDigestWithoutDigits = replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(
@@ -246,15 +276,13 @@ var validatedProducerImage = registryServer == expectedRegistryServer && produce
   ? producerImage
   : fail('producerImage must be a real digest-pinned image in the supplied registry')
 
-resource registry 'Microsoft.ContainerRegistry/registries@2025-04-01' existing = {
-  name: last(split(registryResourceId, '/'))
-  scope: resourceGroup(split(registryResourceId, '/')[2], split(registryResourceId, '/')[4])
-}
-
 resource brokerIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2024-11-30' existing = {
   name: last(split(brokerIdentityResourceId, '/'))
   scope: resourceGroup(split(brokerIdentityResourceId, '/')[2], split(brokerIdentityResourceId, '/')[4])
 }
+var validatedBrokerIdentityPrincipalId = brokerIdentity.properties.principalId == brokerIdentityPrincipalId
+  ? brokerIdentityPrincipalId
+  : fail('brokerIdentityPrincipalId must match the server-returned managed identity principal ID')
 
 resource incidentReaderIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2024-11-30' existing = {
   name: last(split(incidentReaderIdentityResourceId, '/'))
@@ -878,8 +906,9 @@ module producerImagePull 'modules/acr-pull-rbac.bicep' = {
     split(registryResourceId, '/')[4]
   )
   params: {
-    registryName: registry.name
-    identityResourceId: brokerIdentity.id
+    registryResourceId: registryResourceId
+    identityPrincipalId: validatedBrokerIdentityPrincipalId
+    registryRoleAssignmentMode: registryRoleAssignmentMode
   }
 }
 
@@ -1064,7 +1093,7 @@ var notificationSignerAssignmentId = extensionResourceId(notificationKey.id, 'Mi
 var coreRbacResourceIds = [
   triggerReceiver.id
   notificationSender.id
-  extensionResourceId(registry.id, 'Microsoft.Authorization/roleAssignments', guid(registry.id, brokerIdentity.id, acrPullRoleDefinitionId))
+  registryPullRoleAssignmentId
   feedV2WriterRole.id
   feedV2Writer.id
   feedV2ProducerReader.id
@@ -1249,6 +1278,18 @@ output notificationQueueName string = notificationQueue.name
 
 @description('Exact resource ID of the existing Notification v2 outbox queue.')
 output notificationQueueResourceId string = notificationQueue.id
+
+@description('Server-returned ACR resource ID guarded against the reviewed registry resource ID.')
+output registryResourceId string = producerImagePull.outputs.registryResourceId
+
+@description('Live ACR role-assignment permissions mode used for producer image pull.')
+output registryRoleAssignmentMode string = producerImagePull.outputs.roleAssignmentMode
+
+@description('Mode-compatible ACR pull role definition resource ID.')
+output registryPullRoleDefinitionId string = producerImagePull.outputs.roleDefinitionResourceId
+
+@description('Deterministic producer ACR pull role assignment resource ID.')
+output registryPullRoleAssignmentResourceId string = producerImagePull.outputs.roleAssignmentResourceId
 
 @description('Private Service Bus namespace host used by the runtime configuration.')
 output namespaceHostName string = serviceBusNamespaceHostName
