@@ -25,7 +25,7 @@ The harness:
   fingerprint, activation, enablement, retirement, and expiry status;
 - requires a separately signed global-capture manifest plus the platform-attested global Job
   read-back to cover the same exact inventory-defined dynamic artifact set, acceptance/run IDs,
-  approved inventory digest, and capture window;
+  approved inventory digest, capture window, and canonical ordered scenario-set digest;
 - rejects incomplete, duplicate, unlisted, linked, escaping, malformed, noncanonical, oversized,
   or internally inconsistent inputs; and
 - opens every validated file through a stable no-follow handle before reading any bytes, then
@@ -169,6 +169,11 @@ for the harness's private in-memory aggregate draft before its final digest is c
 The caller obtains the inventory SHA-256 through the reviewed release channel, not from the bundle
 being checked. A digest calculated from an unreviewed bundle is not approval.
 
+The canonical version inventory is limited to 512 KiB. Combined with the bounded index, artifact
+count, paths, scenario count, identifiers, and per-field string limits, accepted metadata remains
+within the 2 MiB final-record budget. Oversized approved inventory fails while the inventory
+artifact is parsed, before final record construction.
+
 Each `athena.wc029SigningPublicKey.v1` artifact contains only a public RSA key, its exact Key Vault
 key ID with a 32-hex version, purpose, and fingerprint. The approved inventory binds those values.
 The harness recomputes the SPKI SHA-256, requires every independent signing purpose to be exercised,
@@ -194,6 +199,9 @@ Global evidence must contain:
   for every inventory-required dynamic artifact. The platform-attested Job read-back must contain
   exactly the same artifact/digest map. Missing, extra, substituted, stale, scenario-scoped, or
   self-digested references fail even when the manifest is re-signed;
+- the canonical scenario-set digest in both the signed global-capture manifest and platform Job
+  read-back. Its ordered entries cover every required scenario class, scenario/execution ID,
+  signed manifest digest, exact attestation byte digest, and full execution interval;
 - the exact reviewed `athena.wc024MonitoringCollectorContract.v2` artifact pinned by the inventory;
 - one canonical successful HTTPS URL probe for every inventoried endpoint/path coordinate;
 - captured effective RBAC covering exactly the inventoried principals;
@@ -217,14 +225,14 @@ a broad Owner, Contributor, Reader, RBAC Administrator, or User Access Administr
 
 ## Required scenario classes and phases
 
-The index must include each WC-029 scenario class exactly once:
+The index must include each WC-029 scenario class exactly once in this canonical order:
 
-1. `disk-capacity-pressure`
-2. `vm-failure`
-3. `web-tier-failure`
-4. `load-balancer-vip-failure`
-5. `backend-degradation`
-6. `nsg-connectivity-loss`
+1. `backend-degradation`
+2. `disk-capacity-pressure`
+3. `load-balancer-vip-failure`
+4. `nsg-connectivity-loss`
+5. `vm-failure`
+6. `web-tier-failure`
 
 The index records a mode for review, but it is not authoritative. The harness derives
 `correlation-only` versus `incident-producing` from the approved scenario capability inventory and
@@ -277,6 +285,11 @@ unapproved key ID or version, and a fingerprint mismatch all fail closed.
 Every signed phase window has positive duration and is strictly separated from the following
 window. Mutation, recovery, recovered-state capture, Job start, Job completion, Job read-back, and
 recovery proof timestamps must be strictly increasing; equal timestamps fail.
+
+Every signed scenario-execution manifest also binds the exact acceptance ID, run ID, and
+out-of-band approved inventory digest. A cryptographically valid scenario from another acceptance
+run is rejected even when its inventory, evidence, and timestamps otherwise match. The canonical
+ordered scenario-set digest rejects missing, extra, reordered, or substituted scenarios.
 
 Signed scenario execution intervals are sorted globally and must be strictly non-overlapping.
 Scenario execution IDs, monitoring/correlation request identities, verification inputs, report
@@ -360,8 +373,9 @@ not chosen by the index. The harness verifies:
 - the shared `validate_incident_enrichment_feed_pointer_assets` validator for both active and
   resolved pointers; and
 - exact equality between the captured IncidentState `updatedAt`, feed-pointer `stateUpdatedAt`,
-  and feed-index entry `updatedAt`, with strict state publication → pointer publication → feed
-  index publication chronology.
+  and feed-index entry `updatedAt`, with strict state publication → pointer publication →
+  authoritative v1 source-index publication → v2 feed-index publication chronology. In
+  particular, the resolved source index cannot be published before the resolved IncidentState.
 
 Runtime verification remains required before capture; offline verification is a second acceptance
 check, not a replacement.
@@ -405,7 +419,8 @@ Harness-owned canonical receipts include:
   from the deployed contract package; this runbook deliberately does not prescribe a stale wire
   literal.
 - `athena.wc029ScenarioExecutionManifest.v1` and its independent RSA attestation: complete
-  execution lineage and positive, strictly separated phase windows for every scenario artifact.
+  execution lineage, acceptance/run/inventory identity, and positive, strictly separated phase
+  windows for every scenario artifact.
 - `athena.wc029PublishedManifest.v1`, `athena.wc029PublicationAuthority.v1`, and its independent
   attestation: an exact `CanonicalWorkloadManifest`, native approved-profile resolution, the exact
   shared `PublishedRuntimeContextBinding`, recomputed resolved-profile/dependency/full-authority
@@ -433,6 +448,11 @@ The `--index` value is validated as a bounded portable relative JSON path before
 operation. Traversal, absolute Windows/POSIX paths, alternate separators, NULs, and non-portable
 encodings become the same bounded domain failure and CLI exit code `2`; raw `ValueError` and
 tracebacks are not exposed.
+
+Final acceptance-record digesting, canonical encoding, UTF-8 encoding, size checks, and Pydantic
+validation are translated to `Wc029AcceptanceEvidenceError`. A low record-size limit or final
+validation/encoding failure returns CLI exit code `2`, emits bounded JSON without a traceback, and
+creates no output record.
 
 ## Run
 
