@@ -7,6 +7,7 @@ import os
 import re
 import stat
 import sys
+import uuid
 from collections.abc import Sequence
 from contextlib import suppress
 from dataclasses import asdict, dataclass, field, replace
@@ -178,6 +179,11 @@ _GRAPH_MEMBERSHIP_METHODS = frozenset(
         "transitivememberof",
     }
 )
+_GRAPH_DIRECTORY_PRINCIPAL_TYPES = {
+    "#microsoft.graph.group": "group",
+    "#microsoft.graph.serviceprincipal": "serviceprincipal",
+    "#microsoft.graph.user": "user",
+}
 _MANIFEST_BINDING_NAMES = frozenset(
     {
         "allowChangeIdsDigest",
@@ -381,6 +387,14 @@ class RbacAssignment:
     effective_principal_id_supplied: bool = field(compare=False)
     principal_type_supplied: bool = field(compare=False)
     assigned_principal_fields_supplied: bool = field(compare=False)
+    assignment_id: str | None = field(default=None, compare=False)
+    raw_assignment_digest: str | None = field(default=None, compare=False)
+
+
+@dataclass(frozen=True, slots=True)
+class _TypedPrincipalClaim:
+    principal_id: str
+    principal_type: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -388,10 +402,55 @@ class DenyAssignment:
     assignment_id: str
     scope: str
     do_not_apply_to_child_scopes: bool
-    principal_ids: frozenset[str]
-    excluded_principal_ids: frozenset[str]
+    principals: tuple[_TypedPrincipalClaim, ...]
+    excluded_principals: tuple[_TypedPrincipalClaim, ...]
     condition: str | None
     condition_version: str | None
+
+    @property
+    def principal_ids(self) -> frozenset[str]:
+        return frozenset(principal.principal_id for principal in self.principals)
+
+    @property
+    def excluded_principal_ids(self) -> frozenset[str]:
+        return frozenset(principal.principal_id for principal in self.excluded_principals)
+
+
+@dataclass(slots=True)
+class _PrincipalTypeRegistry:
+    principal_types: dict[str, str] = field(default_factory=dict)
+
+    def register(
+        self,
+        principal_id: str,
+        principal_type: str,
+        *,
+        field_name: str,
+    ) -> None:
+        previous_type = self.principal_types.get(principal_id)
+        if previous_type is not None and previous_type != principal_type:
+            raise PreflightInputError(
+                f"{field_name} conflicts with the tenant-wide principal type "
+                f"{previous_type} for {principal_id}"
+            )
+        self.principal_types[principal_id] = principal_type
+
+
+@dataclass(slots=True)
+class _ArmRoleAssignmentRegistry:
+    raw_digests_by_id: dict[str, str] = field(default_factory=dict)
+
+    def register(
+        self,
+        assignment_id: str,
+        raw_assignment_digest: str,
+    ) -> None:
+        previous_digest = self.raw_digests_by_id.get(assignment_id)
+        if previous_digest is not None and previous_digest != raw_assignment_digest:
+            raise PreflightInputError(
+                "ARM role-assignment ID is associated with conflicting raw assignment bodies"
+            )
+        self.raw_digests_by_id[assignment_id] = raw_assignment_digest
 
 
 @dataclass(frozen=True, slots=True)
@@ -439,6 +498,12 @@ class RbacPolicy:
 type PreflightKind = Literal["rbac", "what-if"]
 type PreflightOutputFormat = Literal["json", "text"]
 type PropertyPathToken = str | int
+type _CanonicalPaginationRequestIdentity = tuple[
+    str,
+    str,
+    str,
+    tuple[tuple[str, str], ...],
+]
 
 
 def _normalized(value: str) -> str:
@@ -2341,6 +2406,10 @@ class _ProtectedPropertyEvidence:
                 snapshot,
                 from_snapshot=True,
             )
+            self._register_partial_snapshot(
+                stage,
+                snapshot,
+            )
 
     def observe_delta(
         self,
@@ -2643,6 +2712,111 @@ class _ProtectedPropertyEvidence:
             canonical_path=canonical_path,
         )
         target_node.explicit_value = value
+
+    def _register_partial_snapshot(
+        self,
+        stage: str,
+        snapshot: dict[str, Any],
+    ) -> None:
+        root_children = frozenset(
+            schema_tokens[0]
+            for _, schema_tokens, _ in self.entries
+            if schema_tokens and isinstance(schema_tokens[0], str)
+        )
+        stack: list[tuple[object, str]] = [
+            (
+                snapshot,
+                _RESOURCE_ROOT_PATH,
+            )
+        ]
+        while stack:
+            value, canonical_path = stack.pop()
+            if not self._path_is_protected(canonical_path):
+                continue
+            self._record_partial_snapshot_value(
+                stage,
+                canonical_path,
+                value,
+            )
+            if isinstance(value, dict):
+                for raw_key, child in reversed(list(value.items())):
+                    child_path = _property_child_path(
+                        canonical_path,
+                        raw_key,
+                        budget=self.budget,
+                    )
+                    if child_path is None:
+                        if canonical_path != _RESOURCE_ROOT_PATH or (
+                            self._malformed_key_targets_protected_child(
+                                raw_key,
+                                expected_children=root_children,
+                            )
+                        ):
+                            raise PreflightInputError(
+                                f"protected object {canonical_path} "
+                                "contains a malformed property alias"
+                            )
+                        continue
+                    if self._path_is_protected(child_path):
+                        stack.append(
+                            (
+                                child,
+                                child_path,
+                            )
+                        )
+            elif isinstance(value, list):
+                stack.extend(
+                    (
+                        child,
+                        _property_index_path(
+                            canonical_path,
+                            index,
+                            budget=self.budget,
+                        ),
+                    )
+                    for index, child in reversed(list(enumerate(value)))
+                )
+
+    def _record_partial_snapshot_value(
+        self,
+        stage: str,
+        canonical_path: str,
+        value: object,
+    ) -> None:
+        node = self._record_path_presence(
+            stage,
+            canonical_path,
+            present=True,
+        )
+        if isinstance(value, (dict, list)):
+            child_kind: Literal["array", "object"] = (
+                "array" if isinstance(value, list) else "object"
+            )
+            if node.child_kind is not None and node.child_kind != child_kind:
+                raise PreflightInputError(
+                    f"protected path container representations conflict at {canonical_path}"
+                )
+            if node.explicit_value is not _NO_EXPLICIT_VALUE and not self._matches_container_kind(
+                node.explicit_value,
+                child_kind,
+            ):
+                raise PreflightInputError(
+                    f"protected path container representations conflict at {canonical_path}"
+                )
+            node.child_kind = child_kind
+            return
+        if node.child_kind is not None:
+            raise PreflightInputError(
+                f"protected path container representations conflict at {canonical_path}"
+            )
+        if node.explicit_value is not _NO_EXPLICIT_VALUE and not _json_values_equal(
+            node.explicit_value,
+            value,
+        ):
+            raise PreflightInputError(
+                f"protected path representations conflict at {canonical_path}"
+            )
+        node.explicit_value = value
 
     def _record_path_presence(
         self,
@@ -4858,6 +5032,46 @@ def _parse_exact_query(
     return query
 
 
+def _register_canonical_pagination_request(
+    parts: SplitResult,
+    query: dict[str, list[str]],
+    *,
+    cursor_key: str,
+    field_name: str,
+    seen_request_identities: set[_CanonicalPaginationRequestIdentity],
+    seen_cursors: set[str],
+) -> None:
+    canonical_query = tuple(
+        sorted(
+            (
+                key.casefold(),
+                (
+                    " ".join(values[0].split()).casefold()
+                    if key.casefold() == "$filter"
+                    else values[0]
+                ),
+            )
+            for key, values in query.items()
+        )
+    )
+    identity = (
+        parts.scheme.casefold(),
+        parts.netloc.casefold(),
+        unquote(parts.path).casefold(),
+        canonical_query,
+    )
+    if identity in seen_request_identities:
+        raise PreflightInputError(f"{field_name} pagination contains a repeated canonical request")
+    seen_request_identities.add(identity)
+    cursor_values = query.get(cursor_key)
+    if cursor_values is None:
+        return
+    cursor = cursor_values[0]
+    if cursor in seen_cursors:
+        raise PreflightInputError(f"{field_name} pagination reuses a decoded cursor")
+    seen_cursors.add(cursor)
+
+
 def _require_exact_page_next_link(
     page: dict[str, Any],
     *,
@@ -5366,6 +5580,8 @@ def _validate_graph_urls(
     method: str,
 ) -> None:
     expected_path = f"/v1.0/serviceprincipals/{effective_principal_id}/{method}"
+    seen_request_identities: set[_CanonicalPaginationRequestIdentity] = set()
+    seen_cursors: set[str] = set()
     for index, request_url in enumerate(request_urls):
         parts = _split_url(
             request_url,
@@ -5388,6 +5604,14 @@ def _validate_graph_urls(
             set(query) != {"$skiptoken"} or not _has_exact_nonempty_cursor(query, "$skiptoken")
         ):
             raise PreflightInputError("Graph membership continuation URL is not canonical")
+        _register_canonical_pagination_request(
+            parts,
+            query,
+            cursor_key="$skiptoken",
+            field_name="Graph membership",
+            seen_request_identities=seen_request_identities,
+            seen_cursors=seen_cursors,
+        )
 
 
 def _parse_security_group_membership(
@@ -5395,6 +5619,7 @@ def _parse_security_group_membership(
     *,
     effective_principal_id: str,
     target: RbacCollection,
+    principal_registry: _PrincipalTypeRegistry,
 ) -> frozenset[str]:
     membership = _mapping(value, field_name="Graph group-membership evidence")
     if (
@@ -5440,6 +5665,11 @@ def _parse_security_group_membership(
                 raise PreflightInputError(
                     "Graph group-membership evidence contains a duplicate group"
                 )
+            principal_registry.register(
+                group_id,
+                "group",
+                field_name="Graph security-group id",
+            )
             groups.add(group_id)
     else:
         for raw_item in values:
@@ -5454,6 +5684,16 @@ def _parse_security_group_membership(
             )
             object_id = _canonical_guid(
                 _get_case_insensitive(item, "id"),
+                field_name="Graph transitiveMemberOf id",
+            )
+            directory_principal_type = _GRAPH_DIRECTORY_PRINCIPAL_TYPES.get(object_type)
+            principal_registry.register(
+                object_id,
+                (
+                    directory_principal_type
+                    if directory_principal_type is not None
+                    else f"graph:{object_type.removeprefix('#microsoft.graph.')}"
+                ),
                 field_name="Graph transitiveMemberOf id",
             )
             if object_type != "#microsoft.graph.group":
@@ -5478,6 +5718,7 @@ def _parse_service_principal(
     *,
     effective_principal_id: str,
     target: RbacCollection,
+    principal_registry: _PrincipalTypeRegistry,
 ) -> None:
     service_principal = _mapping(
         value,
@@ -5497,6 +5738,16 @@ def _parse_service_principal(
         raise PreflightInputError("Graph service-principal evidence crosses tenants")
     object_id = _canonical_guid(
         _get_case_insensitive(service_principal, "id"),
+        field_name="Graph service-principal object id",
+    )
+    principal_registry.register(
+        effective_principal_id,
+        "serviceprincipal",
+        field_name="effectivePrincipalId",
+    )
+    principal_registry.register(
+        object_id,
+        "serviceprincipal",
         field_name="Graph service-principal object id",
     )
     client_id = _canonical_guid(
@@ -5544,6 +5795,8 @@ def _validate_arm_role_assignment_urls(
     expected_path = (
         target.resource_group_scope + "/providers/microsoft.authorization/roleassignments"
     )
+    seen_request_identities: set[_CanonicalPaginationRequestIdentity] = set()
+    seen_cursors: set[str] = set()
     for index, request_url in enumerate(request_urls):
         parts = _split_url(
             request_url,
@@ -5579,6 +5832,14 @@ def _validate_arm_role_assignment_urls(
             effective_principal_id=effective_principal_id,
             field_name="ARM role-assignment requestUrl filter",
         )
+        _register_canonical_pagination_request(
+            parts,
+            query,
+            cursor_key="$skipToken",
+            field_name="ARM role-assignment",
+            seen_request_identities=seen_request_identities,
+            seen_cursors=seen_cursors,
+        )
 
 
 def _validate_principal_id_filter(
@@ -5610,6 +5871,8 @@ def _validate_descendant_arm_urls(
     assigned_principal_id: str,
 ) -> None:
     expected_path = target.subscription_scope + "/providers/microsoft.authorization/roleassignments"
+    seen_request_identities: set[_CanonicalPaginationRequestIdentity] = set()
+    seen_cursors: set[str] = set()
     for index, request_url in enumerate(request_urls):
         parts = _split_url(
             request_url,
@@ -5647,6 +5910,14 @@ def _validate_descendant_arm_urls(
             assigned_principal_id=assigned_principal_id,
             field_name="ARM descendant requestUrl filter",
         )
+        _register_canonical_pagination_request(
+            parts,
+            query,
+            cursor_key="$skipToken",
+            field_name="ARM descendant role-assignment",
+            seen_request_identities=seen_request_identities,
+            seen_cursors=seen_cursors,
+        )
 
 
 def _validate_arm_deny_assignment_urls(
@@ -5664,6 +5935,8 @@ def _validate_arm_deny_assignment_urls(
         expected_scope = target.subscription_scope
         expected_filter = None
     expected_path = expected_scope + "/providers/microsoft.authorization/denyassignments"
+    seen_request_identities: set[_CanonicalPaginationRequestIdentity] = set()
+    seen_cursors: set[str] = set()
     for index, request_url in enumerate(request_urls):
         parts = _split_url(
             request_url,
@@ -5695,14 +5968,24 @@ def _validate_arm_deny_assignment_urls(
             )
         ):
             raise PreflightInputError("ARM deny-assignment requestUrl is not canonical")
+        _register_canonical_pagination_request(
+            parts,
+            query,
+            cursor_key="$skipToken",
+            field_name="ARM deny-assignment",
+            seen_request_identities=seen_request_identities,
+            seen_cursors=seen_cursors,
+        )
 
 
-def _parse_deny_principal_ids(
+def _parse_deny_principals(
     value: object,
     *,
     field_name: str,
-) -> frozenset[str]:
+    principal_registry: _PrincipalTypeRegistry,
+) -> tuple[_TypedPrincipalClaim, ...]:
     principal_ids: set[str] = set()
+    principals: list[_TypedPrincipalClaim] = []
     for raw_principal in _sequence(
         value,
         field_name=field_name,
@@ -5727,8 +6010,19 @@ def _parse_deny_principal_ids(
             raise PreflightInputError(f"{field_name} uses an inconsistent All Principals identity")
         if principal_id in principal_ids:
             raise PreflightInputError(f"{field_name} contains a duplicate principal")
+        principal_registry.register(
+            principal_id,
+            principal_type,
+            field_name=f"{field_name} id",
+        )
         principal_ids.add(principal_id)
-    return frozenset(principal_ids)
+        principals.append(
+            _TypedPrincipalClaim(
+                principal_id=principal_id,
+                principal_type=principal_type,
+            )
+        )
+    return tuple(principals)
 
 
 def _parse_optional_deny_condition(
@@ -5808,6 +6102,7 @@ def _parse_arm_deny_assignment(
     value: object,
     *,
     collection: RbacCollection,
+    principal_registry: _PrincipalTypeRegistry,
 ) -> DenyAssignment:
     resource = _mapping(
         value,
@@ -5864,16 +6159,20 @@ def _parse_arm_deny_assignment(
     )
     if type(is_system_protected) is not bool:
         raise PreflightInputError("ARM deny-assignment isSystemProtected must be boolean")
-    principal_ids = _parse_deny_principal_ids(
+    principals = _parse_deny_principals(
         _get_case_insensitive(properties, "principals"),
         field_name="ARM deny-assignment principals",
+        principal_registry=principal_registry,
     )
-    if not principal_ids:
+    if not principals:
         raise PreflightInputError("ARM deny-assignment principals must not be empty")
-    excluded_principal_ids = _parse_deny_principal_ids(
+    excluded_principals = _parse_deny_principals(
         _get_case_insensitive(properties, "excludePrincipals"),
         field_name="ARM deny-assignment excludePrincipals",
+        principal_registry=principal_registry,
     )
+    principal_ids = frozenset(principal.principal_id for principal in principals)
+    excluded_principal_ids = frozenset(principal.principal_id for principal in excluded_principals)
     if principal_ids & excluded_principal_ids:
         raise PreflightInputError("ARM deny-assignment principals and exclusions must not overlap")
     _validate_deny_permissions(
@@ -5887,8 +6186,8 @@ def _parse_arm_deny_assignment(
         assignment_id=assignment_id,
         scope=scope,
         do_not_apply_to_child_scopes=do_not_apply,
-        principal_ids=principal_ids,
-        excluded_principal_ids=excluded_principal_ids,
+        principals=principals,
+        excluded_principals=excluded_principals,
         condition=condition,
         condition_version=condition_version,
     )
@@ -5942,6 +6241,7 @@ def _parse_deny_assignment_evidence(
     value: object,
     *,
     collection: RbacCollection,
+    principal_registry: _PrincipalTypeRegistry,
 ) -> tuple[DenyAssignment, ...]:
     evidence = _mapping(
         value,
@@ -6031,6 +6331,7 @@ def _parse_deny_assignment_evidence(
             assignment = _parse_arm_deny_assignment(
                 raw_assignment,
                 collection=collection,
+                principal_registry=principal_registry,
             )
             if assignment.assignment_id in collection_assignment_ids:
                 raise PreflightInputError(
@@ -6102,6 +6403,7 @@ def _parse_arm_role_assignment(
     value: object,
     *,
     effective_principal_id: str,
+    assignment_registry: _ArmRoleAssignmentRegistry,
 ) -> RbacAssignment:
     resource = _mapping(
         value,
@@ -6164,9 +6466,19 @@ def _parse_arm_role_assignment(
                 properties,
                 field_name,
             )
-    return _parse_rbac_assignment(
+    parsed_assignment = _parse_rbac_assignment(
         normalized_assignment,
         field_name="ARM role assignment",
+    )
+    raw_assignment_digest = _canonical_json_digest(resource)
+    assignment_registry.register(
+        resource_id,
+        raw_assignment_digest,
+    )
+    return replace(
+        parsed_assignment,
+        assignment_id=resource_id,
+        raw_assignment_digest=raw_assignment_digest,
     )
 
 
@@ -6273,6 +6585,32 @@ def _validate_effective_assignment_principal(
         raise PreflightInputError("ARM group-derived assignment disagrees with Graph membership")
 
 
+def _register_assignment_principal_types(
+    assignment: RbacAssignment | BroadAssignmentAllowance,
+    *,
+    principal_registry: _PrincipalTypeRegistry,
+    field_name: str,
+) -> None:
+    effective_principal_id = _canonical_guid(
+        assignment.effective_principal_id,
+        field_name=f"{field_name} effectivePrincipalId",
+    )
+    assigned_principal_id = _canonical_guid(
+        assignment.principal_id,
+        field_name=f"{field_name} assignedPrincipalId",
+    )
+    principal_registry.register(
+        effective_principal_id,
+        "serviceprincipal",
+        field_name=f"{field_name} effectivePrincipalId",
+    )
+    principal_registry.register(
+        assigned_principal_id,
+        assignment.principal_type,
+        field_name=f"{field_name} assignedPrincipalId",
+    )
+
+
 def _scope_is_ancestor_or_target(
     scope: str,
     *,
@@ -6307,6 +6645,8 @@ def _parse_ancestor_role_assignments(
     effective_principal_id: str,
     security_group_ids: frozenset[str],
     collection: RbacCollection,
+    principal_registry: _PrincipalTypeRegistry,
+    assignment_registry: _ArmRoleAssignmentRegistry,
 ) -> list[RbacAssignment]:
     evidence = _mapping(
         value,
@@ -6356,6 +6696,7 @@ def _parse_ancestor_role_assignments(
             _parse_arm_role_assignment(
                 assignment,
                 effective_principal_id=effective_principal_id,
+                assignment_registry=assignment_registry,
             )
             for assignment in raw_assignments
         ]
@@ -6399,6 +6740,11 @@ def _parse_ancestor_role_assignments(
             raise PreflightInputError("effective role assignment requires roleDefinitionId")
         if not assignment.principal_type_supplied:
             raise PreflightInputError("effective role assignment requires principalType")
+        _register_assignment_principal_types(
+            assignment,
+            principal_registry=principal_registry,
+            field_name="effective role assignment",
+        )
         _validate_effective_assignment_principal(
             assignment,
             effective_principal_id=effective_principal_id,
@@ -6425,6 +6771,8 @@ def _parse_descendant_role_assignments(
     effective_principal_id: str,
     security_group_ids: frozenset[str],
     collection: RbacCollection,
+    principal_registry: _PrincipalTypeRegistry,
+    assignment_registry: _ArmRoleAssignmentRegistry,
 ) -> list[RbacAssignment]:
     evidence = _mapping(
         value,
@@ -6516,6 +6864,7 @@ def _parse_descendant_role_assignments(
                 assignment = _parse_arm_role_assignment(
                     raw_assignment,
                     effective_principal_id=effective_principal_id,
+                    assignment_registry=assignment_registry,
                 )
                 if assignment.principal_id != assigned_principal_id:
                     raise PreflightInputError(
@@ -6594,6 +6943,11 @@ def _parse_descendant_role_assignments(
             raise PreflightInputError("descendant role assignment requires roleDefinitionId")
         if not assignment.principal_type_supplied:
             raise PreflightInputError("descendant role assignment requires principalType")
+        _register_assignment_principal_types(
+            assignment,
+            principal_registry=principal_registry,
+            field_name="descendant role assignment",
+        )
         _validate_effective_assignment_principal(
             assignment,
             effective_principal_id=effective_principal_id,
@@ -6702,8 +7056,32 @@ def _derive_guarded_role_assignments(
         target,
         management_group_ancestry=ancestry,
     )
+    principal_registry = _PrincipalTypeRegistry()
+    assignment_registry = _ArmRoleAssignmentRegistry()
+    for expected_principal_id in policy.expected_principal_ids:
+        principal_registry.register(
+            _canonical_guid(
+                expected_principal_id,
+                field_name="expectedPrincipalIds principal",
+            ),
+            "serviceprincipal",
+            field_name="expectedPrincipalIds principal",
+        )
+    for assignment in policy.approved_assignments:
+        _register_assignment_principal_types(
+            assignment,
+            principal_registry=principal_registry,
+            field_name="approvedAssignments",
+        )
+    for allowance in policy.allowed_broad_assignments:
+        _register_assignment_principal_types(
+            allowance,
+            principal_registry=principal_registry,
+            field_name="allowedBroadAssignments",
+        )
     assignments: list[RbacAssignment] = []
     effective_principal_ids: set[str] = set()
+    principal_contexts: list[tuple[str, frozenset[str]]] = []
     deny_assignment_evidence_digest: str | None = None
     deny_assignments: tuple[DenyAssignment, ...] | None = None
     unique_assignment_keys: set[
@@ -6733,15 +7111,28 @@ def _derive_guarded_role_assignments(
         if effective_principal_id in effective_principal_ids:
             raise PreflightInputError("RBAC evidence contains a duplicate effectivePrincipalId")
         effective_principal_ids.add(effective_principal_id)
+        principal_registry.register(
+            effective_principal_id,
+            "serviceprincipal",
+            field_name="effectivePrincipalId",
+        )
         _parse_service_principal(
             _get_case_insensitive(principal, "servicePrincipal"),
             effective_principal_id=effective_principal_id,
             target=target,
+            principal_registry=principal_registry,
         )
         security_group_ids = _parse_security_group_membership(
             _get_case_insensitive(principal, "groupMembership"),
             effective_principal_id=effective_principal_id,
             target=target,
+            principal_registry=principal_registry,
+        )
+        principal_contexts.append(
+            (
+                effective_principal_id,
+                security_group_ids,
+            )
         )
         deny_assignment_evidence = _get_case_insensitive(
             principal,
@@ -6755,6 +7146,7 @@ def _derive_guarded_role_assignments(
             deny_assignments = _parse_deny_assignment_evidence(
                 deny_assignment_evidence,
                 collection=target,
+                principal_registry=principal_registry,
             )
         elif deny_assignment_evidence_digest != current_deny_assignment_digest:
             raise PreflightInputError(
@@ -6762,13 +7154,6 @@ def _derive_guarded_role_assignments(
             )
         if deny_assignments is None:
             raise PreflightInputError("complete deny-assignment evidence is missing")
-        _validate_deny_assignments_for_principal(
-            deny_assignments,
-            effective_principal_id=effective_principal_id,
-            security_group_ids=security_group_ids,
-            collection=target,
-            approved_assignments=policy.approved_assignments,
-        )
         role_assignment_evidence = _mapping(
             _get_case_insensitive(principal, "roleAssignments"),
             field_name="principal roleAssignments",
@@ -6782,6 +7167,8 @@ def _derive_guarded_role_assignments(
                 effective_principal_id=effective_principal_id,
                 security_group_ids=security_group_ids,
                 collection=target,
+                principal_registry=principal_registry,
+                assignment_registry=assignment_registry,
             ),
             *_parse_descendant_role_assignments(
                 _get_case_insensitive(
@@ -6791,6 +7178,8 @@ def _derive_guarded_role_assignments(
                 effective_principal_id=effective_principal_id,
                 security_group_ids=security_group_ids,
                 collection=target,
+                principal_registry=principal_registry,
+                assignment_registry=assignment_registry,
             ),
         ]
         for assignment in principal_assignments:
@@ -6801,6 +7190,16 @@ def _derive_guarded_role_assignments(
             assignments.append(assignment)
     if not effective_principal_ids:
         raise PreflightInputError("RBAC evidence principals must not be empty")
+    if deny_assignments is None:
+        raise PreflightInputError("complete deny-assignment evidence is missing")
+    for effective_principal_id, security_group_ids in principal_contexts:
+        _validate_deny_assignments_for_principal(
+            deny_assignments,
+            effective_principal_id=effective_principal_id,
+            security_group_ids=security_group_ids,
+            collection=target,
+            approved_assignments=policy.approved_assignments,
+        )
     return (
         assignments,
         replace(
@@ -7391,58 +7790,170 @@ class _SecureLedgerDirectory:
             name=name,
         )
 
+    def _open_record(
+        self,
+        name: str,
+        flags: int,
+        *,
+        mode: int = 0o600,
+        require_existing: bool,
+    ) -> int:
+        if self._directory_fd is None:
+            return os.open(
+                self._fallback_file_path(
+                    name,
+                    require_existing=require_existing,
+                ),
+                flags,
+                mode,
+            )
+        return os.open(
+            name,
+            flags,
+            mode,
+            dir_fd=self._directory_fd,
+        )
+
+    def _unlink_record(self, name: str) -> None:
+        if self._directory_fd is None:
+            os.unlink(
+                self._fallback_file_path(
+                    name,
+                    require_existing=False,
+                )
+            )
+            return
+        os.unlink(
+            name,
+            dir_fd=self._directory_fd,
+        )
+
+    def _publish_staged_record(
+        self,
+        staging_name: str,
+        final_name: str,
+    ) -> None:
+        if self._directory_fd is None:
+            os.link(
+                self._fallback_file_path(
+                    staging_name,
+                    require_existing=True,
+                ),
+                self._fallback_file_path(
+                    final_name,
+                    require_existing=False,
+                ),
+                follow_symlinks=False,
+            )
+            return
+        os.link(
+            staging_name,
+            final_name,
+            src_dir_fd=self._directory_fd,
+            dst_dir_fd=self._directory_fd,
+            follow_symlinks=False,
+        )
+
+    def _verify_published_record(
+        self,
+        name: str,
+        *,
+        staging_stat: os.stat_result,
+    ) -> None:
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NONBLOCK"):
+            flags |= os.O_NONBLOCK
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        flags |= getattr(os, "O_BINARY", 0)
+        file_descriptor = self._open_record(
+            name,
+            flags,
+            require_existing=True,
+        )
+        try:
+            self._verify_file_descriptor(file_descriptor, name)
+            published_stat = os.fstat(file_descriptor)
+            if not stat.S_ISREG(published_stat.st_mode) or not os.path.samestat(
+                staging_stat,
+                published_stat,
+            ):
+                raise PreflightInputError(
+                    "release ledger publication did not preserve the staged record"
+                )
+        finally:
+            os.close(file_descriptor)
+
     def create_json(self, name: str, payload: dict[str, object]) -> None:
         if Path(name).name != name:
             raise PreflightInputError("release ledger record name is invalid")
-        rendered = (
+        rendered = _strict_utf8_bytes(
             json.dumps(
                 payload,
                 sort_keys=True,
                 separators=(",", ":"),
                 ensure_ascii=True,
             )
-            + "\n"
+            + "\n",
+            field_name="release ledger record",
         )
-        if (
-            len(
-                _strict_utf8_bytes(
-                    rendered,
-                    field_name="release ledger record",
-                )
-            )
-            > MAX_RELEASE_LEDGER_RECORD_BYTES
-        ):
+        if len(rendered) > MAX_RELEASE_LEDGER_RECORD_BYTES:
             raise PreflightInputError("release ledger record exceeds its byte bound")
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         if hasattr(os, "O_CLOEXEC"):
             flags |= os.O_CLOEXEC
-        if self._directory_fd is None:
-            file_descriptor = os.open(
-                self._fallback_file_path(name, require_existing=False),
-                flags,
-                0o600,
-            )
-        else:
-            file_descriptor = os.open(
-                name,
-                flags,
-                0o600,
-                dir_fd=self._directory_fd,
-            )
+        flags |= getattr(os, "O_BINARY", 0)
+        staging_name = ""
+        file_descriptor: int | None = None
+        for _ in range(8):
+            staging_name = f".wc029-{uuid.uuid4().hex}.tmp"
+            try:
+                file_descriptor = self._open_record(
+                    staging_name,
+                    flags,
+                    require_existing=False,
+                )
+                break
+            except FileExistsError:
+                continue
+        if file_descriptor is None:
+            raise PreflightInputError("release ledger staging name could not be allocated")
         try:
-            self._verify_file_descriptor(file_descriptor, name)
-        except BaseException:
+            self._verify_file_descriptor(file_descriptor, staging_name)
+            staging_stat = os.fstat(file_descriptor)
+            if not stat.S_ISREG(staging_stat.st_mode):
+                raise PreflightInputError("release ledger staging record must be a regular file")
+            offset = 0
+            while offset < len(rendered):
+                written = os.write(
+                    file_descriptor,
+                    rendered[offset:],
+                )
+                if written <= 0:
+                    raise OSError("release ledger staging write did not make progress")
+                offset += written
+            os.fsync(file_descriptor)
+            self._publish_staged_record(
+                staging_name,
+                name,
+            )
+            self._verify_published_record(
+                name,
+                staging_stat=staging_stat,
+            )
+            if self._directory_fd is not None:
+                os.fsync(self._directory_fd)
+        finally:
             os.close(file_descriptor)
-            raise
-        with os.fdopen(
-            file_descriptor,
-            "w",
-            encoding="utf-8",
-            newline="\n",
-        ) as stream:
-            stream.write(rendered)
+            with suppress(
+                OSError,
+                PreflightInputError,
+            ):
+                self._unlink_record(staging_name)
 
     def read_json(self, name: str) -> object:
         if Path(name).name != name:
@@ -7454,6 +7965,7 @@ class _SecureLedgerDirectory:
             flags |= os.O_NOFOLLOW
         if hasattr(os, "O_CLOEXEC"):
             flags |= os.O_CLOEXEC
+        flags |= getattr(os, "O_BINARY", 0)
         file_descriptor: int | None = None
         try:
             try:
@@ -7475,15 +7987,23 @@ class _SecureLedgerDirectory:
             self._verify_file_descriptor(file_descriptor, name)
             if not stat.S_ISREG(os.fstat(file_descriptor).st_mode):
                 raise PreflightInputError("release ledger record must be a regular file")
-            with os.fdopen(file_descriptor, "r", encoding="utf-8") as stream:
-                file_descriptor = None
-                content = stream.read(MAX_RELEASE_LEDGER_RECORD_BYTES + 1)
-            if (
-                not 1
-                <= len(_strict_utf8_bytes(content, field_name="release ledger record"))
-                <= MAX_RELEASE_LEDGER_RECORD_BYTES
-            ):
+            content_bytes = bytearray()
+            while len(content_bytes) <= MAX_RELEASE_LEDGER_RECORD_BYTES:
+                chunk = os.read(
+                    file_descriptor,
+                    min(
+                        64 * 1024,
+                        MAX_RELEASE_LEDGER_RECORD_BYTES + 1 - len(content_bytes),
+                    ),
+                )
+                if not chunk:
+                    break
+                content_bytes.extend(chunk)
+            os.close(file_descriptor)
+            file_descriptor = None
+            if not 1 <= len(content_bytes) <= MAX_RELEASE_LEDGER_RECORD_BYTES:
                 raise PreflightInputError("release ledger record exceeds its byte bound")
+            content = bytes(content_bytes).decode("utf-8")
             document = json.loads(
                 content,
                 parse_constant=_reject_json_constant,
@@ -7576,14 +8096,22 @@ def _consume_release_ledger(
                 except OSError as exc:
                     raise PreflightInputError(create_message) from exc
             try:
+                consumption_name = f"{manifest.deployment_execution_id}.{kind}.consumed.json"
                 secure_ledger.create_json(
-                    f"{manifest.deployment_execution_id}.{kind}.consumed.json",
+                    consumption_name,
                     consumption,
                 )
-            except FileExistsError as exc:
+            except FileExistsError:
+                existing = secure_ledger.read_json(
+                    consumption_name,
+                )
+                if not _json_values_equal(existing, consumption):
+                    raise PreflightInputError(
+                        "release ledger consumption record does not match this result"
+                    ) from None
                 raise PreflightInputError(
                     f"release ledger already consumed {kind} for this deployment execution"
-                ) from exc
+                ) from None
             except OSError as exc:
                 raise PreflightInputError(
                     "release ledger consumption could not be recorded"

@@ -102,6 +102,10 @@ Create requires prior absence and final presence; Delete/Remove requires prior p
 absence. Those presence and value claims reconcile across exact and ancestor/descendant delta
 representations in either order. Protected strings are exact trimmed ASCII tokens with field-specific
 enum validation even when unchanged.
+Partial snapshots recursively register only paths and values that are actually present. Their
+omitted fields remain unknown, but every present dynamic descendant and object/array kind must agree
+with later delta evidence. An empty object at `ipRules`, an indexed `ipRules[0]`, and a scalar child
+cannot be combined into incompatible representations.
 
 Each canonical path is limited to 4096 characters, and one evaluation has bounded aggregate
 generated-path count and character work. Nested path accumulation and wide generated snapshots fail
@@ -162,6 +166,14 @@ exit `3`. POSIX reads use `O_NONBLOCK|O_NOFOLLOW`, then `fstat` the opened descr
 FIFO, socket, device, or any non-regular entry before reading. Writer and reader use the same
 64-KiB serialized-record limit, checked before create, so a successful first record is always
 readable by the paired artifact.
+The writer first creates a bounded random staging file relative to the secured directory, writes and
+fsyncs the complete JSON, then atomically hard-links it to the final name with no overwrite and
+verifies both names identify the same regular file. A crash or failure before publication cannot
+reserve the final name, orphaned staging files are ignored, and concurrent writers yield one
+complete winner. Staging and reads use binary descriptors, so Windows newline translation cannot
+expand a physically accepted record past 64 KiB. An existing consumption name proves prior use only
+when its JSON exactly matches the expected consumption record; empty, partial, malformed, or
+conflicting finals fail as ledger corruption.
 
 The ledger creates one immutable deployment binding and one create-only consumption record
 for each artifact kind. It also creates an immutable collection-run binding so one
@@ -272,6 +284,9 @@ require exactly one non-empty, non-whitespace `$skipToken`; Graph continuations 
 non-empty, non-whitespace `$skiptoken` and never accept `$skip`. Exact duplicates,
 percent-decoded duplicates, casefold collisions, aliases, and other case variants fail before query
 comparison.
+After endpoint validation, the verifier canonicalizes each request from its normalized scheme and
+host, decoded case-normalized path, and decoded sorted query. Reusing the same canonical request or
+decoded cursor fails even when path casing, percent encoding, or query order differs.
 
 The Resource Graph response must explicitly report `resultTruncated` as JSON `false` or the exact
 transport string `"false"`, no non-null `skipToken` or `$skipToken`, and
@@ -305,6 +320,18 @@ assigned and effective object IDs. A group-derived assignment requires
 `assignedPrincipalType: Group`, a distinct group object ID, and that ID's presence in the complete
 Graph transitive security-group set. The service-principal object ID must match Graph `id` and must
 not be the Graph `appId` client ID. Graph/ARM disagreement fails closed.
+Before any assignment or deny decision, one tenant-wide typed registry reconciles every principal
+GUID in the policy and evidence. Effective IDs and Graph service-principal object IDs are
+`ServicePrincipal`; accepted membership IDs are `Group`; assignment and deny principal/exclusion
+types remain attached to their IDs. A GUID that appears with conflicting types anywhere in identity,
+membership, assignment, deny, collection, or page evidence invalidates the artifact.
+Every typed Graph `transitiveMemberOf` object is registered before non-group objects are excluded
+from the accepted security-group set, so an unfamiliar directory-object type cannot hide a later
+type conflict.
+Every ARM role-assignment row also retains its canonical resource ID and canonical raw-body digest.
+Repeated IDs across pages, ancestor/descendant collections, scopes, or principal artifacts must have
+identical raw bodies. The same group-derived row may map to several effective service principals,
+but changing its principal, role, scope, type, or condition under one ID fails closed.
 
 The verifier derives and deduplicates the union of target/ancestor assignments and the complete
 subscription-descendant inventory, then compares it with separately reviewed

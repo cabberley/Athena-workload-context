@@ -172,6 +172,28 @@ Use the following guarded preflight contract:
     snapshots use the canonical snapshot index; raw partial/ancestor traversal charges actual
     mapping width and array access to the existing lookup-work budget. Protected strings retain
     exact-token and allowed-enum validation even when unchanged.
+24. One tenant-wide principal registry is built before guarded RBAC and deny evaluation. Effective
+    IDs are service principals, accepted membership IDs are groups, and assignment/deny principal
+    types remain attached to their IDs. Any GUID claimed as different principal types across the
+    reviewed policy, Graph identities or memberships, ARM/CLI assignments, deny principals,
+    exclusions, collections, or pages makes the artifact contradictory. Every typed
+    `transitiveMemberOf` directory object enters the registry before non-group objects are filtered.
+25. Every ARM role assignment retains its canonical resource ID and canonical raw-body digest.
+    One assignment ID can map only to one identical raw ARM body across pages, ancestor/descendant
+    collections, and effective-principal artifacts. A group assignment may contribute to multiple
+    effective service principals only when each occurrence is the same canonical raw assignment.
+26. Partial protected snapshots register every present protected path, scalar value, and inferred
+    object/array kind in the same prefix tree used by deltas. Omitted fields remain unknown rather
+    than absent, while present dynamic descendants must reconcile with every delta claim.
+27. Pagination duplicate detection uses the validated canonical request identity: normalized HTTPS
+    scheme/host, decoded case-normalized path, and endpoint-specific decoded and sorted query.
+    Decoded continuation cursors are single-use within one page chain, so path casing, percent
+    encoding, or query ordering cannot hide a repeated request.
+28. Ledger creation writes and fsyncs one bounded random staging record inside the securely opened
+    ledger directory, atomically publishes it with no-overwrite semantics, verifies the published
+    record is the staged inode, and then removes the staging name. Empty or partial staging files
+    never reserve a final record; binary descriptors enforce the physical 64-KiB bound on Windows;
+    malformed final records are corruption, not proof of consumption.
 
 The pure evaluators remain free of storage I/O. One-time consumption belongs to the production CLI
 boundary after parsing, policy evaluation, and bounded rendering succeed but before success or
@@ -197,6 +219,10 @@ blocked output is returned.
   uncaught decoder error.
 - FIFO, socket, device, symlink, junction, and reparse entries cannot be consumed as ledger records.
 - A ledger record accepted by the create-only writer is guaranteed to fit the paired reader's bound.
+- A crash before atomic ledger publication leaves no final reservation; concurrent writers produce
+  one complete final record and deterministic `FileExistsError` outcomes for the others.
+- Existing consumption names are treated as consumed only when their bounded JSON exactly matches
+  the expected consumption record. Empty, partial, malformed, or conflicting finals fail closed.
 - Guarded what-if artifacts must add exact request provenance and regenerate the reviewed shared
   manifest because `whatIfRequestDigest` is mandatory. The reviewed request includes exact
   `--no-prompt true` for both subscription and resource-group what-if commands.
@@ -206,6 +232,10 @@ blocked output is returned.
   regenerate the raw-evidence binding.
 - ARM and Graph page fields and continuation query keys are validated against their own endpoint
   contracts rather than generic aliases.
+- Canonical request and decoded-cursor reuse are rejected after endpoint validation, including
+  percent-encoded, path-case, and query-order aliases.
+- Principal types and ARM role-assignment IDs are reconciled once across the complete tenant-wide
+  evidence set before authorization or deny findings are evaluated.
 - Evidence path replacement cannot redirect an already opened descriptor, while growth beyond the
   bound and POSIX symlink or special-file inputs fail deterministically.
 - Deployment-stack and storage-local-user changes remain unavailable rather than bypassing deny,
@@ -250,7 +280,9 @@ regression. RBAC compatibility tests use the official Management Groups subscrip
 case/legacy aliases and conflicts, Graph/ARM cursor spelling swaps, wrong next-link fields, empty or
 whitespace cursors, duplicates, and casefold collisions. Deny-assignment regressions cover missing
 collections, pagination, direct and group principals, All Principals, exclusions, inheritance,
-conditions, unrelated scopes, and cross-principal collection disagreement. Provider-family tests
+conditions, unrelated scopes, cross-page type conflicts, and cross-principal collection
+disagreement. Role-assignment regressions cover one canonical ID across pages, collections, scopes,
+and multiple effective principals, accepting only identical raw group-derived repeats. Provider-family tests
 cover Key Vault access policies/RBAC mode, managed-identity federated credentials, Microsoft Graph
 permission grants, and existing authorization/imperative families. Input tests prove single binary
 open, maximum-plus-one reads, deterministic growth rejection, POSIX replacement stability,
@@ -267,6 +299,8 @@ exact resource-group Create/Modify/NoChange, allowlist, delta, snapshot-type, an
 Additional adversarial cases cover duplicate canonical resource rows across changes and potential
 changes, post-attestation alias injection, protected scalar descendants, object/array divergence,
 mixed exact/indexed and dynamic object/array paths, repeated or combined malformed snapshot aliases,
-conflicting delta/full-snapshot representations, parent/child presence and value contradictions in
-either order, malformed Key Vault before evidence, unchanged padded security strings, indexed
-wide-snapshot reconciliation, and bounded wide ancestor observations.
+recursive partial-snapshot dynamic values and omissions, conflicting delta/full-snapshot
+representations, parent/child presence and value contradictions in either order, malformed Key
+Vault before evidence, unchanged padded security strings, indexed wide-snapshot reconciliation,
+canonical request/cursor alias reuse, staged-ledger crash/retry and concurrent publication, poisoned
+final records, and bounded wide ancestor observations.

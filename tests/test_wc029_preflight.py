@@ -7,10 +7,12 @@ import socket
 import subprocess
 import tempfile
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from io import StringIO
 from pathlib import Path
+from threading import Barrier
 from urllib.parse import urlencode
 
 import pytest
@@ -2001,6 +2003,112 @@ def test_attested_what_if_rejects_dynamic_object_array_divergence(
             _what_if(change),
             allowed_change_ids=frozenset({_STORAGE_ID}),
         )
+
+
+@pytest.mark.parametrize("snapshot_stage", ["before", "after"])
+def test_attested_what_if_rejects_partial_snapshot_dynamic_object_array_divergence(
+    snapshot_stage: str,
+) -> None:
+    change = {
+        "resourceId": _STORAGE_ID,
+        "changeType": "Modify",
+        snapshot_stage: {
+            "properties": {
+                "networkAcls": {
+                    "ipRules": {},
+                }
+            }
+        },
+        "delta": [
+            {
+                "path": "properties.networkAcls.ipRules[0]",
+                "propertyChangeType": "Modify",
+                "before": "192.0.2.10",
+                "after": "192.0.2.11",
+            }
+        ],
+    }
+
+    with pytest.raises(
+        PreflightInputError,
+        match="container representations conflict",
+    ):
+        _evaluate_attested_what_if(
+            _what_if(change),
+            allowed_change_ids=frozenset({_STORAGE_ID}),
+        )
+
+
+@pytest.mark.parametrize("snapshot_stage", ["before", "after"])
+def test_attested_what_if_rejects_partial_snapshot_dynamic_value_conflict(
+    snapshot_stage: str,
+) -> None:
+    change = {
+        "resourceId": _STORAGE_ID,
+        "changeType": "Modify",
+        snapshot_stage: {
+            "properties": {
+                "networkAcls": {
+                    "ipRules": [
+                        {
+                            "value": "192.0.2.10",
+                        }
+                    ],
+                },
+            },
+        },
+        "delta": [
+            {
+                "path": "properties.networkAcls.ipRules[0].value",
+                "propertyChangeType": "Modify",
+                "before": "192.0.2.99",
+                "after": "192.0.2.11",
+            }
+        ],
+    }
+
+    with pytest.raises(
+        PreflightInputError,
+        match="representations conflict",
+    ):
+        _evaluate_attested_what_if(
+            _what_if(change),
+            allowed_change_ids=frozenset({_STORAGE_ID}),
+        )
+
+
+def test_attested_what_if_does_not_treat_partial_snapshot_omission_as_absence() -> None:
+    change = {
+        "resourceId": _STORAGE_ID,
+        "changeType": "Modify",
+        "before": {
+            "properties": {
+                "allowSharedKeyAccess": False,
+                "allowBlobPublicAccess": False,
+                "publicNetworkAccess": "Disabled",
+                "networkAcls": {
+                    "defaultAction": "Deny",
+                },
+            }
+        },
+        "delta": [
+            {
+                "path": "properties.networkAcls.ipRules[0]",
+                "propertyChangeType": "Create",
+                "after": {
+                    "value": "192.0.2.10",
+                },
+            }
+        ],
+    }
+
+    assert {
+        violation.code
+        for violation in _evaluate_attested_what_if(
+            _what_if(change),
+            allowed_change_ids=frozenset({_STORAGE_ID}),
+        )
+    } == {"public-data-plane-access"}
 
 
 def test_attested_what_if_rejects_mixed_exact_and_array_protected_paths() -> None:
@@ -4950,13 +5058,14 @@ def test_modify_rejects_resource_root_removal_aliases(
         }
     )
 
-    assert "delete" in {
-        item.code
-        for item in evaluate_what_if(
+    with pytest.raises(
+        PreflightInputError,
+        match="protected path presence representations conflict",
+    ):
+        evaluate_what_if(
             document,
             allowed_change_ids=frozenset({_CONTAINER_APP_ID}),
         )
-    }
 
 
 def test_modify_requires_object_resource_root_after_value() -> None:
@@ -5790,7 +5899,7 @@ def test_storage_ancestor_modify_requires_complete_protected_after_state() -> No
 
 
 @pytest.mark.parametrize(
-    ("resource_id", "after", "expected_codes"),
+    ("resource_id", "after"),
     [
         (
             _STORAGE_ID,
@@ -5802,23 +5911,16 @@ def test_storage_ancestor_modify_requires_complete_protected_after_state() -> No
                     "networkAcls": {"defaultAction": "Deny"},
                 }
             },
-            {
-                "public-data-plane-access",
-                "storage-public-blob-access",
-                "storage-shared-key-enabled",
-            },
         ),
         (
             _STORAGE_CONTAINER_ID,
             {"properties": {"publicAccess": "None"}},
-            {"storage-container-public-access"},
         ),
     ],
 )
 def test_ancestor_deletion_blocks_despite_separate_safe_after_payload(
     resource_id: str,
     after: dict[str, object],
-    expected_codes: set[str],
 ) -> None:
     document = _what_if(
         {
@@ -5834,13 +5936,14 @@ def test_ancestor_deletion_blocks_despite_separate_safe_after_payload(
         }
     )
 
-    assert {
-        item.code
-        for item in evaluate_what_if(
+    with pytest.raises(
+        PreflightInputError,
+        match="protected path presence representations conflict",
+    ):
+        evaluate_what_if(
             document,
             allowed_change_ids=frozenset({resource_id}),
         )
-    } == expected_codes
 
 
 @pytest.mark.parametrize(
@@ -7118,10 +7221,24 @@ def test_release_ledger_writer_and_reader_share_one_record_bound(
     oversized_payload = {
         "value": "x" * MAX_RELEASE_LEDGER_RECORD_BYTES,
     }
+    empty_rendered = (
+        json.dumps(
+            {"value": ""},
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        )
+        + "\n"
+    ).encode("utf-8")
+    exact_payload = {
+        "value": "x" * (MAX_RELEASE_LEDGER_RECORD_BYTES - len(empty_rendered)),
+    }
 
     with _SecureLedgerDirectory(ledger_path, trusted_root) as ledger:
         ledger.create_json("readable.json", readable_payload)
         assert ledger.read_json("readable.json") == readable_payload
+        ledger.create_json("exact-bound.json", exact_payload)
+        assert ledger.read_json("exact-bound.json") == exact_payload
         with pytest.raises(
             PreflightInputError,
             match="release ledger record exceeds its byte bound",
@@ -7129,6 +7246,172 @@ def test_release_ledger_writer_and_reader_share_one_record_bound(
             ledger.create_json("oversized.json", oversized_payload)
 
     assert not (ledger_path / "oversized.json").exists()
+    assert (ledger_path / "exact-bound.json").stat().st_size == MAX_RELEASE_LEDGER_RECORD_BYTES
+
+
+@pytest.mark.parametrize(
+    "orphaned_content",
+    [
+        b"",
+        b'{"value":"partial"',
+    ],
+)
+def test_release_ledger_orphaned_staging_record_does_not_reserve_final_name(
+    tmp_path,
+    orphaned_content: bytes,
+) -> None:
+    trusted_root = tmp_path / "trusted-root"
+    ledger_path = trusted_root / "ledger"
+    ledger_path.mkdir(parents=True)
+    orphaned_staging = ledger_path / ".wc029-orphaned.tmp"
+    orphaned_staging.write_bytes(orphaned_content)
+    payload = {"value": "complete"}
+
+    with _SecureLedgerDirectory(ledger_path, trusted_root) as ledger:
+        ledger.create_json("complete.json", payload)
+        assert ledger.read_json("complete.json") == payload
+
+    assert orphaned_staging.read_bytes() == orphaned_content
+
+
+def test_release_ledger_fsyncs_staging_before_atomic_publication(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trusted_root = tmp_path / "trusted-root"
+    ledger_path = trusted_root / "ledger"
+    ledger_path.mkdir(parents=True)
+    events: list[str] = []
+    original_fsync = os.fsync
+    original_publish = _SecureLedgerDirectory._publish_staged_record
+
+    def tracked_fsync(file_descriptor: int) -> None:
+        events.append("fsync")
+        original_fsync(file_descriptor)
+
+    def tracked_publish(
+        ledger: _SecureLedgerDirectory,
+        staging_name: str,
+        final_name: str,
+    ) -> None:
+        assert events == ["fsync"]
+        events.append("publish")
+        original_publish(
+            ledger,
+            staging_name,
+            final_name,
+        )
+
+    monkeypatch.setattr(os, "fsync", tracked_fsync)
+    monkeypatch.setattr(
+        _SecureLedgerDirectory,
+        "_publish_staged_record",
+        tracked_publish,
+    )
+
+    with _SecureLedgerDirectory(ledger_path, trusted_root) as ledger:
+        ledger.create_json("durable.json", {"value": "complete"})
+
+    assert events[:2] == ["fsync", "publish"]
+
+
+def test_release_ledger_publication_failure_does_not_poison_retry(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trusted_root = tmp_path / "trusted-root"
+    ledger_path = trusted_root / "ledger"
+    ledger_path.mkdir(parents=True)
+    payload = {"value": "complete"}
+    original_publish = _SecureLedgerDirectory._publish_staged_record
+    publish_attempts = 0
+
+    def fail_first_publish(
+        ledger: _SecureLedgerDirectory,
+        staging_name: str,
+        final_name: str,
+    ) -> None:
+        nonlocal publish_attempts
+        publish_attempts += 1
+        if publish_attempts == 1:
+            raise OSError("synthetic pre-publication failure")
+        original_publish(
+            ledger,
+            staging_name,
+            final_name,
+        )
+
+    monkeypatch.setattr(
+        _SecureLedgerDirectory,
+        "_publish_staged_record",
+        fail_first_publish,
+    )
+
+    with _SecureLedgerDirectory(ledger_path, trusted_root) as ledger:
+        with pytest.raises(
+            OSError,
+            match="synthetic pre-publication failure",
+        ):
+            ledger.create_json("retry.json", payload)
+        assert not (ledger_path / "retry.json").exists()
+        ledger.create_json("retry.json", payload)
+        assert ledger.read_json("retry.json") == payload
+
+    assert not list(ledger_path.glob(".wc029-*.tmp"))
+
+
+def test_release_ledger_concurrent_writers_publish_one_complete_record(
+    tmp_path,
+) -> None:
+    trusted_root = tmp_path / "trusted-root"
+    ledger_path = trusted_root / "ledger"
+    ledger_path.mkdir(parents=True)
+    payload = {"value": "complete"}
+    ready = Barrier(2)
+
+    def write_record() -> str:
+        with _SecureLedgerDirectory(ledger_path, trusted_root) as ledger:
+            ready.wait()
+            try:
+                ledger.create_json("concurrent.json", payload)
+            except FileExistsError:
+                return "exists"
+            return "created"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = sorted(executor.map(lambda _: write_record(), range(2)))
+
+    assert outcomes == ["created", "exists"]
+    with _SecureLedgerDirectory(ledger_path, trusted_root) as ledger:
+        assert ledger.read_json("concurrent.json") == payload
+    assert not list(ledger_path.glob(".wc029-*.tmp"))
+
+
+@pytest.mark.parametrize(
+    "poisoned_content",
+    [
+        b"",
+        b'{"schemaVersion":',
+    ],
+)
+def test_public_cli_rejects_poisoned_consumption_record_as_invalid(
+    tmp_path,
+    poisoned_content: bytes,
+) -> None:
+    input_path = tmp_path / "what-if.json"
+    input_path.write_text(
+        json.dumps(_attested_what_if(_what_if(_change(_STORAGE_ID, "NoChange")))),
+        encoding="utf-8",
+    )
+    arguments = _what_if_cli_args(input_path)
+    ledger_path = tmp_path / "trusted-release-ledger-root" / "release-ledger"
+    consumption_path = ledger_path / f"{_DEPLOYMENT_EXECUTION_ID}.what-if.consumed.json"
+    consumption_path.write_bytes(poisoned_content)
+    stderr = StringIO()
+
+    assert cli_main(arguments, stdout=StringIO(), stderr=stderr) == 3
+    assert "already consumed" not in stderr.getvalue()
+    assert "release ledger record" in stderr.getvalue()
 
 
 def test_public_cli_rejects_cross_artifact_manifest_rebinding(tmp_path) -> None:
@@ -9103,6 +9386,119 @@ def test_guarded_rbac_accepts_exact_arm_skip_token_pagination(
 
 
 @pytest.mark.parametrize(
+    "evidence_kind",
+    [
+        "arm-role",
+        "graph",
+        "deny",
+    ],
+)
+def test_guarded_rbac_rejects_canonical_pagination_request_and_cursor_reuse(
+    evidence_kind: str,
+) -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignment = _guarded_assignment(
+        principal_id=principal_id,
+        role_name="AcrPull",
+        scope=_RG_SCOPE,
+    )
+    evidence = _guarded_evidence([assignment])
+    principal = _first_principal_artifact(evidence)
+    if evidence_kind == "graph":
+        initial_url = (
+            f"https://graph.microsoft.com/v1.0/servicePrincipals/{principal_id}/transitiveMemberOf"
+        )
+        continuation_url = f"{initial_url}?%24skiptoken=synthetic-reused"
+        aliased_url = (
+            "HTTPS://GRAPH.MICROSOFT.COM/V1.0/servicePrincipals/"
+            f"{principal_id}/transitiveMember%4Ff"
+            "?%24skiptoken=%73ynthetic-reused"
+        )
+        principal["groupMembership"] = {
+            "tenantId": _TENANT_ID,
+            "method": "transitiveMemberOf",
+            "pages": [
+                {
+                    "requestUrl": initial_url,
+                    "statusCode": 200,
+                    "value": [],
+                    "@odata.nextLink": continuation_url,
+                },
+                {
+                    "requestUrl": continuation_url,
+                    "statusCode": 200,
+                    "value": [],
+                    "@odata.nextLink": aliased_url,
+                },
+                {
+                    "requestUrl": aliased_url,
+                    "statusCode": 200,
+                    "value": [],
+                    "@odata.nextLink": None,
+                },
+            ],
+        }
+    else:
+        if evidence_kind == "arm-role":
+            pages = _arm_role_assignment_pages(
+                evidence,
+                collection_kind="ancestors",
+            )
+        else:
+            deny_collection = _deny_assignment_collection(
+                evidence,
+                "target-and-ancestors",
+            )
+            pages = deny_collection["pages"]
+            assert isinstance(pages, list)
+        first_page = pages[0]
+        assert isinstance(first_page, dict)
+        initial_url = str(first_page["requestUrl"])
+        initial_path, initial_query = initial_url.split("?", 1)
+        query_parts = initial_query.split("&")
+        continuation_url = f"{initial_url}&%24skipToken=synthetic-reused"
+        aliased_path = initial_path.replace(
+            "/providers/Microsoft.Authorization/",
+            "/PROVIDERS/Microsoft.Authorization/",
+        ).replace(
+            "Assignments",
+            "%41ssignments",
+        )
+        aliased_url = (
+            f"{aliased_path}?%24skipToken=%73ynthetic-reused&{query_parts[-1]}&{query_parts[0]}"
+        )
+        first_page["nextLink"] = continuation_url
+        pages.extend(
+            [
+                {
+                    "requestUrl": continuation_url,
+                    "statusCode": 200,
+                    "value": [],
+                    "nextLink": aliased_url,
+                },
+                {
+                    "requestUrl": aliased_url,
+                    "statusCode": 200,
+                    "value": [],
+                    "nextLink": None,
+                },
+            ]
+        )
+
+    with pytest.raises(
+        PreflightInputError,
+        match="repeated canonical request|reuses a decoded cursor",
+    ):
+        _evaluate_guarded_rbac(
+            evidence,
+            _production_policy(
+                principal_id,
+                expected_assignments=[assignment],
+            ),
+        )
+
+
+@pytest.mark.parametrize(
     ("continuation_query", "message"),
     [
         ("%24skipToken=", "requestUrl is not canonical"),
@@ -10177,6 +10573,402 @@ def test_guarded_rbac_rejects_graph_arm_membership_disagreement() -> None:
                 expected_assignments=[assignment],
             ),
         )
+
+
+@pytest.mark.parametrize("reverse_principals", [False, True])
+def test_guarded_rbac_rejects_tenant_wide_identity_membership_type_conflict(
+    reverse_principals: bool,
+) -> None:
+    first_principal_id = "11111111-1111-1111-1111-111111111111"
+    second_principal_id = "22222222-2222-2222-2222-222222222222"
+    assignments = [
+        _guarded_assignment(
+            principal_id=first_principal_id,
+            role_name="AcrPull",
+            scope=_RG_SCOPE,
+        ),
+        _guarded_assignment(
+            principal_id=second_principal_id,
+            role_name="Storage Blob Data Reader",
+            scope=_RG_SCOPE,
+        ),
+    ]
+    evidence = _guarded_evidence(assignments)
+    principals = evidence["principals"]
+    assert isinstance(principals, list)
+    first_principal = principals[0]
+    assert isinstance(first_principal, dict)
+    membership = first_principal["groupMembership"]
+    assert isinstance(membership, dict)
+    pages = membership["pages"]
+    assert isinstance(pages, list)
+    page = pages[0]
+    assert isinstance(page, dict)
+    values = page["value"]
+    assert isinstance(values, list)
+    values.append(second_principal_id)
+    if reverse_principals:
+        principals.reverse()
+
+    with pytest.raises(
+        PreflightInputError,
+        match="tenant-wide principal type",
+    ):
+        _evaluate_guarded_rbac(
+            evidence,
+            _production_policy(
+                first_principal_id,
+                second_principal_id,
+                expected_assignments=assignments,
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    "claim_source",
+    [
+        "role-assignment",
+        "deny-principal",
+        "deny-exclusion",
+        "transitive-membership",
+    ],
+)
+def test_guarded_rbac_rejects_tenant_wide_principal_type_conflicts(
+    claim_source: str,
+) -> None:
+    effective_principal_id = "11111111-1111-1111-1111-111111111111"
+    group_principal_id = "22222222-2222-2222-2222-222222222222"
+    assignment = _guarded_assignment(
+        principal_id=group_principal_id,
+        effective_principal_id=effective_principal_id,
+        principal_type="Group",
+        role_name="AcrPull",
+        scope=_RG_SCOPE,
+    )
+    evidence = _guarded_evidence([assignment])
+    principal = _first_principal_artifact(evidence)
+    if claim_source == "role-assignment":
+        pages = _arm_role_assignment_pages(
+            evidence,
+            collection_kind="ancestors",
+        )
+        page = pages[0]
+        assert isinstance(page, dict)
+        values = page["value"]
+        assert isinstance(values, list)
+        raw_assignment = values[0]
+        assert isinstance(raw_assignment, dict)
+        properties = raw_assignment["properties"]
+        assert isinstance(properties, dict)
+        properties["principalType"] = "ServicePrincipal"
+    elif claim_source in {"deny-principal", "deny-exclusion"}:
+        deny = _raw_arm_deny_assignment(
+            principals=(
+                [(group_principal_id, "User")]
+                if claim_source == "deny-principal"
+                else [("00000000-0000-0000-0000-000000000000", "SystemDefined")]
+            ),
+            exclude_principals=(
+                [(group_principal_id, "User")] if claim_source == "deny-exclusion" else []
+            ),
+        )
+        _add_deny_assignment(
+            evidence,
+            deny,
+            target_and_ancestors=True,
+            subscription_inventory=True,
+        )
+    else:
+        principal["groupMembership"] = {
+            "tenantId": _TENANT_ID,
+            "method": "transitiveMemberOf",
+            "pages": [
+                {
+                    "requestUrl": (
+                        "https://graph.microsoft.com/v1.0/servicePrincipals/"
+                        f"{effective_principal_id}/transitiveMemberOf"
+                    ),
+                    "statusCode": 200,
+                    "value": [
+                        {
+                            "@odata.type": "#microsoft.graph.user",
+                            "id": group_principal_id,
+                        }
+                    ],
+                    "@odata.nextLink": None,
+                }
+            ],
+        }
+
+    with pytest.raises(
+        PreflightInputError,
+        match="tenant-wide principal type",
+    ):
+        _evaluate_guarded_rbac(
+            evidence,
+            _production_policy(
+                effective_principal_id,
+                expected_assignments=[assignment],
+            ),
+        )
+
+
+def test_guarded_rbac_rejects_principal_type_conflict_across_deny_pages() -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    unrelated_principal_id = "33333333-3333-3333-3333-333333333333"
+    assignment = _guarded_assignment(
+        principal_id=principal_id,
+        role_name="AcrPull",
+        scope=_RG_SCOPE,
+    )
+    evidence = _guarded_evidence([assignment])
+    group_deny = _raw_arm_deny_assignment(
+        principals=[(unrelated_principal_id, "Group")],
+        index=1,
+    )
+    user_deny = _raw_arm_deny_assignment(
+        principals=[(unrelated_principal_id, "User")],
+        index=2,
+    )
+    target_collection = _deny_assignment_collection(
+        evidence,
+        "target-and-ancestors",
+    )
+    target_pages = target_collection["pages"]
+    assert isinstance(target_pages, list)
+    target_page = target_pages[0]
+    assert isinstance(target_page, dict)
+    continuation_url = f"{target_page['requestUrl']}&%24skipToken=principal-type-conflict"
+    target_page["value"] = [group_deny]
+    target_page["nextLink"] = continuation_url
+    target_pages.append(
+        {
+            "requestUrl": continuation_url,
+            "statusCode": 200,
+            "value": [user_deny],
+            "nextLink": None,
+        }
+    )
+
+    with pytest.raises(
+        PreflightInputError,
+        match="tenant-wide principal type",
+    ):
+        _evaluate_guarded_rbac(
+            evidence,
+            _production_policy(
+                principal_id,
+                expected_assignments=[assignment],
+            ),
+        )
+
+
+def test_guarded_rbac_rejects_unknown_graph_type_conflict_across_pages() -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    conflicting_principal_id = "33333333-3333-3333-3333-333333333333"
+    assignment = _guarded_assignment(
+        principal_id=principal_id,
+        role_name="AcrPull",
+        scope=_RG_SCOPE,
+    )
+    evidence = _guarded_evidence([assignment])
+    principal = _first_principal_artifact(evidence)
+    initial_url = (
+        f"https://graph.microsoft.com/v1.0/servicePrincipals/{principal_id}/transitiveMemberOf"
+    )
+    continuation_url = f"{initial_url}?%24skiptoken=synthetic-types"
+    principal["groupMembership"] = {
+        "tenantId": _TENANT_ID,
+        "method": "transitiveMemberOf",
+        "pages": [
+            {
+                "requestUrl": initial_url,
+                "statusCode": 200,
+                "value": [
+                    {
+                        "@odata.type": "#microsoft.graph.directoryRole",
+                        "id": conflicting_principal_id,
+                    }
+                ],
+                "@odata.nextLink": continuation_url,
+            },
+            {
+                "requestUrl": continuation_url,
+                "statusCode": 200,
+                "value": [
+                    {
+                        "@odata.type": "#microsoft.graph.group",
+                        "id": conflicting_principal_id,
+                        "securityEnabled": True,
+                    }
+                ],
+                "@odata.nextLink": None,
+            },
+        ],
+    }
+
+    with pytest.raises(
+        PreflightInputError,
+        match="tenant-wide principal type",
+    ):
+        _evaluate_guarded_rbac(
+            evidence,
+            _production_policy(
+                principal_id,
+                expected_assignments=[assignment],
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    "conflict_field",
+    [
+        "condition",
+        "principal",
+        "principal-type",
+        "role",
+        "scope",
+    ],
+)
+@pytest.mark.parametrize("conflict_location", ["collection", "page"])
+def test_guarded_rbac_rejects_conflicting_raw_body_for_one_assignment_id(
+    conflict_location: str,
+    conflict_field: str,
+) -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignment = _guarded_assignment(
+        principal_id=principal_id,
+        role_name="AcrPull",
+        scope=_RG_SCOPE,
+    )
+    evidence = _guarded_evidence([assignment])
+    ancestor_pages = _arm_role_assignment_pages(
+        evidence,
+        collection_kind="ancestors",
+    )
+    ancestor_page = ancestor_pages[0]
+    assert isinstance(ancestor_page, dict)
+    ancestor_values = ancestor_page["value"]
+    assert isinstance(ancestor_values, list)
+    conflicting_assignment = copy.deepcopy(ancestor_values[0])
+    assert isinstance(conflicting_assignment, dict)
+    conflicting_properties = conflicting_assignment["properties"]
+    assert isinstance(conflicting_properties, dict)
+    if conflict_field == "condition":
+        conflicting_properties["condition"] = (
+            "@Resource[Microsoft.Storage/storageAccounts:name] StringEquals 'synthetic'"
+        )
+        conflicting_properties["conditionVersion"] = "2.0"
+    elif conflict_field == "principal":
+        conflicting_properties["principalId"] = "33333333-3333-3333-3333-333333333333"
+    elif conflict_field == "principal-type":
+        conflicting_properties["principalType"] = "Group"
+    elif conflict_field == "role":
+        conflicting_properties["roleDefinitionId"] = _TEST_ROLE_IDS["reader"]
+    else:
+        assert conflict_field == "scope"
+        conflicting_properties["scope"] = _SUBSCRIPTION_SCOPE
+    if conflict_location == "page":
+        continuation_url = f"{ancestor_page['requestUrl']}&%24skipToken=synthetic-conflict"
+        ancestor_page["nextLink"] = continuation_url
+        ancestor_pages.append(
+            {
+                "requestUrl": continuation_url,
+                "statusCode": 200,
+                "value": [conflicting_assignment],
+                "nextLink": None,
+            }
+        )
+    else:
+        descendant_pages = _arm_role_assignment_pages(
+            evidence,
+            collection_kind="descendants",
+        )
+        descendant_page = descendant_pages[0]
+        assert isinstance(descendant_page, dict)
+        descendant_page["value"] = [conflicting_assignment]
+
+    with pytest.raises(
+        PreflightInputError,
+        match="conflicting raw assignment bodies|id and properties.scope disagree",
+    ):
+        _evaluate_guarded_rbac(
+            evidence,
+            _production_policy(
+                principal_id,
+                expected_assignments=[assignment],
+            ),
+        )
+
+
+def test_guarded_rbac_allows_identical_group_assignment_id_for_multiple_effective_principals() -> (
+    None
+):
+    first_principal_id = "11111111-1111-1111-1111-111111111111"
+    second_principal_id = "22222222-2222-2222-2222-222222222222"
+    group_principal_id = "33333333-3333-3333-3333-333333333333"
+    assignments = [
+        _guarded_assignment(
+            principal_id=group_principal_id,
+            effective_principal_id=first_principal_id,
+            principal_type="Group",
+            role_name="AcrPull",
+            scope=_RG_SCOPE,
+        ),
+        _guarded_assignment(
+            principal_id=group_principal_id,
+            effective_principal_id=second_principal_id,
+            principal_type="Group",
+            role_name="AcrPull",
+            scope=_RG_SCOPE,
+        ),
+    ]
+    evidence = _guarded_evidence(assignments)
+    principals = evidence["principals"]
+    assert isinstance(principals, list)
+
+    def raw_assignments(principal: dict[str, object]) -> list[dict[str, object]]:
+        role_assignments = principal["roleAssignments"]
+        assert isinstance(role_assignments, dict)
+        ancestors = role_assignments["ancestors"]
+        assert isinstance(ancestors, dict)
+        descendants = role_assignments["descendants"]
+        assert isinstance(descendants, dict)
+        raw_values: list[dict[str, object]] = []
+        collections = [ancestors, *descendants["collections"]]
+        for collection in collections:
+            assert isinstance(collection, dict)
+            pages = collection["pages"]
+            assert isinstance(pages, list)
+            for page in pages:
+                assert isinstance(page, dict)
+                values = page["value"]
+                assert isinstance(values, list)
+                for raw_assignment in values:
+                    assert isinstance(raw_assignment, dict)
+                    raw_values.append(raw_assignment)
+        return raw_values
+
+    first_principal = principals[0]
+    second_principal = principals[1]
+    assert isinstance(first_principal, dict)
+    assert isinstance(second_principal, dict)
+    first_raw_assignments = raw_assignments(first_principal)
+    canonical_assignment_id = first_raw_assignments[0]["id"]
+    for raw_assignment in raw_assignments(second_principal):
+        raw_assignment["id"] = canonical_assignment_id
+
+    assert (
+        _evaluate_guarded_rbac(
+            evidence,
+            _production_policy(
+                first_principal_id,
+                second_principal_id,
+                expected_assignments=assignments,
+            ),
+        )
+        == ()
+    )
 
 
 def test_guarded_rbac_rejects_direct_assignment_to_another_object() -> None:

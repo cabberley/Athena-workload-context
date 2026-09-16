@@ -159,6 +159,11 @@ non-reparse ledger-directory handle and verifies each record handle before writi
 validated directory with a junction cannot redirect a successful consumption.
 POSIX ledger reads are nonblocking and no-follow, then require a regular file by `fstat`; FIFOs,
 sockets, and devices fail deterministically. Ledger writes and reads share one 64-KiB record bound.
+Each write is completed and fsynced in a random staging file inside the secured directory before an
+atomic no-overwrite publication. Orphaned empty/partial staging files never reserve a final record;
+concurrent writers produce one complete winner, binary descriptors preserve the physical 64-KiB
+bound on Windows, and malformed final consumption records are corruption rather than proof of prior
+use.
 
 The versioned `athena.wc029PreflightManifest.v1` records UTC `collectedAt`/`expiresAt` with a
 validity window no longer than 30 minutes, the deployment execution ID, and a reviewed
@@ -302,6 +307,9 @@ every delta representation regardless of order. Complete snapshots are reconcile
 canonical path index; wide partial observations and ancestor traversal consume the same bounded
 lookup-work budget. Unchanged protected strings still require exact trimmed ASCII spelling and an
 allowed enum value.
+Partial snapshots recursively register every present protected dynamic path, scalar value, and
+container kind without interpreting omitted fields as absent. Present partial values must reconcile
+with delta evidence in either order.
 All status, change, method, principal/role type, and protected network/access values must be exact
 trimmed ASCII tokens before normalization. Do not repair whitespace or Unicode lookalikes manually.
 
@@ -547,6 +555,9 @@ reject `$skip`. ARM page wrappers use literal `nextLink`; Graph page wrappers us
 `@odata.nextLink`. Cross-endpoint aliases, duplicates, whitespace, ambiguous cursor fields, and case
 variants fail closed. Single-dash-prefixed values are rejected rather than treated as positional
 data.
+The verifier then canonicalizes each validated request from its scheme, host, decoded
+case-normalized path, and decoded sorted endpoint query. A repeated canonical request or decoded
+cursor fails even when percent encoding, path casing, or query ordering differs.
 
 The CLI equivalent for the separate subscription-descendant inventory is:
 
@@ -568,6 +579,15 @@ Group rows must name a security group present in the complete Graph set. The sep
 policy uses `approvedAssignments`; never populate it by copying the observed output. Preserve
 `condition`, `conditionVersion`, canonical `roleDefinitionId`, `assignedPrincipalId`,
 `assignedPrincipalType`, and `effectivePrincipalId`.
+Build one tenant-wide type view from the complete artifact: every effective ID is a service
+principal, every accepted membership ID is a group, and each assignment or deny
+principal/exclusion retains its supplied type. Any GUID claimed with different types across policy,
+identity, membership, role-assignment, deny, collection, or page evidence requires recollection.
+Retain every typed `transitiveMemberOf` object: the verifier registers its type before excluding
+non-group objects from the accepted security-group set.
+Retain every ARM role-assignment `id` unchanged. The verifier permits the same group-derived ID
+under multiple effective principals only when the complete raw assignment body is canonically
+identical; changing principal, role, scope, type, or condition under one ID invalidates the evidence.
 
 The RBAC envelope uses the same `$CollectionRunId`, bounded timestamps, and SHA-256 bindings for the
 reviewed policy, target, hierarchy, membership, both role-assignment collections, and both complete
