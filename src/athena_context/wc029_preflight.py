@@ -27,6 +27,7 @@ MAX_JSON_DECIMAL_DIGITS = 1024
 MAX_JSON_DECIMAL_EXPONENT = 1024
 MAX_VIOLATIONS = 256
 MAX_RENDER_BYTES = 1024 * 1024
+MAX_SEPARATION_RULE_WORK = 100000
 MAX_PROPERTY_PATH_LENGTH = 4096
 MAX_PROPERTY_PATH_ITEMS = 50000
 MAX_PROPERTY_PATH_CHARACTERS = 4 * 1024 * 1024
@@ -73,9 +74,16 @@ _MANAGEMENT_GROUP_SCOPE = re.compile(
 _STORAGE_ACCOUNT_TYPE = "microsoft.storage/storageaccounts"
 _STORAGE_CONTAINER_TYPE = "microsoft.storage/storageaccounts/blobservices/containers"
 _KEY_VAULT_TYPE = "microsoft.keyvault/vaults"
+_KEY_VAULT_DEPLOYMENT_ACCESS_TARGETS = (
+    "properties.enabledfordeployment",
+    "properties.enabledfordiskencryption",
+    "properties.enabledfortemplatedeployment",
+)
 _CONTAINER_APP_TYPE = "microsoft.app/containerapps"
 _CONTAINER_ENVIRONMENT_TYPE = "microsoft.app/managedenvironments"
 _RESOURCE_ROOT_PATH = "<resource>"
+_MISSING_AFTER_VALUE = object()
+_PROPERTY_OBSERVATION = "observation"
 _RESOURCE_ROOT_ALIASES = frozenset(
     {
         ".",
@@ -215,6 +223,27 @@ class PreflightViolation:
     detail: str
 
 
+@dataclass(slots=True)
+class _ViolationAccumulator:
+    values: list[PreflightViolation] = field(default_factory=list)
+    seen: set[PreflightViolation] = field(default_factory=set)
+
+    def add(self, violation: PreflightViolation) -> bool:
+        _strict_utf8_bytes(violation.code, field_name="violation code")
+        _strict_utf8_bytes(violation.subject, field_name="violation subject")
+        _strict_utf8_bytes(violation.detail, field_name="violation detail")
+        if violation in self.seen:
+            return False
+        if len(self.values) >= MAX_VIOLATIONS:
+            raise PreflightInputError(f"violation count exceeds {MAX_VIOLATIONS}")
+        self.seen.add(violation)
+        self.values.append(violation)
+        return True
+
+    def finalize(self) -> tuple[PreflightViolation, ...]:
+        return tuple(self.values)
+
+
 @dataclass(frozen=True, slots=True)
 class DeploymentTarget:
     tenant_id: str
@@ -258,19 +287,10 @@ class AttestationManifest:
 def _finalize_violations(
     values: Sequence[PreflightViolation],
 ) -> tuple[PreflightViolation, ...]:
-    violations: list[PreflightViolation] = []
-    seen: set[PreflightViolation] = set()
+    accumulator = _ViolationAccumulator()
     for violation in values:
-        _strict_utf8_bytes(violation.code, field_name="violation code")
-        _strict_utf8_bytes(violation.subject, field_name="violation subject")
-        _strict_utf8_bytes(violation.detail, field_name="violation detail")
-        if violation in seen:
-            continue
-        if len(violations) >= MAX_VIOLATIONS:
-            raise PreflightInputError(f"violation count exceeds {MAX_VIOLATIONS}")
-        seen.add(violation)
-        violations.append(violation)
-    return tuple(violations)
+        accumulator.add(violation)
+    return accumulator.finalize()
 
 
 @dataclass(frozen=True, slots=True)
@@ -332,6 +352,18 @@ class SeparationRule:
     forbidden_role_names: frozenset[str]
     forbidden_role_ids: frozenset[str]
     forbidden_scope_prefixes: tuple[str, ...]
+
+
+@dataclass(slots=True)
+class _SeparationRuleWorkBudget:
+    work: int = 0
+
+    def charge(self, amount: int = 1) -> None:
+        self.work += amount
+        if self.work > MAX_SEPARATION_RULE_WORK:
+            raise PreflightInputError(
+                "identity-separation rule evaluation exceeds its deterministic work budget"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1132,13 +1164,25 @@ def _validate_what_if_snapshot_ids(
         )
 
 
-def _minimal_scope_prefixes(values: Sequence[str]) -> tuple[str, ...]:
-    unique = sorted(set(values))
-    return tuple(
-        value
-        for value in unique
-        if not any(other != value and _scope_contains(other, value) for other in unique)
-    )
+def _minimal_scope_prefixes(
+    values: Sequence[str],
+    *,
+    budget: _SeparationRuleWorkBudget,
+) -> tuple[str, ...]:
+    scopes_with_segments: list[tuple[tuple[str, ...], str]] = []
+    for value in set(values):
+        segments = () if value == "/" else tuple(value.strip("/").split("/"))
+        budget.charge(1 + len(segments))
+        scopes_with_segments.append((segments, value))
+    scopes_with_segments.sort(key=lambda item: item[0])
+    minimal: list[str] = []
+    for _, value in scopes_with_segments:
+        if minimal:
+            budget.charge()
+            if _scope_contains(minimal[-1], value):
+                continue
+        minimal.append(value)
+    return tuple(minimal)
 
 
 def _separation_scope_matches(
@@ -1740,6 +1784,7 @@ def _walk_delta(
     *,
     budget: _PropertyPathBudget,
     snapshot_index: _SnapshotPairIndex | None = None,
+    preserve_evidence_for: frozenset[str] = frozenset(),
 ) -> list[tuple[str, object, str]]:
     values: list[tuple[str, object, str]] = []
     stack: list[tuple[dict[str, Any], str]] = [(item, "") for item in reversed(items)]
@@ -1781,6 +1826,11 @@ def _walk_delta(
         after_supplied = _has_case_insensitive(item, "after")
         before = _get_case_insensitive(item, "before")
         after = _get_case_insensitive(item, "after")
+        preserve_observation = any(
+            _property_path_contains(canonical_path, target)
+            or _property_path_contains(target, canonical_path)
+            for target in preserve_evidence_for
+        )
         if (
             canonical_path == _RESOURCE_ROOT_PATH
             and property_change_type not in {"delete", "remove", "noeffect"}
@@ -1792,6 +1842,18 @@ def _walk_delta(
             and not after_supplied
             and children is None
         ):
+            if any(
+                canonical_path == target or _property_path_contains(target, canonical_path)
+                for target in preserve_evidence_for
+            ):
+                values.append(
+                    (
+                        canonical_path,
+                        _MISSING_AFTER_VALUE,
+                        property_change_type,
+                    )
+                )
+                continue
             raise PreflightInputError("delta item lacks inspectable after value or children")
         child_items: list[dict[str, Any]] = []
         if children is not None:
@@ -1820,8 +1882,24 @@ def _walk_delta(
                 snapshot_index=snapshot_index,
                 budget=budget,
             )
+            if preserve_observation:
+                values.append(
+                    (
+                        canonical_path,
+                        after,
+                        _PROPERTY_OBSERVATION,
+                    )
+                )
         elif after_supplied:
             if before_supplied:
+                if preserve_observation:
+                    values.append(
+                        (
+                            canonical_path,
+                            after,
+                            _PROPERTY_OBSERVATION,
+                        )
+                    )
                 values.extend(
                     _derive_snapshot_delta(
                         before,
@@ -2173,6 +2251,183 @@ def _flatten_after(
     return values
 
 
+def _has_complete_resource_snapshot_shape(value: object) -> bool:
+    return (
+        isinstance(value, dict)
+        and all(
+            _has_case_insensitive(value, field_name)
+            for field_name in ("id", "name", "type", "properties")
+        )
+        and isinstance(_get_case_insensitive(value, "properties"), dict)
+    )
+
+
+def _snapshot_property_state(
+    value: object,
+    target: str,
+) -> tuple[bool, object]:
+    if not isinstance(value, dict):
+        return False, None
+    properties = _get_case_insensitive(value, "properties")
+    if not isinstance(properties, dict):
+        return False, None
+    field_name = target.rsplit(".", 1)[-1]
+    if not _has_case_insensitive(properties, field_name):
+        return False, None
+    return True, _get_case_insensitive(properties, field_name)
+
+
+def _resolve_property_observation(
+    *,
+    observation_path: str,
+    observed_after: object,
+    target: str,
+) -> tuple[bool, bool, object]:
+    path_tokens = _property_path_tokens(observation_path)
+    target_tokens = _property_path_tokens(target)
+    if path_tokens[: len(target_tokens)] == target_tokens and path_tokens != target_tokens:
+        return True, False, None
+    if target_tokens[: len(path_tokens)] != path_tokens:
+        return False, False, None
+    value = observed_after
+    for token in target_tokens[len(path_tokens) :]:
+        if isinstance(token, str):
+            if not isinstance(value, dict) or not _has_case_insensitive(value, token):
+                return True, False, None
+            value = _get_case_insensitive(value, token)
+        elif not isinstance(value, list) or token >= len(value):
+            return True, False, None
+        else:
+            value = value[token]
+    return True, True, value
+
+
+def _deployment_access_delta_evidence(
+    target: str,
+    declared_delta_candidates: Sequence[tuple[str, object, str]],
+    delta_observations: Sequence[tuple[str, object, str]],
+) -> tuple[bool, bool, bool, bool]:
+    related: list[tuple[str, object, str]] = []
+    for raw_path, after, property_change_type in declared_delta_candidates:
+        path = _canonical_property_path(raw_path)
+        if _property_path_contains(path, target) or _property_path_contains(target, path):
+            related.append((path, after, property_change_type))
+    observations_related = False
+    observations_safe = True
+    for raw_path, after, _ in delta_observations:
+        path = _canonical_property_path(raw_path)
+        observation_related, observation_resolved, observed_value = _resolve_property_observation(
+            observation_path=path,
+            observed_after=after,
+            target=target,
+        )
+        if not observation_related:
+            continue
+        observations_related = True
+        observations_safe = observations_safe and (
+            observation_resolved and type(observed_value) is bool and observed_value is False
+        )
+    if not related:
+        return False, False, observations_related, observations_safe
+    exact = [
+        (after, property_change_type)
+        for path, after, property_change_type in related
+        if path == target
+    ]
+    unsafe = (
+        any(
+            property_change_type in {"delete", "remove"}
+            or (path != target and _property_path_contains(target, path))
+            for path, _, property_change_type in related
+        )
+        or not exact
+        or any(
+            property_change_type in {"delete", "remove"}
+            or type(after) is not bool
+            or after is not False
+            for after, property_change_type in exact
+        )
+    )
+    return True, not unsafe, observations_related, observations_safe
+
+
+def _key_vault_deployment_access_is_unsafe(
+    *,
+    change_type: str,
+    declared_delta_candidates: Sequence[tuple[str, object, str]],
+    delta_observations: Sequence[tuple[str, object, str]],
+    before_payload_supplied: bool,
+    after_payload_supplied: bool,
+    before_payload: object,
+    after_payload: object,
+    complete_snapshots: bool,
+) -> bool:
+    for target in _KEY_VAULT_DEPLOYMENT_ACCESS_TARGETS:
+        (
+            delta_touched,
+            delta_safe,
+            observations_related,
+            observations_safe,
+        ) = _deployment_access_delta_evidence(
+            target,
+            declared_delta_candidates,
+            delta_observations,
+        )
+        before_has_value, before_value = _snapshot_property_state(before_payload, target)
+        after_has_value, after_value = _snapshot_property_state(after_payload, target)
+        snapshot_mentions_target = before_has_value or after_has_value
+
+        if observations_related and not observations_safe:
+            return True
+        if complete_snapshots:
+            snapshot_changed = before_has_value != after_has_value or (
+                before_has_value
+                and not _json_values_equal(
+                    before_value,
+                    after_value,
+                )
+            )
+            if observations_related and (
+                not after_has_value or type(after_value) is not bool or after_value is not False
+            ):
+                return True
+            if delta_touched and (not delta_safe or not snapshot_changed):
+                return True
+            if snapshot_changed and (
+                not after_has_value or type(after_value) is not bool or after_value is not False
+            ):
+                return True
+            continue
+
+        if change_type == "create":
+            if before_payload_supplied and (
+                delta_touched or snapshot_mentions_target or observations_related
+            ):
+                return True
+            if (
+                after_payload_supplied
+                and (delta_touched or snapshot_mentions_target or observations_related)
+                and (
+                    not _has_complete_resource_snapshot_shape(after_payload)
+                    or not after_has_value
+                    or type(after_value) is not bool
+                    or after_value is not False
+                )
+            ):
+                return True
+            if delta_touched and not delta_safe:
+                return True
+            continue
+
+        if (before_payload_supplied or after_payload_supplied) and (
+            delta_touched or snapshot_mentions_target or observations_related
+        ):
+            return True
+        if delta_touched and not delta_safe:
+            return True
+    return False
+
+
 def _unsafe_property_violations(
     resource_id: str,
     change: dict[str, Any],
@@ -2222,15 +2477,26 @@ def _unsafe_property_violations(
             after_payload,
             budget=budget,
         )
-    declared_delta_candidates = (
+    walked_delta_candidates = (
         _walk_delta(
             delta,
             budget=budget,
             snapshot_index=snapshot_index,
+            preserve_evidence_for=(
+                frozenset(_KEY_VAULT_DEPLOYMENT_ACCESS_TARGETS)
+                if resource_type == _KEY_VAULT_TYPE
+                else frozenset()
+            ),
         )
         if delta
         else []
     )
+    delta_observations = [
+        candidate for candidate in walked_delta_candidates if candidate[2] == _PROPERTY_OBSERVATION
+    ]
+    declared_delta_candidates = [
+        candidate for candidate in walked_delta_candidates if candidate[2] != _PROPERTY_OBSERVATION
+    ]
     effective_delta_candidates = (
         snapshot_delta_candidates if complete_snapshots else declared_delta_candidates
     )
@@ -2260,11 +2526,6 @@ def _unsafe_property_violations(
         authorization_targets = (
             "properties.accesspolicies",
             "properties.enablerbacauthorization",
-        )
-        deployment_access_targets = (
-            "properties.enabledfordeployment",
-            "properties.enabledfordiskencryption",
-            "properties.enabledfortemplatedeployment",
         )
         authorization_mutation = any(
             _property_path_contains(
@@ -2318,20 +2579,16 @@ def _unsafe_property_violations(
                         )
                     )
                 )
-        deployment_access_candidates = (
-            snapshot_delta_candidates if complete_snapshots else candidates
+        unsafe_deployment_access = _key_vault_deployment_access_is_unsafe(
+            change_type=change_type,
+            declared_delta_candidates=declared_delta_candidates,
+            delta_observations=delta_observations,
+            before_payload_supplied=before_payload_supplied,
+            after_payload_supplied=after_payload_supplied,
+            before_payload=before_payload,
+            after_payload=after_payload,
+            complete_snapshots=complete_snapshots,
         )
-        unsafe_deployment_access = False
-        for raw_path, after, property_change_type in deployment_access_candidates:
-            path = _canonical_property_path(raw_path)
-            if path not in deployment_access_targets or property_change_type in {
-                "delete",
-                "remove",
-            }:
-                continue
-            if type(after) is not bool:
-                raise PreflightInputError(f"{path} must be boolean when supplied")
-            unsafe_deployment_access = unsafe_deployment_access or after
         if authorization_mutation or unsafe_deployment_access:
             violations.append(
                 PreflightViolation(
@@ -3241,7 +3498,80 @@ def _effective_rule_role_matchers(
     return frozenset(matchers)
 
 
-def _parse_policy(document: object | None) -> RbacPolicy:
+def _separation_rule_role_tokens(rule: SeparationRule) -> tuple[str, ...]:
+    return tuple(
+        [
+            *(f"name:{role_name}" for role_name in sorted(rule.forbidden_role_names)),
+            *(f"id:{role_id}" for role_id in sorted(rule.forbidden_role_ids)),
+        ]
+    )
+
+
+def _assignment_role_tokens(
+    *,
+    role_name: str,
+    role_definition_id: str,
+) -> tuple[str, ...]:
+    tokens = [f"name:{role_name}"]
+    if role_definition_id:
+        tokens.append(f"id:{role_definition_id}")
+    return tuple(dict.fromkeys(tokens))
+
+
+def _index_separation_rules(
+    rules: Sequence[SeparationRule],
+    *,
+    budget: _SeparationRuleWorkBudget,
+) -> dict[tuple[str, str], tuple[SeparationRule, ...]]:
+    mutable_index: dict[tuple[str, str], list[SeparationRule]] = {}
+    for rule in rules:
+        budget.charge(1 + len(rule.forbidden_scope_prefixes))
+        for role_token in _separation_rule_role_tokens(rule):
+            budget.charge()
+            mutable_index.setdefault(
+                (rule.principal_id, role_token),
+                [],
+            ).append(rule)
+    return {key: tuple(indexed_rules) for key, indexed_rules in mutable_index.items()}
+
+
+def _assignment_violates_separation(
+    *,
+    effective_principal_id: str,
+    role_name: str,
+    role_definition_id: str,
+    scope: str,
+    collection: RbacCollection | None,
+    rule_index: dict[tuple[str, str], tuple[SeparationRule, ...]],
+    budget: _SeparationRuleWorkBudget,
+) -> bool:
+    evaluated_rules: set[SeparationRule] = set()
+    for role_token in _assignment_role_tokens(
+        role_name=role_name,
+        role_definition_id=role_definition_id,
+    ):
+        budget.charge()
+        for rule in rule_index.get((effective_principal_id, role_token), ()):
+            budget.charge()
+            if rule in evaluated_rules:
+                continue
+            evaluated_rules.add(rule)
+            for prefix in rule.forbidden_scope_prefixes:
+                budget.charge()
+                if _separation_scope_matches(
+                    scope,
+                    prefix,
+                    collection=collection,
+                ):
+                    return True
+    return False
+
+
+def _parse_policy(
+    document: object | None,
+    *,
+    separation_budget: _SeparationRuleWorkBudget,
+) -> RbacPolicy:
     if document is None:
         return RbacPolicy(
             allowed_broad_assignments=frozenset(),
@@ -3332,6 +3662,7 @@ def _parse_policy(document: object | None) -> RbacPolicy:
                 raise PreflightInputError(
                     "separation rule requires forbidden roles and scope prefixes"
                 )
+            separation_budget.charge(len(role_names) + len(role_ids) + len(scope_prefixes))
             rule = SeparationRule(
                 principal_id=_normalized(
                     _require_string(
@@ -3366,7 +3697,8 @@ def _parse_policy(document: object | None) -> RbacPolicy:
                             )
                         )
                         for prefix in scope_prefixes
-                    ]
+                    ],
+                    budget=separation_budget,
                 ),
             )
             rule_key = (
@@ -5531,7 +5863,11 @@ def evaluate_role_assignments(
     now: datetime | None = None,
 ) -> tuple[PreflightViolation, ...]:
     _validate_json_shape(document)
-    policy = _parse_policy(policy_document)
+    separation_budget = _SeparationRuleWorkBudget()
+    policy = _parse_policy(
+        policy_document,
+        separation_budget=separation_budget,
+    )
     collection = policy.target
     if require_separation_rules:
         if not policy.separation_rules:
@@ -5673,7 +6009,11 @@ def evaluate_role_assignments(
             unique_assignments.add(assignment)
             assignments.append(assignment)
 
-    violations: list[PreflightViolation] = []
+    separation_rule_index = _index_separation_rules(
+        policy.separation_rules,
+        budget=separation_budget,
+    )
+    violations = _ViolationAccumulator()
     for assignment in assignments:
         assignment_principal_id = assignment.principal_id
         effective_principal_id = assignment.effective_principal_id
@@ -5718,37 +6058,30 @@ def evaluate_role_assignments(
             and broad_scope
             and not allowed
         ):
-            violations.append(
+            violations.add(
                 PreflightViolation(
                     code="broad-role-assignment",
                     subject=effective_principal_id,
                     detail=(f"{access_path} at broad scope {scope}"),
                 )
             )
-        for rule in policy.separation_rules:
-            if (
-                effective_principal_id == rule.principal_id
-                and (
-                    canonical_role in rule.forbidden_role_names
-                    or role_id in rule.forbidden_role_ids
+        if _assignment_violates_separation(
+            effective_principal_id=effective_principal_id,
+            role_name=canonical_role,
+            role_definition_id=role_id,
+            scope=scope,
+            collection=collection,
+            rule_index=separation_rule_index,
+            budget=separation_budget,
+        ):
+            violations.add(
+                PreflightViolation(
+                    code="identity-separation",
+                    subject=effective_principal_id,
+                    detail=(f"{access_path} is forbidden at scope {scope}"),
                 )
-                and any(
-                    _separation_scope_matches(
-                        scope,
-                        prefix,
-                        collection=collection,
-                    )
-                    for prefix in rule.forbidden_scope_prefixes
-                )
-            ):
-                violations.append(
-                    PreflightViolation(
-                        code="identity-separation",
-                        subject=effective_principal_id,
-                        detail=(f"{access_path} is forbidden at scope {scope}"),
-                    )
-                )
-    return _finalize_violations(violations)
+            )
+    return violations.finalize()
 
 
 def render_preflight_json(

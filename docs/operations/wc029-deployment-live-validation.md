@@ -246,9 +246,12 @@ The gate fails on:
   federated credential, Microsoft Graph app-role/delegated-permission/credential grant, equivalent
   identity-granting resource, or any `Microsoft.Resources/deploymentScripts` mutation, even if its
   resource ID is allowlisted, until post-deployment effects are fully evaluated;
-- any Key Vault change that enables `enabledForTemplateDeployment`, `enabledForDeployment`, or
-  `enabledForDiskEncryption`; exact boolean `false` is the only accepted value when one of these
-  properties changes;
+- any Key Vault change to `enabledForTemplateDeployment`, `enabledForDeployment`, or
+  `enabledForDiskEncryption` unless the final value is proven as exact boolean `false`.
+  Delete/Remove, omitted final values, descendant-only evidence, non-boolean values, and partial or
+  conflicting snapshots or overlapping delta observations remain unsupported authorization
+  changes. Every exact, ancestor, or descendant observation must independently resolve the
+  protected property to `false`; a separate exact value cannot mask an omission;
 - any Create, Modify, or Delete of `Microsoft.Resources/deploymentStacks` or
   `Microsoft.Storage/storageAccounts/localUsers`, including stack
   `denySettings`/`actionOnUnmanage` and local-user SSH key, password, shared-key, ACL, or
@@ -573,6 +576,12 @@ if ($RbacPreflightExitCode -ne 0) {
   throw "WC-029 RBAC preflight blocked deployment with exit code $RbacPreflightExitCode"
 }
 ```
+
+Separation rules are indexed by effective principal and role before assignment evaluation. The
+verifier records each identical assignment violation once, enforces the 256-unique-violation limit
+while generating findings, and charges rule-token and scope-match work to a deterministic budget
+instead of materializing assignment-by-rule duplicates. Scope-prefix minimization is a sorted
+segment-aware linear pass rather than an all-pairs comparison.
 
 Each artifact kind can be consumed once for the deployment execution. A repeated what-if or RBAC
 evaluation, or an attempt to use a different manifest with the same execution ID, exits `3` even

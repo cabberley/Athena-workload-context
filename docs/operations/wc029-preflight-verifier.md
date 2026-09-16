@@ -52,10 +52,14 @@ assignment/eligibility schedule requests and Lighthouse registration assignments
 `Microsoft.KeyVault/vaults/accessPolicies`, changes to a vault's `properties.accessPolicies` or
 `properties.enableRbacAuthorization`, `Microsoft.ManagedIdentity/.../federatedIdentityCredentials`,
 Microsoft Graph directory grants and credential resources, and equivalent federated identity,
-app-role, or delegated-permission grant types also block. Key Vault changes that enable
-`enabledForTemplateDeployment`, `enabledForDeployment`, or `enabledForDiskEncryption` block even
-when allowlisted; exact boolean `false` remains an accepted tightening. Every Create, Modify, or
-Delete for `Microsoft.Resources/deploymentStacks` and
+app-role, or delegated-permission grant types also block. A Key Vault change to
+`enabledForTemplateDeployment`, `enabledForDeployment`, or `enabledForDiskEncryption` is accepted
+only when its exact final value is proven as boolean `false`. Delete/Remove, omitted final values,
+descendant-only evidence, non-boolean values, and partial or conflicting snapshots are unsupported
+authorization changes even when allowlisted; overlapping delta observations must agree with that
+exact final value. Every exact, ancestor, or descendant observation independently resolves the
+property, and one-sided snapshots cannot omit an observed value. Every Create, Modify, or Delete for
+`Microsoft.Resources/deploymentStacks` and
 `Microsoft.Storage/storageAccounts/localUsers` blocks because deployment-stack
 `denySettings`/`actionOnUnmanage` and local-user SSH keys, passwords, and permission scopes can
 change downstream deny, delete, credential, or data permissions. `Microsoft.Resources/deploymentScripts`
@@ -416,9 +420,13 @@ versus `1.0` cannot collapse before `NoEffect` or manifest-digest comparison. Ev
 string must round-trip through strict UTF-8; escaped lone surrogates and any defensive encoding
 failure produce a bounded `PreflightInputError`/exit `3`, never a traceback.
 
-Equivalent separation rules are rejected before evaluation. Identical violations from distinct
-non-equivalent rules are emitted once, no result may contain more than 256 unique violations, and
-JSON or text output is bounded to 1 MiB.
+Equivalent separation rules are rejected before evaluation. Rules are indexed by effective
+principal and role, and rule-token plus scope-match work is charged to a deterministic budget.
+Scope-prefix minimization uses one segment-sorted linear containment pass, not all-pairs comparison.
+Identical assignment violations from distinct non-equivalent rules are recorded once during
+generation, evaluation stops for that assignment after the first match, and the 256-unique-
+violation limit is enforced before further findings are materialized. JSON or text output remains
+bounded to 1 MiB.
 
 The verifier is an offline review gate, not proof of Azure deployment success. It performs no Azure
 network call, but the guarded wrapper writes create-only local release-ledger records. Preserve the

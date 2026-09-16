@@ -15,6 +15,7 @@ from urllib.parse import urlencode
 
 import pytest
 
+import athena_context.wc029_preflight as wc029_preflight_module
 from athena_context.cli import main as cli_main
 from athena_context.wc029_preflight import (
     MAX_RELEASE_LEDGER_RECORD_BYTES,
@@ -2012,21 +2013,604 @@ def test_attested_key_vault_deployment_access_disablement_is_allowed(
         "enabledForTemplateDeployment",
     ],
 )
-def test_attested_key_vault_deployment_access_requires_boolean(
+def test_attested_key_vault_deployment_access_non_boolean_is_unsupported(
     field_name: str,
 ) -> None:
-    with pytest.raises(PreflightInputError, match="must be boolean"):
+    violations = _evaluate_attested_what_if(
+        _what_if(
+            _change(
+                _KEY_VAULT_ID,
+                "Modify",
+                path=f"properties.{field_name}",
+                after="true",
+            )
+        ),
+        allowed_change_ids=frozenset({_KEY_VAULT_ID}),
+    )
+
+    assert "authorization-change-unsupported" in {violation.code for violation in violations}
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "enabledForDeployment",
+        "enabledForDiskEncryption",
+        "enabledForTemplateDeployment",
+    ],
+)
+def test_attested_key_vault_deployment_access_exact_delta_disablement_is_allowed(
+    field_name: str,
+) -> None:
+    assert (
         _evaluate_attested_what_if(
             _what_if(
                 _change(
                     _KEY_VAULT_ID,
                     "Modify",
                     path=f"properties.{field_name}",
-                    after="true",
+                    after=False,
                 )
             ),
             allowed_change_ids=frozenset({_KEY_VAULT_ID}),
         )
+        == ()
+    )
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "enabledForDeployment",
+        "enabledForDiskEncryption",
+        "enabledForTemplateDeployment",
+    ],
+)
+@pytest.mark.parametrize(
+    "after",
+    [
+        0,
+        None,
+    ],
+)
+def test_attested_key_vault_deployment_access_other_non_boolean_values_are_unsupported(
+    field_name: str,
+    after: object,
+) -> None:
+    violations = _evaluate_attested_what_if(
+        _what_if(
+            _change(
+                _KEY_VAULT_ID,
+                "Modify",
+                path=f"properties.{field_name}",
+                after=after,
+            )
+        ),
+        allowed_change_ids=frozenset({_KEY_VAULT_ID}),
+    )
+
+    assert "authorization-change-unsupported" in {violation.code for violation in violations}
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "enabledForDeployment",
+        "enabledForDiskEncryption",
+        "enabledForTemplateDeployment",
+    ],
+)
+@pytest.mark.parametrize(
+    "property_change_type",
+    [
+        "Delete",
+        "Remove",
+        "Modify",
+    ],
+)
+def test_attested_key_vault_deployment_access_requires_exact_final_false(
+    field_name: str,
+    property_change_type: str,
+) -> None:
+    violations = _evaluate_attested_what_if(
+        _what_if(
+            {
+                "resourceId": _KEY_VAULT_ID,
+                "changeType": "Modify",
+                "delta": [
+                    {
+                        "path": f"properties.{field_name}",
+                        "propertyChangeType": property_change_type,
+                    }
+                ],
+            }
+        ),
+        allowed_change_ids=frozenset({_KEY_VAULT_ID}),
+    )
+
+    assert "authorization-change-unsupported" in {violation.code for violation in violations}
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "enabledForDeployment",
+        "enabledForDiskEncryption",
+        "enabledForTemplateDeployment",
+    ],
+)
+def test_attested_key_vault_deployment_access_rejects_child_only_evidence(
+    field_name: str,
+) -> None:
+    violations = _evaluate_attested_what_if(
+        _what_if(
+            {
+                "resourceId": _KEY_VAULT_ID,
+                "changeType": "Modify",
+                "delta": [
+                    {
+                        "path": f"properties.{field_name}",
+                        "propertyChangeType": "Modify",
+                        "children": [
+                            {
+                                "path": "value",
+                                "propertyChangeType": "Modify",
+                                "after": False,
+                            }
+                        ],
+                    }
+                ],
+            }
+        ),
+        allowed_change_ids=frozenset({_KEY_VAULT_ID}),
+    )
+
+    assert "authorization-change-unsupported" in {violation.code for violation in violations}
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "enabledForDeployment",
+        "enabledForDiskEncryption",
+        "enabledForTemplateDeployment",
+    ],
+)
+def test_attested_key_vault_deployment_access_rejects_incomplete_snapshot(
+    field_name: str,
+) -> None:
+    violations = _evaluate_attested_what_if(
+        _what_if(
+            {
+                "resourceId": _KEY_VAULT_ID,
+                "changeType": "Modify",
+                "after": _resource_snapshot(
+                    _KEY_VAULT_ID,
+                    properties={
+                        "publicNetworkAccess": "Disabled",
+                        "networkAcls": {"defaultAction": "Deny"},
+                        field_name: False,
+                    },
+                ),
+            }
+        ),
+        allowed_change_ids=frozenset({_KEY_VAULT_ID}),
+    )
+
+    assert "authorization-change-unsupported" in {violation.code for violation in violations}
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "enabledForDeployment",
+        "enabledForDiskEncryption",
+        "enabledForTemplateDeployment",
+    ],
+)
+def test_attested_key_vault_deployment_access_rejects_missing_final_snapshot_value(
+    field_name: str,
+) -> None:
+    safe_properties: dict[str, object] = {
+        "publicNetworkAccess": "Disabled",
+        "networkAcls": {"defaultAction": "Deny"},
+    }
+    violations = _evaluate_attested_what_if(
+        _what_if(
+            {
+                "resourceId": _KEY_VAULT_ID,
+                "changeType": "Modify",
+                "before": _resource_snapshot(
+                    _KEY_VAULT_ID,
+                    properties={
+                        **safe_properties,
+                        field_name: True,
+                    },
+                ),
+                "after": _resource_snapshot(
+                    _KEY_VAULT_ID,
+                    properties=copy.deepcopy(safe_properties),
+                ),
+            }
+        ),
+        allowed_change_ids=frozenset({_KEY_VAULT_ID}),
+    )
+
+    assert "authorization-change-unsupported" in {violation.code for violation in violations}
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "enabledForDeployment",
+        "enabledForDiskEncryption",
+        "enabledForTemplateDeployment",
+    ],
+)
+def test_attested_key_vault_deployment_access_rejects_conflicting_snapshot_and_delta(
+    field_name: str,
+) -> None:
+    safe_properties: dict[str, object] = {
+        "publicNetworkAccess": "Disabled",
+        "networkAcls": {"defaultAction": "Deny"},
+    }
+    violations = _evaluate_attested_what_if(
+        _what_if(
+            {
+                "resourceId": _KEY_VAULT_ID,
+                "changeType": "Modify",
+                "before": _resource_snapshot(
+                    _KEY_VAULT_ID,
+                    properties={
+                        **safe_properties,
+                        field_name: True,
+                    },
+                ),
+                "after": _resource_snapshot(
+                    _KEY_VAULT_ID,
+                    properties={
+                        **safe_properties,
+                        field_name: False,
+                    },
+                ),
+                "delta": [
+                    {
+                        "path": f"properties.{field_name}",
+                        "propertyChangeType": "Modify",
+                        "after": True,
+                    }
+                ],
+            }
+        ),
+        allowed_change_ids=frozenset({_KEY_VAULT_ID}),
+    )
+
+    assert "authorization-change-unsupported" in {violation.code for violation in violations}
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "enabledForDeployment",
+        "enabledForDiskEncryption",
+        "enabledForTemplateDeployment",
+    ],
+)
+def test_attested_key_vault_deployment_access_rejects_conflicting_delta_observations(
+    field_name: str,
+) -> None:
+    violations = _evaluate_attested_what_if(
+        _what_if(
+            {
+                "resourceId": _KEY_VAULT_ID,
+                "changeType": "Modify",
+                "delta": [
+                    {
+                        "path": f"properties.{field_name}",
+                        "propertyChangeType": "Modify",
+                        "before": True,
+                        "after": True,
+                    },
+                    {
+                        "path": f"properties.{field_name}",
+                        "propertyChangeType": "Modify",
+                        "after": False,
+                    },
+                ],
+            }
+        ),
+        allowed_change_ids=frozenset({_KEY_VAULT_ID}),
+    )
+
+    assert "authorization-change-unsupported" in {violation.code for violation in violations}
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "enabledForDeployment",
+        "enabledForDiskEncryption",
+        "enabledForTemplateDeployment",
+    ],
+)
+@pytest.mark.parametrize("include_final_snapshot", [False, True])
+def test_attested_key_vault_create_rejects_true_observation(
+    field_name: str,
+    include_final_snapshot: bool,
+) -> None:
+    change: dict[str, object] = {
+        "resourceId": _KEY_VAULT_ID,
+        "changeType": "Create",
+        "delta": [
+            {
+                "path": f"properties.{field_name}",
+                "propertyChangeType": "Modify",
+                "before": True,
+                "after": True,
+            },
+            {
+                "path": "properties.publicNetworkAccess",
+                "propertyChangeType": "Modify",
+                "after": "Disabled",
+            },
+            {
+                "path": "properties.networkAcls.defaultAction",
+                "propertyChangeType": "Modify",
+                "after": "Deny",
+            },
+        ],
+    }
+    if include_final_snapshot:
+        change["after"] = _resource_snapshot(
+            _KEY_VAULT_ID,
+            properties={
+                "publicNetworkAccess": "Disabled",
+                "networkAcls": {"defaultAction": "Deny"},
+                field_name: False,
+            },
+        )
+
+    violations = _evaluate_attested_what_if(
+        _what_if(change),
+        allowed_change_ids=frozenset({_KEY_VAULT_ID}),
+    )
+
+    assert "authorization-change-unsupported" in {violation.code for violation in violations}
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "enabledForDeployment",
+        "enabledForDiskEncryption",
+        "enabledForTemplateDeployment",
+    ],
+)
+def test_attested_key_vault_modify_rejects_true_delta_observation(
+    field_name: str,
+) -> None:
+    violations = _evaluate_attested_what_if(
+        _what_if(
+            {
+                "resourceId": _KEY_VAULT_ID,
+                "changeType": "Modify",
+                "delta": [
+                    {
+                        "path": f"properties.{field_name}",
+                        "propertyChangeType": "Modify",
+                        "before": True,
+                        "after": True,
+                    },
+                    {
+                        "path": "tags.release",
+                        "propertyChangeType": "Modify",
+                        "after": "wc029",
+                    },
+                ],
+            }
+        ),
+        allowed_change_ids=frozenset({_KEY_VAULT_ID}),
+    )
+
+    assert "authorization-change-unsupported" in {violation.code for violation in violations}
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "enabledForDeployment",
+        "enabledForDiskEncryption",
+        "enabledForTemplateDeployment",
+    ],
+)
+def test_attested_key_vault_modify_rejects_true_noeffect_observation(
+    field_name: str,
+) -> None:
+    safe_properties: dict[str, object] = {
+        "publicNetworkAccess": "Disabled",
+        "networkAcls": {"defaultAction": "Deny"},
+        field_name: True,
+    }
+    before = _resource_snapshot(
+        _KEY_VAULT_ID,
+        properties=copy.deepcopy(safe_properties),
+        tags={"release": "before"},
+    )
+    after = copy.deepcopy(before)
+    after["tags"] = {"release": "after"}
+    violations = _evaluate_attested_what_if(
+        _what_if(
+            {
+                "resourceId": _KEY_VAULT_ID,
+                "changeType": "Modify",
+                "before": before,
+                "after": after,
+                "delta": [
+                    {
+                        "path": f"properties.{field_name}",
+                        "propertyChangeType": "NoEffect",
+                        "before": True,
+                        "after": True,
+                    }
+                ],
+            }
+        ),
+        allowed_change_ids=frozenset({_KEY_VAULT_ID}),
+    )
+
+    assert "authorization-change-unsupported" in {violation.code for violation in violations}
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "enabledForDeployment",
+        "enabledForDiskEncryption",
+        "enabledForTemplateDeployment",
+    ],
+)
+@pytest.mark.parametrize("property_change_type", ["Modify", "NoEffect"])
+def test_attested_key_vault_modify_allows_false_noop_observation(
+    field_name: str,
+    property_change_type: str,
+) -> None:
+    safe_properties: dict[str, object] = {
+        "publicNetworkAccess": "Disabled",
+        "networkAcls": {"defaultAction": "Deny"},
+        field_name: False,
+    }
+    before = _resource_snapshot(
+        _KEY_VAULT_ID,
+        properties=copy.deepcopy(safe_properties),
+        tags={"release": "before"},
+    )
+    after = copy.deepcopy(before)
+    after["tags"] = {"release": "after"}
+
+    assert (
+        _evaluate_attested_what_if(
+            _what_if(
+                {
+                    "resourceId": _KEY_VAULT_ID,
+                    "changeType": "Modify",
+                    "before": before,
+                    "after": after,
+                    "delta": [
+                        {
+                            "path": f"properties.{field_name}",
+                            "propertyChangeType": property_change_type,
+                            "before": False,
+                            "after": False,
+                        }
+                    ],
+                }
+            ),
+            allowed_change_ids=frozenset({_KEY_VAULT_ID}),
+        )
+        == ()
+    )
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "enabledForDeployment",
+        "enabledForDiskEncryption",
+        "enabledForTemplateDeployment",
+    ],
+)
+def test_attested_key_vault_exact_false_does_not_mask_ambiguous_ancestor_observation(
+    field_name: str,
+) -> None:
+    other_deployment_access = {
+        other_field: False
+        for other_field in (
+            "enabledForDeployment",
+            "enabledForDiskEncryption",
+            "enabledForTemplateDeployment",
+        )
+        if other_field != field_name
+    }
+    observed_properties: dict[str, object] = {
+        "publicNetworkAccess": "Disabled",
+        "networkAcls": {"defaultAction": "Deny"},
+        **other_deployment_access,
+    }
+    violations = _evaluate_attested_what_if(
+        _what_if(
+            {
+                "resourceId": _KEY_VAULT_ID,
+                "changeType": "Modify",
+                "delta": [
+                    {
+                        "path": f"properties.{field_name}",
+                        "propertyChangeType": "Modify",
+                        "before": False,
+                        "after": False,
+                    },
+                    {
+                        "path": "properties",
+                        "propertyChangeType": "Modify",
+                        "before": copy.deepcopy(observed_properties),
+                        "after": copy.deepcopy(observed_properties),
+                    },
+                    {
+                        "path": "tags.release",
+                        "propertyChangeType": "Modify",
+                        "after": "wc029",
+                    },
+                ],
+            }
+        ),
+        allowed_change_ids=frozenset({_KEY_VAULT_ID}),
+    )
+
+    assert "authorization-change-unsupported" in {violation.code for violation in violations}
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "enabledForDeployment",
+        "enabledForDiskEncryption",
+        "enabledForTemplateDeployment",
+    ],
+)
+def test_attested_key_vault_false_observation_rejects_one_sided_snapshot_omission(
+    field_name: str,
+) -> None:
+    violations = _evaluate_attested_what_if(
+        _what_if(
+            {
+                "resourceId": _KEY_VAULT_ID,
+                "changeType": "Modify",
+                "after": _resource_snapshot(
+                    _KEY_VAULT_ID,
+                    properties={
+                        "publicNetworkAccess": "Disabled",
+                        "networkAcls": {"defaultAction": "Deny"},
+                    },
+                    tags={"release": "after"},
+                ),
+                "delta": [
+                    {
+                        "path": f"properties.{field_name}",
+                        "propertyChangeType": "Modify",
+                        "before": False,
+                        "after": False,
+                    },
+                    {
+                        "path": "tags.release",
+                        "propertyChangeType": "Modify",
+                        "after": "after",
+                    },
+                ],
+            }
+        ),
+        allowed_change_ids=frozenset({_KEY_VAULT_ID}),
+    )
+
+    assert "authorization-change-unsupported" in {violation.code for violation in violations}
 
 
 def test_what_if_allows_unchanged_key_vault_authorization_mode() -> None:
@@ -6787,6 +7371,266 @@ def test_guarded_rbac_deduplicates_matching_rule_violations() -> None:
     )
 
     assert [item.code for item in violations] == ["identity-separation"]
+
+
+def test_guarded_rbac_bounds_400_assignments_against_256_matching_rules(
+    monkeypatch,
+) -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignment_count = 400
+    rule_count = 256
+    assignments = [
+        _guarded_assignment(
+            principal_id=principal_id,
+            role_name="AcrPull",
+            scope=_RG_SCOPE,
+            condition=f"synthetic-condition-{index:03d}",
+            condition_version="2.0",
+        )
+        for index in range(assignment_count)
+    ]
+    policy = _production_policy(
+        principal_id,
+        expected_assignments=assignments,
+    )
+    policy["separationRules"] = [
+        {
+            "principalId": principal_id,
+            "forbiddenRoleNames": ["AcrPull"],
+            "forbiddenRoleDefinitionIds": [
+                _TEST_ROLE_IDS["acrpull"],
+            ],
+            "forbiddenScopePrefixes": [
+                (f"{_RG_SCOPE}/providers/Microsoft.Storage/storageAccounts/synthetic{index:03d}")
+            ],
+        }
+        for index in range(rule_count)
+    ]
+    original_scope_match = wc029_preflight_module._separation_scope_matches
+    scope_evaluations = 0
+
+    def counted_scope_match(
+        assignment_scope: str,
+        forbidden_scope_prefix: str,
+        *,
+        collection: object,
+    ) -> bool:
+        nonlocal scope_evaluations
+        scope_evaluations += 1
+        return original_scope_match(
+            assignment_scope,
+            forbidden_scope_prefix,
+            collection=collection,
+        )
+
+    monkeypatch.setattr(
+        wc029_preflight_module,
+        "_separation_scope_matches",
+        counted_scope_match,
+    )
+
+    violations = _evaluate_guarded_rbac(
+        _guarded_evidence(assignments),
+        policy,
+    )
+
+    assert [item.code for item in violations] == ["identity-separation"]
+    assert scope_evaluations == assignment_count
+
+
+def test_rbac_violation_cap_stops_generation_before_remaining_assignments(
+    monkeypatch,
+) -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignments = [
+        _assignment(
+            principal_id=principal_id,
+            role_name="AcrPull",
+            role_id=_TEST_ROLE_IDS["acrpull"],
+            scope=(f"{_RG_SCOPE}/providers/Microsoft.Storage/storageAccounts/synthetic{index:03d}"),
+        )
+        for index in range(400)
+    ]
+    policy = {
+        "separationRules": [
+            {
+                "principalId": principal_id,
+                "forbiddenRoleNames": ["AcrPull"],
+                "forbiddenRoleDefinitionIds": [
+                    _TEST_ROLE_IDS["acrpull"],
+                ],
+                "forbiddenScopePrefixes": [_RG_SCOPE],
+            }
+        ]
+    }
+    original_scope_match = wc029_preflight_module._separation_scope_matches
+    scope_evaluations = 0
+
+    def counted_scope_match(
+        assignment_scope: str,
+        forbidden_scope_prefix: str,
+        *,
+        collection: object,
+    ) -> bool:
+        nonlocal scope_evaluations
+        scope_evaluations += 1
+        return original_scope_match(
+            assignment_scope,
+            forbidden_scope_prefix,
+            collection=collection,
+        )
+
+    monkeypatch.setattr(
+        wc029_preflight_module,
+        "_separation_scope_matches",
+        counted_scope_match,
+    )
+
+    with pytest.raises(
+        PreflightInputError,
+        match="violation count exceeds 256",
+    ):
+        evaluate_role_assignments(
+            assignments,
+            policy_document=policy,
+        )
+
+    assert scope_evaluations == 257
+
+
+def test_rbac_separation_rule_work_budget_fails_closed(
+    monkeypatch,
+) -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignment = _assignment(
+        principal_id=principal_id,
+        role_name="AcrPull",
+        role_id=_TEST_ROLE_IDS["acrpull"],
+        scope=_RG_SCOPE,
+    )
+    policy = {
+        "separationRules": [
+            {
+                "principalId": principal_id,
+                "forbiddenRoleNames": ["AcrPull"],
+                "forbiddenRoleDefinitionIds": [
+                    _TEST_ROLE_IDS["acrpull"],
+                ],
+                "forbiddenScopePrefixes": [
+                    f"/subscriptions/{index:08x}-0000-0000-0000-000000000000"
+                ],
+            }
+            for index in range(1, 6)
+        ]
+    }
+    monkeypatch.setattr(
+        wc029_preflight_module,
+        "MAX_SEPARATION_RULE_WORK",
+        25,
+    )
+
+    with pytest.raises(
+        PreflightInputError,
+        match="identity-separation rule evaluation exceeds its deterministic work budget",
+    ):
+        evaluate_role_assignments(
+            [assignment],
+            policy_document=policy,
+        )
+
+
+def test_rbac_scope_prefix_minimization_is_linear_and_budgeted(
+    monkeypatch,
+) -> None:
+    prefixes = [
+        (f"{_RG_SCOPE}/providers/Microsoft.Storage/storageAccounts/synthetic{index:03d}")
+        for index in range(512)
+    ]
+    original_scope_contains = wc029_preflight_module._scope_contains
+    containment_checks = 0
+
+    def counted_scope_contains(ancestor: str, descendant: str) -> bool:
+        nonlocal containment_checks
+        containment_checks += 1
+        return original_scope_contains(ancestor, descendant)
+
+    monkeypatch.setattr(
+        wc029_preflight_module,
+        "_scope_contains",
+        counted_scope_contains,
+    )
+    budget = wc029_preflight_module._SeparationRuleWorkBudget()
+
+    minimal = wc029_preflight_module._minimal_scope_prefixes(
+        prefixes,
+        budget=budget,
+    )
+
+    assert minimal == tuple(prefixes)
+    assert containment_checks == len(prefixes) - 1
+    expected_token_work = sum(1 + len(prefix.strip("/").split("/")) for prefix in prefixes)
+    assert budget.work == expected_token_work + len(prefixes) - 1
+
+
+def test_rbac_scope_prefix_minimization_handles_interleaved_sibling_names() -> None:
+    ancestor = f"{_SUBSCRIPTION_SCOPE}/resourceGroups/rg".lower()
+    sibling = f"{_SUBSCRIPTION_SCOPE}/resourceGroups/rg-archive".lower()
+    descendant = f"{ancestor}/providers/Microsoft.Storage/storageAccounts/synthetic".lower()
+    budget = wc029_preflight_module._SeparationRuleWorkBudget()
+
+    assert wc029_preflight_module._minimal_scope_prefixes(
+        [ancestor, sibling, descendant],
+        budget=budget,
+    ) == (
+        ancestor,
+        sibling,
+    )
+
+
+def test_rbac_rejects_equivalent_rules_with_interleaved_redundant_descendant() -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignment = _assignment(
+        principal_id=principal_id,
+        role_name="AcrPull",
+        role_id=_TEST_ROLE_IDS["acrpull"],
+        scope=_RG_SCOPE,
+    )
+    ancestor = f"{_SUBSCRIPTION_SCOPE}/resourceGroups/rg"
+    sibling = f"{_SUBSCRIPTION_SCOPE}/resourceGroups/rg-archive"
+    descendant = f"{ancestor}/providers/Microsoft.Storage/storageAccounts/synthetic"
+    policy = {
+        "separationRules": [
+            {
+                "principalId": principal_id,
+                "forbiddenRoleNames": ["AcrPull"],
+                "forbiddenRoleDefinitionIds": [
+                    _TEST_ROLE_IDS["acrpull"],
+                ],
+                "forbiddenScopePrefixes": [ancestor, sibling],
+            },
+            {
+                "principalId": principal_id,
+                "forbiddenRoleNames": ["AcrPull"],
+                "forbiddenRoleDefinitionIds": [
+                    _TEST_ROLE_IDS["acrpull"],
+                ],
+                "forbiddenScopePrefixes": [
+                    ancestor,
+                    sibling,
+                    descendant,
+                ],
+            },
+        ]
+    }
+
+    with pytest.raises(
+        PreflightInputError,
+        match="equivalent duplicate rule",
+    ):
+        evaluate_role_assignments(
+            [assignment],
+            policy_document=policy,
+        )
 
 
 def test_guarded_rbac_rejects_flat_or_self_asserted_inventory() -> None:

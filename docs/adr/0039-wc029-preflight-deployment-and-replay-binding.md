@@ -100,9 +100,13 @@ Use the following guarded preflight contract:
    `Microsoft.Resources/deploymentScripts` remain blocked until their post-deployment effects are
    fully evaluated. Every Create, Modify, or Delete of `Microsoft.Resources/deploymentStacks` and
    `Microsoft.Storage/storageAccounts/localUsers` also blocks until stack deny/delete behavior and
-   local-user SSH/password/permission effects are evaluated. Key Vault changes that enable
-   `enabledForTemplateDeployment`, `enabledForDeployment`, or `enabledForDiskEncryption` block;
-   exact boolean `false` remains an accepted tightening.
+   local-user SSH/password/permission effects are evaluated. A Key Vault change to
+   `enabledForTemplateDeployment`, `enabledForDeployment`, or `enabledForDiskEncryption` is
+   accepted only when the exact final value is proven as boolean `false`. Delete/Remove, absent
+   final values, descendant-only evidence, non-boolean values, and partial or conflicting
+   snapshots or overlapping delta observations remain unsupported authorization changes. Every
+   exact, ancestor, or descendant observation must independently resolve the property to `false`;
+   one exact observation cannot mask an omission in another.
 9. Paged evidence uses endpoint-exact fields and cursors. ARM pages require literal `nextLink` and
    exactly one non-empty `$skipToken` on continuation URLs. Graph pages require literal
    `@odata.nextLink` and exactly one non-empty `$skiptoken`; `$skip` is not accepted. Cross-endpoint
@@ -150,6 +154,11 @@ Use the following guarded preflight contract:
     `Microsoft.Resources/resourceGroups`. Its Create, Modify, and NoChange rows undergo the same
     manifest boundary, subscription, snapshot identity/type, allowlist, meaningful-delta, and
     deletion controls as provider resource IDs.
+21. Separation rules are indexed by effective principal and role. Rule-token and scope-match work
+    consumes one deterministic evaluation budget; an assignment stops after its first identical
+    identity-separation finding. Unique violations are deduplicated and checked against the
+    256-finding limit as they are generated, before assignment-by-rule amplification. Scope-prefix
+    minimization is a segment-sorted linear containment pass rather than an all-pairs scan.
 
 The pure evaluators remain free of storage I/O. One-time consumption belongs to the production CLI
 boundary after parsing, policy evaluation, and bounded rendering succeed but before success or
