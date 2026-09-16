@@ -1808,7 +1808,7 @@ def _validated_azure_client_contract(
         raise TypeError("Azure acquisition client requires an exact collector contract")
     if reviewed_contract.schema_version != MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION:
         raise MonitoringAcquisitionError(
-            "Azure acquisition client requires collector contract schema v7"
+            "Azure acquisition client requires collector contract schema v8"
         )
     return reviewed_contract
 
@@ -2150,7 +2150,10 @@ class AzureLogAnalyticsAcquisitionClient(_AzureAcquisitionClientBase):
         allowed_targets = {
             *(
                 item.casefold().rstrip("/")
-                for item in self._reviewed_contract.signal_read_scope_ids
+                for item in cast(
+                    tuple[str, ...],
+                    self._reviewed_contract.resource_log_read_scope_ids,
+                )
             ),
         }
         table_plans: dict[str, str] = {
@@ -3200,7 +3203,7 @@ class AzureMonitoringAdapter:
             != MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION
         ):
             raise MonitoringAcquisitionError(
-                "Azure monitoring acquisition requires collector contract schema v7"
+                "Azure monitoring acquisition requires collector contract schema v8"
             )
         self._credential = ManagedIdentityCredential(
             client_id=self._reviewed_contract.collector_identity_client_id
@@ -3521,6 +3524,17 @@ def _required_control_authority_scope(
         if control_requires_io:
             required_resources.update(_canonical_resource_id(item) for item in control_resources)
     return tuple(sorted(required_sources)), tuple(sorted(required_resources))
+
+
+def compute_monitoring_acquisition_authority_scope(
+    controls: tuple[PublishedMonitoringIntentControl, ...],
+    contract: MonitoringCollectorContract,
+) -> tuple[tuple[AcquisitionSource, ...], tuple[str, ...]]:
+    """Compute the exact source and resource boundary before production trust I/O."""
+
+    if type(contract) is not MonitoringCollectorContract:
+        raise TypeError("authority scope requires an exact monitoring collector contract")
+    return _required_control_authority_scope(controls, contract)
 
 
 def _control_binding_matches(
@@ -4126,6 +4140,7 @@ class MonitoringAcquisitionCoordinator:
         issued_at: datetime,
         trusted_as_of: datetime,
         expires_at: datetime,
+        stabilize_correlation_window: bool = False,
     ) -> MonitoringAcquisitionOutcome:
         if type(monitoring_intent) is not PublishedMonitoringIntent:
             raise TypeError("acquisition requires an exact PublishedMonitoringIntent")
@@ -4240,6 +4255,12 @@ class MonitoringAcquisitionCoordinator:
                 "effective RBAC inventory expired before Azure source I/O"
             )
         collected_at = identity_proof.verified_at
+        if stabilize_correlation_window:
+            trust_delay = trusted_as_of - issued_at
+            request_lifetime = expires_at - issued_at
+            issued_at = collected_at
+            trusted_as_of = collected_at + trust_delay
+            expires_at = collected_at + request_lifetime
         if (
             issued_at.utcoffset() != UTC.utcoffset(issued_at)
             or trusted_as_of.utcoffset() != UTC.utcoffset(trusted_as_of)
@@ -5564,5 +5585,6 @@ __all__ = [
     "ResourceHealthRow",
     "TrafficAnalyticsRow",
     "VmConnectionRow",
+    "compute_monitoring_acquisition_authority_scope",
     "compute_monitoring_acquisition_control_selection_digest",
 ]

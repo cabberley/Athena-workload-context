@@ -38,6 +38,11 @@ from athena_context.live_acceptance import (
     run_wc013_live_acceptance,
     wc013_configuration_template,
 )
+from athena_context.monitoring_acquisition_runtime import (
+    MonitoringAcquisitionJobError,
+    load_wc028_monitoring_acquisition_job_configuration,
+    run_wc028_monitoring_acquisition_job,
+)
 from athena_context.operational_demo_operator import (
     OperationalDemoOperatorError,
     PhaseJobPort,
@@ -397,6 +402,13 @@ def build_parser() -> argparse.ArgumentParser:
         choices=range(1, 16),
         default=10,
     )
+    monitoring_acquisition_parser = subparsers.add_parser(
+        "wc028-monitoring-acquisition-job",
+        help="acquire, normalize, attest, and immutably persist reviewed WC-028 evidence",
+    )
+    monitoring_acquisition_parser.add_argument("--config", type=Path)
+    monitoring_acquisition_parser.add_argument("--config-json")
+    monitoring_acquisition_parser.add_argument("--config-digest")
     return parser
 
 
@@ -957,6 +969,34 @@ def main(
                 f"WC-025 change history query processed {history_count} change record(s)\n"
             )
             return 0
+        if args.command == "wc028-monitoring-acquisition-job":
+            configuration_json = (
+                args.config_json
+                or os.environ.get(
+                    "ATHENA_WC028_MONITORING_ACQUISITION_CONFIG_JSON"
+                )
+            )
+            monitoring_acquisition_configuration = (
+                load_wc028_monitoring_acquisition_job_configuration(
+                    path=args.config,
+                    environment_json=configuration_json,
+                    expected_digest=(
+                        args.config_digest
+                        or os.environ.get(
+                            "ATHENA_WC028_MONITORING_ACQUISITION_CONFIG_DIGEST"
+                        )
+                    ),
+                )
+            )
+            outcome = run_wc028_monitoring_acquisition_job(
+                configuration=monitoring_acquisition_configuration
+            )
+            output.write(
+                "WC-028 monitoring acquisition committed "
+                f"{outcome.committed.monitoring_handoff.collection_id}; "
+                f"correlation request {outcome.correlation_request.request_id}\n"
+            )
+            return 0
     except Wc013LiveAcceptanceError as exc:
         errors.write(f"WC-013 live acceptance failed: {exc}\n")
         return 1
@@ -986,6 +1026,9 @@ def main(
     except ChangeIngestionError as exc:
         errors.write(f"{args.command} failed: {exc}\n")
         return 1
+    except MonitoringAcquisitionJobError as exc:
+        errors.write(f"wc028-monitoring-acquisition-job failed: {exc}\n")
+        return 1
     except ValueError as exc:
         if args.command in {
             "wc016-signal-detector",
@@ -995,6 +1038,7 @@ def main(
             "wc025-change-event-ingester",
             "wc025-change-dead-letter-purge",
             "wc025-change-history-query",
+            "wc028-monitoring-acquisition-job",
         }:
             errors.write(f"{args.command} failed: {exc}\n")
             return 1

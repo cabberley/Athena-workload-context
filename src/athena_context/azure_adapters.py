@@ -268,6 +268,12 @@ class KeyVaultRsaPublicKeyVerifier:
             raise ValueError("Key Vault verification key fingerprint does not match")
         self._public_key = public_key
 
+    @property
+    def public_key(self) -> rsa.RSAPublicKey:
+        """Return the fingerprint-verified public key for a pinned trust record."""
+
+        return self._public_key
+
     def verify_preimage(
         self,
         canonical_preimage: bytes,
