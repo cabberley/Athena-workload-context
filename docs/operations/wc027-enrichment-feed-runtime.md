@@ -144,7 +144,7 @@ public material, EC keys, version drift, wrong fingerprints, or extra/missing ke
 before readiness.
 
 The guidance-authority storage account must have Blob versioning enabled. Each reviewed
-`athena.wc029DeploymentPlan.v6` records a digest-chained authority checkpoint. One
+`athena.wc029DeploymentPlan.v7` records a digest-chained authority checkpoint. One
 version-inclusive listing supplies exact case-sensitive names, version IDs, ETags, and lengths.
 Every newly observed exact version is downloaded, SHA-256 hashed, and validated as the canonical
 published authority or binding contract. Prior versions and digests must remain byte-identical;
@@ -320,21 +320,24 @@ producer/publisher entry point. The publisher must be ready and the WC-016 runti
   already-created publisher sender assignment on `wc027-enrichment-feed-requests`. Producer
   verification enumerates the complete direct assignment set at that queue. It accepts only current
   producer assignments, the deterministic current publisher assignment, and up to four exact
-  retired queue assignment/principal pairs explicitly approved with
-  `--rotation-transition-assignment <assignment-id> <retired-principal-id>`. The same reviewed
+  retired queue assignment/principal pairs explicitly approved by
+  `prepare-revocation --rotation-transition-assignment <assignment-id>
+  <retired-principal-id>`. The same reviewed
   transition model covers every other
   deterministic assignment affected by identity rotation, including notification and publisher
-  queues, exact keys, Blob containers, Tables, and ACR. Planning proves every approved retired
-  assignment is present for the exact reviewed retired principal and conforms to an approved
-  role/condition profile; controlled operator revocation then removes the stale grant.
-  Post-deployment readiness rejects that retired principal. When a same-name UAMI recreation
+  queues, exact keys, Blob containers, Tables, and ACR. Phase A proves every approved retired
+  assignment is present for the exact reviewed retired principal and conforms to the exact
+  role/condition profile; controlled operator revocation then removes the stale grant. Phase B
+  generates a fresh final what-if only after proving absence. Apply and post-deployment readiness
+  repeat absence. When a same-name UAMI recreation
   deterministically reuses the assignment ID, it is accepted only for the exact current principal,
   role, scope, type, condition, and custom permissions. The orchestrator performs no automatic RBAC
   deletion and allows no broad publisher exemption.
 - The principal-seeded ACR assignment intentionally has a different GUID from earlier
   resource-ID/name-seeded assignments. Supply every old assignment and its exact principal through
-  `--legacy-acr-pull-migration-assignment`; planning verifies it, an operator revokes it manually,
-  and apply/readiness require it to remain absent before creating or accepting the new assignment.
+  `prepare-revocation --legacy-acr-pull-migration-assignment`; phase A verifies it, an operator
+  revokes it manually, and phase-B planning/apply/readiness require it to remain absent before
+  creating or accepting the new assignment.
 
 Never delete partial immutable assets to retry. They are undiscoverable until the signed feed-v2
 head includes the exact pointer.

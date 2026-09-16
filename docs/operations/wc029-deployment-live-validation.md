@@ -277,16 +277,17 @@ Run the four orchestration stages in order. Use a unique deployment name and a n
 directory for each plan. Review the generated `*.what-if.json` and `*.plan.json` before running
 `apply`; the apply command rejects any changed byte.
 
-The plan schema is `athena.wc029DeploymentPlan.v6`. Every reviewed plan, base/effective parameter
+The final plan schema is `athena.wc029DeploymentPlan.v7`. Every reviewed plan, base/effective parameter
 document, what-if, predecessor handoff, and receipt is read exactly once through the secure
 non-reparse artifact reader. Its immutable raw bytes, parsed document, file identity, and SHA-256
 remain attached to that orchestration invocation; later checks never reopen the reviewed path.
 Every Azure deployment validate, what-if, and create command includes `--no-prompt true`, and the
-subprocess receives no stdin. Before Azure validation, the orchestrator compiles the exact Bicep
-template and requires every non-defaulted parameter. It writes the derived effective bytes once to
-a private, identity-pinned temporary file; validate and what-if use that same file. Apply
-rematerializes the captured reviewed bytes privately, and its repeated what-if and create consume
-that same pinned copy. Identity and bytes are checked before and after each Azure command.
+subprocess receives no stdin. Final planning compiles Bicep exactly once, writes the canonical ARM
+JSON to an immutable `*.template.json` review artifact, and records its path, bytes, identity, and
+SHA-256. Validate and what-if consume one private pinned copy of that ARM JSON plus one private
+pinned effective-parameter copy. Apply captures those reviewed artifacts without reopening Bicep
+and rematerializes the same bytes for its final what-if and create. Post-deployment template export
+must corroborate the reviewed ARM JSON; it is not the first detection of template drift.
 
 For producer, publisher, and live-acceptance stages the plan also records
 `authorityBlobInventory` plus its exact checkpoint SHA-256. Blob service versioning must be enabled.
@@ -318,16 +319,23 @@ incremental mode, reviewed parameters, exported compiled template, outputs, enab
 empty container before issuing the recovery receipt. Deployment and readiness readbacks use eight
 bounded attempts with no delete or unreviewed mutation.
 
-Use `--rotation-transition-assignment <exact-role-assignment-id>
-<exact-retired-principal-id>` for retired-principal assignments. Producer upgrades from the earlier
-signer grants use the distinct
-`--legacy-crypto-user-migration-assignment <exact-role-assignment-id>` option because those
-assignments remain bound to the current signer principals while their role profile changes.
+Identity and role migrations use two separately reviewed phases. Phase A runs
+`prepare-revocation`, verifies each exact stale assignment while it is still present, and emits
+`athena.wc029RevocationPlan.v1` with the full live assignment ID, principal, role, scope, principal
+type, condition, and ACR mode where applicable. The operator independently reviews that artifact
+and performs the manual revocations. Phase B runs `plan` with `--revocation-plan` and
+`--reviewed-revocation-plan-sha256`, verifies every reviewed stale assignment is absent, and only
+then compiles the pinned ARM template and generates a new final what-if. Apply rechecks absence and
+replays only that post-revocation final what-if. A pre-revocation what-if is never reusable.
+
+Supply `--rotation-transition-assignment <exact-role-assignment-id>
+<exact-retired-principal-id>` only to `prepare-revocation`. Producer signer migration uses
+`--legacy-crypto-user-migration-assignment <exact-role-assignment-id>` in the same phase.
 
 Upgrading from an earlier ACR module requires a separate reviewed migration because the corrected
 principal-object-ID seed intentionally produces a new role-assignment GUID. Record each old
-assignment with `--legacy-acr-pull-migration-assignment <old-assignment-id>
-<exact-principal-id>`. Planning requires every listed legacy assignment to be present with its
+assignment to `prepare-revocation` with `--legacy-acr-pull-migration-assignment
+<old-assignment-id> <exact-principal-id>`. Phase A requires every listed legacy assignment to be present with its
 exact ACR scope, `AcrPull` role, service-principal type, and absent condition. A controlled
 operator action must revoke all listed assignments before apply; apply and post-deployment
 readiness require continued absence. This boundary covers the producer, publisher, and all WC-013
@@ -337,7 +345,20 @@ assignments. The orchestrator never deletes them.
 ```powershell
 $Orchestrator = '.\scripts\wc029_deployment_orchestration.py'
 
+# When exact assignments require manual revocation, run phase A first and independently
+# review its digest. Omit these two commands when there is no revocation set.
+python $Orchestrator prepare-revocation --stage <stage> `
+  --deployment-name <deployment> `
+  --parameters <reviewed base parameters> `
+  --evidence-directory <new evidence directory> `
+  --rotation-transition-assignment <assignment ID> <retired principal ID> `
+  <matching predecessor arguments>
+# Manually revoke only the independently reviewed assignments.
+
 python $Orchestrator plan --stage foundation <reviewed foundation arguments>
+# For a two-phase deployment append:
+#   --revocation-plan <reviewed phase-A plan>
+#   --reviewed-revocation-plan-sha256 <independently recorded sha256:...>
 python $Orchestrator apply --plan-manifest <reviewed foundation plan> `
   --reviewed-plan-sha256 <independently recorded sha256:...>
 
@@ -386,8 +407,8 @@ parameter artifact, evidence directory, and explicit `--allow-change` entry for 
 create or modify. WC-027 resource-group stages additionally require
 `--resource-group rg-athena-wc013-live`. Do not treat these abbreviated placeholders as executable
 approval; record the complete reviewed commands and plan-file SHA-256 values separately in the
-evidence bundle. `apply` writes the immutable `athena.wc029DeploymentHandoff.v4` handoff and a separate
-`athena.wc029DeploymentReceipt.v3`, then prints the receipt path. Independently record the receipt
+evidence bundle. `apply` writes the immutable `athena.wc029DeploymentHandoff.v5` handoff and a separate
+`athena.wc029DeploymentReceipt.v4`, then prints the receipt path. Independently record the receipt
 SHA-256 before using it in a later stage. Each later `plan` loads the predecessor receipt, its
 referenced plan, effective parameters, what-if, handoff, and earlier receipt chain; a handoff's
 self-computed hashes alone are never approval evidence. The evidence directory must be outside the
@@ -427,6 +448,13 @@ recreating a same-name UAMI produces a new legal assignment. Each assignment set
 `reference(registry.id, '2025-04-01', 'Full')` and exports that server-returned ID; a constructed
 `existing.id` alone is never treated as runtime evidence.
 
+Foundation and live-acceptance outputs inventory the seven current WC-013/WC-016/presentation ACR
+assignments with exact label, assignment ID, principal, role, mode, scope, type, and null condition.
+The handoff also carries the phase-A `revocationAssignments` records for retired assignments with a
+separate digest. Readiness re-reads every current assignment and each registry mode, enumerates the
+registry scopes, and rejects any extra legacy or mode-compatible pull grant held by a governed
+principal.
+
 Readiness compares the reviewed mode with the live ACR `roleAssignmentMode`.
 `LegacyRegistryPermissions` requires `AcrPull`; `AbacRepositoryPermissions` requires
 `Container Registry Repository Reader` because an ABAC-enabled registry does not honor legacy
@@ -443,15 +471,16 @@ its live principal, queue scope, sender role, principal type, and absent conditi
 The complete set of direct assignments at the dedicated trigger queue must contain only the current
 producer assignments, the current deterministic publisher assignment when present, and at most
 four exact retired queue transition pairs. Record each assignment ID and retired principal ID with
-`--rotation-transition-assignment`; do not overload the what-if `--allow-change` list. The reviewed
-plan carries a bounded maximum of 32 transition assignments across all rotated-identity scopes,
+`prepare-revocation --rotation-transition-assignment`; do not overload the what-if
+`--allow-change` list. The reviewed revocation plan carries a bounded maximum of 32 transition
+assignments across all rotated-identity scopes,
 including notification sender, publisher request receiver, exact Key Vault roles, Blob and Table
-assignments, and ACR pull. Planning requires every approved transition ID to be present, bound to
-the independently reviewed retired service-principal ID, and constrained to an approved exact
-scope/role/condition profile.
-After independent plan review, an operator performs separately approved controlled revocation.
-Post-deployment verification requires the retired principal to be absent before emitting a
-handoff. If deletion and recreation of a same-name UAMI causes ARM's deterministic assignment ID to
+assignments, and ACR pull. Phase A requires every approved transition ID to be present, bound to
+the independently reviewed retired service-principal ID, and constrained to its exact
+scope/role/condition profile. After independent phase-A review, an operator performs controlled
+revocation. The phase-B plan and apply both require absence before their respective final what-if
+and create, and post-deployment verification repeats absence before emitting a handoff. If deletion
+and recreation of a same-name UAMI causes ARM's deterministic assignment ID to
 be reused, the live assignment is accepted only when its principal is the exact current principal
 and its role, scope, principal type, condition, and custom-role permissions exactly match the
 current expected assignment. The stale reviewed retired principal always fails. The orchestrator
@@ -459,11 +488,11 @@ never deletes RBAC automatically. Any stale or unapproved queue assignment, miss
 assignment, malformed transition pair or role, or leaked assignment page fails closed.
 
 The five deterministic legacy Key Vault Crypto User assignments are not classified as retired
-identity transitions. Producer planning carries them in the separately bounded
-`legacyCryptoUserMigrationAssignmentIds` plan field, validates their current signer principals and
+identity transitions. Producer phase-A planning carries them in the separately bounded
+`legacyCryptoUserMigrationAssignmentIds` field, validates their current signer principals and
 exact key scopes, and requires the reviewed set to match the assignments still present. They must
-be manually revoked before create; apply and every later producer dependency check require all
-five IDs to remain absent.
+be manually revoked before phase B; final planning, apply, and every later producer dependency
+check require all five IDs to remain absent.
 
 Legacy ACR pull assignments are likewise tracked separately in the bounded
 `legacyAcrPullMigrationAssignments` plan field with both assignment and principal IDs. They cannot

@@ -28,9 +28,10 @@ REGISTRY_RESOURCE_ID = (
 )
 REGISTRY_ROLE_ASSIGNMENT_MODE = orchestration.ACR_LEGACY_ROLE_ASSIGNMENT_MODE
 SYNTHETIC_COMPILED_TEMPLATE: dict[str, object] = {"parameters": {}}
-SYNTHETIC_COMPILED_TEMPLATE_SHA256 = orchestration._sha256_bytes(
-    orchestration._canonical_json_bytes(SYNTHETIC_COMPILED_TEMPLATE)
+SYNTHETIC_COMPILED_TEMPLATE_BYTES = orchestration._canonical_json_file_bytes(
+    SYNTHETIC_COMPILED_TEMPLATE
 )
+SYNTHETIC_COMPILED_TEMPLATE_SHA256 = orchestration._sha256_bytes(SYNTHETIC_COMPILED_TEMPLATE_BYTES)
 
 
 @pytest.fixture(autouse=True)
@@ -47,6 +48,7 @@ def _stub_required_template_parameter_names(
         "_compiled_template",
         lambda _stage: (
             dict(SYNTHETIC_COMPILED_TEMPLATE),
+            SYNTHETIC_COMPILED_TEMPLATE_BYTES,
             SYNTHETIC_COMPILED_TEMPLATE_SHA256,
         ),
     )
@@ -183,12 +185,8 @@ def _synthetic_image_pull_evidence(
                     if kind == "producer"
                     else PUBLISHER_BROKER_PRINCIPAL_ID
                 ),
-                "registryRoleAssignmentMode": outputs[
-                    "registryRoleAssignmentMode"
-                ],
-                "registryPullRoleDefinitionId": outputs[
-                    "registryPullRoleDefinitionId"
-                ],
+                "registryRoleAssignmentMode": outputs["registryRoleAssignmentMode"],
+                "registryPullRoleDefinitionId": outputs["registryPullRoleDefinitionId"],
                 "registryPullRoleAssignmentResourceId": outputs[
                     "registryPullRoleAssignmentResourceId"
                 ],
@@ -220,6 +218,7 @@ def _write_handoff(
     effective_parameter_sha256: str | None = None,
     authority_inventory: dict[str, object] | None = None,
     image_pull_evidence: dict[str, object] | None = None,
+    revocation_assignments: list[dict[str, object]] | None = None,
 ) -> None:
     bindings = {} if parameter_bindings is None else parameter_bindings
     if stage != "foundation" and authority_inventory is None:
@@ -228,9 +227,8 @@ def _write_handoff(
             previous_checkpoint_sha256=f"sha256:{'d' * 64}",
         )
     if stage in {"producer", "publisher"} and image_pull_evidence is None:
-        image_pull_evidence = _synthetic_image_pull_evidence(
-            (outputs, stage)
-        )
+        image_pull_evidence = _synthetic_image_pull_evidence((outputs, stage))
+    reviewed_revocations = [] if revocation_assignments is None else revocation_assignments
     predecessor_hashes = (
         {
             predecessor: f"sha256:{str(index + 1) * 64}"
@@ -271,15 +269,15 @@ def _write_handoff(
                 "deployedTemplateSha256": SYNTHETIC_COMPILED_TEMPLATE_SHA256,
                 "authorityBlobInventory": authority_inventory,
                 "authorityBlobInventorySha256": (
-                    orchestration._authority_checkpoint_sha256(
-                        authority_inventory
-                    )
+                    orchestration._authority_checkpoint_sha256(authority_inventory)
                 ),
                 "imagePullEvidence": image_pull_evidence,
                 "imagePullEvidenceSha256": (
-                    orchestration._image_pull_evidence_sha256(
-                        image_pull_evidence
-                    )
+                    orchestration._image_pull_evidence_sha256(image_pull_evidence)
+                ),
+                "revocationAssignments": reviewed_revocations,
+                "revocationAssignmentsSha256": (
+                    orchestration._revocation_assignment_evidence_sha256(reviewed_revocations)
                 ),
             }
         ),
@@ -298,6 +296,8 @@ def _write_plan(
     authority_inventory: dict[str, object] | None = None,
 ) -> None:
     resource_group = RUNTIME_RESOURCE_GROUP if stage in {"producer", "publisher"} else None
+    compiled_template_path = path.with_name(f"{stage}.template.json")
+    compiled_template_path.write_bytes(SYNTHETIC_COMPILED_TEMPLATE_BYTES)
     required_checkpoint_sha256s: dict[str, str] = {}
     if stage in {"publisher", "live-acceptance"}:
         predecessor_name = "producer" if stage == "publisher" else "publisher"
@@ -317,6 +317,7 @@ def _write_plan(
         "deploymentName": f"synthetic-{stage}",
         "templatePath": str(orchestration.TEMPLATES[stage].relative_to(ROOT)).replace("\\", "/"),
         "templateSha256": orchestration._sha256_file(orchestration.TEMPLATES[stage]),
+        "compiledTemplatePath": str(compiled_template_path.resolve()),
         "compiledTemplateSha256": SYNTHETIC_COMPILED_TEMPLATE_SHA256,
         "orchestratorSha256": orchestration._sha256_file(Path(orchestration.__file__).resolve()),
         "preflightSha256": orchestration._sha256_file(orchestration.PREFLIGHT_PATH),
@@ -330,6 +331,10 @@ def _write_plan(
         "rotationTransitionAssignments": [],
         "legacyCryptoUserMigrationAssignmentIds": [],
         "legacyAcrPullMigrationAssignments": [],
+        "revocationPlanPath": None,
+        "revocationPlanSha256": None,
+        "reviewedRevocationPlanSha256": None,
+        "revocationAssignments": [],
         "authorityBlobInventory": authority_inventory,
         "authorityBlobInventorySha256": (
             orchestration._authority_checkpoint_sha256(authority_inventory)
@@ -380,24 +385,27 @@ def _write_receipt(
                 "handoffPath": str(handoff_path.resolve()),
                 "handoffSha256": orchestration._sha256_file(handoff_path),
                 "predecessorReceiptSha256s": predecessor_receipt_sha256s,
-                "effectiveParameterSha256": json.loads(
-                    handoff_path.read_text(encoding="utf-8")
-                )["effectiveParameterSha256"],
-                "applicationMode": json.loads(
-                    handoff_path.read_text(encoding="utf-8")
-                )["applicationMode"],
-                "deploymentRecordSha256": json.loads(
-                    handoff_path.read_text(encoding="utf-8")
-                )["deploymentRecordSha256"],
-                "deployedTemplateSha256": json.loads(
-                    handoff_path.read_text(encoding="utf-8")
-                )["deployedTemplateSha256"],
+                "effectiveParameterSha256": json.loads(handoff_path.read_text(encoding="utf-8"))[
+                    "effectiveParameterSha256"
+                ],
+                "applicationMode": json.loads(handoff_path.read_text(encoding="utf-8"))[
+                    "applicationMode"
+                ],
+                "deploymentRecordSha256": json.loads(handoff_path.read_text(encoding="utf-8"))[
+                    "deploymentRecordSha256"
+                ],
+                "deployedTemplateSha256": json.loads(handoff_path.read_text(encoding="utf-8"))[
+                    "deployedTemplateSha256"
+                ],
                 "authorityBlobInventorySha256": json.loads(
                     handoff_path.read_text(encoding="utf-8")
                 )["authorityBlobInventorySha256"],
-                "imagePullEvidenceSha256": json.loads(
-                    handoff_path.read_text(encoding="utf-8")
-                )["imagePullEvidenceSha256"],
+                "imagePullEvidenceSha256": json.loads(handoff_path.read_text(encoding="utf-8"))[
+                    "imagePullEvidenceSha256"
+                ],
+                "revocationAssignmentsSha256": json.loads(handoff_path.read_text(encoding="utf-8"))[
+                    "revocationAssignmentsSha256"
+                ],
             }
         ),
         encoding="utf-8",
@@ -414,6 +422,39 @@ def _write_safe_plan_inputs(tmp_path: Path, stage: str) -> tuple[Path, Path]:
         )
     )
     return parameter_path, what_if_path
+
+
+def _wc013_acr_pull_assignments() -> list[dict[str, object]]:
+    role_definition_id = orchestration._acr_pull_role_definition_id(
+        role_assignment_mode=REGISTRY_ROLE_ASSIGNMENT_MODE,
+        subscription_id=SUBSCRIPTION_ID,
+    )
+    assignments: list[dict[str, object]] = []
+    for index, label in enumerate(
+        orchestration.WC013_ACR_ASSIGNMENT_LABELS,
+        start=1,
+    ):
+        principal_id = f"51515151-{index:04d}-4{index:03d}-8{index:03d}-{index:012d}"
+        assignments.append(
+            {
+                "label": label,
+                "assignmentResourceId": (
+                    orchestration._deterministic_principal_role_assignment_id(
+                        REGISTRY_RESOURCE_ID,
+                        principal_id,
+                        role_definition_id,
+                    )
+                ),
+                "principalId": principal_id,
+                "principalType": "ServicePrincipal",
+                "roleDefinitionId": role_definition_id,
+                "roleAssignmentMode": REGISTRY_ROLE_ASSIGNMENT_MODE,
+                "scope": REGISTRY_RESOURCE_ID,
+                "conditionVersion": None,
+                "condition": None,
+            }
+        )
+    return assignments
 
 
 def _foundation_outputs() -> dict[str, object]:
@@ -450,6 +491,7 @@ def _foundation_outputs() -> dict[str, object]:
         "wc016ServiceBusNamespace": "athena-wc016-events.servicebus.windows.net",
         "incidentSigningKeyUriWithVersion": (f"{key_base}/wc016-incident/{key_version}"),
         "wc016ApprovedConfiguration": {
+            "wc013AcrPullAssignments": _wc013_acr_pull_assignments(),
             "wc027OrchestrationFoundation": {
                 "notificationQueueName": "incident-notification-outbox",
                 "incidentSigningKeyFingerprint": f"sha256:{'1' * 64}",
@@ -467,7 +509,7 @@ def _foundation_outputs() -> dict[str, object]:
                     f"{key_base}/wc027-notification/{key_version}"
                 ),
                 "notificationSigningKeyFingerprint": f"sha256:{'a' * 64}",
-            }
+            },
         },
     }
 
@@ -738,12 +780,10 @@ def _producer_outputs() -> dict[str, object]:
         role_assignment_mode=REGISTRY_ROLE_ASSIGNMENT_MODE,
         subscription_id=SUBSCRIPTION_ID,
     )
-    registry_role_assignment_id = (
-        orchestration._deterministic_principal_role_assignment_id(
-            REGISTRY_RESOURCE_ID,
-            PRODUCER_BROKER_PRINCIPAL_ID,
-            registry_role_definition_id,
-        )
+    registry_role_assignment_id = orchestration._deterministic_principal_role_assignment_id(
+        REGISTRY_RESOURCE_ID,
+        PRODUCER_BROKER_PRINCIPAL_ID,
+        registry_role_definition_id,
     )
     return {
         "producerJobResourceId": (
@@ -938,12 +978,10 @@ def _publisher_outputs(producer: dict[str, object]) -> dict[str, object]:
         role_assignment_mode=REGISTRY_ROLE_ASSIGNMENT_MODE,
         subscription_id=SUBSCRIPTION_ID,
     )
-    registry_role_assignment_id = (
-        orchestration._deterministic_principal_role_assignment_id(
-            REGISTRY_RESOURCE_ID,
-            PUBLISHER_BROKER_PRINCIPAL_ID,
-            registry_role_definition_id,
-        )
+    registry_role_assignment_id = orchestration._deterministic_principal_role_assignment_id(
+        REGISTRY_RESOURCE_ID,
+        PUBLISHER_BROKER_PRINCIPAL_ID,
+        registry_role_definition_id,
     )
     return {
         "publisherJobResourceId": (
@@ -1046,9 +1084,9 @@ def _write_stage_bundle(
         else (
             None
             if stage == "producer"
-            else predecessors[
-                "producer" if stage == "publisher" else "publisher"
-            ]["authorityInventory"]
+            else predecessors["producer" if stage == "publisher" else "publisher"][
+                "authorityInventory"
+            ]
         )
     )
     plan_authority_inventory = (
@@ -1081,9 +1119,7 @@ def _write_stage_bundle(
         else _empty_authority_inventory(
             container_exists=True,
             previous_checkpoint_sha256=(
-                orchestration._authority_checkpoint_sha256(
-                    plan_authority_inventory
-                )
+                orchestration._authority_checkpoint_sha256(plan_authority_inventory)
             ),
         )
     )
@@ -1130,6 +1166,7 @@ def _accepted_readiness_outputs(
 ) -> dict[str, object]:
     return {
         "wc016ApprovedConfiguration": {
+            "wc013AcrPullAssignments": _wc013_acr_pull_assignments(),
             "wc027DeploymentReadiness": {
                 "producer": {
                     "ready": True,
@@ -1148,7 +1185,7 @@ def _accepted_readiness_outputs(
                     ],
                     "bindingEvidenceDigest": publisher["bindingEvidenceDigest"],
                 },
-            }
+            },
         }
     }
 
@@ -1418,6 +1455,7 @@ def test_azure_deployment_commands_are_noninteractive(operation: str) -> None:
         subscription_id=SUBSCRIPTION_ID,
         location="australiaeast",
         resource_group=RUNTIME_RESOURCE_GROUP,
+        template_path=Path("synthetic.template.json"),
         parameter_path=Path("synthetic.parameters.json"),
     )
     no_prompt_index = command.index("--no-prompt")
@@ -1451,15 +1489,12 @@ def test_reviewed_create_uses_one_private_pinned_parameter_copy(
     parameter_path = tmp_path / "reviewed.parameters.json"
     parameter_document = {
         "$schema": (
-            "https://schema.management.azure.com/schemas/"
-            "2019-04-01/deploymentParameters.json#"
+            "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#"
         ),
         "contentVersion": "1.0.0.0",
         "parameters": {"reviewed": {"value": "exact"}},
     }
-    parameter_path.write_bytes(
-        orchestration._canonical_json_file_bytes(parameter_document)
-    )
+    parameter_path.write_bytes(orchestration._canonical_json_file_bytes(parameter_document))
     artifact = orchestration._ArtifactReader().capture_json(
         parameter_path,
         field="reviewed parameters",
@@ -1474,13 +1509,26 @@ def test_reviewed_create_uses_one_private_pinned_parameter_copy(
     )
     reviewed_what_if = {"status": "Succeeded", "properties": {"changes": []}}
     parameter_paths: list[Path] = []
+    template_paths: list[Path] = []
+    compiled_template = {"parameters": {"reviewed": {"type": "string"}}}
+    compiled_template_bytes = orchestration._canonical_json_file_bytes(compiled_template)
+    compiled_template_artifact = orchestration._CapturedJsonArtifact(
+        path=Path("captured.template.json"),
+        raw_bytes=compiled_template_bytes,
+        document=compiled_template,
+        sha256=orchestration._sha256_bytes(compiled_template_bytes),
+        identity=orchestration._FileIdentity(2, 2, len(compiled_template_bytes), 2),
+    )
 
     def run_json(command: object, *, field: str) -> object:
         arguments = list(command)
         pinned_path = Path(arguments[arguments.index("--parameters") + 1])
+        pinned_template_path = Path(arguments[arguments.index("--template-file") + 1])
         parameter_paths.append(pinned_path)
+        template_paths.append(pinned_template_path)
         assert pinned_path != parameter_path
         assert pinned_path.read_bytes() == artifact.raw_bytes
+        assert pinned_template_path.read_bytes() == compiled_template_bytes
         if "what-if" in arguments:
             return reviewed_what_if
         return {
@@ -1511,13 +1559,16 @@ def test_reviewed_create_uses_one_private_pinned_parameter_copy(
         effective_parameter_artifact=artifact,
         effective_parameters={"reviewed": {"value": "exact"}},
         reviewed_what_if=reviewed_what_if,
-        compiled_template={"parameters": {"reviewed": {"type": "string"}}},
-        compiled_template_sha256=f"sha256:{'2' * 64}",
+        compiled_template_artifact=compiled_template_artifact,
+        compiled_template=compiled_template,
+        compiled_template_sha256=compiled_template_artifact.sha256,
     )
     assert outputs == {}
     assert len(parameter_paths) == 2
     assert parameter_paths[0] == parameter_paths[1]
+    assert template_paths[0] == template_paths[1]
     assert not parameter_paths[0].exists()
+    assert not template_paths[0].exists()
 
 
 def test_resume_retries_attestation_without_recreating(
@@ -1553,6 +1604,14 @@ def test_resume_retries_attestation_without_recreating(
         sha256=orchestration._sha256_bytes(b"{}\n"),
         identity=orchestration._FileIdentity(1, 1, 3, 1),
     )
+    compiled_template_bytes = orchestration._canonical_json_file_bytes({"parameters": {}})
+    compiled_template_artifact = orchestration._CapturedJsonArtifact(
+        path=Path("captured.template.json"),
+        raw_bytes=compiled_template_bytes,
+        document={"parameters": {}},
+        sha256=orchestration._sha256_bytes(compiled_template_bytes),
+        identity=orchestration._FileIdentity(2, 2, len(compiled_template_bytes), 2),
+    )
 
     outputs, _, _ = orchestration._execute_reviewed_deployment(
         resume_succeeded_deployment=True,
@@ -1564,8 +1623,9 @@ def test_resume_retries_attestation_without_recreating(
         effective_parameter_artifact=artifact,
         effective_parameters={},
         reviewed_what_if={},
+        compiled_template_artifact=compiled_template_artifact,
         compiled_template={"parameters": {}},
-        compiled_template_sha256=f"sha256:{'4' * 64}",
+        compiled_template_sha256=compiled_template_artifact.sha256,
     )
     assert outputs == {}
     assert attempts == 3
@@ -1586,7 +1646,7 @@ def test_succeeded_deployment_attestation_binds_template_and_parameters(
         "resources": [],
     }
     compiled_digest = orchestration._sha256_bytes(
-        orchestration._canonical_json_bytes(compiled_template)
+        orchestration._canonical_json_file_bytes(compiled_template)
     )
     recorded_value = "exact"
 
@@ -1659,6 +1719,169 @@ def test_resume_is_limited_to_fresh_producer_bootstrap() -> None:
             },
             trusted_prior_inventory=None,
         )
+
+
+def test_transition_arguments_are_phase_a_only() -> None:
+    parser = orchestration._parser()
+    common = [
+        "--stage",
+        "foundation",
+        "--subscription",
+        SUBSCRIPTION_ID,
+        "--deployment-name",
+        "synthetic",
+        "--parameters",
+        "parameters.json",
+        "--evidence-directory",
+        "evidence",
+    ]
+    assignment_id = (
+        f"{REGISTRY_RESOURCE_ID}/providers/Microsoft.Authorization/roleAssignments/"
+        "61616161-1111-4111-8111-111111111111"
+    )
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "plan",
+                *common,
+                "--location",
+                "australiaeast",
+                "--rotation-transition-assignment",
+                assignment_id,
+                PRODUCER_BROKER_PRINCIPAL_ID,
+            ]
+        )
+    revocation = parser.parse_args(
+        [
+            "prepare-revocation",
+            *common,
+            "--rotation-transition-assignment",
+            assignment_id,
+            PRODUCER_BROKER_PRINCIPAL_ID,
+        ]
+    )
+    assert revocation.command == "prepare-revocation"
+    final = parser.parse_args(
+        [
+            "plan",
+            *common,
+            "--location",
+            "australiaeast",
+            "--revocation-plan",
+            "revocation.plan.json",
+            "--reviewed-revocation-plan-sha256",
+            f"sha256:{'1' * 64}",
+        ]
+    )
+    assert final.revocation_plan == Path("revocation.plan.json")
+
+
+def test_reviewed_revocation_plan_binds_phase_a_to_final_inputs(
+    tmp_path: Path,
+) -> None:
+    base_path = tmp_path / "base.parameters.json"
+    effective_path = tmp_path / "revocation.parameters.json"
+    _write_parameters(base_path, {})
+    _write_parameters(effective_path, {})
+    principal_id = PRODUCER_BROKER_PRINCIPAL_ID
+    role_definition_id = orchestration._acr_pull_role_definition_id(
+        role_assignment_mode=REGISTRY_ROLE_ASSIGNMENT_MODE,
+        subscription_id=SUBSCRIPTION_ID,
+    )
+    assignment_id = (
+        f"{REGISTRY_RESOURCE_ID}/providers/Microsoft.Authorization/roleAssignments/"
+        "62626262-2222-4222-8222-222222222222"
+    )
+    revocation_plan = {
+        "schemaVersion": orchestration.REVOCATION_PLAN_SCHEMA_VERSION,
+        "stage": "foundation",
+        "sourceCommit": orchestration.SOURCE_COMMIT,
+        "subscriptionId": SUBSCRIPTION_ID,
+        "resourceGroup": None,
+        "deploymentName": "synthetic",
+        "baseParameterPath": str(base_path.resolve()),
+        "baseParameterSha256": orchestration._sha256_file(base_path),
+        "effectiveParameterPath": str(effective_path.resolve()),
+        "effectiveParameterSha256": orchestration._sha256_file(effective_path),
+        "foundationHandoffPath": None,
+        "foundationHandoffSha256": None,
+        "producerHandoffPath": None,
+        "producerHandoffSha256": None,
+        "publisherHandoffPath": None,
+        "publisherHandoffSha256": None,
+        "predecessorReceipts": {},
+        "rotationTransitionAssignments": [_rotation_transition(assignment_id, principal_id)],
+        "legacyCryptoUserMigrationAssignmentIds": [],
+        "legacyAcrPullMigrationAssignments": [],
+        "revocationAssignments": [
+            {
+                "assignmentResourceId": assignment_id,
+                "principalId": principal_id,
+                "principalType": "ServicePrincipal",
+                "roleDefinitionId": role_definition_id,
+                "scope": REGISTRY_RESOURCE_ID,
+                "conditionVersion": None,
+                "condition": None,
+                "registryRoleAssignmentMode": REGISTRY_ROLE_ASSIGNMENT_MODE,
+            }
+        ],
+    }
+    plan_path = tmp_path / "foundation.revocation.plan.json"
+    plan_path.write_bytes(orchestration._canonical_json_file_bytes(revocation_plan))
+    reader = orchestration._ArtifactReader()
+    record = orchestration._load_revocation_plan(
+        plan_path,
+        reviewed_sha256=orchestration._sha256_file(plan_path),
+        artifact_reader=reader,
+    )
+    base_artifact = reader.capture_json(
+        base_path,
+        field="base parameters",
+    )
+    orchestration._verify_revocation_plan_binding(
+        record,
+        stage="foundation",
+        subscription_id=SUBSCRIPTION_ID,
+        resource_group=None,
+        deployment_name="synthetic",
+        base_parameter_artifact=base_artifact,
+        effective_parameters={},
+        verified_predecessors={},
+    )
+    with pytest.raises(orchestration.OrchestrationError, match="final deployment scope"):
+        orchestration._verify_revocation_plan_binding(
+            record,
+            stage="foundation",
+            subscription_id=SUBSCRIPTION_ID,
+            resource_group=None,
+            deployment_name="different",
+            base_parameter_artifact=base_artifact,
+            effective_parameters={},
+            verified_predecessors={},
+        )
+
+    raced_plan = json.loads(json.dumps(revocation_plan))
+    raced_plan["revocationAssignments"][0]["principalId"] = "62626262-9999-4999-8999-999999999999"
+    raced_path = tmp_path / "raced.revocation.plan.json"
+    raced_path.write_bytes(orchestration._canonical_json_file_bytes(raced_plan))
+    with pytest.raises(
+        orchestration.OrchestrationError,
+        match="reviewed retired principal",
+    ):
+        orchestration._load_revocation_plan(
+            raced_path,
+            reviewed_sha256=orchestration._sha256_file(raced_path),
+            artifact_reader=orchestration._ArtifactReader(),
+        )
+
+
+def test_apply_uses_reviewed_compiled_template_without_reopening_bicep() -> None:
+    source = (ROOT / "scripts" / "wc029_deployment_orchestration.py").read_text(encoding="utf-8")
+    apply_source = source[source.index("def apply(") : source.index("def _parser(")]
+    assert "_compiled_template(" not in apply_source
+    assert "_sha256_file(TEMPLATES[stage])" not in apply_source
+    assert "compiled_template_artifact.raw_bytes" in source
+    assert "template_path=pinned_template.path" in source
 
 
 def test_effective_parameters_require_every_required_template_parameter(
@@ -1923,6 +2146,44 @@ def test_handoff_schema_rejects_unexpected_fields(tmp_path: Path) -> None:
         orchestration._load_handoff(path, expected_stage="foundation")
 
 
+def test_foundation_handoff_carries_current_and_retired_acr_assignments(
+    tmp_path: Path,
+) -> None:
+    current = _wc013_acr_pull_assignments()
+    retired = [
+        {
+            "assignmentResourceId": (
+                f"{REGISTRY_RESOURCE_ID}/providers/"
+                "Microsoft.Authorization/roleAssignments/"
+                "81818181-1111-4111-8111-111111111111"
+            ),
+            "principalId": current[0]["principalId"],
+            "principalType": "ServicePrincipal",
+            "roleDefinitionId": current[0]["roleDefinitionId"],
+            "scope": REGISTRY_RESOURCE_ID,
+            "conditionVersion": None,
+            "condition": None,
+            "registryRoleAssignmentMode": REGISTRY_ROLE_ASSIGNMENT_MODE,
+        }
+    ]
+    path = tmp_path / "foundation.handoff.json"
+    _write_handoff(
+        path,
+        "foundation",
+        _foundation_outputs(),
+        parameter_bindings=_foundation_parameter_bindings({}),
+        revocation_assignments=retired,
+    )
+
+    handoff = orchestration._load_handoff(
+        path,
+        expected_stage="foundation",
+    )
+    outputs = orchestration._foundation_outputs(handoff)
+    assert outputs["wc013AcrPullAssignments"] == current
+    assert handoff["revocationAssignments"] == retired
+
+
 def test_predecessor_requires_exact_plan_and_trusted_receipt(
     tmp_path: Path,
 ) -> None:
@@ -2088,29 +2349,21 @@ def test_authority_checkpoints_chain_through_plan_handoff_and_receipt(
         predecessors={"foundation": foundation, "producer": producer},
     )
 
-    producer_plan = json.loads(
-        Path(str(producer["planPath"])).read_text(encoding="utf-8")
-    )
-    producer_handoff = json.loads(
-        Path(str(producer["handoffPath"])).read_text(encoding="utf-8")
-    )
-    producer_receipt = json.loads(
-        Path(str(producer["receiptPath"])).read_text(encoding="utf-8")
-    )
-    publisher_plan = json.loads(
-        Path(str(publisher["planPath"])).read_text(encoding="utf-8")
-    )
+    producer_plan = json.loads(Path(str(producer["planPath"])).read_text(encoding="utf-8"))
+    producer_handoff = json.loads(Path(str(producer["handoffPath"])).read_text(encoding="utf-8"))
+    producer_receipt = json.loads(Path(str(producer["receiptPath"])).read_text(encoding="utf-8"))
+    publisher_plan = json.loads(Path(str(publisher["planPath"])).read_text(encoding="utf-8"))
     assert producer_handoff["authorityBlobInventory"][
         "previousCheckpointSha256"
-    ] == orchestration._authority_checkpoint_sha256(
-        producer_plan["authorityBlobInventory"]
+    ] == orchestration._authority_checkpoint_sha256(producer_plan["authorityBlobInventory"])
+    assert (
+        producer_receipt["authorityBlobInventorySha256"]
+        == (producer_handoff["authorityBlobInventorySha256"])
     )
-    assert producer_receipt["authorityBlobInventorySha256"] == (
-        producer_handoff["authorityBlobInventorySha256"]
+    assert (
+        publisher_plan["authorityBlobInventory"]["previousCheckpointSha256"]
+        == producer_handoff["authorityBlobInventorySha256"]
     )
-    assert publisher_plan["authorityBlobInventory"][
-        "previousCheckpointSha256"
-    ] == producer_handoff["authorityBlobInventorySha256"]
     assert publisher_plan["requiredAuthorityCheckpointSha256s"] == {
         "producer": producer_handoff["authorityBlobInventorySha256"]
     }
@@ -2253,10 +2506,8 @@ def test_prior_same_stage_receipt_rejects_inventory_for_another_container(
     plan["authorityBlobInventory"]["containerResourceId"] = str(
         plan["authorityBlobInventory"]["containerResourceId"]
     ).replace("athenacorrelation", "athenadecoy")
-    plan["authorityBlobInventorySha256"] = (
-        orchestration._authority_checkpoint_sha256(
-            plan["authorityBlobInventory"]
-        )
+    plan["authorityBlobInventorySha256"] = orchestration._authority_checkpoint_sha256(
+        plan["authorityBlobInventory"]
     )
     plan_path.write_text(json.dumps(plan), encoding="utf-8")
     plan_digest = orchestration._sha256_file(plan_path)
@@ -2264,18 +2515,14 @@ def test_prior_same_stage_receipt_rejects_inventory_for_another_container(
     handoff_path = Path(str(producer["handoffPath"]))
     handoff = json.loads(handoff_path.read_text(encoding="utf-8"))
     handoff["planManifestSha256"] = plan_digest
-    handoff["authorityBlobInventory"]["containerResourceId"] = plan[
-        "authorityBlobInventory"
-    ]["containerResourceId"]
+    handoff["authorityBlobInventory"]["containerResourceId"] = plan["authorityBlobInventory"][
+        "containerResourceId"
+    ]
     handoff["authorityBlobInventory"]["previousCheckpointSha256"] = (
-        orchestration._authority_checkpoint_sha256(
-            plan["authorityBlobInventory"]
-        )
+        orchestration._authority_checkpoint_sha256(plan["authorityBlobInventory"])
     )
-    handoff["authorityBlobInventorySha256"] = (
-        orchestration._authority_checkpoint_sha256(
-            handoff["authorityBlobInventory"]
-        )
+    handoff["authorityBlobInventorySha256"] = orchestration._authority_checkpoint_sha256(
+        handoff["authorityBlobInventory"]
     )
     handoff_path.write_text(json.dumps(handoff), encoding="utf-8")
 
@@ -2284,9 +2531,7 @@ def test_prior_same_stage_receipt_rejects_inventory_for_another_container(
     receipt["planManifestSha256"] = plan_digest
     receipt["reviewedPlanSha256"] = plan_digest
     receipt["handoffSha256"] = orchestration._sha256_file(handoff_path)
-    receipt["authorityBlobInventorySha256"] = handoff[
-        "authorityBlobInventorySha256"
-    ]
+    receipt["authorityBlobInventorySha256"] = handoff["authorityBlobInventorySha256"]
     receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
 
     with pytest.raises(orchestration.OrchestrationError, match="exact handoff output"):
@@ -2333,9 +2578,7 @@ def test_artifact_reader_preserves_first_bytes_across_path_swap(
     assert reused.document == original
     assert reused.raw_bytes == orchestration._canonical_json_file_bytes(original)
     assert (
-        orchestration._ArtifactReader()
-        .capture_json(path, field="replacement artifact")
-        .document
+        orchestration._ArtifactReader().capture_json(path, field="replacement artifact").document
         == replacement
     )
 
@@ -2345,13 +2588,44 @@ def test_private_parameter_materialization_detects_identity_replacement() -> Non
         {"parameters": {"reviewed": {"value": "exact"}}}
     )
 
-    with pytest.raises(
-        orchestration.OrchestrationError,
-        match="changed during Azure execution",
-    ), orchestration._materialized_private_artifact(raw_bytes) as pinned:
+    with (
+        pytest.raises(
+            orchestration.OrchestrationError,
+            match="changed during Azure execution",
+        ),
+        orchestration._materialized_private_artifact(raw_bytes) as pinned,
+    ):
         assert pinned.raw_bytes == raw_bytes
         pinned.path.unlink()
         pinned.path.write_bytes(raw_bytes)
+
+
+def test_compiled_template_write_capture_rejects_replacement_race(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected_document = {"resources": []}
+    expected_bytes = orchestration._canonical_json_file_bytes(expected_document)
+    replacement_bytes = orchestration._canonical_json_file_bytes(
+        {"resources": [{"type": "Synthetic/Replacement"}]}
+    )
+
+    monkeypatch.setattr(
+        orchestration,
+        "_write_new_bytes",
+        lambda path, _raw_bytes: path.write_bytes(replacement_bytes),
+    )
+    with pytest.raises(
+        orchestration.OrchestrationError,
+        match="exact generated bytes",
+    ):
+        orchestration._write_and_capture_exact_json(
+            tmp_path / "compiled.template.json",
+            raw_bytes=expected_bytes,
+            document=expected_document,
+            artifact_reader=orchestration._ArtifactReader(),
+            field="compiled template",
+        )
 
 
 def test_live_acceptance_requires_exact_job_readback() -> None:
@@ -3528,9 +3802,7 @@ def test_broker_identity_rotation_requires_controlled_stale_sender_revocation(
         }
 
     monkeypatch.setattr(orchestration, "_get_resource", get_resource)
-    approved_transitions = [
-        _rotation_transition(retired_sender_id, retired_principal_id)
-    ]
+    approved_transitions = [_rotation_transition(retired_sender_id, retired_principal_id)]
 
     assert (
         orchestration._verify_trigger_queue_assignment_set(
@@ -3614,24 +3886,18 @@ def test_same_name_uami_trigger_assignment_reuse_requires_current_principal(
     verified = orchestration._verify_complete_trigger_queue_assignment_set(
         current_expected_assignments={assignment_id.casefold(): expected},
         required_current_assignment_ids={assignment_id},
-        approved_transitions=[
-            _rotation_transition(assignment_id, retired_principal_id)
-        ],
+        approved_transitions=[_rotation_transition(assignment_id, retired_principal_id)],
         transition_state="absent",
         subscription_id=SUBSCRIPTION_ID,
     )
-    assert verified == {
-        current_principal_id: {assignment_id.casefold()}
-    }
+    assert verified == {current_principal_id: {assignment_id.casefold()}}
 
     live_principal_id = retired_principal_id
     with pytest.raises(orchestration.OrchestrationError, match="retired principal"):
         orchestration._verify_complete_trigger_queue_assignment_set(
             current_expected_assignments={assignment_id.casefold(): expected},
             required_current_assignment_ids={assignment_id},
-            approved_transitions=[
-                _rotation_transition(assignment_id, retired_principal_id)
-            ],
+            approved_transitions=[_rotation_transition(assignment_id, retired_principal_id)],
             transition_state="absent",
             subscription_id=SUBSCRIPTION_ID,
         )
@@ -3734,11 +4000,7 @@ def test_removed_scope_rotation_transition_must_be_absent(
     assignment_present = True
 
     def run_json(command: object, *, field: str) -> object:
-        return (
-            [{"id": assignment_id, "scope": retired_scope}]
-            if assignment_present
-            else []
-        )
+        return [{"id": assignment_id, "scope": retired_scope}] if assignment_present else []
 
     monkeypatch.setattr(orchestration, "_run_json", run_json)
     monkeypatch.setattr(
@@ -3878,9 +4140,7 @@ def test_rotation_transitions_cover_all_deterministic_assignment_domains(
         )
         principal_id = f"98989898-{index:04d}-4{index:03d}-8{index:03d}-{index:012d}"
         transition_ids.add(assignment_id)
-        transition_documents.append(
-            _rotation_transition(assignment_id, principal_id)
-        )
+        transition_documents.append(_rotation_transition(assignment_id, principal_id))
         assignments_by_scope.setdefault(scope.casefold(), []).append(
             {"id": assignment_id, "scope": scope}
         )
@@ -3919,12 +4179,12 @@ def test_rotation_transitions_cover_all_deterministic_assignment_domains(
     }
 
     mismatched_assignment_id = sorted(transition_ids)[0]
-    original_principal_id = resources[mismatched_assignment_id.casefold()][
-        "properties"
-    ]["principalId"]
-    resources[mismatched_assignment_id.casefold()]["properties"][
+    original_principal_id = resources[mismatched_assignment_id.casefold()]["properties"][
         "principalId"
-    ] = "98989898-9999-4999-8999-999999999999"
+    ]
+    resources[mismatched_assignment_id.casefold()]["properties"]["principalId"] = (
+        "98989898-9999-4999-8999-999999999999"
+    )
     with pytest.raises(
         orchestration.OrchestrationError,
         match="reviewed retired principal",
@@ -3935,9 +4195,9 @@ def test_rotation_transitions_cover_all_deterministic_assignment_domains(
             transition_state="present",
             subscription_id=SUBSCRIPTION_ID,
         )
-    resources[mismatched_assignment_id.casefold()]["properties"][
-        "principalId"
-    ] = original_principal_id
+    resources[mismatched_assignment_id.casefold()]["properties"]["principalId"] = (
+        original_principal_id
+    )
 
     transitions_present = False
     orchestration._verify_reviewed_rotation_transitions(
@@ -4186,10 +4446,7 @@ def test_acr_readiness_binds_live_mode_principal_seed_and_server_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     outputs = _producer_outputs()
-    parameters = {
-        name: {"value": value}
-        for name, value in _producer_parameter_bindings().items()
-    }
+    parameters = {name: {"value": value} for name, value in _producer_parameter_bindings().items()}
     live_mode = REGISTRY_ROLE_ASSIGNMENT_MODE
     monkeypatch.setattr(
         orchestration,
@@ -4207,16 +4464,12 @@ def test_acr_readiness_binds_live_mode_principal_seed_and_server_id(
         field="producer",
     )
     assert role_definition_id == outputs["registryPullRoleDefinitionId"]
-    recreated_assignment_id = (
-        orchestration._deterministic_principal_role_assignment_id(
-            REGISTRY_RESOURCE_ID,
-            "10101010-9999-4999-8999-999999999999",
-            role_definition_id,
-        )
+    recreated_assignment_id = orchestration._deterministic_principal_role_assignment_id(
+        REGISTRY_RESOURCE_ID,
+        "10101010-9999-4999-8999-999999999999",
+        role_definition_id,
     )
-    assert recreated_assignment_id != outputs[
-        "registryPullRoleAssignmentResourceId"
-    ]
+    assert recreated_assignment_id != outputs["registryPullRoleAssignmentResourceId"]
 
     live_mode = orchestration.ACR_ABAC_ROLE_ASSIGNMENT_MODE
     with pytest.raises(orchestration.OrchestrationError, match="role-assignment mode"):
@@ -4287,11 +4540,7 @@ def test_legacy_acr_assignment_requires_reviewed_manual_revocation(
     assignment_present = True
 
     def run_json(command: object, *, field: str) -> object:
-        return (
-            [{"id": assignment_id, "scope": REGISTRY_RESOURCE_ID}]
-            if assignment_present
-            else []
-        )
+        return [{"id": assignment_id, "scope": REGISTRY_RESOURCE_ID}] if assignment_present else []
 
     monkeypatch.setattr(orchestration, "_run_json", run_json)
     monkeypatch.setattr(
@@ -4358,13 +4607,96 @@ def test_foundation_legacy_acr_migration_is_limited_to_reviewed_registries() -> 
             migration_state="present",
             stage="foundation",
             effective_parameters={
-                "acceptanceImageRegistryResourceId": {
-                    "value": reviewed_registry
-                },
-                "presentationImageRegistryResourceId": {
-                    "value": reviewed_registry
-                },
+                "acceptanceImageRegistryResourceId": {"value": reviewed_registry},
+                "presentationImageRegistryResourceId": {"value": reviewed_registry},
             },
+            subscription_id=SUBSCRIPTION_ID,
+        )
+
+
+def test_wc013_acr_inventory_rejects_stale_pull_grants(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assignments = _wc013_acr_pull_assignments()
+    assignments_by_id = {str(item["assignmentResourceId"]).casefold(): item for item in assignments}
+    stale_present = False
+    stale_assignment_id = (
+        f"{REGISTRY_RESOURCE_ID}/providers/Microsoft.Authorization/roleAssignments/"
+        "71717171-1111-4111-8111-111111111111"
+    )
+
+    def get_resource(resource_id: str, *, subscription_id: str) -> dict[str, object]:
+        if resource_id.casefold() == REGISTRY_RESOURCE_ID.casefold():
+            return {
+                "id": resource_id,
+                "properties": {"roleAssignmentMode": REGISTRY_ROLE_ASSIGNMENT_MODE},
+            }
+        assignment = assignments_by_id[resource_id.casefold()]
+        return {
+            "id": resource_id,
+            "properties": {
+                "principalId": assignment["principalId"],
+                "principalType": "ServicePrincipal",
+                "roleDefinitionId": assignment["roleDefinitionId"],
+                "scope": assignment["scope"],
+            },
+        }
+
+    def resolved_assignments(
+        principal_id: str,
+        *,
+        subscription_id: str,
+        field: str,
+    ) -> list[dict[str, object]]:
+        expected = next(
+            item
+            for item in assignments
+            if str(item["principalId"]).casefold() == principal_id.casefold()
+        )
+        observed = [
+            {
+                "id": expected["assignmentResourceId"],
+                "principalId": expected["principalId"],
+                "roleDefinitionId": expected["roleDefinitionId"],
+                "scope": expected["scope"],
+            }
+        ]
+        if (
+            stale_present
+            and principal_id.casefold() == str(assignments[0]["principalId"]).casefold()
+        ):
+            observed.append(
+                {
+                    "id": stale_assignment_id,
+                    "principalId": assignments[0]["principalId"],
+                    "roleDefinitionId": (
+                        f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+                        "Microsoft.Authorization/roleDefinitions/"
+                        f"{orchestration.ACR_PULL_ROLE_ID}"
+                    ),
+                    "scope": REGISTRY_RESOURCE_ID,
+                }
+            )
+        return observed
+
+    monkeypatch.setattr(orchestration, "_get_resource", get_resource)
+    monkeypatch.setattr(
+        orchestration,
+        "_resolved_effective_role_assignments",
+        resolved_assignments,
+    )
+    orchestration._verify_wc013_acr_pull_assignments(
+        assignments,
+        subscription_id=SUBSCRIPTION_ID,
+    )
+
+    stale_present = True
+    with pytest.raises(
+        orchestration.OrchestrationError,
+        match="stale, inherited, group-derived",
+    ):
+        orchestration._verify_wc013_acr_pull_assignments(
+            assignments,
             subscription_id=SUBSCRIPTION_ID,
         )
 
@@ -4383,13 +4715,9 @@ def test_digest_pinned_job_pull_probe_retries_without_implicit_role_creation(
         if arguments[:4] == ["az", "containerapp", "job", "start"]:
             start_attempts += 1
             assert "--registry-identity" not in arguments
-            assert arguments[arguments.index("--image") + 1] == outputs[
-                "producerImage"
-            ]
+            assert arguments[arguments.index("--image") + 1] == outputs["producerImage"]
             if start_attempts == 1:
-                raise orchestration.OrchestrationError(
-                    "synthetic RBAC propagation delay"
-                )
+                raise orchestration.OrchestrationError("synthetic RBAC propagation delay")
             return {"name": "wc027-producer-pull-proof"}
         execution_polls += 1
         status = "Running" if execution_polls == 1 else "Succeeded"
@@ -4422,9 +4750,7 @@ def test_digest_pinned_job_pull_probe_retries_without_implicit_role_creation(
         registry_resource_id=str(outputs["registryResourceId"]),
         principal_id=PRODUCER_BROKER_PRINCIPAL_ID,
         registry_role_assignment_mode=str(outputs["registryRoleAssignmentMode"]),
-        registry_pull_role_definition_id=str(
-            outputs["registryPullRoleDefinitionId"]
-        ),
+        registry_pull_role_definition_id=str(outputs["registryPullRoleDefinitionId"]),
         registry_pull_role_assignment_resource_id=str(
             outputs["registryPullRoleAssignmentResourceId"]
         ),
@@ -4444,9 +4770,7 @@ def test_image_pull_evidence_rejects_legacy_role_in_abac_mode() -> None:
     outputs = _producer_outputs()
     evidence = _synthetic_image_pull_evidence((outputs, "producer"))
     execution = evidence["executions"][0]
-    execution["registryRoleAssignmentMode"] = (
-        orchestration.ACR_ABAC_ROLE_ASSIGNMENT_MODE
-    )
+    execution["registryRoleAssignmentMode"] = orchestration.ACR_ABAC_ROLE_ASSIGNMENT_MODE
     with pytest.raises(orchestration.OrchestrationError, match="role definition"):
         orchestration._validated_image_pull_evidence(
             evidence,
@@ -4481,9 +4805,7 @@ def test_image_pull_evidence_is_bound_to_exact_jobs_and_distinct_kinds() -> None
     )
 
     duplicate_producer = json.loads(json.dumps(evidence))
-    duplicate_producer["executions"][1] = dict(
-        duplicate_producer["executions"][0]
-    )
+    duplicate_producer["executions"][1] = dict(duplicate_producer["executions"][0])
     with pytest.raises(orchestration.OrchestrationError, match="exact job kinds"):
         orchestration._validated_image_pull_evidence(
             duplicate_producer,
@@ -4492,9 +4814,7 @@ def test_image_pull_evidence_is_bound_to_exact_jobs_and_distinct_kinds() -> None
         )
 
     wrong_image = json.loads(json.dumps(evidence))
-    wrong_image["executions"][0]["image"] = (
-        "athena.azurecr.io/athena/unreviewed@sha256:" + "f" * 64
-    )
+    wrong_image["executions"][0]["image"] = "athena.azurecr.io/athena/unreviewed@sha256:" + "f" * 64
     with pytest.raises(orchestration.OrchestrationError, match="reviewed outputs"):
         orchestration._verify_image_pull_evidence_matches_outputs(
             wrong_image,
@@ -4704,9 +5024,7 @@ def test_authority_blob_inventory_fresh_and_recovery_rules(
         current_inventory=empty_inventory,
     )
 
-    fixture, publisher, writer, _activation, _trigger, _correlation, _incident = (
-        _publisher()
-    )
+    fixture, publisher, writer, _activation, _trigger, _correlation, _incident = _publisher()
     publication = publisher.publish(
         _request(fixture),
         now=_request(fixture).evaluated_at,
@@ -4746,9 +5064,7 @@ def test_authority_blob_inventory_fresh_and_recovery_rules(
     monkeypatch.setattr(
         orchestration,
         "_run_bytes",
-        lambda _command: pytest.fail(
-            "reviewed immutable versions must not be downloaded again"
-        ),
+        lambda _command: pytest.fail("reviewed immutable versions must not be downloaded again"),
     )
     stable_successor = orchestration._authority_blob_inventory(
         container_id,
@@ -4838,9 +5154,7 @@ def test_authority_blob_inventory_rejects_missing_or_conflicting_versions() -> N
 
     duplicate_version = json.loads(json.dumps(inventory))
     duplicate_version["versions"].append(dict(duplicate_version["versions"][0]))
-    duplicate_version["versions"].sort(
-        key=lambda item: (item["name"], item["versionId"])
-    )
+    duplicate_version["versions"].sort(key=lambda item: (item["name"], item["versionId"]))
     with pytest.raises(orchestration.OrchestrationError, match="duplicates|multiple versions"):
         orchestration._validated_authority_blob_inventory(
             duplicate_version,
@@ -4870,9 +5184,7 @@ def test_authority_blob_inventory_uses_trusted_predecessor_plan_evidence() -> No
                     "handoff": {
                         "authorityBlobInventory": producer_inventory,
                         "authorityBlobInventorySha256": (
-                            orchestration._authority_checkpoint_sha256(
-                                producer_inventory
-                            )
+                            orchestration._authority_checkpoint_sha256(producer_inventory)
                         ),
                     }
                 }
@@ -4889,9 +5201,7 @@ def test_authority_blob_inventory_uses_trusted_predecessor_plan_evidence() -> No
                     "handoff": {
                         "authorityBlobInventory": producer_inventory,
                         "authorityBlobInventorySha256": (
-                            orchestration._authority_checkpoint_sha256(
-                                producer_inventory
-                            )
+                            orchestration._authority_checkpoint_sha256(producer_inventory)
                         ),
                     }
                 }
@@ -4925,9 +5235,7 @@ def test_authority_blob_planning_requires_absent_fresh_or_trusted_predecessor() 
     )
     successor_inventory = _empty_authority_inventory(
         container_exists=True,
-        previous_checkpoint_sha256=(
-            orchestration._authority_checkpoint_sha256(trusted_inventory)
-        ),
+        previous_checkpoint_sha256=(orchestration._authority_checkpoint_sha256(trusted_inventory)),
     )
     orchestration._verify_planned_authority_blob_inventory(
         stage="producer",
@@ -4952,9 +5260,7 @@ def test_publisher_recovery_preserves_newer_producer_checkpoint() -> None:
     )
     candidate = _empty_authority_inventory(
         container_exists=True,
-        previous_checkpoint_sha256=(
-            orchestration._authority_checkpoint_sha256(prior_publisher)
-        ),
+        previous_checkpoint_sha256=(orchestration._authority_checkpoint_sha256(prior_publisher)),
     )
     orchestration._verify_planned_authority_blob_inventory(
         stage="publisher",
@@ -5858,9 +6164,10 @@ def test_apply_is_bound_to_external_digest_and_fresh_what_if() -> None:
     assert '--foundation-reviewed-receipt-sha256"' in source
     assert '--producer-reviewed-receipt-sha256"' in source
     assert '--publisher-reviewed-receipt-sha256"' in source
-    assert "athena.wc029DeploymentPlan.v6" in source
-    assert "athena.wc029DeploymentReceipt.v3" in source
-    assert "athena.wc029DeploymentHandoff.v4" in source
+    assert "athena.wc029DeploymentPlan.v7" in source
+    assert "athena.wc029DeploymentReceipt.v4" in source
+    assert "athena.wc029DeploymentHandoff.v5" in source
+    assert "athena.wc029RevocationPlan.v1" in source
     assert "predecessorReceiptSha256s" in source
     assert "--rotation-transition-assignment" in source
     assert "rotationTransitionAssignments" in source
@@ -5890,10 +6197,20 @@ def test_apply_is_bound_to_external_digest_and_fresh_what_if() -> None:
 
 def test_trigger_queue_transition_cleanup_precedes_apply_mutation() -> None:
     source = (ROOT / "scripts" / "wc029_deployment_orchestration.py").read_text(encoding="utf-8")
+    revocation_start = source.index("def prepare_revocation(")
+    revocation_end = source.index("def plan(", revocation_start)
+    revocation_source = source[revocation_start:revocation_end]
+    assert 'transition_state="present"' in revocation_source
+    assert 'operation="what-if"' not in revocation_source
+
     plan_start = source.index("def plan(")
     plan_transition_check = source.index(
-        'transition_state="present"',
+        'transition_state="absent"',
         plan_start,
+    )
+    assert (
+        "phase_a_rotation_assignments"
+        in source[plan_transition_check - 300 : plan_transition_check]
     )
     plan_what_if = source.index('operation="what-if"', plan_transition_check)
     assert plan_transition_check < plan_what_if
@@ -5901,6 +6218,9 @@ def test_trigger_queue_transition_cleanup_precedes_apply_mutation() -> None:
     apply_start = source.index("def apply(")
     apply_source = source[apply_start:]
     apply_transition_check = apply_source.index('transition_state="absent"')
+    assert (
+        "phase_a_rotations" in apply_source[apply_transition_check - 300 : apply_transition_check]
+    )
     execute = apply_source.index("_execute_reviewed_deployment(")
     helper_start = source.index("def _execute_reviewed_deployment(")
     current_what_if = source.index("current_what_if = _run_json(", helper_start)
@@ -5908,6 +6228,7 @@ def test_trigger_queue_transition_cleanup_precedes_apply_mutation() -> None:
     assert apply_transition_check < execute
     assert current_what_if < deployment_create
     assert "require_transition_revoked=False" not in apply_source
+    assert "does not accept new rotation transition assignments" not in apply_source
 
 
 def test_authority_blob_inventory_gates_plan_apply_and_handoff() -> None:

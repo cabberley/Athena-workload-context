@@ -84,9 +84,10 @@ MINIMUM_RSA_KEY_SIZE_BITS = 2048
 REVIEWED_RSA_KEY_SIZE_BITS = 3072
 REVIEWED_RSA_KEY_OPERATIONS = frozenset({"sign", "verify"})
 PREFLIGHT_PATH = ROOT / "src" / "athena_context" / "wc029_preflight.py"
-PLAN_SCHEMA_VERSION = "athena.wc029DeploymentPlan.v6"
-HANDOFF_SCHEMA_VERSION = "athena.wc029DeploymentHandoff.v4"
-RECEIPT_SCHEMA_VERSION = "athena.wc029DeploymentReceipt.v3"
+PLAN_SCHEMA_VERSION = "athena.wc029DeploymentPlan.v7"
+HANDOFF_SCHEMA_VERSION = "athena.wc029DeploymentHandoff.v5"
+RECEIPT_SCHEMA_VERSION = "athena.wc029DeploymentReceipt.v4"
+REVOCATION_PLAN_SCHEMA_VERSION = "athena.wc029RevocationPlan.v1"
 AUTHORITY_BLOB_INVENTORY_SCHEMA_VERSION = "athena.wc029AuthorityBlobInventory.v2"
 IMAGE_PULL_EVIDENCE_SCHEMA_VERSION = "athena.wc029ImagePullEvidence.v1"
 HANDOFF_FIELDS = frozenset(
@@ -111,6 +112,8 @@ HANDOFF_FIELDS = frozenset(
         "authorityBlobInventorySha256",
         "imagePullEvidence",
         "imagePullEvidenceSha256",
+        "revocationAssignments",
+        "revocationAssignmentsSha256",
     }
 )
 PLAN_FIELDS = frozenset(
@@ -124,6 +127,7 @@ PLAN_FIELDS = frozenset(
         "deploymentName",
         "templatePath",
         "templateSha256",
+        "compiledTemplatePath",
         "compiledTemplateSha256",
         "orchestratorSha256",
         "preflightSha256",
@@ -140,6 +144,10 @@ PLAN_FIELDS = frozenset(
         "authorityBlobInventory",
         "authorityBlobInventorySha256",
         "requiredAuthorityCheckpointSha256s",
+        "revocationPlanPath",
+        "revocationPlanSha256",
+        "reviewedRevocationPlanSha256",
+        "revocationAssignments",
         "priorStageHandoffPath",
         "priorStageHandoffSha256",
         "priorStageReceipt",
@@ -150,6 +158,31 @@ PLAN_FIELDS = frozenset(
         "publisherHandoffPath",
         "publisherHandoffSha256",
         "predecessorReceipts",
+    }
+)
+REVOCATION_PLAN_FIELDS = frozenset(
+    {
+        "schemaVersion",
+        "stage",
+        "sourceCommit",
+        "subscriptionId",
+        "resourceGroup",
+        "deploymentName",
+        "baseParameterPath",
+        "baseParameterSha256",
+        "effectiveParameterPath",
+        "effectiveParameterSha256",
+        "foundationHandoffPath",
+        "foundationHandoffSha256",
+        "producerHandoffPath",
+        "producerHandoffSha256",
+        "publisherHandoffPath",
+        "publisherHandoffSha256",
+        "predecessorReceipts",
+        "rotationTransitionAssignments",
+        "legacyCryptoUserMigrationAssignmentIds",
+        "legacyAcrPullMigrationAssignments",
+        "revocationAssignments",
     }
 )
 PREDECESSOR_RECEIPT_REFERENCE_FIELDS = frozenset(
@@ -179,6 +212,7 @@ RECEIPT_FIELDS = frozenset(
         "deployedTemplateSha256",
         "authorityBlobInventorySha256",
         "imagePullEvidenceSha256",
+        "revocationAssignmentsSha256",
     }
 )
 FOUNDATION_OUTPUT_FIELDS = frozenset(
@@ -215,7 +249,17 @@ LIVE_ACCEPTANCE_OUTPUT_FIELDS = frozenset(
     {
         "wc027DeploymentReadiness",
         "publisherInvocationBoundary",
+        "wc013AcrPullAssignments",
     }
+)
+WC013_ACR_ASSIGNMENT_LABELS = (
+    "acceptance",
+    "evidence",
+    "controller",
+    "presentation",
+    "wc016-detector",
+    "wc016-orchestrator",
+    "wc016-notification",
 )
 PUBLISHER_INVOCATION_BOUNDARY = {
     "schemaVersion": "athena.wc029PublisherInvocationBoundary.v1",
@@ -528,16 +572,13 @@ def _read_regular_file_once(
     try:
         path_stat = path.lstat()
         reparse_attribute = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
-        if (
-            not stat.S_ISREG(path_stat.st_mode)
-            or bool(getattr(path_stat, "st_file_attributes", 0) & reparse_attribute)
+        if not stat.S_ISREG(path_stat.st_mode) or bool(
+            getattr(path_stat, "st_file_attributes", 0) & reparse_attribute
         ):
             raise OrchestrationError(f"{field} must be one non-reparse regular file")
         path_identity = _identity_from_stat(path_stat)
         if path_identity.size > MAX_REVIEWED_ARTIFACT_BYTES:
-            raise OrchestrationError(
-                f"{field} exceeds the bounded reviewed artifact size"
-            )
+            raise OrchestrationError(f"{field} exceeds the bounded reviewed artifact size")
         with path.open("rb") as handle:
             opened_identity = _identity_from_stat(os.fstat(handle.fileno()))
             if opened_identity != path_identity:
@@ -574,11 +615,13 @@ def _canonical_json_file_bytes(value: object) -> bytes:
 @contextmanager
 def _materialized_private_artifact(
     raw_bytes: bytes,
+    *,
+    file_name: str = "parameters.json",
 ) -> Iterator[_PinnedArtifact]:
     with tempfile.TemporaryDirectory(prefix="athena-wc029-parameters-") as directory_value:
         directory = Path(directory_value)
         os.chmod(directory, 0o700)
-        path = directory / "parameters.json"
+        path = directory / file_name
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
         descriptor = os.open(path, flags, 0o600)
         try:
@@ -988,11 +1031,34 @@ def _write_new_json(path: Path, value: object) -> None:
     _write_new_bytes(path, _canonical_json_file_bytes(value))
 
 
+def _write_and_capture_exact_json(
+    path: Path,
+    *,
+    raw_bytes: bytes,
+    document: object,
+    artifact_reader: _ArtifactReader,
+    field: str,
+) -> _CapturedJsonArtifact:
+    _write_new_bytes(path, raw_bytes)
+    artifact = artifact_reader.capture_json(path, field=field)
+    if (
+        artifact.raw_bytes != raw_bytes
+        or artifact.sha256 != _sha256_bytes(raw_bytes)
+        or artifact.document != document
+    ):
+        raise OrchestrationError(f"{field} does not match the exact generated bytes")
+    return artifact
+
+
 def _load_parameters(path: Path) -> dict[str, dict[str, object]]:
-    document = _ArtifactReader().capture_json(
-        path,
-        field="parameter document",
-    ).document
+    document = (
+        _ArtifactReader()
+        .capture_json(
+            path,
+            field="parameter document",
+        )
+        .document
+    )
     return _load_parameter_document(document)
 
 
@@ -1008,7 +1074,7 @@ def _load_parameter_document(document: object) -> dict[str, dict[str, object]]:
     return normalized
 
 
-def _compiled_template(stage: str) -> tuple[dict[str, Any], str]:
+def _compiled_template(stage: str) -> tuple[dict[str, Any], bytes, str]:
     template = _mapping(
         _run_json(
             [
@@ -1023,7 +1089,8 @@ def _compiled_template(stage: str) -> tuple[dict[str, Any], str]:
         ),
         field=f"compiled {stage} Bicep template",
     )
-    return template, _sha256_bytes(_canonical_json_bytes(template))
+    raw_bytes = _canonical_json_file_bytes(template)
+    return template, raw_bytes, _sha256_bytes(raw_bytes)
 
 
 def _required_parameter_names_from_template(
@@ -1047,7 +1114,7 @@ def _required_parameter_names_from_template(
 
 
 def _required_template_parameter_names(stage: str) -> set[str]:
-    template, _ = _compiled_template(stage)
+    template, _, _ = _compiled_template(stage)
     return _required_parameter_names_from_template(template, stage=stage)
 
 
@@ -1249,20 +1316,12 @@ def _load_handoff(
     authority_inventory_digest = handoff.get("authorityBlobInventorySha256")
     if expected_stage == "foundation":
         if authority_inventory is not None or authority_inventory_digest is not None:
-            raise OrchestrationError(
-                "foundation handoff cannot carry authority Blob inventory"
-            )
-    elif (
-        authority_inventory is None
-        or _sha256_digest(
-            authority_inventory_digest,
-            field="handoff.authorityBlobInventorySha256",
-        )
-        != _authority_checkpoint_sha256(authority_inventory)
-    ):
-        raise OrchestrationError(
-            "handoff authority Blob checkpoint digest does not match"
-        )
+            raise OrchestrationError("foundation handoff cannot carry authority Blob inventory")
+    elif authority_inventory is None or _sha256_digest(
+        authority_inventory_digest,
+        field="handoff.authorityBlobInventorySha256",
+    ) != _authority_checkpoint_sha256(authority_inventory):
+        raise OrchestrationError("handoff authority Blob checkpoint digest does not match")
     image_pull_evidence = _validated_image_pull_evidence(
         handoff.get("imagePullEvidence"),
         stage=expected_stage,
@@ -1271,23 +1330,15 @@ def _load_handoff(
     image_pull_evidence_digest = handoff.get("imagePullEvidenceSha256")
     if expected_stage == "foundation":
         if image_pull_evidence_digest is not None:
-            raise OrchestrationError(
-                "foundation handoff cannot carry image-pull evidence"
-            )
-    elif (
-        image_pull_evidence is None
-        or _sha256_digest(
-            image_pull_evidence_digest,
-            field="handoff.imagePullEvidenceSha256",
-        )
-        != _image_pull_evidence_sha256(image_pull_evidence)
-    ):
+            raise OrchestrationError("foundation handoff cannot carry image-pull evidence")
+    elif image_pull_evidence is None or _sha256_digest(
+        image_pull_evidence_digest,
+        field="handoff.imagePullEvidenceSha256",
+    ) != _image_pull_evidence_sha256(image_pull_evidence):
         raise OrchestrationError("handoff image-pull evidence digest does not match")
     if expected_stage in {"producer", "publisher"}:
         if image_pull_evidence is None:
-            raise OrchestrationError(
-                f"{expected_stage} handoff is missing image-pull evidence"
-            )
+            raise OrchestrationError(f"{expected_stage} handoff is missing image-pull evidence")
         _verify_image_pull_evidence_matches_outputs(
             image_pull_evidence,
             kind=expected_stage,
@@ -1297,6 +1348,15 @@ def _load_handoff(
                 field=f"{expected_stage} handoff broker principal ID",
             ),
         )
+    revocation_assignments = _validated_revocation_assignment_evidence(
+        handoff.get("revocationAssignments"),
+        subscription_id=handoff_subscription,
+    )
+    if _sha256_digest(
+        handoff.get("revocationAssignmentsSha256"),
+        field="handoff.revocationAssignmentsSha256",
+    ) != _revocation_assignment_evidence_sha256(revocation_assignments):
+        raise OrchestrationError("handoff revocation assignment evidence digest does not match")
     if expected_stage == "foundation":
         _foundation_outputs(handoff, require_exact=True)
     elif expected_stage == "producer":
@@ -1472,17 +1532,30 @@ def _load_plan_manifest(
     )
     if manifest.get("templatePath") != expected_template_path:
         raise OrchestrationError("plan template path does not match its exact stage")
-    if _sha256_file(TEMPLATES[stage]) != _sha256_digest(
+    _sha256_digest(
         manifest.get("templateSha256"),
         field="plan template SHA-256",
-    ):
-        raise OrchestrationError("planned Bicep template changed after review")
-    compiled_template, compiled_template_sha256 = _compiled_template(stage)
-    if compiled_template_sha256 != _sha256_digest(
+    )
+    compiled_template_path = Path(
+        _string(
+            manifest.get("compiledTemplatePath"),
+            field="plan compiled template path",
+        )
+    )
+    _ensure_evidence_directory_outside_repository(compiled_template_path.parent)
+    compiled_template_artifact = reader.capture_json(
+        compiled_template_path,
+        field="plan compiled template artifact",
+    )
+    if compiled_template_artifact.sha256 != _sha256_digest(
         manifest.get("compiledTemplateSha256"),
         field="plan compiled template SHA-256",
     ):
         raise OrchestrationError("compiled Bicep template changed after review")
+    compiled_template = _mapping(
+        compiled_template_artifact.document,
+        field="plan compiled template",
+    )
     if _sha256_file(Path(__file__).resolve()) != _sha256_digest(
         manifest.get("orchestratorSha256"),
         field="plan orchestrator SHA-256",
@@ -1586,35 +1659,62 @@ def _load_plan_manifest(
         field="plan legacy ACR pull migration assignments",
     )
     if manifest.get("legacyAcrPullMigrationAssignments") != legacy_acr_pull_migrations:
-        raise OrchestrationError(
-            "plan legacy ACR pull migration assignments must be sorted"
+        raise OrchestrationError("plan legacy ACR pull migration assignments must be sorted")
+    revocation_plan_path_value = manifest.get("revocationPlanPath")
+    revocation_plan_sha256_value = manifest.get("revocationPlanSha256")
+    reviewed_revocation_plan_sha256_value = manifest.get("reviewedRevocationPlanSha256")
+    revocation_values = (
+        revocation_plan_path_value,
+        revocation_plan_sha256_value,
+        reviewed_revocation_plan_sha256_value,
+    )
+    if any(value is not None for value in revocation_values) and not all(
+        value is not None for value in revocation_values
+    ):
+        raise OrchestrationError("plan revocation evidence is incomplete")
+    revocation_assignments = _validated_revocation_assignment_evidence(
+        manifest.get("revocationAssignments"),
+        subscription_id=subscription_id,
+    )
+    if all(value is not None for value in revocation_values):
+        revocation_path = Path(
+            _string(
+                revocation_plan_path_value,
+                field="plan revocation path",
+            )
         )
+        revocation_artifact = reader.capture_json(
+            revocation_path,
+            field="plan revocation artifact",
+        )
+        revocation_digest = _sha256_digest(
+            revocation_plan_sha256_value,
+            field="plan revocation SHA-256",
+        )
+        if (
+            revocation_artifact.sha256 != revocation_digest
+            or _sha256_digest(
+                reviewed_revocation_plan_sha256_value,
+                field="plan reviewed revocation SHA-256",
+            )
+            != revocation_digest
+        ):
+            raise OrchestrationError("plan revocation evidence does not match independent review")
+    elif revocation_assignments:
+        raise OrchestrationError("plan revocation assignments have no reviewed phase-A plan")
     authority_blob_inventory = _validated_authority_blob_inventory(
         manifest.get("authorityBlobInventory"),
         subscription_id=subscription_id,
     )
-    authority_blob_inventory_digest = manifest.get(
-        "authorityBlobInventorySha256"
-    )
+    authority_blob_inventory_digest = manifest.get("authorityBlobInventorySha256")
     if stage == "foundation":
-        if (
-            authority_blob_inventory is not None
-            or authority_blob_inventory_digest is not None
-        ):
-            raise OrchestrationError(
-                "foundation plan cannot contain authority Blob inventory"
-            )
-    elif (
-        authority_blob_inventory is None
-        or _sha256_digest(
-            authority_blob_inventory_digest,
-            field="plan authority Blob inventory SHA-256",
-        )
-        != _authority_checkpoint_sha256(authority_blob_inventory)
-    ):
-        raise OrchestrationError(
-            "WC-027 plan authority Blob checkpoint digest does not match"
-        )
+        if authority_blob_inventory is not None or authority_blob_inventory_digest is not None:
+            raise OrchestrationError("foundation plan cannot contain authority Blob inventory")
+    elif authority_blob_inventory is None or _sha256_digest(
+        authority_blob_inventory_digest,
+        field="plan authority Blob inventory SHA-256",
+    ) != _authority_checkpoint_sha256(authority_blob_inventory):
+        raise OrchestrationError("WC-027 plan authority Blob checkpoint digest does not match")
     prior_handoff_path = manifest.get("priorStageHandoffPath")
     prior_handoff_sha256 = manifest.get("priorStageHandoffSha256")
     prior_receipt_value = manifest.get("priorStageReceipt")
@@ -1740,6 +1840,281 @@ def _load_plan_manifest(
     return manifest
 
 
+def _load_revocation_plan(
+    path: Path,
+    *,
+    reviewed_sha256: str,
+    artifact_reader: _ArtifactReader,
+) -> dict[str, Any]:
+    _ensure_evidence_directory_outside_repository(path.parent)
+    artifact = artifact_reader.capture_json(
+        path,
+        field="reviewed revocation plan",
+    )
+    reviewed_digest = _sha256_digest(
+        reviewed_sha256,
+        field="reviewed revocation plan SHA-256",
+    )
+    if artifact.sha256 != reviewed_digest:
+        raise OrchestrationError(
+            "revocation plan does not match its independently reviewed SHA-256"
+        )
+    plan = _mapping(artifact.document, field="revocation plan")
+    _require_exact_fields(plan, REVOCATION_PLAN_FIELDS, field="revocation plan")
+    if plan.get("schemaVersion") != REVOCATION_PLAN_SCHEMA_VERSION:
+        raise OrchestrationError("unsupported WC-029 revocation plan schema")
+    stage = _string(plan.get("stage"), field="revocation plan stage")
+    if stage not in STAGES:
+        raise OrchestrationError("revocation plan stage is unsupported")
+    if plan.get("sourceCommit") != SOURCE_COMMIT:
+        raise OrchestrationError("revocation plan source commit is not the current exact commit")
+    subscription_id = _canonical_subscription_id(
+        plan.get("subscriptionId"),
+        field="revocation plan subscription",
+    )
+    resource_group = plan.get("resourceGroup")
+    if stage in {"producer", "publisher"}:
+        _string(resource_group, field="revocation plan resource group")
+    elif resource_group is not None:
+        raise OrchestrationError(f"{stage} revocation plan must use subscription deployment scope")
+    _string(plan.get("deploymentName"), field="revocation plan deployment name")
+    base_path = Path(
+        _string(
+            plan.get("baseParameterPath"),
+            field="revocation plan base parameter path",
+        )
+    )
+    effective_path = Path(
+        _string(
+            plan.get("effectiveParameterPath"),
+            field="revocation plan effective parameter path",
+        )
+    )
+    base_artifact = artifact_reader.capture_json(
+        base_path,
+        field="revocation plan base parameters",
+    )
+    effective_artifact = artifact_reader.capture_json(
+        effective_path,
+        field="revocation plan effective parameters",
+    )
+    if base_artifact.sha256 != _sha256_digest(
+        plan.get("baseParameterSha256"),
+        field="revocation plan base parameter SHA-256",
+    ):
+        raise OrchestrationError("revocation plan base parameters changed after review")
+    if effective_artifact.sha256 != _sha256_digest(
+        plan.get("effectiveParameterSha256"),
+        field="revocation plan effective parameter SHA-256",
+    ):
+        raise OrchestrationError("revocation plan effective parameters changed after review")
+    handoff_paths: dict[str, Path | None] = {}
+    for predecessor in ("foundation", "producer", "publisher"):
+        path_value = plan.get(f"{predecessor}HandoffPath")
+        digest_value = plan.get(f"{predecessor}HandoffSha256")
+        if path_value is None:
+            if digest_value is not None:
+                raise OrchestrationError(
+                    f"revocation plan {predecessor} handoff digest has no path"
+                )
+            handoff_paths[predecessor] = None
+            continue
+        handoff_path = Path(
+            _string(
+                path_value,
+                field=f"revocation plan {predecessor} handoff path",
+            )
+        )
+        handoff_paths[predecessor] = handoff_path
+        if artifact_reader.capture_json(
+            handoff_path,
+            field=f"revocation plan {predecessor} handoff",
+        ).sha256 != _sha256_digest(
+            digest_value,
+            field=f"revocation plan {predecessor} handoff SHA-256",
+        ):
+            raise OrchestrationError(f"revocation plan {predecessor} handoff changed after review")
+    _validate_stage_inputs(
+        stage=stage,
+        resource_group=(None if resource_group is None else str(resource_group)),
+        foundation_handoff_path=handoff_paths["foundation"],
+        producer_handoff_path=handoff_paths["producer"],
+        publisher_handoff_path=handoff_paths["publisher"],
+    )
+    predecessor_receipts = _mapping(
+        plan.get("predecessorReceipts"),
+        field="revocation plan predecessor receipts",
+    )
+    _require_exact_fields(
+        predecessor_receipts,
+        frozenset(EXPECTED_PREDECESSOR_STAGES[stage]),
+        field="revocation plan predecessor receipts",
+    )
+    for predecessor, raw_reference in predecessor_receipts.items():
+        reference = _mapping(
+            raw_reference,
+            field=f"revocation plan {predecessor} receipt",
+        )
+        _require_exact_fields(
+            reference,
+            PREDECESSOR_RECEIPT_REFERENCE_FIELDS,
+            field=f"revocation plan {predecessor} receipt",
+        )
+        _string(
+            reference.get("path"),
+            field=f"revocation plan {predecessor} receipt path",
+        )
+        actual_digest = _sha256_digest(
+            reference.get("sha256"),
+            field=f"revocation plan {predecessor} receipt SHA-256",
+        )
+        if (
+            _sha256_digest(
+                reference.get("reviewedSha256"),
+                field=f"revocation plan {predecessor} reviewed receipt SHA-256",
+            )
+            != actual_digest
+        ):
+            raise OrchestrationError(
+                f"revocation plan {predecessor} receipt is not independently reviewed"
+            )
+    rotations = _canonical_rotation_transition_assignments(
+        plan.get("rotationTransitionAssignments"),
+        subscription_id=subscription_id,
+        field="revocation plan rotation transitions",
+    )
+    legacy_crypto = _canonical_legacy_crypto_user_migration_assignments(
+        plan.get("legacyCryptoUserMigrationAssignmentIds"),
+        subscription_id=subscription_id,
+        field="revocation plan legacy Crypto User migrations",
+    )
+    legacy_acr = _canonical_legacy_acr_pull_migration_assignments(
+        plan.get("legacyAcrPullMigrationAssignments"),
+        subscription_id=subscription_id,
+        field="revocation plan legacy ACR pull migrations",
+    )
+    if (
+        plan.get("rotationTransitionAssignments") != rotations
+        or plan.get("legacyCryptoUserMigrationAssignmentIds") != legacy_crypto
+        or plan.get("legacyAcrPullMigrationAssignments") != legacy_acr
+    ):
+        raise OrchestrationError("revocation plan assignment sets must be canonical and sorted")
+    evidence = _validated_revocation_assignment_evidence(
+        plan.get("revocationAssignments"),
+        subscription_id=subscription_id,
+    )
+    expected_ids = {
+        *(item["assignmentResourceId"].casefold() for item in rotations),
+        *(item.casefold() for item in legacy_crypto),
+        *(item["assignmentResourceId"].casefold() for item in legacy_acr),
+    }
+    if {str(item["assignmentResourceId"]).casefold() for item in evidence} != expected_ids:
+        raise OrchestrationError(
+            "revocation plan evidence does not match its exact assignment sets"
+        )
+    _verify_revocation_assignment_evidence_bindings(
+        evidence,
+        rotations=rotations,
+        legacy_acr_migrations=legacy_acr,
+        legacy_crypto_expected=None,
+        subscription_id=subscription_id,
+    )
+    return {
+        "plan": plan,
+        "artifact": artifact,
+        "baseArtifact": base_artifact,
+        "effectiveArtifact": effective_artifact,
+        "rotationTransitionAssignments": rotations,
+        "legacyCryptoUserMigrationAssignmentIds": legacy_crypto,
+        "legacyAcrPullMigrationAssignments": legacy_acr,
+        "revocationAssignments": evidence,
+    }
+
+
+def _verify_revocation_plan_binding(
+    record: Mapping[str, object],
+    *,
+    stage: str,
+    subscription_id: str,
+    resource_group: str | None,
+    deployment_name: str,
+    base_parameter_artifact: _CapturedJsonArtifact,
+    effective_parameters: Mapping[str, Mapping[str, object]],
+    verified_predecessors: Mapping[str, Mapping[str, object]],
+) -> None:
+    plan = _mapping(record.get("plan"), field="revocation plan")
+    if (
+        plan.get("stage") != stage
+        or plan.get("subscriptionId") != subscription_id
+        or plan.get("resourceGroup") != resource_group
+        or plan.get("deploymentName") != deployment_name
+        or plan.get("baseParameterPath") != str(base_parameter_artifact.path)
+        or plan.get("baseParameterSha256") != base_parameter_artifact.sha256
+    ):
+        raise OrchestrationError(
+            "revocation plan does not match the final deployment scope and base parameters"
+        )
+    effective_artifact = record.get("effectiveArtifact")
+    if not isinstance(effective_artifact, _CapturedJsonArtifact):
+        raise OrchestrationError("revocation plan lost its captured effective parameters")
+    if effective_artifact.raw_bytes != _canonical_json_file_bytes(
+        _parameter_document(effective_parameters)
+    ):
+        raise OrchestrationError(
+            "revocation plan effective parameters differ from final planning inputs"
+        )
+    if plan.get("predecessorReceipts") != _predecessor_receipt_references(verified_predecessors):
+        raise OrchestrationError(
+            "revocation plan predecessor receipts differ from final planning inputs"
+        )
+    for predecessor in ("foundation", "producer", "publisher"):
+        record_value = verified_predecessors.get(predecessor)
+        expected_path = None if record_value is None else str(record_value["handoffPath"])
+        expected_digest = None if record_value is None else record_value["handoffSha256"]
+        if (
+            plan.get(f"{predecessor}HandoffPath") != expected_path
+            or plan.get(f"{predecessor}HandoffSha256") != expected_digest
+        ):
+            raise OrchestrationError(
+                f"revocation plan {predecessor} handoff differs from final planning inputs"
+            )
+    legacy_crypto_ids = record.get("legacyCryptoUserMigrationAssignmentIds")
+    if not isinstance(legacy_crypto_ids, list):
+        raise OrchestrationError("revocation plan lost legacy Crypto User migration IDs")
+    legacy_crypto_expected: Mapping[str, _ExpectedRoleAssignment] | None = None
+    if legacy_crypto_ids:
+        if stage != "producer":
+            raise OrchestrationError(
+                "legacy Crypto User revocation evidence is producer-stage only"
+            )
+        all_expected = _planned_legacy_crypto_user_assignments(
+            effective_parameters=effective_parameters,
+            resource_group=_string(
+                resource_group,
+                field="producer resource group",
+            ),
+            subscription_id=subscription_id,
+        )
+        missing_legacy_ids = {
+            assignment_id.casefold() for assignment_id in legacy_crypto_ids
+        } - set(all_expected)
+        if missing_legacy_ids:
+            raise OrchestrationError(
+                "revocation plan legacy Crypto User IDs are outside the exact expected set"
+            )
+        legacy_crypto_expected = {
+            assignment_id.casefold(): all_expected[assignment_id.casefold()]
+            for assignment_id in legacy_crypto_ids
+        }
+    _verify_revocation_assignment_evidence_bindings(
+        record["revocationAssignments"],
+        rotations=record["rotationTransitionAssignments"],
+        legacy_acr_migrations=record["legacyAcrPullMigrationAssignments"],
+        legacy_crypto_expected=legacy_crypto_expected,
+        subscription_id=subscription_id,
+    )
+
+
 def _load_verified_predecessor(
     *,
     expected_stage: str,
@@ -1793,18 +2168,18 @@ def _load_verified_predecessor(
         receipt.get("deployedTemplateSha256"),
         field=f"{expected_stage} receipt deployed template SHA-256",
     )
-    receipt_authority_inventory_sha256 = receipt.get(
-        "authorityBlobInventorySha256"
-    )
+    receipt_authority_inventory_sha256 = receipt.get("authorityBlobInventorySha256")
     receipt_image_pull_evidence_sha256 = receipt.get("imagePullEvidenceSha256")
+    receipt_revocation_assignments_sha256 = _sha256_digest(
+        receipt.get("revocationAssignmentsSha256"),
+        field=f"{expected_stage} receipt revocation assignments SHA-256",
+    )
     if expected_stage == "foundation":
         if (
             receipt_authority_inventory_sha256 is not None
             or receipt_image_pull_evidence_sha256 is not None
         ):
-            raise OrchestrationError(
-                "foundation receipt cannot carry WC-027 readiness evidence"
-            )
+            raise OrchestrationError("foundation receipt cannot carry WC-027 readiness evidence")
     else:
         receipt_authority_inventory_sha256 = _sha256_digest(
             receipt_authority_inventory_sha256,
@@ -1893,21 +2268,15 @@ def _load_verified_predecessor(
     if handoff.get("planManifestSha256") != plan_digest:
         raise OrchestrationError(f"{expected_stage} handoff is not bound to its reviewed plan")
     if (
-        plan.get("effectiveParameterSha256")
-        != receipt_effective_parameter_sha256
-        or handoff.get("effectiveParameterSha256")
-        != receipt_effective_parameter_sha256
+        plan.get("effectiveParameterSha256") != receipt_effective_parameter_sha256
+        or handoff.get("effectiveParameterSha256") != receipt_effective_parameter_sha256
         or handoff.get("applicationMode") != receipt_application_mode
-        or handoff.get("deploymentRecordSha256")
-        != receipt_deployment_record_sha256
-        or handoff.get("deployedTemplateSha256")
-        != receipt_deployed_template_sha256
-        or plan.get("compiledTemplateSha256")
-        != receipt_deployed_template_sha256
-        or handoff.get("authorityBlobInventorySha256")
-        != receipt_authority_inventory_sha256
-        or handoff.get("imagePullEvidenceSha256")
-        != receipt_image_pull_evidence_sha256
+        or handoff.get("deploymentRecordSha256") != receipt_deployment_record_sha256
+        or handoff.get("deployedTemplateSha256") != receipt_deployed_template_sha256
+        or plan.get("compiledTemplateSha256") != receipt_deployed_template_sha256
+        or handoff.get("authorityBlobInventorySha256") != receipt_authority_inventory_sha256
+        or handoff.get("imagePullEvidenceSha256") != receipt_image_pull_evidence_sha256
+        or handoff.get("revocationAssignmentsSha256") != receipt_revocation_assignments_sha256
     ):
         raise OrchestrationError(
             f"{expected_stage} receipt deployment attestation chain does not match"
@@ -1922,15 +2291,12 @@ def _load_verified_predecessor(
             subscription_id=receipt_subscription,
         )
         if planned_inventory is None or final_inventory is None:
-            raise OrchestrationError(
-                f"{expected_stage} receipt authority checkpoint is incomplete"
-            )
+            raise OrchestrationError(f"{expected_stage} receipt authority checkpoint is incomplete")
         _verify_authority_checkpoint_successor(
             previous_inventory=planned_inventory,
             current_inventory=final_inventory,
             allow_container_creation=(
-                expected_stage == "producer"
-                and planned_inventory.get("containerExists") is False
+                expected_stage == "producer" and planned_inventory.get("containerExists") is False
             ),
         )
     if expected_stage == "live-acceptance":
@@ -1940,9 +2306,7 @@ def _load_verified_predecessor(
             subscription_id=receipt_subscription,
         )
         if image_pull_evidence is None:
-            raise OrchestrationError(
-                "live-acceptance receipt is missing image-pull evidence"
-            )
+            raise OrchestrationError("live-acceptance receipt is missing image-pull evidence")
         for predecessor in ("producer", "publisher"):
             predecessor_handoff = _load_handoff(
                 Path(
@@ -1962,9 +2326,7 @@ def _load_verified_predecessor(
                     field=f"live-acceptance {predecessor} outputs",
                 ),
                 principal_id=_string(
-                    _handoff_bindings(predecessor_handoff).get(
-                        "brokerIdentityPrincipalId"
-                    ),
+                    _handoff_bindings(predecessor_handoff).get("brokerIdentityPrincipalId"),
                     field=f"live-acceptance {predecessor} principal ID",
                 ),
             )
@@ -2096,6 +2458,10 @@ def _load_verified_prior_stage_inventory(
         receipt.get("imagePullEvidenceSha256"),
         field="prior stage receipt image-pull evidence SHA-256",
     )
+    receipt_revocation_assignments_sha256 = _sha256_digest(
+        receipt.get("revocationAssignmentsSha256"),
+        field="prior stage receipt revocation assignments SHA-256",
+    )
     receipt_predecessors = _mapping(
         receipt.get("predecessorReceiptSha256s"),
         field="prior stage receipt predecessor hashes",
@@ -2206,6 +2572,7 @@ def _load_verified_prior_stage_inventory(
             field=f"prior stage plan {digest_name}",
         )
     for path_name, digest_name in (
+        ("compiledTemplatePath", "compiledTemplateSha256"),
         ("baseParameterPath", "baseParameterSha256"),
         ("effectiveParameterPath", "effectiveParameterSha256"),
         ("whatIfPath", "whatIfSha256"),
@@ -2224,9 +2591,7 @@ def _load_verified_prior_stage_inventory(
             plan.get(digest_name),
             field=f"prior stage plan {digest_name}",
         ):
-            raise OrchestrationError(
-                f"prior stage plan {path_name} changed after review"
-            )
+            raise OrchestrationError(f"prior stage plan {path_name} changed after review")
     raw_allowed_changes = plan.get("allowedChangeResourceIds")
     if not isinstance(raw_allowed_changes, list) or any(
         not isinstance(item, str) for item in raw_allowed_changes
@@ -2252,15 +2617,11 @@ def _load_verified_prior_stage_inventory(
         field="prior stage plan rotation transition assignments",
     )
     if plan.get("rotationTransitionAssignments") != rotation_transition_assignments:
-        raise OrchestrationError(
-            "prior stage plan rotation transition assignments must be sorted"
-        )
-    legacy_crypto_user_migration_assignments = (
-        _canonical_legacy_crypto_user_migration_assignments(
-            plan.get("legacyCryptoUserMigrationAssignmentIds"),
-            subscription_id=subscription_id,
-            field="prior stage plan legacy Crypto User migration assignments",
-        )
+        raise OrchestrationError("prior stage plan rotation transition assignments must be sorted")
+    legacy_crypto_user_migration_assignments = _canonical_legacy_crypto_user_migration_assignments(
+        plan.get("legacyCryptoUserMigrationAssignmentIds"),
+        subscription_id=subscription_id,
+        field="prior stage plan legacy Crypto User migration assignments",
     )
     if (
         plan.get("legacyCryptoUserMigrationAssignmentIds")
@@ -2278,6 +2639,47 @@ def _load_verified_prior_stage_inventory(
         raise OrchestrationError(
             "prior stage plan legacy ACR pull migration assignments must be sorted"
         )
+    revocation_plan_path_value = plan.get("revocationPlanPath")
+    revocation_plan_sha256_value = plan.get("revocationPlanSha256")
+    reviewed_revocation_plan_sha256_value = plan.get("reviewedRevocationPlanSha256")
+    revocation_values = (
+        revocation_plan_path_value,
+        revocation_plan_sha256_value,
+        reviewed_revocation_plan_sha256_value,
+    )
+    if any(value is not None for value in revocation_values) and not all(
+        value is not None for value in revocation_values
+    ):
+        raise OrchestrationError("prior stage plan revocation evidence is incomplete")
+    _validated_revocation_assignment_evidence(
+        plan.get("revocationAssignments"),
+        subscription_id=subscription_id,
+    )
+    if all(value is not None for value in revocation_values):
+        revocation_artifact = reader.capture_json(
+            Path(
+                _string(
+                    revocation_plan_path_value,
+                    field="prior stage revocation plan path",
+                )
+            ),
+            field="prior stage revocation plan",
+        )
+        revocation_digest = _sha256_digest(
+            revocation_plan_sha256_value,
+            field="prior stage revocation plan SHA-256",
+        )
+        if (
+            revocation_artifact.sha256 != revocation_digest
+            or _sha256_digest(
+                reviewed_revocation_plan_sha256_value,
+                field="prior stage reviewed revocation plan SHA-256",
+            )
+            != revocation_digest
+        ):
+            raise OrchestrationError(
+                "prior stage revocation plan does not match independent review"
+            )
     planned_handoff_paths = {
         predecessor: (
             None
@@ -2310,13 +2712,14 @@ def _load_verified_prior_stage_inventory(
             predecessor_handoff_digest,
             field=f"prior stage plan {predecessor} handoff SHA-256",
         )
-        if reader.capture_json(
-            predecessor_handoff_path,
-            field=f"prior stage plan {predecessor} handoff",
-        ).sha256 != predecessor_handoff_digest:
-            raise OrchestrationError(
-                f"prior stage plan {predecessor} handoff changed after review"
-            )
+        if (
+            reader.capture_json(
+                predecessor_handoff_path,
+                field=f"prior stage plan {predecessor} handoff",
+            ).sha256
+            != predecessor_handoff_digest
+        ):
+            raise OrchestrationError(f"prior stage plan {predecessor} handoff changed after review")
     prior_handoff_path = plan.get("priorStageHandoffPath")
     prior_handoff_sha256 = plan.get("priorStageHandoffSha256")
     prior_receipt_value = plan.get("priorStageReceipt")
@@ -2369,9 +2772,7 @@ def _load_verified_prior_stage_inventory(
         plan.get("requiredAuthorityCheckpointSha256s"),
         field="prior stage plan required authority checkpoint SHA-256s",
     )
-    expected_checkpoint_keys = {
-        "producer" if expected_stage == "publisher" else ""
-    }
+    expected_checkpoint_keys = {"producer" if expected_stage == "publisher" else ""}
     expected_checkpoint_keys.discard("")
     if all(value is not None for value in prior_values):
         expected_checkpoint_keys.add("priorStage")
@@ -2416,16 +2817,11 @@ def _load_verified_prior_stage_inventory(
             predecessor_digest
             != _sha256_digest(
                 reference.get("reviewedSha256"),
-                field=(
-                    f"prior stage plan predecessor receipt {predecessor} "
-                    "reviewed SHA-256"
-                ),
+                field=(f"prior stage plan predecessor receipt {predecessor} reviewed SHA-256"),
             )
             or predecessor_digest != receipt_predecessors[predecessor]
         ):
-            raise OrchestrationError(
-                "prior stage plan predecessor receipt chain does not match"
-            )
+            raise OrchestrationError("prior stage plan predecessor receipt chain does not match")
     handoff = _load_handoff(
         handoff_path,
         expected_stage=expected_stage,
@@ -2442,64 +2838,44 @@ def _load_verified_prior_stage_inventory(
     ):
         raise OrchestrationError("prior stage handoff does not match its receipt and plan")
     if (
-        plan.get("effectiveParameterSha256")
-        != receipt_effective_parameter_sha256
-        or handoff.get("effectiveParameterSha256")
-        != receipt_effective_parameter_sha256
+        plan.get("effectiveParameterSha256") != receipt_effective_parameter_sha256
+        or handoff.get("effectiveParameterSha256") != receipt_effective_parameter_sha256
         or handoff.get("applicationMode") != receipt_application_mode
-        or handoff.get("deploymentRecordSha256")
-        != receipt_deployment_record_sha256
-        or handoff.get("deployedTemplateSha256")
-        != receipt_deployed_template_sha256
-        or plan.get("compiledTemplateSha256")
-        != receipt_deployed_template_sha256
-        or handoff.get("authorityBlobInventorySha256")
-        != receipt_authority_inventory_sha256
-        or handoff.get("imagePullEvidenceSha256")
-        != receipt_image_pull_evidence_sha256
+        or handoff.get("deploymentRecordSha256") != receipt_deployment_record_sha256
+        or handoff.get("deployedTemplateSha256") != receipt_deployed_template_sha256
+        or plan.get("compiledTemplateSha256") != receipt_deployed_template_sha256
+        or handoff.get("authorityBlobInventorySha256") != receipt_authority_inventory_sha256
+        or handoff.get("imagePullEvidenceSha256") != receipt_image_pull_evidence_sha256
+        or handoff.get("revocationAssignmentsSha256") != receipt_revocation_assignments_sha256
     ):
-        raise OrchestrationError(
-            "prior stage deployment attestation chain does not match"
-        )
+        raise OrchestrationError("prior stage deployment attestation chain does not match")
     planned_inventory = _validated_authority_blob_inventory(
         plan.get("authorityBlobInventory"),
         subscription_id=subscription_id,
     )
     if planned_inventory is None:
         raise OrchestrationError("prior stage plan is missing authority Blob inventory")
-    if plan.get("authorityBlobInventorySha256") != _authority_checkpoint_sha256(
-        planned_inventory
-    ):
-        raise OrchestrationError(
-            "prior stage plan authority checkpoint digest does not match"
-        )
+    if plan.get("authorityBlobInventorySha256") != _authority_checkpoint_sha256(planned_inventory):
+        raise OrchestrationError("prior stage plan authority checkpoint digest does not match")
     inventory = _validated_authority_blob_inventory(
         handoff.get("authorityBlobInventory"),
         subscription_id=subscription_id,
     )
     if inventory is None:
         raise OrchestrationError("prior stage handoff is missing authority Blob inventory")
-    if (
-        handoff.get("authorityBlobInventorySha256")
-        != _authority_checkpoint_sha256(inventory)
-        or receipt.get("authorityBlobInventorySha256")
-        != _authority_checkpoint_sha256(inventory)
-    ):
-        raise OrchestrationError(
-            "prior stage authority checkpoint digest chain does not match"
-        )
+    if handoff.get("authorityBlobInventorySha256") != _authority_checkpoint_sha256(
+        inventory
+    ) or receipt.get("authorityBlobInventorySha256") != _authority_checkpoint_sha256(inventory):
+        raise OrchestrationError("prior stage authority checkpoint digest chain does not match")
     _verify_authority_checkpoint_successor(
         previous_inventory=planned_inventory,
         current_inventory=inventory,
         allow_container_creation=(
-            expected_stage == "producer"
-            and planned_inventory.get("containerExists") is False
+            expected_stage == "producer" and planned_inventory.get("containerExists") is False
         ),
     )
     handoff_outputs = (
-        _producer_outputs(handoff)
-        if expected_stage == "producer"
-        else _publisher_outputs(handoff)
+        _producer_outputs(handoff) if expected_stage == "producer" else _publisher_outputs(handoff)
     )
     expected_container_id = _canonical_subscription_resource_id(
         handoff_outputs[
@@ -2628,7 +3004,7 @@ def _predecessor_rotation_transition_assignments(
         key=lambda item: (
             item["assignmentResourceId"].casefold(),
             item["retiredPrincipalId"],
-        )
+        ),
     )
 
 
@@ -2684,6 +3060,223 @@ def _predecessor_receipt_hashes(
     return {stage: record["receiptSha256"] for stage, record in verified.items()}
 
 
+def _validated_wc013_acr_pull_assignments(
+    value: object,
+    *,
+    subscription_id: str,
+) -> list[dict[str, object]]:
+    if not isinstance(value, list):
+        raise OrchestrationError("WC-013 ACR pull assignments must be an array")
+    assignments: list[dict[str, object]] = []
+    for index, raw_assignment in enumerate(value):
+        assignment = _mapping(
+            raw_assignment,
+            field=f"WC-013 ACR pull assignment {index}",
+        )
+        _require_exact_fields(
+            assignment,
+            frozenset(
+                {
+                    "label",
+                    "assignmentResourceId",
+                    "principalId",
+                    "principalType",
+                    "roleDefinitionId",
+                    "roleAssignmentMode",
+                    "scope",
+                    "conditionVersion",
+                    "condition",
+                }
+            ),
+            field=f"WC-013 ACR pull assignment {index}",
+        )
+        _string(
+            assignment.get("label"),
+            field=f"WC-013 ACR pull assignment {index} label",
+        )
+        assignment_resource_id = _canonical_subscription_resource_id(
+            assignment.get("assignmentResourceId"),
+            subscription_id=subscription_id,
+            field=f"WC-013 ACR pull assignment {index} ID",
+        )
+        principal_id = _canonical_directory_object_id(
+            assignment.get("principalId"),
+            field=f"WC-013 ACR pull assignment {index} principal",
+        )
+        if assignment.get("principalType") != "ServicePrincipal":
+            raise OrchestrationError(
+                "WC-013 ACR pull assignment principal type must be ServicePrincipal"
+            )
+        role_assignment_mode = _acr_role_assignment_mode(
+            assignment.get("roleAssignmentMode"),
+            field=f"WC-013 ACR pull assignment {index} mode",
+        )
+        expected_role_definition_id = _acr_pull_role_definition_id(
+            role_assignment_mode=role_assignment_mode,
+            subscription_id=subscription_id,
+        )
+        _require_subscription_resource_id_equal(
+            assignment.get("roleDefinitionId"),
+            expected_role_definition_id,
+            subscription_id=subscription_id,
+            field=f"WC-013 ACR pull assignment {index} role",
+        )
+        scope = _canonical_subscription_resource_id(
+            assignment.get("scope"),
+            subscription_id=subscription_id,
+            field=f"WC-013 ACR pull assignment {index} scope",
+        )
+        if _resource_type(scope) != "microsoft.containerregistry/registries":
+            raise OrchestrationError("WC-013 ACR pull assignment scope must identify one registry")
+        _require_subscription_resource_id_equal(
+            assignment_resource_id,
+            _deterministic_principal_role_assignment_id(
+                scope,
+                principal_id,
+                expected_role_definition_id,
+            ),
+            subscription_id=subscription_id,
+            field=f"WC-013 ACR pull assignment {index} deterministic ID",
+        )
+        if (
+            assignment.get("conditionVersion") is not None
+            or assignment.get("condition") is not None
+        ):
+            raise OrchestrationError("WC-013 ACR pull assignment must not contain a condition")
+        assignments.append(dict(assignment))
+    if tuple(item["label"] for item in assignments) != WC013_ACR_ASSIGNMENT_LABELS:
+        raise OrchestrationError(
+            "WC-013 ACR pull assignment labels/order do not match the exact inventory"
+        )
+    if len({str(item["assignmentResourceId"]).casefold() for item in assignments}) != len(
+        assignments
+    ) or len({str(item["principalId"]).casefold() for item in assignments}) != len(assignments):
+        raise OrchestrationError("WC-013 ACR pull assignment IDs and principals must be distinct")
+    return assignments
+
+
+def _verify_wc013_acr_pull_assignments(
+    value: object,
+    *,
+    subscription_id: str,
+) -> list[dict[str, object]]:
+    assignments = _validated_wc013_acr_pull_assignments(
+        value,
+        subscription_id=subscription_id,
+    )
+    expected_by_principal = {str(item["principalId"]).casefold(): item for item in assignments}
+    registry_modes: dict[str, str] = {}
+    for assignment in assignments:
+        scope = str(assignment["scope"])
+        normalized_scope = scope.casefold()
+        if normalized_scope not in registry_modes:
+            registry = _get_resource(
+                scope,
+                subscription_id=subscription_id,
+            )
+            _require_resource_id_equal(
+                registry.get("id"),
+                scope,
+                field="WC-013 ACR runtime readback",
+            )
+            registry_modes[normalized_scope] = _acr_role_assignment_mode(
+                _mapping(
+                    registry.get("properties"),
+                    field="WC-013 ACR properties",
+                ).get("roleAssignmentMode"),
+                field="WC-013 ACR live role-assignment mode",
+            )
+        _require_equal(
+            assignment["roleAssignmentMode"],
+            registry_modes[normalized_scope],
+            field="WC-013 ACR role-assignment mode",
+        )
+        assignment_resource = _get_resource(
+            str(assignment["assignmentResourceId"]),
+            subscription_id=subscription_id,
+        )
+        _require_resource_id_equal(
+            assignment_resource.get("id"),
+            assignment["assignmentResourceId"],
+            field="WC-013 ACR assignment readback",
+        )
+        properties = _mapping(
+            assignment_resource.get("properties"),
+            field="WC-013 ACR assignment properties",
+        )
+        if (
+            _canonical_directory_object_id(
+                properties.get("principalId"),
+                field="WC-013 ACR assignment principal",
+            )
+            != assignment["principalId"]
+            or properties.get("principalType") != "ServicePrincipal"
+        ):
+            raise OrchestrationError("WC-013 ACR assignment principal does not match inventory")
+        _require_subscription_resource_id_equal(
+            properties.get("roleDefinitionId"),
+            assignment["roleDefinitionId"],
+            subscription_id=subscription_id,
+            field="WC-013 ACR assignment role",
+        )
+        if properties.get("scope") is not None:
+            _require_resource_id_equal(
+                properties.get("scope"),
+                scope,
+                field="WC-013 ACR assignment scope",
+            )
+        if (
+            properties.get("conditionVersion") is not None
+            or properties.get("condition") is not None
+        ):
+            raise OrchestrationError("WC-013 ACR assignment must not contain a condition")
+    registry_scopes = {str(item["scope"]).casefold() for item in assignments}
+    for principal_id, expected in expected_by_principal.items():
+        observed = _resolved_effective_role_assignments(
+            principal_id,
+            subscription_id=subscription_id,
+            field=f"effective WC-013 ACR assignments for {principal_id}",
+        )
+        expected_assignment_id = str(expected["assignmentResourceId"]).casefold()
+        expected_seen = False
+        for raw_assignment in observed:
+            observed_assignment = _mapping(
+                raw_assignment,
+                field="effective WC-013 ACR assignment",
+            )
+            role_definition_id = observed_assignment.get("roleDefinitionId")
+            assignment_scope = observed_assignment.get("scope")
+            if (
+                isinstance(role_definition_id, str)
+                and isinstance(assignment_scope, str)
+                and role_definition_id.casefold().rsplit("/", 1)[-1]
+                in {ACR_PULL_ROLE_ID, ACR_REPOSITORY_READER_ROLE_ID}
+                and any(
+                    _scopes_overlap(assignment_scope, registry_scope)
+                    for registry_scope in registry_scopes
+                )
+            ):
+                observed_id = _string(
+                    observed_assignment.get("id"),
+                    field="effective WC-013 ACR assignment ID",
+                ).casefold()
+                if (
+                    observed_id != expected_assignment_id
+                    or assignment_scope.casefold() != str(expected["scope"]).casefold()
+                    or role_definition_id.casefold() != str(expected["roleDefinitionId"]).casefold()
+                ):
+                    raise OrchestrationError(
+                        "WC-013 identity retains a stale, inherited, group-derived, "
+                        "or otherwise unreviewed ACR pull grant"
+                    )
+                expected_seen = True
+        if not expected_seen:
+            raise OrchestrationError(
+                "WC-013 effective ACR evidence is missing its exact current assignment"
+            )
+    return assignments
+
+
 def _foundation_outputs(
     handoff: Mapping[str, object],
     *,
@@ -2703,7 +3296,12 @@ def _foundation_outputs(
     if require_exact:
         _require_exact_fields(
             approved_configuration,
-            frozenset({"wc027OrchestrationFoundation"}),
+            frozenset(
+                {
+                    "wc027OrchestrationFoundation",
+                    "wc013AcrPullAssignments",
+                }
+            ),
             field="foundation approved configuration",
         )
     wc027_foundation = _mapping(
@@ -2716,6 +3314,23 @@ def _foundation_outputs(
         field="foundation WC-027 orchestration outputs",
     )
     normalized_outputs = dict(outputs)
+    handoff_subscription = (
+        _canonical_subscription_id(
+            handoff.get("subscriptionId"),
+            field="foundation handoff subscription",
+        )
+        if handoff.get("subscriptionId") is not None
+        else _resource_subscription_and_group(
+            _string(
+                outputs.get("managedEnvironmentResourceId"),
+                field="foundation managed environment",
+            )
+        )[0]
+    )
+    wc013_acr_assignments = _validated_wc013_acr_pull_assignments(
+        approved_configuration.get("wc013AcrPullAssignments"),
+        subscription_id=handoff_subscription,
+    )
     normalized_outputs.update(
         {
             "wc016NotificationQueueName": wc027_foundation.get("notificationQueueName"),
@@ -2744,6 +3359,7 @@ def _foundation_outputs(
             "notificationSigningKeyFingerprint": wc027_foundation.get(
                 "notificationSigningKeyFingerprint"
             ),
+            "wc013AcrPullAssignments": wc013_acr_assignments,
         }
     )
     required = (
@@ -3654,6 +4270,7 @@ def _az_command(
     subscription_id: str,
     location: str,
     resource_group: str | None,
+    template_path: Path,
     parameter_path: Path,
 ) -> list[str]:
     scope = "sub" if stage in SUBSCRIPTION_STAGES else "group"
@@ -3669,7 +4286,7 @@ def _az_command(
             "--name",
             deployment_name,
             "--template-file",
-            str(TEMPLATES[stage]),
+            str(template_path),
             "--parameters",
             str(parameter_path),
             "--no-prompt",
@@ -3722,9 +4339,7 @@ def _run_bytes(command: Sequence[str]) -> bytes:
     if completed.returncode != 0:
         detail_bytes = completed.stderr.strip() or completed.stdout.strip()
         detail = detail_bytes.decode("utf-8", errors="replace")
-        raise OrchestrationError(
-            f"command failed with exit code {completed.returncode}: {detail}"
-        )
+        raise OrchestrationError(f"command failed with exit code {completed.returncode}: {detail}")
     return completed.stdout
 
 
@@ -3804,8 +4419,7 @@ def _verify_recorded_deployment_parameters(
     missing = set(effective_parameters) - set(recorded_parameters)
     if missing:
         raise OrchestrationError(
-            "succeeded deployment record omits reviewed parameters: "
-            + ", ".join(sorted(missing))
+            "succeeded deployment record omits reviewed parameters: " + ", ".join(sorted(missing))
         )
     for name, expected in effective_parameters.items():
         recorded_entry = _mapping(
@@ -3829,9 +4443,7 @@ def _verify_recorded_deployment_parameters(
             "defaultValue" not in definition
             or recorded_entry.get("value") != definition["defaultValue"]
         ):
-            raise OrchestrationError(
-                f"succeeded deployment contains unreviewed parameter {name}"
-            )
+            raise OrchestrationError(f"succeeded deployment contains unreviewed parameter {name}")
 
 
 def _attest_succeeded_deployment(
@@ -3901,9 +4513,7 @@ def _attest_succeeded_deployment(
         ),
         field="succeeded deployment exported template",
     )
-    deployed_template_sha256 = _sha256_bytes(
-        _canonical_json_bytes(exported_template)
-    )
+    deployed_template_sha256 = _sha256_bytes(_canonical_json_file_bytes(exported_template))
     if deployed_template_sha256 != compiled_template_sha256:
         raise OrchestrationError(
             "succeeded deployment template differs from the reviewed compiled template"
@@ -3927,14 +4537,22 @@ def _execute_reviewed_deployment(
     effective_parameter_artifact: _CapturedJsonArtifact,
     effective_parameters: Mapping[str, Mapping[str, object]],
     reviewed_what_if: object,
+    compiled_template_artifact: _CapturedJsonArtifact,
     compiled_template: Mapping[str, object],
     compiled_template_sha256: str,
 ) -> tuple[dict[str, Any], str, str]:
     created_outputs: dict[str, Any] | None = None
     if not resume_succeeded_deployment:
-        with _materialized_private_artifact(
-            effective_parameter_artifact.raw_bytes
-        ) as pinned_parameters:
+        with (
+            _materialized_private_artifact(
+                compiled_template_artifact.raw_bytes,
+                file_name="template.json",
+            ) as pinned_template,
+            _materialized_private_artifact(
+                effective_parameter_artifact.raw_bytes
+            ) as pinned_parameters,
+        ):
+            pinned_template.verify()
             pinned_parameters.verify()
             current_what_if = _run_json(
                 _az_command(
@@ -3944,19 +4562,19 @@ def _execute_reviewed_deployment(
                     subscription_id=subscription_id,
                     location=location,
                     resource_group=resource_group,
+                    template_path=pinned_template.path,
                     parameter_path=pinned_parameters.path,
                 ),
                 field="current what-if",
             )
+            pinned_template.verify()
             pinned_parameters.verify()
             _validate_subscription_boundary(
                 current_what_if,
                 subscription_id=subscription_id,
                 field="current what-if",
             )
-            if _canonical_json_bytes(current_what_if) != _canonical_json_bytes(
-                reviewed_what_if
-            ):
+            if _canonical_json_bytes(current_what_if) != _canonical_json_bytes(reviewed_what_if):
                 raise OrchestrationError(
                     "Azure state changed after review; current what-if differs from the plan"
                 )
@@ -3968,10 +4586,12 @@ def _execute_reviewed_deployment(
                     subscription_id=subscription_id,
                     location=location,
                     resource_group=resource_group,
+                    template_path=pinned_template.path,
                     parameter_path=pinned_parameters.path,
                 ),
                 field="deployment create",
             )
+            pinned_template.verify()
             pinned_parameters.verify()
         created_outputs = _deployment_outputs(result)
     (
@@ -3991,11 +4611,9 @@ def _execute_reviewed_deployment(
         ),
         field="succeeded deployment attestation",
     )
-    if (
-        created_outputs is not None
-        and _canonical_json_bytes(created_outputs)
-        != _canonical_json_bytes(outputs)
-    ):
+    if created_outputs is not None and _canonical_json_bytes(
+        created_outputs
+    ) != _canonical_json_bytes(outputs):
         raise OrchestrationError(
             "succeeded deployment record outputs differ from the create response"
         )
@@ -4248,9 +4866,7 @@ def _download_authority_blob_version(
     version_id: str,
     subscription_id: str,
 ) -> bytes:
-    account_name, container_name, _, _ = _blob_container_parts(
-        container_resource_id
-    )
+    account_name, container_name, _, _ = _blob_container_parts(container_resource_id)
     return _run_bytes(
         [
             "az",
@@ -4285,29 +4901,19 @@ def _authority_contract_metadata(
     try:
         if blob_name.startswith("guidance-authority/"):
             authority = PublishedGuidanceAuthority.model_validate_json(payload)
-            if (
-                payload != authority.canonical_bytes()
-                or blob_name
-                != (
-                    f"guidance-authority/{authority.authority_id}/"
-                    "authority.json"
-                )
+            if payload != authority.canonical_bytes() or blob_name != (
+                f"guidance-authority/{authority.authority_id}/authority.json"
             ):
-                raise OrchestrationError(
-                    "authority Blob payload is not canonical or path-bound"
-                )
+                raise OrchestrationError("authority Blob payload is not canonical or path-bound")
             return {
                 "kind": "authority",
                 "artifactId": authority.authority_id,
             }
         if blob_name.startswith("guidance-bindings/"):
-            binding = PublishedGuidanceAuthorityBinding.model_validate_json(
-                payload
-            )
+            binding = PublishedGuidanceAuthorityBinding.model_validate_json(payload)
             if (
                 payload != binding.canonical_bytes()
-                or blob_name
-                != f"guidance-bindings/{binding.binding_id}/binding.json"
+                or blob_name != f"guidance-bindings/{binding.binding_id}/binding.json"
             ):
                 raise OrchestrationError(
                     "guidance binding Blob payload is not canonical or path-bound"
@@ -4384,10 +4990,7 @@ def _authority_blob_inventory(
     if exists not in (True, False):
         raise OrchestrationError("authority Blob container existence response is invalid")
     if not exists:
-        if (
-            trusted_previous is not None
-            and trusted_previous.get("containerExists") is True
-        ):
+        if trusted_previous is not None and trusted_previous.get("containerExists") is True:
             raise OrchestrationError(
                 "authority Blob container disappeared after the reviewed checkpoint"
             )
@@ -4433,17 +5036,13 @@ def _authority_blob_inventory(
         )
     )
     if len(live_versions) > MAX_AUTHORITY_CHECKPOINT_VERSIONS:
-        raise OrchestrationError(
-            "authority Blob inventory exceeds the bounded version count"
-        )
+        raise OrchestrationError("authority Blob inventory exceeds the bounded version count")
     if any(item["isCurrentVersion"] is not True for item in live_versions):
         raise OrchestrationError(
             "authority Blob inventory is not append-only; every content-addressed "
             "asset must retain one current immutable version"
         )
-    live_version_keys = {
-        (str(item["name"]), str(item["versionId"])) for item in live_versions
-    }
+    live_version_keys = {(str(item["name"]), str(item["versionId"])) for item in live_versions}
     if len(live_version_keys) != len(live_versions):
         raise OrchestrationError("authority Blob version inventory contains duplicates")
     if len({str(item["name"]) for item in live_versions}) != len(live_versions):
@@ -4508,9 +5107,7 @@ def _authority_blob_inventory(
         )
         total_content_bytes += content_length
     if total_content_bytes > MAX_AUTHORITY_CHECKPOINT_CONTENT_BYTES:
-        raise OrchestrationError(
-            "authority Blob checkpoint exceeds the bounded total content size"
-        )
+        raise OrchestrationError("authority Blob checkpoint exceeds the bounded total content size")
     checkpoint_versions.sort(
         key=lambda item: (
             str(item["name"]),
@@ -4587,9 +5184,7 @@ def _validated_authority_blob_inventory(
             "authority Blob checkpoint currentBlobs and versions must be arrays"
         )
     if len(versions) > MAX_AUTHORITY_CHECKPOINT_VERSIONS:
-        raise OrchestrationError(
-            "authority Blob checkpoint exceeds the bounded version count"
-        )
+        raise OrchestrationError("authority Blob checkpoint exceeds the bounded version count")
     for index, raw_item in enumerate(current_blobs):
         item = _mapping(
             raw_item,
@@ -4621,9 +5216,7 @@ def _validated_authority_blob_inventory(
             or isinstance(content_length, bool)
             or content_length < 0
         ):
-            raise OrchestrationError(
-                "authority Blob current content length is invalid"
-            )
+            raise OrchestrationError("authority Blob current content length is invalid")
     total_content_bytes = 0
     for index, raw_item in enumerate(versions):
         item = _mapping(
@@ -4658,9 +5251,7 @@ def _validated_authority_blob_inventory(
             or content_length < 0
             or content_length > MAX_GUIDANCE_AUTHORITY_BINDING_BYTES
         ):
-            raise OrchestrationError(
-                "authority Blob version content length is invalid"
-            )
+            raise OrchestrationError("authority Blob version content length is invalid")
         total_content_bytes += content_length
         contract = _mapping(
             item.get("contract"),
@@ -4677,13 +5268,8 @@ def _validated_authority_blob_inventory(
                 contract.get("artifactId"),
                 field="authority Blob authority ID",
             )
-            if (
-                name
-                != f"guidance-authority/{artifact_id}/authority.json"
-            ):
-                raise OrchestrationError(
-                    "authority Blob authority contract is not path-bound"
-                )
+            if name != f"guidance-authority/{artifact_id}/authority.json":
+                raise OrchestrationError("authority Blob authority contract is not path-bound")
         elif kind == "binding":
             _require_exact_fields(
                 contract,
@@ -4695,9 +5281,7 @@ def _validated_authority_blob_inventory(
                 field="authority Blob binding ID",
             )
             if name != f"guidance-bindings/{artifact_id}/binding.json":
-                raise OrchestrationError(
-                    "authority Blob binding contract is not path-bound"
-                )
+                raise OrchestrationError("authority Blob binding contract is not path-bound")
             reference = _mapping(
                 contract.get("authorityReference"),
                 field="authority Blob binding authority reference",
@@ -4724,9 +5308,7 @@ def _validated_authority_blob_inventory(
                 "authority Blob checkpoint contains an unsupported contract kind"
             )
     if total_content_bytes > MAX_AUTHORITY_CHECKPOINT_CONTENT_BYTES:
-        raise OrchestrationError(
-            "authority Blob checkpoint exceeds the bounded total content size"
-        )
+        raise OrchestrationError("authority Blob checkpoint exceeds the bounded total content size")
     if inventory["containerExists"] is False and (
         inventory["currentBlobs"] or inventory["versions"]
     ):
@@ -4777,20 +5359,14 @@ def _validated_authority_blob_inventory(
             str(item["versionId"]),
         )
     )
-    if (
-        inventory["containerExists"] is True
-        and current_blobs != projected_current_blobs
-    ):
+    if inventory["containerExists"] is True and current_blobs != projected_current_blobs:
         raise OrchestrationError("authority Blob current and version inventories conflict")
-    version_by_reference = {
-        (str(item["name"]), str(item["versionId"])): item for item in versions
-    }
+    version_by_reference = {(str(item["name"]), str(item["versionId"])): item for item in versions}
     referenced_authorities: set[tuple[str, str]] = set()
     authority_keys = {
         (str(item["name"]), str(item["versionId"]))
         for item in versions
-        if _mapping(item["contract"], field="authority contract").get("kind")
-        == "authority"
+        if _mapping(item["contract"], field="authority contract").get("kind") == "authority"
     }
     for item in versions:
         contract = _mapping(item["contract"], field="authority contract")
@@ -5160,8 +5736,7 @@ def _acr_role_assignment_mode(value: object, *, field: str) -> str:
         ACR_ABAC_ROLE_ASSIGNMENT_MODE,
     }:
         raise OrchestrationError(
-            f"{field} must be {ACR_LEGACY_ROLE_ASSIGNMENT_MODE} "
-            f"or {ACR_ABAC_ROLE_ASSIGNMENT_MODE}"
+            f"{field} must be {ACR_LEGACY_ROLE_ASSIGNMENT_MODE} or {ACR_ABAC_ROLE_ASSIGNMENT_MODE}"
         )
     return mode
 
@@ -6631,9 +7206,7 @@ def _verify_legacy_acr_pull_migration(
         {
             _role_assignment_scope(
                 assignment["assignmentResourceId"]
-            ).casefold(): _role_assignment_scope(
-                assignment["assignmentResourceId"]
-            )
+            ).casefold(): _role_assignment_scope(assignment["assignmentResourceId"])
             for assignment in assignments
         }
         if allow_reviewed_assignment_scopes
@@ -6699,13 +7272,9 @@ def _verify_legacy_acr_pull_migration(
         for assignment in scoped_assignments:
             normalized_id = assignment["assignmentResourceId"].casefold()
             if normalized_id in observed_at_scope:
-                observed_resource_ids[normalized_id] = observed_at_scope[
-                    normalized_id
-                ]
+                observed_resource_ids[normalized_id] = observed_at_scope[normalized_id]
 
-    reviewed_by_id = {
-        item["assignmentResourceId"].casefold(): item for item in assignments
-    }
+    reviewed_by_id = {item["assignmentResourceId"].casefold(): item for item in assignments}
     observed_ids = set(observed_resource_ids)
     if migration_state == "absent":
         if observed_ids:
@@ -6716,8 +7285,7 @@ def _verify_legacy_acr_pull_migration(
         return
     if observed_ids != set(reviewed_by_id):
         raise OrchestrationError(
-            "legacy ACR pull migration evidence does not exactly match "
-            "the reviewed assignment IDs"
+            "legacy ACR pull migration evidence does not exactly match the reviewed assignment IDs"
         )
     expected_role_definition_id = _built_in_role_definition_id(
         subscription_id,
@@ -6726,11 +7294,14 @@ def _verify_legacy_acr_pull_migration(
     for assignment_id in sorted(observed_ids):
         reviewed = reviewed_by_id[assignment_id]
         original_assignment_id = observed_resource_ids[assignment_id]
-        if assignment_id == _deterministic_principal_role_assignment_id(
-            _role_assignment_scope(original_assignment_id),
-            reviewed["principalId"],
-            expected_role_definition_id,
-        ).casefold():
+        if (
+            assignment_id
+            == _deterministic_principal_role_assignment_id(
+                _role_assignment_scope(original_assignment_id),
+                reviewed["principalId"],
+                expected_role_definition_id,
+            ).casefold()
+        ):
             raise OrchestrationError(
                 "current principal-seeded ACR assignment cannot be classified as legacy"
             )
@@ -6755,9 +7326,7 @@ def _verify_legacy_acr_pull_migration(
             != reviewed["principalId"]
             or properties.get("principalType") != "ServicePrincipal"
         ):
-            raise OrchestrationError(
-                "legacy ACR pull assignment principal does not match review"
-            )
+            raise OrchestrationError("legacy ACR pull assignment principal does not match review")
         _require_subscription_resource_id_equal(
             properties.get("roleDefinitionId"),
             expected_role_definition_id,
@@ -6779,9 +7348,296 @@ def _verify_legacy_acr_pull_migration(
             properties.get("conditionVersion") is not None
             or properties.get("condition") is not None
         ):
-            raise OrchestrationError(
-                "legacy ACR pull assignment must not contain a condition"
+            raise OrchestrationError("legacy ACR pull assignment must not contain a condition")
+
+
+def _capture_revocation_assignment_evidence(
+    assignment_resource_ids: Sequence[str],
+    *,
+    subscription_id: str,
+) -> list[dict[str, object]]:
+    evidence: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for index, raw_assignment_id in enumerate(assignment_resource_ids):
+        assignment_id = _canonical_subscription_resource_id(
+            raw_assignment_id,
+            subscription_id=subscription_id,
+            field=f"revocation assignment {index}",
+        )
+        normalized_id = assignment_id.casefold()
+        if normalized_id in seen:
+            raise OrchestrationError("revocation assignment evidence must contain distinct IDs")
+        seen.add(normalized_id)
+        resource = _get_resource(
+            assignment_id,
+            subscription_id=subscription_id,
+        )
+        _require_resource_id_equal(
+            resource.get("id"),
+            assignment_id,
+            field="revocation assignment readback",
+        )
+        properties = _mapping(
+            resource.get("properties"),
+            field="revocation assignment properties",
+        )
+        scope = _role_assignment_scope(assignment_id)
+        if properties.get("scope") is not None:
+            _require_resource_id_equal(
+                properties.get("scope"),
+                scope,
+                field="revocation assignment scope",
             )
+        registry_mode: str | None = None
+        if _resource_type(scope) == "microsoft.containerregistry/registries":
+            registry = _get_resource(
+                scope,
+                subscription_id=subscription_id,
+            )
+            _require_resource_id_equal(
+                registry.get("id"),
+                scope,
+                field="revocation ACR runtime readback",
+            )
+            registry_mode = _acr_role_assignment_mode(
+                _mapping(
+                    registry.get("properties"),
+                    field="revocation ACR properties",
+                ).get("roleAssignmentMode"),
+                field="revocation ACR role-assignment mode",
+            )
+        evidence.append(
+            {
+                "assignmentResourceId": assignment_id,
+                "principalId": _canonical_directory_object_id(
+                    properties.get("principalId"),
+                    field="revocation assignment principal ID",
+                ),
+                "principalType": _string(
+                    properties.get("principalType"),
+                    field="revocation assignment principal type",
+                ),
+                "roleDefinitionId": _canonical_subscription_resource_id(
+                    properties.get("roleDefinitionId"),
+                    subscription_id=subscription_id,
+                    field="revocation assignment role definition",
+                ),
+                "scope": scope,
+                "conditionVersion": properties.get("conditionVersion"),
+                "condition": properties.get("condition"),
+                "registryRoleAssignmentMode": registry_mode,
+            }
+        )
+    evidence.sort(key=lambda item: str(item["assignmentResourceId"]).casefold())
+    return evidence
+
+
+def _validated_revocation_assignment_evidence(
+    value: object,
+    *,
+    subscription_id: str,
+) -> list[dict[str, object]]:
+    if not isinstance(value, list):
+        raise OrchestrationError("revocation assignments must be an array")
+    validated: list[dict[str, object]] = []
+    for index, raw_assignment in enumerate(value):
+        assignment = _mapping(
+            raw_assignment,
+            field=f"revocation assignment evidence {index}",
+        )
+        _require_exact_fields(
+            assignment,
+            frozenset(
+                {
+                    "assignmentResourceId",
+                    "principalId",
+                    "principalType",
+                    "roleDefinitionId",
+                    "scope",
+                    "conditionVersion",
+                    "condition",
+                    "registryRoleAssignmentMode",
+                }
+            ),
+            field=f"revocation assignment evidence {index}",
+        )
+        assignment_id = _canonical_subscription_resource_id(
+            assignment.get("assignmentResourceId"),
+            subscription_id=subscription_id,
+            field=f"revocation assignment evidence {index} ID",
+        )
+        scope = _azure_resource_id(
+            assignment.get("scope"),
+            field=f"revocation assignment evidence {index} scope",
+        )
+        _require_resource_id_equal(
+            _role_assignment_scope(assignment_id),
+            scope,
+            field=f"revocation assignment evidence {index} scope",
+        )
+        _canonical_directory_object_id(
+            assignment.get("principalId"),
+            field=f"revocation assignment evidence {index} principal",
+        )
+        if assignment.get("principalType") != "ServicePrincipal":
+            raise OrchestrationError(
+                "revocation assignment principal type must be ServicePrincipal"
+            )
+        _canonical_subscription_resource_id(
+            assignment.get("roleDefinitionId"),
+            subscription_id=subscription_id,
+            field=f"revocation assignment evidence {index} role",
+        )
+        for condition_field in ("conditionVersion", "condition"):
+            condition_value = assignment.get(condition_field)
+            if condition_value is not None and not isinstance(
+                condition_value,
+                str,
+            ):
+                raise OrchestrationError(f"revocation assignment {condition_field} is invalid")
+        registry_mode = assignment.get("registryRoleAssignmentMode")
+        if _resource_type(scope) == "microsoft.containerregistry/registries":
+            _acr_role_assignment_mode(
+                registry_mode,
+                field="revocation assignment registry mode",
+            )
+        elif registry_mode is not None:
+            raise OrchestrationError("non-ACR revocation assignment cannot carry a registry mode")
+        validated.append(dict(assignment))
+    if validated != sorted(
+        validated,
+        key=lambda item: str(item["assignmentResourceId"]).casefold(),
+    ) or len({str(item["assignmentResourceId"]).casefold() for item in validated}) != len(
+        validated
+    ):
+        raise OrchestrationError("revocation assignment evidence must be sorted and distinct")
+    return validated
+
+
+def _revocation_assignment_evidence_sha256(
+    value: Sequence[Mapping[str, object]],
+) -> str:
+    return _sha256_bytes(_canonical_json_bytes(list(value)))
+
+
+def _verify_revocation_assignment_evidence_bindings(
+    evidence: Sequence[Mapping[str, object]],
+    *,
+    rotations: Sequence[Mapping[str, str]],
+    legacy_acr_migrations: Sequence[Mapping[str, str]],
+    legacy_crypto_expected: Mapping[str, _ExpectedRoleAssignment] | None,
+    subscription_id: str,
+) -> None:
+    by_id = {str(item["assignmentResourceId"]).casefold(): item for item in evidence}
+    rotation_ids = {item["assignmentResourceId"].casefold() for item in rotations}
+    legacy_acr_ids = {item["assignmentResourceId"].casefold() for item in legacy_acr_migrations}
+    legacy_crypto_ids = set() if legacy_crypto_expected is None else set(legacy_crypto_expected)
+    if len(rotation_ids | legacy_acr_ids | legacy_crypto_ids) != len(rotation_ids) + len(
+        legacy_acr_ids
+    ) + len(legacy_crypto_ids):
+        raise OrchestrationError(
+            "one revocation assignment cannot belong to multiple migration categories"
+        )
+    for rotation in rotations:
+        assignment_id = rotation["assignmentResourceId"].casefold()
+        item = by_id[assignment_id]
+        if item["principalId"] != rotation["retiredPrincipalId"]:
+            raise OrchestrationError(
+                "revocation evidence principal differs from the reviewed retired principal"
+            )
+        scope = str(item["scope"])
+        role_definition_id = str(item["roleDefinitionId"])
+        role_id = role_definition_id.casefold().rsplit("/", 1)[-1]
+        scope_type = _resource_type(scope)
+        custom_permissions: _RolePermissionProfile | None = None
+        if role_id in BUILT_IN_DATA_ROLE_IDS:
+            if role_id not in ALLOWED_BUILT_IN_ROLES_BY_SCOPE_TYPE.get(
+                scope_type,
+                frozenset(),
+            ):
+                raise OrchestrationError(
+                    "revocation evidence role does not match its reviewed scope"
+                )
+        else:
+            role = _get_resource(
+                role_definition_id,
+                subscription_id=subscription_id,
+            )
+            _require_subscription_resource_id_equal(
+                role.get("id"),
+                role_definition_id,
+                subscription_id=subscription_id,
+                field="revocation evidence custom role readback",
+            )
+            custom_permissions = _verify_custom_role(role)
+            if custom_permissions not in (
+                ALLOWED_CUSTOM_PERMISSION_PROFILES_BY_SCOPE_TYPE.get(
+                    scope_type,
+                    frozenset(),
+                )
+            ):
+                raise OrchestrationError("revocation evidence custom role does not match its scope")
+        grants_blob_read = role_id == BLOB_DATA_READER_ROLE_ID or (
+            custom_permissions is not None
+            and BLOB_READ_DATA_ACTION in custom_permissions.data_actions
+        )
+        expected_condition_version = "2.0" if grants_blob_read else None
+        expected_condition = BLOB_LIST_DENY_CONDITION if grants_blob_read else None
+        if (
+            item["conditionVersion"] != expected_condition_version
+            or item["condition"] != expected_condition
+        ):
+            raise OrchestrationError(
+                "revocation evidence condition does not match its exact role profile"
+            )
+        if scope_type == "microsoft.containerregistry/registries":
+            mode = _acr_role_assignment_mode(
+                item["registryRoleAssignmentMode"],
+                field="revocation evidence ACR mode",
+            )
+            _require_subscription_resource_id_equal(
+                role_definition_id,
+                _acr_pull_role_definition_id(
+                    role_assignment_mode=mode,
+                    subscription_id=subscription_id,
+                ),
+                subscription_id=subscription_id,
+                field="revocation evidence ACR role",
+            )
+    for migration in legacy_acr_migrations:
+        item = by_id[migration["assignmentResourceId"].casefold()]
+        if item["principalId"] != migration["principalId"]:
+            raise OrchestrationError("legacy ACR revocation evidence principal differs from review")
+        if (
+            _resource_type(str(item["scope"])) != "microsoft.containerregistry/registries"
+            or item["conditionVersion"] is not None
+            or item["condition"] is not None
+        ):
+            raise OrchestrationError("legacy ACR revocation evidence scope or condition is invalid")
+        _require_subscription_resource_id_equal(
+            item["roleDefinitionId"],
+            _built_in_role_definition_id(subscription_id, ACR_PULL_ROLE_ID),
+            subscription_id=subscription_id,
+            field="legacy ACR revocation evidence role",
+        )
+        _acr_role_assignment_mode(
+            item["registryRoleAssignmentMode"],
+            field="legacy ACR revocation evidence mode",
+        )
+    if legacy_crypto_expected is not None:
+        for assignment_id, expected in legacy_crypto_expected.items():
+            item = by_id[assignment_id]
+            if (
+                item["principalId"] != expected.principal_id
+                or str(item["scope"]).casefold() != expected.scope.casefold()
+                or str(item["roleDefinitionId"]).casefold()
+                != expected.role_definition_id.casefold()
+                or item["conditionVersion"] != expected.condition_version
+                or item["condition"] != expected.condition
+            ):
+                raise OrchestrationError(
+                    "legacy Crypto User revocation evidence differs from exact review"
+                )
 
 
 def _verify_complete_trigger_queue_assignment_set(
@@ -6929,8 +7785,7 @@ def _verify_complete_trigger_queue_assignment_set(
         if transition_state == "absent":
             if principal_id == evidence.retired_principal_id:
                 raise OrchestrationError(
-                    "retired trigger-queue assignment still targets the reviewed "
-                    "retired principal"
+                    "retired trigger-queue assignment still targets the reviewed retired principal"
                 )
             expected = current_expected_assignments.get(assignment_id)
             if expected is None:
@@ -6993,9 +7848,7 @@ def _verify_complete_trigger_queue_assignment_set(
     if transition_state == "present" and (transition_assignment_ids - observed_assignment_ids):
         raise OrchestrationError("approved trigger-queue transition evidence is incomplete")
     for principal_id, assignment_ids in reused_current_assignments.items():
-        verified_current_assignments.setdefault(principal_id, set()).update(
-            assignment_ids
-        )
+        verified_current_assignments.setdefault(principal_id, set()).update(assignment_ids)
     return verified_current_assignments
 
 
@@ -7068,9 +7921,7 @@ def _canonical_rotation_transition_assignments(
             "/providers/microsoft.authorization/roleassignments/"
             not in assignment_resource_id.casefold()
         ):
-            raise OrchestrationError(
-                f"{field}[{index}] must identify one role assignment"
-            )
+            raise OrchestrationError(f"{field}[{index}] must identify one role assignment")
         canonical.append(
             _RotationTransitionEvidence(
                 assignment_resource_id=assignment_resource_id,
@@ -7080,9 +7931,7 @@ def _canonical_rotation_transition_assignments(
                 ),
             )
         )
-    normalized_ids = {
-        item.assignment_resource_id.casefold() for item in canonical
-    }
+    normalized_ids = {item.assignment_resource_id.casefold() for item in canonical}
     if len(normalized_ids) != len(canonical):
         raise OrchestrationError(f"{field} must contain distinct assignment IDs")
     if len(canonical) > MAX_APPROVED_ROTATION_TRANSITION_ASSIGNMENTS:
@@ -7149,9 +7998,7 @@ def _canonical_legacy_acr_pull_migration_assignments(
             "/providers/microsoft.authorization/roleassignments/"
             not in assignment_resource_id.casefold()
         ):
-            raise OrchestrationError(
-                f"{field}[{index}] must identify one ACR role assignment"
-            )
+            raise OrchestrationError(f"{field}[{index}] must identify one ACR role assignment")
         canonical.append(
             {
                 "assignmentResourceId": assignment_resource_id,
@@ -7161,12 +8008,8 @@ def _canonical_legacy_acr_pull_migration_assignments(
                 ),
             }
         )
-    if len(
-        {item["assignmentResourceId"].casefold() for item in canonical}
-    ) != len(canonical):
-        raise OrchestrationError(
-            f"{field} must contain distinct assignment resource IDs"
-        )
+    if len({item["assignmentResourceId"].casefold() for item in canonical}) != len(canonical):
+        raise OrchestrationError(f"{field} must contain distinct assignment resource IDs")
     if len(canonical) > MAX_LEGACY_ACR_PULL_MIGRATION_ASSIGNMENTS:
         raise OrchestrationError(f"{field} exceeds the bounded maximum")
     return sorted(
@@ -7257,17 +8100,14 @@ def _rotation_transitions_for_expected_assignments(
     expected_assignments: Mapping[str, _ExpectedRoleAssignment],
     subscription_id: str,
 ) -> list[dict[str, str]]:
-    expected_scopes = {
-        expected.scope.casefold() for expected in expected_assignments.values()
-    }
+    expected_scopes = {expected.scope.casefold() for expected in expected_assignments.values()}
     return [
         evidence.document()
         for evidence in _rotation_transition_assignments_by_id(
             approved_transitions,
             subscription_id=subscription_id,
         ).values()
-        if _role_assignment_scope(evidence.assignment_resource_id).casefold()
-        in expected_scopes
+        if _role_assignment_scope(evidence.assignment_resource_id).casefold() in expected_scopes
     ]
 
 
@@ -7361,9 +8201,7 @@ def _verify_current_transition_reuse(
         properties.get("conditionVersion") != expected.condition_version
         or properties.get("condition") != expected.condition
     ):
-        raise OrchestrationError(
-            f"{expected.label} recreated assignment condition does not match"
-        )
+        raise OrchestrationError(f"{expected.label} recreated assignment condition does not match")
     if expected.custom_role_permissions is not None:
         role = _get_resource(
             role_definition_id,
@@ -7469,8 +8307,7 @@ def _verify_reviewed_rotation_transitions(
         if transition_state == "absent":
             if principal_id == evidence.retired_principal_id:
                 raise OrchestrationError(
-                    "retired deterministic assignment still targets the reviewed "
-                    "retired principal"
+                    "retired deterministic assignment still targets the reviewed retired principal"
                 )
             current_expected = expected_assignments.get(assignment_id)
             if current_expected is None:
@@ -8215,9 +9052,7 @@ def _validated_image_pull_evidence(
         raise OrchestrationError("image-pull evidence executions must be an array")
     expected_count = 2 if stage == "live-acceptance" else 1
     if stage == "foundation" or len(executions) != expected_count:
-        raise OrchestrationError(
-            f"{stage} image-pull evidence has an unexpected execution count"
-        )
+        raise OrchestrationError(f"{stage} image-pull evidence has an unexpected execution count")
     for index, raw_execution in enumerate(executions):
         execution = _mapping(
             raw_execution,
@@ -8247,9 +9082,7 @@ def _validated_image_pull_evidence(
             field=f"image-pull execution {index} kind",
         )
         if kind not in {"producer", "publisher"}:
-            raise OrchestrationError(
-                f"image-pull execution {index} kind is unsupported"
-            )
+            raise OrchestrationError(f"image-pull execution {index} kind is unsupported")
         _canonical_subscription_resource_id(
             execution.get("jobResourceId"),
             subscription_id=subscription_id,
@@ -8318,10 +9151,14 @@ def _validated_image_pull_evidence(
         key=lambda item: str(item["jobResourceId"]).casefold(),
     ):
         raise OrchestrationError("image-pull evidence executions must be sorted")
-    expected_kinds = {
-        "producer",
-        "publisher",
-    } if stage == "live-acceptance" else {stage}
+    expected_kinds = (
+        {
+            "producer",
+            "publisher",
+        }
+        if stage == "live-acceptance"
+        else {stage}
+    )
     if {str(item["kind"]) for item in executions} != expected_kinds:
         raise OrchestrationError(
             f"{stage} image-pull evidence does not contain its exact job kinds"
@@ -8468,9 +9305,7 @@ def _verify_digest_pinned_job_image_pull(
                         "status": "Succeeded",
                     }
                 if status == "Failed":
-                    raise OrchestrationError(
-                        "digest-pinned image-pull execution failed"
-                    )
+                    raise OrchestrationError("digest-pinned image-pull execution failed")
                 if poll < IMAGE_PULL_EXECUTION_POLL_ATTEMPTS:
                     time.sleep(READBACK_RETRY_SECONDS)
             raise OrchestrationError(
@@ -8498,60 +9333,60 @@ def _image_pull_probe_from_outputs(
         return {
             "kind": kind,
             **_verify_digest_pinned_job_image_pull(
-            job_resource_id=_string(
-                outputs.get("producerJobResourceId"),
-                field="producer image-pull job",
-            ),
-            image=_string(outputs.get("producerImage"), field="producer image"),
-            container_name="wc027-enrichment-feed-producer",
-            registry_resource_id=_string(
-                outputs.get("registryResourceId"),
-                field="producer registry resource ID",
-            ),
-            principal_id=principal_id,
-            registry_role_assignment_mode=_string(
-                outputs.get("registryRoleAssignmentMode"),
-                field="producer registry role-assignment mode",
-            ),
-            registry_pull_role_definition_id=_string(
-                outputs.get("registryPullRoleDefinitionId"),
-                field="producer registry pull role definition",
-            ),
-            registry_pull_role_assignment_resource_id=_string(
-                outputs.get("registryPullRoleAssignmentResourceId"),
-                field="producer registry pull role assignment",
-            ),
-            subscription_id=subscription_id,
+                job_resource_id=_string(
+                    outputs.get("producerJobResourceId"),
+                    field="producer image-pull job",
+                ),
+                image=_string(outputs.get("producerImage"), field="producer image"),
+                container_name="wc027-enrichment-feed-producer",
+                registry_resource_id=_string(
+                    outputs.get("registryResourceId"),
+                    field="producer registry resource ID",
+                ),
+                principal_id=principal_id,
+                registry_role_assignment_mode=_string(
+                    outputs.get("registryRoleAssignmentMode"),
+                    field="producer registry role-assignment mode",
+                ),
+                registry_pull_role_definition_id=_string(
+                    outputs.get("registryPullRoleDefinitionId"),
+                    field="producer registry pull role definition",
+                ),
+                registry_pull_role_assignment_resource_id=_string(
+                    outputs.get("registryPullRoleAssignmentResourceId"),
+                    field="producer registry pull role assignment",
+                ),
+                subscription_id=subscription_id,
             ),
         }
     if kind == "publisher":
         return {
             "kind": kind,
             **_verify_digest_pinned_job_image_pull(
-            job_resource_id=_string(
-                outputs.get("publisherJobResourceId"),
-                field="publisher image-pull job",
-            ),
-            image=_string(outputs.get("publisherImage"), field="publisher image"),
-            container_name="wc027-guidance-authority-publisher",
-            registry_resource_id=_string(
-                outputs.get("registryResourceId"),
-                field="publisher registry resource ID",
-            ),
-            principal_id=principal_id,
-            registry_role_assignment_mode=_string(
-                outputs.get("registryRoleAssignmentMode"),
-                field="publisher registry role-assignment mode",
-            ),
-            registry_pull_role_definition_id=_string(
-                outputs.get("registryPullRoleDefinitionId"),
-                field="publisher registry pull role definition",
-            ),
-            registry_pull_role_assignment_resource_id=_string(
-                outputs.get("registryPullRoleAssignmentResourceId"),
-                field="publisher registry pull role assignment",
-            ),
-            subscription_id=subscription_id,
+                job_resource_id=_string(
+                    outputs.get("publisherJobResourceId"),
+                    field="publisher image-pull job",
+                ),
+                image=_string(outputs.get("publisherImage"), field="publisher image"),
+                container_name="wc027-guidance-authority-publisher",
+                registry_resource_id=_string(
+                    outputs.get("registryResourceId"),
+                    field="publisher registry resource ID",
+                ),
+                principal_id=principal_id,
+                registry_role_assignment_mode=_string(
+                    outputs.get("registryRoleAssignmentMode"),
+                    field="publisher registry role-assignment mode",
+                ),
+                registry_pull_role_definition_id=_string(
+                    outputs.get("registryPullRoleDefinitionId"),
+                    field="publisher registry pull role definition",
+                ),
+                registry_pull_role_assignment_resource_id=_string(
+                    outputs.get("registryPullRoleAssignmentResourceId"),
+                    field="publisher registry pull role assignment",
+                ),
+                subscription_id=subscription_id,
             ),
         }
     raise OrchestrationError(f"unsupported image-pull probe kind: {kind}")
@@ -8576,12 +9411,8 @@ def _expected_image_pull_binding(
         "registryResourceId": outputs["registryResourceId"],
         "principalId": principal_id,
         "registryRoleAssignmentMode": outputs["registryRoleAssignmentMode"],
-        "registryPullRoleDefinitionId": outputs[
-            "registryPullRoleDefinitionId"
-        ],
-        "registryPullRoleAssignmentResourceId": outputs[
-            "registryPullRoleAssignmentResourceId"
-        ],
+        "registryPullRoleDefinitionId": outputs["registryPullRoleDefinitionId"],
+        "registryPullRoleAssignmentResourceId": outputs["registryPullRoleAssignmentResourceId"],
         "status": "Succeeded",
     }
 
@@ -8602,9 +9433,7 @@ def _verify_image_pull_evidence_matches_outputs(
         if isinstance(item, dict) and item.get("kind") == kind
     ]
     if len(matches) != 1:
-        raise OrchestrationError(
-            f"image-pull evidence must contain one exact {kind} execution"
-        )
+        raise OrchestrationError(f"image-pull evidence must contain one exact {kind} execution")
     actual = dict(matches[0])
     actual.pop("executionName", None)
     if actual != _expected_image_pull_binding(
@@ -8612,9 +9441,7 @@ def _verify_image_pull_evidence_matches_outputs(
         kind=kind,
         principal_id=principal_id,
     ):
-        raise OrchestrationError(
-            f"{kind} image-pull evidence does not match reviewed outputs"
-        )
+        raise OrchestrationError(f"{kind} image-pull evidence does not match reviewed outputs")
 
 
 def _verify_service_bus_queue(
@@ -8926,6 +9753,10 @@ def _verify_foundation_resources(
     )
     _verify_foundation_key_heads(
         foundation,
+        subscription_id=subscription_id,
+    )
+    _verify_wc013_acr_pull_assignments(
+        outputs["wc013AcrPullAssignments"],
         subscription_id=subscription_id,
     )
 
@@ -9827,7 +10658,8 @@ def _handoff_outputs(
             if name != "wc016ApprovedConfiguration"
         }
         projected["wc016ApprovedConfiguration"] = {
-            "wc027OrchestrationFoundation": dict(wc027_foundation)
+            "wc027OrchestrationFoundation": dict(wc027_foundation),
+            "wc013AcrPullAssignments": approved_configuration.get("wc013AcrPullAssignments"),
         }
         _foundation_outputs({"outputs": projected}, require_exact=True)
         return projected
@@ -9850,6 +10682,7 @@ def _handoff_outputs(
                 field="live-acceptance WC-027 readiness",
             ),
             "publisherInvocationBoundary": dict(PUBLISHER_INVOCATION_BOUNDARY),
+            "wc013AcrPullAssignments": approved_configuration.get("wc013AcrPullAssignments"),
         }
         _validate_live_acceptance_handoff_outputs(projected)
         return projected
@@ -9957,8 +10790,7 @@ def _validate_resume_succeeded_deployment(
         and trusted_prior_inventory is None
     ):
         raise OrchestrationError(
-            "succeeded-deployment resume is limited to a reviewed fresh "
-            "producer bootstrap plan"
+            "succeeded-deployment resume is limited to a reviewed fresh producer bootstrap plan"
         )
 
 
@@ -9973,20 +10805,15 @@ def _verify_authority_checkpoint_successor(
         raise OrchestrationError(
             "authority Blob checkpoint does not reference its exact reviewed predecessor"
         )
-    if (
-        current_inventory.get("containerResourceId")
-        != previous_inventory.get("containerResourceId")
+    if current_inventory.get("containerResourceId") != previous_inventory.get(
+        "containerResourceId"
     ):
-        raise OrchestrationError(
-            "authority Blob checkpoint changed its governed container"
-        )
+        raise OrchestrationError("authority Blob checkpoint changed its governed container")
     if (
         previous_inventory.get("containerExists") is True
         and current_inventory.get("containerExists") is not True
     ):
-        raise OrchestrationError(
-            "authority Blob checkpoint removed the governed container"
-        )
+        raise OrchestrationError("authority Blob checkpoint removed the governed container")
     if (
         previous_inventory.get("containerExists") is False
         and current_inventory.get("containerExists") is True
@@ -10007,32 +10834,23 @@ def _verify_authority_checkpoint_contains(
     required_inventory: Mapping[str, object],
     current_inventory: Mapping[str, object],
 ) -> None:
-    if (
-        current_inventory.get("containerResourceId")
-        != required_inventory.get("containerResourceId")
+    if current_inventory.get("containerResourceId") != required_inventory.get(
+        "containerResourceId"
     ):
-        raise OrchestrationError(
-            "authority Blob checkpoint changed its governed container"
-        )
+        raise OrchestrationError("authority Blob checkpoint changed its governed container")
     if (
         required_inventory.get("containerExists") is True
         and current_inventory.get("containerExists") is not True
     ):
-        raise OrchestrationError(
-            "authority Blob checkpoint removed a required container"
-        )
+        raise OrchestrationError("authority Blob checkpoint removed a required container")
     required_versions = {
-        (str(item["name"]), str(item["versionId"])): item
-        for item in required_inventory["versions"]
+        (str(item["name"]), str(item["versionId"])): item for item in required_inventory["versions"]
     }
     current_versions = {
-        (str(item["name"]), str(item["versionId"])): item
-        for item in current_inventory["versions"]
+        (str(item["name"]), str(item["versionId"])): item for item in current_inventory["versions"]
     }
     if not set(required_versions).issubset(current_versions):
-        raise OrchestrationError(
-            "authority Blob checkpoint removed a reviewed immutable version"
-        )
+        raise OrchestrationError("authority Blob checkpoint removed a reviewed immutable version")
     for key, required in required_versions.items():
         if current_versions[key] != required:
             raise OrchestrationError(
@@ -10052,10 +10870,7 @@ def _verify_post_deployment_authority_inventory(
         return
     if reviewed_inventory is None or current_inventory is None:
         raise OrchestrationError("authority Blob inventory is required for WC-027 readiness")
-    fresh_producer = (
-        stage == "producer"
-        and reviewed_inventory.get("containerExists") is False
-    )
+    fresh_producer = stage == "producer" and reviewed_inventory.get("containerExists") is False
     _verify_authority_checkpoint_successor(
         previous_inventory=reviewed_inventory,
         current_inventory=current_inventory,
@@ -10089,12 +10904,8 @@ def _predecessor_authority_blob_inventory(
         subscription_id=subscription_id,
     )
     if inventory is None:
-        raise OrchestrationError(
-            f"{predecessor_name} handoff is missing authority Blob inventory"
-        )
-    if handoff.get("authorityBlobInventorySha256") != _authority_checkpoint_sha256(
-        inventory
-    ):
+        raise OrchestrationError(f"{predecessor_name} handoff is missing authority Blob inventory")
+    if handoff.get("authorityBlobInventorySha256") != _authority_checkpoint_sha256(inventory):
         raise OrchestrationError(
             f"{predecessor_name} handoff authority checkpoint digest does not match"
         )
@@ -10254,7 +11065,17 @@ def _validate_live_acceptance_handoff_outputs(
         PUBLISHER_INVOCATION_BOUNDARY,
         field="publisher invocation boundary",
     )
-    _readiness_sections(outputs)
+    producer_readback, _ = _readiness_sections(outputs)
+    subscription_id, _ = _resource_subscription_and_group(
+        _job_resource_id(
+            producer_readback.get("jobResourceId"),
+            field="live-acceptance producer job",
+        )
+    )
+    _validated_wc013_acr_pull_assignments(
+        outputs.get("wc013AcrPullAssignments"),
+        subscription_id=subscription_id,
+    )
 
 
 def _acceptance_outputs(
@@ -10413,15 +11234,17 @@ def _verify_deployed_stage_state(
             subscription_id=subscription_id,
             rotation_transitions=reviewed_transitions,
         )
+        _verify_wc013_acr_pull_assignments(
+            outputs["wc013AcrPullAssignments"],
+            subscription_id=subscription_id,
+        )
         image_pull_executions.extend(
             [
                 _image_pull_probe_from_outputs(
                     _mapping(producer["outputs"], field="producer outputs"),
                     kind="producer",
                     principal_id=_string(
-                        _handoff_bindings(producer).get(
-                            "brokerIdentityPrincipalId"
-                        ),
+                        _handoff_bindings(producer).get("brokerIdentityPrincipalId"),
                         field="producer broker principal ID",
                     ),
                     subscription_id=subscription_id,
@@ -10430,9 +11253,7 @@ def _verify_deployed_stage_state(
                     _mapping(publisher["outputs"], field="publisher outputs"),
                     kind="publisher",
                     principal_id=_string(
-                        _handoff_bindings(publisher).get(
-                            "brokerIdentityPrincipalId"
-                        ),
+                        _handoff_bindings(publisher).get("brokerIdentityPrincipalId"),
                         field="publisher broker principal ID",
                     ),
                     subscription_id=subscription_id,
@@ -10445,9 +11266,7 @@ def _verify_deployed_stage_state(
         producer_assignment_ids_by_principal = _verify_producer_resources(
             _mapping(producer["outputs"], field="producer outputs"),
             foundation=foundation,
-            effective_parameters=_bindings_as_parameters(
-                _handoff_bindings(producer)
-            ),
+            effective_parameters=_bindings_as_parameters(_handoff_bindings(producer)),
             subscription_id=subscription_id,
             approved_transitions=reviewed_transitions,
             require_transition_revoked=True,
@@ -10485,14 +11304,10 @@ def _verify_deployed_stage_state(
         )
     if authority_container_id is None:
         if reviewed_authority_inventory is not None:
-            raise OrchestrationError(
-                "foundation deployment cannot carry authority Blob inventory"
-            )
+            raise OrchestrationError("foundation deployment cannot carry authority Blob inventory")
         return None, None
     if reviewed_authority_inventory is None:
-        raise OrchestrationError(
-            "WC-027 deployment is missing its reviewed authority checkpoint"
-        )
+        raise OrchestrationError("WC-027 deployment is missing its reviewed authority checkpoint")
     current_inventory = _authority_blob_inventory(
         authority_container_id,
         subscription_id=subscription_id,
@@ -10503,9 +11318,7 @@ def _verify_deployed_stage_state(
         reviewed_inventory=reviewed_authority_inventory,
         current_inventory=current_inventory,
     )
-    image_pull_executions.sort(
-        key=lambda item: str(item["jobResourceId"]).casefold()
-    )
+    image_pull_executions.sort(key=lambda item: str(item["jobResourceId"]).casefold())
     image_pull_evidence = {
         "schemaVersion": IMAGE_PULL_EVIDENCE_SCHEMA_VERSION,
         "executions": image_pull_executions,
@@ -10518,6 +11331,246 @@ def _verify_deployed_stage_state(
     if validated_image_pull_evidence is None:
         raise OrchestrationError("image-pull evidence unexpectedly vanished")
     return current_inventory, validated_image_pull_evidence
+
+
+def prepare_revocation(args: argparse.Namespace) -> Path:
+    artifact_reader = _ArtifactReader()
+    subscription_id = _canonical_subscription_id(
+        args.subscription,
+        field="subscription",
+    )
+    base_parameter_artifact = artifact_reader.capture_json(
+        args.parameters,
+        field="reviewed base parameter artifact",
+    )
+    handoff_paths = {
+        "foundation": args.foundation_handoff,
+        "producer": args.producer_handoff,
+        "publisher": args.publisher_handoff,
+    }
+    receipt_paths = {
+        "foundation": args.foundation_receipt,
+        "producer": args.producer_receipt,
+        "publisher": args.publisher_receipt,
+    }
+    reviewed_receipt_sha256s = {
+        "foundation": args.foundation_reviewed_receipt_sha256,
+        "producer": args.producer_reviewed_receipt_sha256,
+        "publisher": args.publisher_reviewed_receipt_sha256,
+    }
+    _validate_stage_inputs(
+        stage=args.stage,
+        resource_group=args.resource_group,
+        foundation_handoff_path=args.foundation_handoff,
+        producer_handoff_path=args.producer_handoff,
+        publisher_handoff_path=args.publisher_handoff,
+    )
+    verified_predecessors = _load_verified_predecessors(
+        stage=args.stage,
+        handoff_paths=handoff_paths,
+        receipt_paths=receipt_paths,
+        reviewed_receipt_sha256s=reviewed_receipt_sha256s,
+        artifact_reader=artifact_reader,
+    )
+    _ensure_evidence_directory_outside_repository(args.evidence_directory)
+    _ensure_clean_worktree()
+    effective = _build_effective_parameters_from_documents(
+        stage=args.stage,
+        parameter_document=base_parameter_artifact.document,
+        handoffs={
+            predecessor: _mapping(
+                record["handoff"],
+                field=f"verified {predecessor} handoff",
+            )
+            for predecessor, record in verified_predecessors.items()
+        },
+    )
+    _bind_broker_identity_principal(
+        stage=args.stage,
+        effective_parameters=effective,
+        subscription_id=subscription_id,
+    )
+    _validate_effective_parameter_subscription_boundary(
+        effective,
+        subscription_id=subscription_id,
+    )
+    raw_rotations = list(getattr(args, "rotation_transition_assignment", []))
+    rotations = _canonical_rotation_transition_assignments(
+        [
+            {
+                "assignmentResourceId": pair[0],
+                "retiredPrincipalId": pair[1],
+            }
+            for pair in raw_rotations
+            if isinstance(pair, list | tuple) and len(pair) == 2
+        ],
+        subscription_id=subscription_id,
+        field="revocation rotation transitions",
+    )
+    if len(rotations) != len(raw_rotations):
+        raise OrchestrationError(
+            "each rotation transition requires an assignment ID and retired principal ID"
+        )
+    legacy_crypto = _canonical_legacy_crypto_user_migration_assignments(
+        list(
+            getattr(
+                args,
+                "legacy_crypto_user_migration_assignment",
+                [],
+            )
+        ),
+        subscription_id=subscription_id,
+        field="revocation legacy Crypto User migrations",
+    )
+    raw_legacy_acr = list(getattr(args, "legacy_acr_pull_migration_assignment", []))
+    legacy_acr = _canonical_legacy_acr_pull_migration_assignments(
+        [
+            {
+                "assignmentResourceId": pair[0],
+                "principalId": pair[1],
+            }
+            for pair in raw_legacy_acr
+            if isinstance(pair, list | tuple) and len(pair) == 2
+        ],
+        subscription_id=subscription_id,
+        field="revocation legacy ACR pull migrations",
+    )
+    if len(legacy_acr) != len(raw_legacy_acr):
+        raise OrchestrationError(
+            "each legacy ACR pull migration requires an assignment ID and principal ID"
+        )
+    if not rotations and not legacy_crypto and not legacy_acr:
+        raise OrchestrationError(
+            "revocation planning requires at least one exact reviewed assignment"
+        )
+    if args.stage != "producer" and legacy_crypto:
+        raise OrchestrationError("legacy Crypto User migration assignments are producer-stage only")
+    current_principal_ids = (
+        set()
+        if args.stage in {"foundation", "live-acceptance"}
+        else _current_principal_ids_from_effective_parameters(
+            effective,
+            subscription_id=subscription_id,
+        )
+    )
+    if rotations:
+        _verify_reviewed_rotation_transitions(
+            rotations,
+            current_principal_ids=current_principal_ids,
+            transition_state="present",
+            subscription_id=subscription_id,
+        )
+    legacy_crypto_expected: Mapping[str, _ExpectedRoleAssignment] | None = None
+    if args.stage == "producer":
+        _verify_planned_trigger_queue_transition_state(
+            effective_parameters=effective,
+            resource_group=_string(
+                args.resource_group,
+                field="producer resource group",
+            ),
+            approved_transitions=rotations,
+            transition_state="present",
+            subscription_id=subscription_id,
+        )
+        all_legacy_crypto_expected = _planned_legacy_crypto_user_assignments(
+            effective_parameters=effective,
+            resource_group=_string(
+                args.resource_group,
+                field="producer resource group",
+            ),
+            subscription_id=subscription_id,
+        )
+        _verify_legacy_crypto_user_migration(
+            all_legacy_crypto_expected,
+            set(legacy_crypto),
+            migration_state="present",
+            subscription_id=subscription_id,
+        )
+        legacy_crypto_expected = {
+            assignment_id.casefold(): all_legacy_crypto_expected[assignment_id.casefold()]
+            for assignment_id in legacy_crypto
+        }
+    if legacy_acr:
+        _verify_legacy_acr_pull_migration(
+            legacy_acr,
+            migration_state="present",
+            stage=args.stage,
+            effective_parameters=effective,
+            subscription_id=subscription_id,
+        )
+    assignment_ids = [
+        *(item["assignmentResourceId"] for item in rotations),
+        *legacy_crypto,
+        *(item["assignmentResourceId"] for item in legacy_acr),
+    ]
+    revocation_assignments = _capture_revocation_assignment_evidence(
+        assignment_ids,
+        subscription_id=subscription_id,
+    )
+    _verify_revocation_assignment_evidence_bindings(
+        revocation_assignments,
+        rotations=rotations,
+        legacy_acr_migrations=legacy_acr,
+        legacy_crypto_expected=legacy_crypto_expected,
+        subscription_id=subscription_id,
+    )
+    stem = f"{args.stage}-{args.deployment_name}"
+    effective_path = args.evidence_directory / f"{stem}.revocation.parameters.json"
+    plan_path = args.evidence_directory / f"{stem}.revocation.plan.json"
+    for evidence_path in (effective_path, plan_path):
+        if evidence_path.exists():
+            raise OrchestrationError(f"refusing to overwrite immutable evidence {evidence_path}")
+    effective_raw_bytes = _canonical_json_file_bytes(_parameter_document(effective))
+    _write_new_bytes(effective_path, effective_raw_bytes)
+    plan = {
+        "schemaVersion": REVOCATION_PLAN_SCHEMA_VERSION,
+        "stage": args.stage,
+        "sourceCommit": SOURCE_COMMIT,
+        "subscriptionId": subscription_id,
+        "resourceGroup": args.resource_group,
+        "deploymentName": args.deployment_name,
+        "baseParameterPath": str(base_parameter_artifact.path),
+        "baseParameterSha256": base_parameter_artifact.sha256,
+        "effectiveParameterPath": str(effective_path.resolve()),
+        "effectiveParameterSha256": _sha256_bytes(effective_raw_bytes),
+        "foundationHandoffPath": (
+            None
+            if "foundation" not in verified_predecessors
+            else str(verified_predecessors["foundation"]["handoffPath"])
+        ),
+        "foundationHandoffSha256": (
+            None
+            if "foundation" not in verified_predecessors
+            else verified_predecessors["foundation"]["handoffSha256"]
+        ),
+        "producerHandoffPath": (
+            None
+            if "producer" not in verified_predecessors
+            else str(verified_predecessors["producer"]["handoffPath"])
+        ),
+        "producerHandoffSha256": (
+            None
+            if "producer" not in verified_predecessors
+            else verified_predecessors["producer"]["handoffSha256"]
+        ),
+        "publisherHandoffPath": (
+            None
+            if "publisher" not in verified_predecessors
+            else str(verified_predecessors["publisher"]["handoffPath"])
+        ),
+        "publisherHandoffSha256": (
+            None
+            if "publisher" not in verified_predecessors
+            else verified_predecessors["publisher"]["handoffSha256"]
+        ),
+        "predecessorReceipts": _predecessor_receipt_references(verified_predecessors),
+        "rotationTransitionAssignments": rotations,
+        "legacyCryptoUserMigrationAssignmentIds": legacy_crypto,
+        "legacyAcrPullMigrationAssignments": legacy_acr,
+        "revocationAssignments": revocation_assignments,
+    }
+    _write_new_json(plan_path, plan)
+    return plan_path
 
 
 def plan(args: argparse.Namespace) -> Path:
@@ -10570,71 +11623,19 @@ def plan(args: argparse.Namespace) -> Path:
     ]
     if len({value.casefold() for value in allowed_changes}) != len(allowed_changes):
         raise OrchestrationError("allowed change resource IDs must be distinct")
-    raw_rotation_transitions = list(
-        getattr(args, "rotation_transition_assignment", [])
-    )
-    rotation_transition_assignments = _canonical_rotation_transition_assignments(
-        [
-            {
-                "assignmentResourceId": pair[0],
-                "retiredPrincipalId": pair[1],
-            }
-            for pair in raw_rotation_transitions
-            if isinstance(pair, list | tuple) and len(pair) == 2
-        ],
-        subscription_id=subscription_id,
-        field="rotation transition assignments",
-    )
-    if len(rotation_transition_assignments) != len(raw_rotation_transitions):
-        raise OrchestrationError(
-            "each rotation transition requires an assignment ID and retired principal ID"
-        )
-    legacy_crypto_user_migration_assignments = _canonical_legacy_crypto_user_migration_assignments(
-        list(
-            getattr(
-                args,
-                "legacy_crypto_user_migration_assignment",
-                [],
-            )
-        ),
-        subscription_id=subscription_id,
-        field="legacy Crypto User migration assignments",
-    )
-    raw_legacy_acr_migrations = list(
-        getattr(args, "legacy_acr_pull_migration_assignment", [])
-    )
-    legacy_acr_pull_migrations = _canonical_legacy_acr_pull_migration_assignments(
-        [
-            {
-                "assignmentResourceId": pair[0],
-                "principalId": pair[1],
-            }
-            for pair in raw_legacy_acr_migrations
-            if isinstance(pair, list | tuple) and len(pair) == 2
-        ],
-        subscription_id=subscription_id,
-        field="legacy ACR pull migration assignments",
-    )
-    if len(legacy_acr_pull_migrations) != len(raw_legacy_acr_migrations):
-        raise OrchestrationError(
-            "each legacy ACR pull migration requires an assignment ID and principal ID"
-        )
+    rotation_transition_assignments: list[dict[str, str]] = []
+    legacy_crypto_user_migration_assignments: list[str] = []
+    legacy_acr_pull_migrations: list[dict[str, str]] = []
+    revocation_assignments: list[dict[str, object]] = []
+    revocation_plan_record: dict[str, Any] | None = None
     predecessor_rotation_transitions = _predecessor_rotation_transition_assignments(
         verified_predecessors,
         subscription_id=subscription_id,
     )
-    predecessor_legacy_acr_migrations = (
-        _predecessor_legacy_acr_pull_migration_assignments(
-            verified_predecessors,
-            subscription_id=subscription_id,
-        )
+    predecessor_legacy_acr_migrations = _predecessor_legacy_acr_pull_migration_assignments(
+        verified_predecessors,
+        subscription_id=subscription_id,
     )
-    if args.stage in {"foundation", "live-acceptance"} and rotation_transition_assignments:
-        raise OrchestrationError(
-            f"{args.stage} does not accept new rotation transition assignments"
-        )
-    if args.stage != "producer" and legacy_crypto_user_migration_assignments:
-        raise OrchestrationError("legacy Crypto User migration assignments are producer-stage only")
     prior_stage_handoff = getattr(args, "prior_stage_handoff", None)
     prior_stage_receipt = getattr(args, "prior_stage_receipt", None)
     prior_stage_reviewed_receipt_sha256 = getattr(
@@ -10698,7 +11699,93 @@ def plan(args: argparse.Namespace) -> Path:
         effective,
         subscription_id=subscription_id,
     )
-    compiled_template, compiled_template_sha256 = _compiled_template(args.stage)
+    revocation_plan_path = getattr(args, "revocation_plan", None)
+    reviewed_revocation_plan_sha256 = getattr(
+        args,
+        "reviewed_revocation_plan_sha256",
+        None,
+    )
+    if (revocation_plan_path is None) != (reviewed_revocation_plan_sha256 is None):
+        raise OrchestrationError(
+            "final planning requires both revocation plan path and reviewed SHA-256"
+        )
+    phase_a_rotation_assignments: list[dict[str, str]] = []
+    if revocation_plan_path is not None:
+        revocation_plan_record = _load_revocation_plan(
+            revocation_plan_path,
+            reviewed_sha256=_string(
+                reviewed_revocation_plan_sha256,
+                field="reviewed revocation plan SHA-256",
+            ),
+            artifact_reader=artifact_reader,
+        )
+        _verify_revocation_plan_binding(
+            revocation_plan_record,
+            stage=args.stage,
+            subscription_id=subscription_id,
+            resource_group=args.resource_group,
+            deployment_name=args.deployment_name,
+            base_parameter_artifact=base_parameter_artifact,
+            effective_parameters=effective,
+            verified_predecessors=verified_predecessors,
+        )
+        phase_a_rotation_assignments = list(revocation_plan_record["rotationTransitionAssignments"])
+        legacy_crypto_user_migration_assignments = list(
+            revocation_plan_record["legacyCryptoUserMigrationAssignmentIds"]
+        )
+        legacy_acr_pull_migrations = list(
+            revocation_plan_record["legacyAcrPullMigrationAssignments"]
+        )
+        revocation_assignments = list(revocation_plan_record["revocationAssignments"])
+    rotation_transition_assignments = _merge_rotation_transition_assignments(
+        phase_a_rotation_assignments,
+        predecessor_rotation_transitions,
+        subscription_id=subscription_id,
+    )
+    legacy_acr_pull_migrations = _merge_legacy_acr_pull_migration_assignments(
+        legacy_acr_pull_migrations,
+        predecessor_legacy_acr_migrations,
+        subscription_id=subscription_id,
+    )
+    if phase_a_rotation_assignments:
+        _verify_reviewed_rotation_transitions(
+            phase_a_rotation_assignments,
+            current_principal_ids=set(),
+            transition_state="absent",
+            subscription_id=subscription_id,
+        )
+    if legacy_acr_pull_migrations:
+        _verify_legacy_acr_pull_migration(
+            legacy_acr_pull_migrations,
+            migration_state="absent",
+            stage=args.stage,
+            effective_parameters=effective,
+            subscription_id=subscription_id,
+            allow_reviewed_assignment_scopes=True,
+        )
+    if legacy_crypto_user_migration_assignments:
+        if args.stage != "producer":
+            raise OrchestrationError(
+                "legacy Crypto User migration assignments are producer-stage only"
+            )
+        _verify_legacy_crypto_user_migration(
+            _planned_legacy_crypto_user_assignments(
+                effective_parameters=effective,
+                resource_group=_string(
+                    args.resource_group,
+                    field="producer resource group",
+                ),
+                subscription_id=subscription_id,
+            ),
+            set(legacy_crypto_user_migration_assignments),
+            migration_state="absent",
+            subscription_id=subscription_id,
+        )
+    (
+        compiled_template,
+        compiled_template_raw_bytes,
+        compiled_template_sha256,
+    ) = _compiled_template(args.stage)
     _verify_effective_parameter_completeness(
         args.stage,
         effective,
@@ -10707,35 +11794,6 @@ def plan(args: argparse.Namespace) -> Path:
             stage=args.stage,
         ),
     )
-    if predecessor_legacy_acr_migrations:
-        _verify_legacy_acr_pull_migration(
-            predecessor_legacy_acr_migrations,
-            migration_state="absent",
-            stage=args.stage,
-            effective_parameters=effective,
-            subscription_id=subscription_id,
-            allow_reviewed_assignment_scopes=True,
-        )
-    if legacy_acr_pull_migrations:
-        _verify_legacy_acr_pull_migration(
-            legacy_acr_pull_migrations,
-            migration_state="present",
-            stage=args.stage,
-            effective_parameters=effective,
-            subscription_id=subscription_id,
-        )
-    if args.stage in {"producer", "publisher"}:
-        current_principal_ids = _current_principal_ids_from_effective_parameters(
-            effective,
-            subscription_id=subscription_id,
-        )
-        if rotation_transition_assignments:
-            _verify_reviewed_rotation_transitions(
-                rotation_transition_assignments,
-                current_principal_ids=current_principal_ids,
-                transition_state="present",
-                subscription_id=subscription_id,
-            )
     if args.stage == "producer":
         foundation = _mapping(
             verified_predecessors["foundation"]["handoff"],
@@ -10756,20 +11814,7 @@ def plan(args: argparse.Namespace) -> Path:
                 field="producer resource group",
             ),
             approved_transitions=rotation_transition_assignments,
-            transition_state="present",
-            subscription_id=subscription_id,
-        )
-        _verify_legacy_crypto_user_migration(
-            _planned_legacy_crypto_user_assignments(
-                effective_parameters=effective,
-                resource_group=_string(
-                    args.resource_group,
-                    field="producer resource group",
-                ),
-                subscription_id=subscription_id,
-            ),
-            set(legacy_crypto_user_migration_assignments),
-            migration_state="present",
+            transition_state="absent",
             subscription_id=subscription_id,
         )
     elif args.stage == "publisher":
@@ -10800,7 +11845,7 @@ def plan(args: argparse.Namespace) -> Path:
             effective_parameters=_bindings_as_parameters(_handoff_bindings(producer)),
             subscription_id=subscription_id,
             approved_transitions=rotation_transition_assignments,
-            require_transition_revoked=False,
+            require_transition_revoked=True,
         )
         _verify_publisher_binding_key_head(
             effective,
@@ -10857,22 +11902,15 @@ def plan(args: argparse.Namespace) -> Path:
     )
     additional_required_inventories = (
         [predecessor_authority_inventory]
-        if (
-            prior_stage_record is not None
-            and predecessor_authority_inventory is not None
-        )
+        if (prior_stage_record is not None and predecessor_authority_inventory is not None)
         else []
     )
-    required_authority_checkpoint_sha256s = (
-        _required_authority_checkpoint_sha256s(
-            stage=args.stage,
-            predecessor_inventory=predecessor_authority_inventory,
-            prior_stage_inventory=(
-                None
-                if prior_stage_record is None
-                else prior_stage_record["inventory"]
-            ),
-        )
+    required_authority_checkpoint_sha256s = _required_authority_checkpoint_sha256s(
+        stage=args.stage,
+        predecessor_inventory=predecessor_authority_inventory,
+        prior_stage_inventory=(
+            None if prior_stage_record is None else prior_stage_record["inventory"]
+        ),
     )
     authority_container_id = _authority_container_resource_id_for_stage(
         stage=args.stage,
@@ -10900,17 +11938,37 @@ def plan(args: argparse.Namespace) -> Path:
                 current_inventory=authority_blob_inventory,
             )
     stem = f"{args.stage}-{args.deployment_name}"
+    compiled_template_path = args.evidence_directory / f"{stem}.template.json"
     effective_path = args.evidence_directory / f"{stem}.parameters.json"
     what_if_path = args.evidence_directory / f"{stem}.what-if.json"
     manifest_path = args.evidence_directory / f"{stem}.plan.json"
-    for evidence_path in (effective_path, what_if_path, manifest_path):
+    for evidence_path in (
+        compiled_template_path,
+        effective_path,
+        what_if_path,
+        manifest_path,
+    ):
         if evidence_path.exists():
-            raise OrchestrationError(
-                f"refusing to overwrite immutable evidence {evidence_path}"
-            )
+            raise OrchestrationError(f"refusing to overwrite immutable evidence {evidence_path}")
+    compiled_template_artifact = _write_and_capture_exact_json(
+        compiled_template_path,
+        raw_bytes=compiled_template_raw_bytes,
+        document=compiled_template,
+        artifact_reader=artifact_reader,
+        field="compiled deployment template artifact",
+    )
+    if compiled_template_artifact.sha256 != compiled_template_sha256:
+        raise OrchestrationError("persisted ARM template digest differs from compiler output")
     effective_document = _parameter_document(effective)
     effective_raw_bytes = _canonical_json_file_bytes(effective_document)
-    with _materialized_private_artifact(effective_raw_bytes) as pinned_parameters:
+    with (
+        _materialized_private_artifact(
+            compiled_template_artifact.raw_bytes,
+            file_name="template.json",
+        ) as pinned_template,
+        _materialized_private_artifact(effective_raw_bytes) as pinned_parameters,
+    ):
+        pinned_template.verify()
         pinned_parameters.verify()
         _run(
             _az_command(
@@ -10920,9 +11978,11 @@ def plan(args: argparse.Namespace) -> Path:
                 subscription_id=subscription_id,
                 location=args.location,
                 resource_group=args.resource_group,
+                template_path=pinned_template.path,
                 parameter_path=pinned_parameters.path,
             )
         )
+        pinned_template.verify()
         pinned_parameters.verify()
         what_if = _run_json(
             _az_command(
@@ -10932,10 +11992,12 @@ def plan(args: argparse.Namespace) -> Path:
                 subscription_id=subscription_id,
                 location=args.location,
                 resource_group=args.resource_group,
+                template_path=pinned_template.path,
                 parameter_path=pinned_parameters.path,
             ),
             field="what-if",
         )
+        pinned_template.verify()
         pinned_parameters.verify()
     _validate_subscription_boundary(
         what_if,
@@ -10962,7 +12024,8 @@ def plan(args: argparse.Namespace) -> Path:
         "deploymentName": args.deployment_name,
         "templatePath": str(TEMPLATES[args.stage].relative_to(ROOT)).replace("\\", "/"),
         "templateSha256": _sha256_file(TEMPLATES[args.stage]),
-        "compiledTemplateSha256": compiled_template_sha256,
+        "compiledTemplatePath": str(compiled_template_artifact.path),
+        "compiledTemplateSha256": compiled_template_artifact.sha256,
         "orchestratorSha256": _sha256_file(Path(__file__).resolve()),
         "preflightSha256": _sha256_file(PREFLIGHT_PATH),
         "baseParameterPath": str(base_parameter_artifact.path),
@@ -10975,13 +12038,19 @@ def plan(args: argparse.Namespace) -> Path:
         "rotationTransitionAssignments": rotation_transition_assignments,
         "legacyCryptoUserMigrationAssignmentIds": (legacy_crypto_user_migration_assignments),
         "legacyAcrPullMigrationAssignments": legacy_acr_pull_migrations,
+        "revocationPlanPath": (
+            None if revocation_plan_record is None else str(revocation_plan_record["artifact"].path)
+        ),
+        "revocationPlanSha256": (
+            None if revocation_plan_record is None else revocation_plan_record["artifact"].sha256
+        ),
+        "reviewedRevocationPlanSha256": (
+            None if revocation_plan_record is None else revocation_plan_record["artifact"].sha256
+        ),
+        "revocationAssignments": revocation_assignments,
         "authorityBlobInventory": authority_blob_inventory,
-        "authorityBlobInventorySha256": _authority_checkpoint_sha256(
-            authority_blob_inventory
-        ),
-        "requiredAuthorityCheckpointSha256s": (
-            required_authority_checkpoint_sha256s
-        ),
+        "authorityBlobInventorySha256": _authority_checkpoint_sha256(authority_blob_inventory),
+        "requiredAuthorityCheckpointSha256s": (required_authority_checkpoint_sha256s),
         "priorStageHandoffPath": (
             None if prior_stage_record is None else str(prior_stage_record["handoffPath"])
         ),
@@ -11059,16 +12128,27 @@ def apply(args: argparse.Namespace) -> Path:
         raise OrchestrationError("plan has an unsupported deployment stage")
     if manifest.get("sourceCommit") != SOURCE_COMMIT:
         raise OrchestrationError("plan source commit is not the current exact commit")
-    template = TEMPLATES[stage]
-    if _sha256_file(template) != manifest.get("templateSha256"):
-        raise OrchestrationError("planned Bicep template changed after review")
     if _sha256_file(Path(__file__).resolve()) != manifest.get("orchestratorSha256"):
         raise OrchestrationError("orchestrator implementation changed after review")
     if _sha256_file(PREFLIGHT_PATH) != manifest.get("preflightSha256"):
         raise OrchestrationError("preflight implementation changed after review")
-    compiled_template, compiled_template_sha256 = _compiled_template(stage)
-    if compiled_template_sha256 != manifest.get("compiledTemplateSha256"):
+    compiled_template_path = Path(
+        _string(
+            manifest.get("compiledTemplatePath"),
+            field="compiled deployment template",
+        )
+    )
+    compiled_template_artifact = artifact_reader.capture_json(
+        compiled_template_path,
+        field="reviewed compiled deployment template",
+    )
+    if compiled_template_artifact.sha256 != manifest.get("compiledTemplateSha256"):
         raise OrchestrationError("compiled Bicep template changed after review")
+    compiled_template = _mapping(
+        compiled_template_artifact.document,
+        field="reviewed compiled deployment template",
+    )
+    compiled_template_sha256 = compiled_template_artifact.sha256
     effective_path = Path(
         _string(manifest.get("effectiveParameterPath"), field="effective parameters")
     )
@@ -11148,6 +12228,10 @@ def apply(args: argparse.Namespace) -> Path:
         manifest.get("legacyAcrPullMigrationAssignments"),
         subscription_id=subscription_id,
         field="legacy ACR pull migration assignments",
+    )
+    revocation_assignments = _validated_revocation_assignment_evidence(
+        manifest.get("revocationAssignments"),
+        subscription_id=subscription_id,
     )
     reviewed_authority_blob_inventory = _validated_authority_blob_inventory(
         manifest.get("authorityBlobInventory"),
@@ -11268,31 +12352,13 @@ def apply(args: argparse.Namespace) -> Path:
         verified_predecessors,
         subscription_id=subscription_id,
     )
-    predecessor_legacy_acr_migrations = (
-        _predecessor_legacy_acr_pull_migration_assignments(
-            verified_predecessors,
-            subscription_id=subscription_id,
-        )
-    )
-    if stage in {"foundation", "live-acceptance"} and rotation_transition_assignments:
-        raise OrchestrationError(f"{stage} does not accept new rotation transition assignments")
-    if stage != "producer" and legacy_crypto_user_migration_assignment_ids:
-        raise OrchestrationError("legacy Crypto User migration assignments are producer-stage only")
-    reviewed_rotation_transitions = _merge_rotation_transition_assignments(
-        rotation_transition_assignments,
-        predecessor_rotation_transitions,
+    predecessor_legacy_acr_migrations = _predecessor_legacy_acr_pull_migration_assignments(
+        verified_predecessors,
         subscription_id=subscription_id,
     )
-    reviewed_legacy_acr_migrations = (
-        _merge_legacy_acr_pull_migration_assignments(
-            legacy_acr_pull_migrations,
-            predecessor_legacy_acr_migrations,
-            subscription_id=subscription_id,
-        )
-    )
-    effective_parameters = _load_parameter_document(
-        effective_parameter_artifact.document
-    )
+    if stage != "producer" and legacy_crypto_user_migration_assignment_ids:
+        raise OrchestrationError("legacy Crypto User migration assignments are producer-stage only")
+    effective_parameters = _load_parameter_document(effective_parameter_artifact.document)
     _validate_effective_parameter_subscription_boundary(
         effective_parameters,
         subscription_id=subscription_id,
@@ -11324,12 +12390,81 @@ def apply(args: argparse.Namespace) -> Path:
     if (
         effective_parameters != recomputed_effective_parameters
         or effective_parameter_artifact.raw_bytes
-        != _canonical_json_file_bytes(
-            _parameter_document(recomputed_effective_parameters)
-        )
+        != _canonical_json_file_bytes(_parameter_document(recomputed_effective_parameters))
     ):
         raise OrchestrationError(
             "reviewed effective parameters do not match the captured base and handoffs"
+        )
+    phase_a_rotations: list[dict[str, str]] = []
+    phase_a_legacy_crypto: list[str] = []
+    phase_a_legacy_acr: list[dict[str, str]] = []
+    phase_a_revocation_assignments: list[dict[str, object]] = []
+    revocation_plan_path_value = manifest.get("revocationPlanPath")
+    if revocation_plan_path_value is not None:
+        revocation_plan_record = _load_revocation_plan(
+            Path(
+                _string(
+                    revocation_plan_path_value,
+                    field="plan revocation path",
+                )
+            ),
+            reviewed_sha256=_string(
+                manifest.get("reviewedRevocationPlanSha256"),
+                field="reviewed revocation plan SHA-256",
+            ),
+            artifact_reader=artifact_reader,
+        )
+        _verify_revocation_plan_binding(
+            revocation_plan_record,
+            stage=stage,
+            subscription_id=subscription_id,
+            resource_group=resource_group,
+            deployment_name=deployment_name,
+            base_parameter_artifact=base_parameter_artifact,
+            effective_parameters=effective_parameters,
+            verified_predecessors=verified_predecessors,
+        )
+        if manifest.get("revocationAssignments") != revocation_plan_record.get(
+            "revocationAssignments"
+        ):
+            raise OrchestrationError("final plan revocation assignments differ from phase-A review")
+        phase_a_rotations = list(revocation_plan_record["rotationTransitionAssignments"])
+        phase_a_legacy_crypto = list(
+            revocation_plan_record["legacyCryptoUserMigrationAssignmentIds"]
+        )
+        phase_a_legacy_acr = list(revocation_plan_record["legacyAcrPullMigrationAssignments"])
+        phase_a_revocation_assignments = list(revocation_plan_record["revocationAssignments"])
+    elif revocation_assignments:
+        raise OrchestrationError(
+            "final plan contains revocation assignments without phase-A review"
+        )
+    expected_rotation_transitions = _merge_rotation_transition_assignments(
+        phase_a_rotations,
+        predecessor_rotation_transitions,
+        subscription_id=subscription_id,
+    )
+    expected_legacy_acr_migrations = _merge_legacy_acr_pull_migration_assignments(
+        phase_a_legacy_acr,
+        predecessor_legacy_acr_migrations,
+        subscription_id=subscription_id,
+    )
+    if (
+        rotation_transition_assignments != expected_rotation_transitions
+        or legacy_acr_pull_migrations != expected_legacy_acr_migrations
+        or legacy_crypto_user_migration_assignment_ids != phase_a_legacy_crypto
+        or revocation_assignments != phase_a_revocation_assignments
+    ):
+        raise OrchestrationError(
+            "final plan assignment sets are not the exact phase-A plus predecessor sets"
+        )
+    reviewed_rotation_transitions = expected_rotation_transitions
+    reviewed_legacy_acr_migrations = expected_legacy_acr_migrations
+    if phase_a_rotations:
+        _verify_reviewed_rotation_transitions(
+            phase_a_rotations,
+            current_principal_ids=set(),
+            transition_state="absent",
+            subscription_id=subscription_id,
         )
     if what_if_artifact.raw_bytes != _canonical_json_file_bytes(what_if):
         raise OrchestrationError("reviewed what-if artifact is not canonical")
@@ -11358,22 +12493,15 @@ def apply(args: argparse.Namespace) -> Path:
     )
     additional_required_inventories = (
         [predecessor_authority_inventory]
-        if (
-            prior_stage_record is not None
-            and predecessor_authority_inventory is not None
-        )
+        if (prior_stage_record is not None and predecessor_authority_inventory is not None)
         else []
     )
-    expected_required_checkpoint_sha256s = (
-        _required_authority_checkpoint_sha256s(
-            stage=stage,
-            predecessor_inventory=predecessor_authority_inventory,
-            prior_stage_inventory=(
-                None
-                if prior_stage_record is None
-                else prior_stage_record["inventory"]
-            ),
-        )
+    expected_required_checkpoint_sha256s = _required_authority_checkpoint_sha256s(
+        stage=stage,
+        predecessor_inventory=predecessor_authority_inventory,
+        prior_stage_inventory=(
+            None if prior_stage_record is None else prior_stage_record["inventory"]
+        ),
     )
     planned_required_checkpoint_sha256s = _mapping(
         manifest.get("requiredAuthorityCheckpointSha256s"),
@@ -11399,9 +12527,7 @@ def apply(args: argparse.Namespace) -> Path:
                 required_inventory=required_inventory,
                 current_inventory=reviewed_authority_blob_inventory,
             )
-    resume_succeeded_deployment = bool(
-        getattr(args, "resume_succeeded_deployment", False)
-    )
+    resume_succeeded_deployment = bool(getattr(args, "resume_succeeded_deployment", False))
     _validate_resume_succeeded_deployment(
         requested=resume_succeeded_deployment,
         stage=stage,
@@ -11428,16 +12554,10 @@ def apply(args: argparse.Namespace) -> Path:
             if _canonical_json_bytes(current_authority_blob_inventory) != (
                 _canonical_json_bytes(reviewed_authority_blob_inventory)
             ):
-                raise OrchestrationError(
-                    "authority Blob checkpoint changed after plan review"
-                )
-        if (
-            prior_stage_record is not None
-            and reviewed_authority_blob_inventory.get(
-                "previousCheckpointSha256"
-            )
-            != _authority_checkpoint_sha256(prior_stage_record["inventory"])
-        ):
+                raise OrchestrationError("authority Blob checkpoint changed after plan review")
+        if prior_stage_record is not None and reviewed_authority_blob_inventory.get(
+            "previousCheckpointSha256"
+        ) != _authority_checkpoint_sha256(prior_stage_record["inventory"]):
             raise OrchestrationError(
                 "reviewed authority checkpoint is not chained to the prior same-stage receipt"
             )
@@ -11557,22 +12677,12 @@ def apply(args: argparse.Namespace) -> Path:
             subscription_id=subscription_id,
             rotation_transitions=reviewed_rotation_transitions,
         )
-    handoff_path = args.plan_manifest.with_name(
-        f"{stage}-{deployment_name}.handoff.json"
-    )
-    receipt_path = args.plan_manifest.with_name(
-        f"{stage}-{deployment_name}.receipt.json"
-    )
+    handoff_path = args.plan_manifest.with_name(f"{stage}-{deployment_name}.handoff.json")
+    receipt_path = args.plan_manifest.with_name(f"{stage}-{deployment_name}.receipt.json")
     for output_path in (handoff_path, receipt_path):
         if output_path.exists():
-            raise OrchestrationError(
-                f"refusing to overwrite immutable evidence {output_path}"
-            )
-    application_mode = (
-        "resume-succeeded-deployment"
-        if resume_succeeded_deployment
-        else "create"
-    )
+            raise OrchestrationError(f"refusing to overwrite immutable evidence {output_path}")
+    application_mode = "resume-succeeded-deployment" if resume_succeeded_deployment else "create"
     (
         outputs,
         deployment_record_sha256,
@@ -11587,6 +12697,7 @@ def apply(args: argparse.Namespace) -> Path:
         effective_parameter_artifact=effective_parameter_artifact,
         effective_parameters=effective_parameters,
         reviewed_what_if=what_if,
+        compiled_template_artifact=compiled_template_artifact,
         compiled_template=compiled_template,
         compiled_template_sha256=compiled_template_sha256,
     )
@@ -11634,8 +12745,10 @@ def apply(args: argparse.Namespace) -> Path:
             post_deployment_authority_inventory
         ),
         "imagePullEvidence": image_pull_evidence,
-        "imagePullEvidenceSha256": _image_pull_evidence_sha256(
-            image_pull_evidence
+        "imagePullEvidenceSha256": _image_pull_evidence_sha256(image_pull_evidence),
+        "revocationAssignments": revocation_assignments,
+        "revocationAssignmentsSha256": (
+            _revocation_assignment_evidence_sha256(revocation_assignments)
         ),
     }
     handoff_raw_bytes = _canonical_json_file_bytes(handoff)
@@ -11661,8 +12774,9 @@ def apply(args: argparse.Namespace) -> Path:
         "authorityBlobInventorySha256": _authority_checkpoint_sha256(
             post_deployment_authority_inventory
         ),
-        "imagePullEvidenceSha256": _image_pull_evidence_sha256(
-            image_pull_evidence
+        "imagePullEvidenceSha256": _image_pull_evidence_sha256(image_pull_evidence),
+        "revocationAssignmentsSha256": (
+            _revocation_assignment_evidence_sha256(revocation_assignments)
         ),
     }
     _write_new_bytes(receipt_path, _canonical_json_file_bytes(receipt))
@@ -11695,28 +12809,47 @@ def _parser() -> argparse.ArgumentParser:
     plan_parser.add_argument("--publisher-receipt", type=Path)
     plan_parser.add_argument("--publisher-reviewed-receipt-sha256")
     plan_parser.add_argument("--allow-change", action="append", default=[])
-    plan_parser.add_argument(
+    plan_parser.add_argument("--revocation-plan", type=Path)
+    plan_parser.add_argument("--reviewed-revocation-plan-sha256")
+    plan_parser.add_argument("--prior-stage-handoff", type=Path)
+    plan_parser.add_argument("--prior-stage-receipt", type=Path)
+    plan_parser.add_argument("--prior-stage-reviewed-receipt-sha256")
+
+    revocation_parser = subparsers.add_parser("prepare-revocation")
+    revocation_parser.add_argument("--stage", choices=STAGES, required=True)
+    revocation_parser.add_argument("--subscription", required=True)
+    revocation_parser.add_argument("--resource-group")
+    revocation_parser.add_argument("--deployment-name", required=True)
+    revocation_parser.add_argument("--parameters", type=Path, required=True)
+    revocation_parser.add_argument("--evidence-directory", type=Path, required=True)
+    revocation_parser.add_argument("--foundation-handoff", type=Path)
+    revocation_parser.add_argument("--foundation-receipt", type=Path)
+    revocation_parser.add_argument("--foundation-reviewed-receipt-sha256")
+    revocation_parser.add_argument("--producer-handoff", type=Path)
+    revocation_parser.add_argument("--producer-receipt", type=Path)
+    revocation_parser.add_argument("--producer-reviewed-receipt-sha256")
+    revocation_parser.add_argument("--publisher-handoff", type=Path)
+    revocation_parser.add_argument("--publisher-receipt", type=Path)
+    revocation_parser.add_argument("--publisher-reviewed-receipt-sha256")
+    revocation_parser.add_argument(
         "--rotation-transition-assignment",
         action="append",
         nargs=2,
         metavar=("ASSIGNMENT_RESOURCE_ID", "RETIRED_PRINCIPAL_ID"),
         default=[],
     )
-    plan_parser.add_argument(
+    revocation_parser.add_argument(
         "--legacy-crypto-user-migration-assignment",
         action="append",
         default=[],
     )
-    plan_parser.add_argument(
+    revocation_parser.add_argument(
         "--legacy-acr-pull-migration-assignment",
         action="append",
         nargs=2,
         metavar=("ASSIGNMENT_RESOURCE_ID", "PRINCIPAL_ID"),
         default=[],
     )
-    plan_parser.add_argument("--prior-stage-handoff", type=Path)
-    plan_parser.add_argument("--prior-stage-receipt", type=Path)
-    plan_parser.add_argument("--prior-stage-reviewed-receipt-sha256")
     apply_parser = subparsers.add_parser("apply")
     apply_parser.add_argument("--plan-manifest", type=Path, required=True)
     apply_parser.add_argument("--reviewed-plan-sha256", required=True)
@@ -11734,7 +12867,12 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
-        output = plan(args) if args.command == "plan" else apply(args)
+        if args.command == "prepare-revocation":
+            output = prepare_revocation(args)
+        elif args.command == "plan":
+            output = plan(args)
+        else:
+            output = apply(args)
     except (OrchestrationError, PreflightInputError, json.JSONDecodeError) as exc:
         print(f"WC-029 orchestration failed closed: {exc}", file=sys.stderr)
         return 2

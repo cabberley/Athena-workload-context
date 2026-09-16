@@ -315,3 +315,16 @@ output identityClientId string = presentationIdentityClientId
 
 @description('Principal ID of the presentation AcrPull and presentation-assets Reader identity.')
 output identityPrincipalId string = presentationIdentityPrincipalId
+
+@description('Exact current presentation ACR pull assignment evidence.')
+output acrPullAssignment object = {
+  label: 'presentation'
+  assignmentResourceId: presentationImagePull.outputs.roleAssignmentResourceId
+  principalId: presentationIdentityPrincipalId
+  principalType: 'ServicePrincipal'
+  roleDefinitionId: presentationImagePull.outputs.roleDefinitionResourceId
+  roleAssignmentMode: presentationImagePull.outputs.roleAssignmentMode
+  scope: presentationImagePull.outputs.registryResourceId
+  conditionVersion: null
+  condition: null
+}

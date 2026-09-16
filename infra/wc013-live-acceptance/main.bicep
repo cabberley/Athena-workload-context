@@ -1261,6 +1261,84 @@ module wc016NotificationImagePull 'modules/acr-pull-rbac.bicep' = if (validatedW
   }
 }
 
+var wc013CoreAcrPullAssignments = [
+  {
+    label: 'acceptance'
+    assignmentResourceId: acceptanceImagePull.outputs.roleAssignmentResourceId
+    principalId: acceptanceJobIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: acceptanceImagePull.outputs.roleDefinitionResourceId
+    roleAssignmentMode: acceptanceImagePull.outputs.roleAssignmentMode
+    scope: acceptanceImagePull.outputs.registryResourceId
+    conditionVersion: null
+    condition: null
+  }
+  {
+    label: 'evidence'
+    assignmentResourceId: evidenceCollectorImagePull.outputs.roleAssignmentResourceId
+    principalId: evidenceIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: evidenceCollectorImagePull.outputs.roleDefinitionResourceId
+    roleAssignmentMode: evidenceCollectorImagePull.outputs.roleAssignmentMode
+    scope: evidenceCollectorImagePull.outputs.registryResourceId
+    conditionVersion: null
+    condition: null
+  }
+  {
+    label: 'controller'
+    assignmentResourceId: collectorControllerImagePull.outputs.roleAssignmentResourceId
+    principalId: collectorControllerIdentity.outputs.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: collectorControllerImagePull.outputs.roleDefinitionResourceId
+    roleAssignmentMode: collectorControllerImagePull.outputs.roleAssignmentMode
+    scope: collectorControllerImagePull.outputs.registryResourceId
+    conditionVersion: null
+    condition: null
+  }
+  presentationWeb.outputs.acrPullAssignment
+]
+var wc016AcrPullAssignments = validatedWc016RuntimeEnabled
+  ? [
+      {
+        label: 'wc016-detector'
+        assignmentResourceId: wc016DetectorImagePull!.outputs.roleAssignmentResourceId
+        principalId: wc016DetectorIdentity.outputs.principalId
+        principalType: 'ServicePrincipal'
+        roleDefinitionId: wc016DetectorImagePull!.outputs.roleDefinitionResourceId
+        roleAssignmentMode: wc016DetectorImagePull!.outputs.roleAssignmentMode
+        scope: wc016DetectorImagePull!.outputs.registryResourceId
+        conditionVersion: null
+        condition: null
+      }
+      {
+        label: 'wc016-orchestrator'
+        assignmentResourceId: wc016OrchestratorImagePull!.outputs.roleAssignmentResourceId
+        principalId: wc016OrchestratorIdentity.outputs.principalId
+        principalType: 'ServicePrincipal'
+        roleDefinitionId: wc016OrchestratorImagePull!.outputs.roleDefinitionResourceId
+        roleAssignmentMode: wc016OrchestratorImagePull!.outputs.roleAssignmentMode
+        scope: wc016OrchestratorImagePull!.outputs.registryResourceId
+        conditionVersion: null
+        condition: null
+      }
+      {
+        label: 'wc016-notification'
+        assignmentResourceId: wc016NotificationImagePull!.outputs.roleAssignmentResourceId
+        principalId: wc016NotificationIdentity.outputs.principalId
+        principalType: 'ServicePrincipal'
+        roleDefinitionId: wc016NotificationImagePull!.outputs.roleDefinitionResourceId
+        roleAssignmentMode: wc016NotificationImagePull!.outputs.roleAssignmentMode
+        scope: wc016NotificationImagePull!.outputs.registryResourceId
+        conditionVersion: null
+        condition: null
+      }
+    ]
+  : []
+var wc013AcrPullAssignments = concat(
+  wc013CoreAcrPullAssignments,
+  wc016AcrPullAssignments
+)
+
 var notificationV2ConfigurationJson = string({
   lifecycle: {
     keyVaultKeyId: acceptanceResources.outputs.incidentSigningKeyUriWithVersion
@@ -1564,6 +1642,7 @@ output wc016ApprovedConfiguration object = {
     notificationSigningKeyFingerprint: incidentNotificationSigningKeyFingerprint
     incidentSigningKeyFingerprint: signingKeyFingerprint
   }
+  wc013AcrPullAssignments: wc013AcrPullAssignments
   wc027DeploymentReadiness: {
     producer: {
       ready: validatedWc027FeedV2ProducerReady

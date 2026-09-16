@@ -217,6 +217,13 @@ publication. The controller has only its three Job actions and the registry-scop
 the reviewed ACR permission mode. The operator and workload arrays remain normalized and deployment fails if they
 overlap or contain either Athena runtime identity.
 
+`wc016ApprovedConfiguration.wc013AcrPullAssignments` inventories the exact current pull assignment
+for the acceptance, evidence, controller, presentation, detector, orchestrator, and notification
+principals. Each record carries the server-returned registry ID, assignment ID, principal, role,
+permission mode, scope, service-principal type, and null condition. WC-029 foundation and
+live-acceptance readiness re-read this inventory and reject any stale pull assignment for those
+principals.
+
 The presentation app uses a digest-pinned image and one 0.25-vCPU/0.5-GiB replica in
 `athena-wc013-live-mcp-env`. Its ingress is external to the Container Apps environment only so it
 is reachable from the linked VNet; the environment remains `internal: true` with

@@ -331,6 +331,18 @@ def test_controller_identity_oidc_and_workflow_are_closed_and_separate() -> None
     ):
         assert expected in acr_pull
     assert "identityName" not in acr_pull
+    for expected in (
+        "var wc013AcrPullAssignments = concat(",
+        "wc013AcrPullAssignments: wc013AcrPullAssignments",
+        "label: 'acceptance'",
+        "label: 'evidence'",
+        "label: 'controller'",
+        "label: 'wc016-detector'",
+        "label: 'wc016-orchestrator'",
+        "label: 'wc016-notification'",
+        "presentationWeb.outputs.acrPullAssignment",
+    ):
+        assert expected in orchestration
 
     assert "environment: athena-live" in workflow
     assert "github.ref == 'refs/heads/main'" in workflow
