@@ -28,6 +28,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from athena_context.artifacts import MAX_ARTIFACT_TRANSFER_BYTES
 from athena_context.contracts import (
     CORRELATION_REQUEST_SCHEMA_VERSION,
+    MONITORING_COLLECTOR_CONTRACT_SCHEMA_VERSION,
     ActiveIncidentIndex,
     ActiveIncidentIndexAttestation,
     CanonicalWorkloadManifest,
@@ -47,12 +48,15 @@ from athena_context.contracts import (
     IncidentNotificationEnvelopeV2,
     IncidentState,
     IncidentStateAttestation,
+    MonitoringCollectorContract,
     MonitoringEvidenceHandoff,
     NetworkFlowObservation,
     PublishedContextAuthority,
     PublishedCorrelationReportAttestation,
     PublishedCorrelationReportStatement,
     PublishedRuntimeContextBinding,
+    TrustedKeyAnchor,
+    TrustedKeyRecord,
     UtcDateTime,
     canonicalize_json,
     compute_artifact_digest,
@@ -67,9 +71,15 @@ from athena_context.contracts import (
     validate_incident_feed_index_assets,
     validate_incident_guidance_assets,
     validate_published_correlation_report_assets,
+    verify_monitoring_evidence_handoff_attestation,
 )
 from athena_context.contracts.change_ingestion import change_evidence_attestation_preimage
 from athena_context.contracts.monitoring import monitoring_handoff_preimage
+from athena_context.correlation.rules import (
+    CORRELATION_RULE_CATALOG_DIGEST,
+    assert_catalog_digest,
+    assert_contract_compatibility,
+)
 from athena_context.wc029_preflight import (
     PreflightInputError,
     evaluate_role_assignments,
@@ -91,6 +101,8 @@ JOB_EXECUTION_SCHEMA_VERSION = "athena.wc029JobExecution.v1"
 JOB_READBACK_SCHEMA_VERSION = "athena.wc029JobReadback.v1"
 JOB_PLATFORM_CAPTURE_STATEMENT_SCHEMA_VERSION = "athena.wc029JobPlatformCaptureStatement.v1"
 JOB_PLATFORM_CAPTURE_ATTESTATION_SCHEMA_VERSION = "athena.wc029JobPlatformCaptureAttestation.v1"
+GLOBAL_CAPTURE_MANIFEST_SCHEMA_VERSION = "athena.wc029GlobalCaptureManifest.v1"
+GLOBAL_CAPTURE_ATTESTATION_SCHEMA_VERSION = "athena.wc029GlobalCaptureAttestation.v1"
 PREFLIGHT_RESULT_SCHEMA_VERSION = "athena.wc029PreflightResult.v1"
 SCENARIO_PLAN_SCHEMA_VERSION = "athena.wc029ScenarioPlan.v1"
 SCENARIO_EXECUTION_MANIFEST_SCHEMA_VERSION = "athena.wc029ScenarioExecutionManifest.v1"
@@ -130,9 +142,20 @@ type QueueScope = Literal["baseline", "scenario-verify", "final"]
 type DeploymentStage = Literal["foundation", "producer", "publisher", "live-acceptance"]
 type JobScope = Literal["global", "scenario"]
 type JobPurpose = Literal["global-acceptance", "scenario-recovery-verification"]
+type GlobalCaptureEvidenceClass = Literal[
+    "deployment-plan",
+    "deployment-what-if",
+    "deployment-output",
+    "deployment-readback",
+    "url-probe",
+    "effective-rbac",
+    "preflight-result",
+    "queue-state",
+]
 type EvidenceClass = Literal[
     "version-inventory",
     "signing-public-key",
+    "monitoring-collector-contract",
     "published-manifest",
     "publication-authority",
     "publication-authority-attestation",
@@ -143,6 +166,8 @@ type EvidenceClass = Literal[
     "job-execution",
     "job-readback",
     "job-platform-attestation",
+    "global-capture-manifest",
+    "global-capture-attestation",
     "url-probe",
     "effective-rbac",
     "rbac-policy",
@@ -253,6 +278,12 @@ _MANAGED_IDENTITY_RESOURCE_ID_PATTERN = re.compile(
     r"Microsoft\.ManagedIdentity/userAssignedIdentities/[A-Za-z0-9._()-]{1,128}$",
     re.IGNORECASE,
 )
+_SERVICE_BUS_NAMESPACE_RESOURCE_ID_PATTERN = re.compile(
+    r"^/subscriptions/(?P<subscription>[0-9a-fA-F-]{36})/"
+    r"resourceGroups/(?P<resource_group>[^/]{1,90})/providers/"
+    r"Microsoft\.ServiceBus/namespaces/(?P<namespace>[A-Za-z0-9-]{6,50})$",
+    re.IGNORECASE,
+)
 _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 _ZERO_DIGEST = "sha256:" + ("0" * 64)
 _PREFLIGHT_IMPLEMENTATION = Path(__file__).with_name("wc029_preflight.py")
@@ -261,6 +292,7 @@ _GLOBAL_REQUIRED_CLASSES: frozenset[EvidenceClass] = frozenset(
     {
         "version-inventory",
         "signing-public-key",
+        "monitoring-collector-contract",
         "published-manifest",
         "publication-authority",
         "publication-authority-attestation",
@@ -271,6 +303,8 @@ _GLOBAL_REQUIRED_CLASSES: frozenset[EvidenceClass] = frozenset(
         "job-execution",
         "job-readback",
         "job-platform-attestation",
+        "global-capture-manifest",
+        "global-capture-attestation",
         "url-probe",
         "effective-rbac",
         "rbac-policy",
@@ -322,6 +356,7 @@ _ATTESTATION_SUBJECT_CLASSES: dict[EvidenceClass, EvidenceClass] = {
     "source-index-resolved-attestation": "source-index-resolved",
     "publication-authority-attestation": "publication-authority",
     "job-platform-attestation": "job-readback",
+    "global-capture-attestation": "global-capture-manifest",
     "scenario-execution-attestation": "scenario-execution-manifest",
 }
 _SIGNED_KEY_PURPOSE_BY_CLASS: dict[EvidenceClass, str] = {
@@ -341,6 +376,7 @@ _SIGNED_KEY_PURPOSE_BY_CLASS: dict[EvidenceClass, str] = {
     "source-index-resolved-attestation": "incident",
     "publication-authority-attestation": "context-authority",
     "job-platform-attestation": "job-capture",
+    "global-capture-attestation": "job-capture",
     "scenario-execution-attestation": "scenario-authority",
     "notification-active": "notification",
     "notification-resolved": "notification",
@@ -348,6 +384,7 @@ _SIGNED_KEY_PURPOSE_BY_CLASS: dict[EvidenceClass, str] = {
 _EXPECTED_SCHEMA_BY_CLASS: dict[EvidenceClass, str | None] = {
     "version-inventory": VERSION_INVENTORY_SCHEMA_VERSION,
     "signing-public-key": SIGNING_PUBLIC_KEY_SCHEMA_VERSION,
+    "monitoring-collector-contract": MONITORING_COLLECTOR_CONTRACT_SCHEMA_VERSION,
     "published-manifest": PUBLISHED_MANIFEST_SCHEMA_VERSION,
     "publication-authority": PUBLICATION_AUTHORITY_SCHEMA_VERSION,
     "publication-authority-attestation": (PUBLICATION_AUTHORITY_ATTESTATION_SCHEMA_VERSION),
@@ -358,6 +395,8 @@ _EXPECTED_SCHEMA_BY_CLASS: dict[EvidenceClass, str | None] = {
     "job-execution": JOB_EXECUTION_SCHEMA_VERSION,
     "job-readback": JOB_READBACK_SCHEMA_VERSION,
     "job-platform-attestation": JOB_PLATFORM_CAPTURE_ATTESTATION_SCHEMA_VERSION,
+    "global-capture-manifest": GLOBAL_CAPTURE_MANIFEST_SCHEMA_VERSION,
+    "global-capture-attestation": GLOBAL_CAPTURE_ATTESTATION_SCHEMA_VERSION,
     "url-probe": URL_PROBE_SCHEMA_VERSION,
     "effective-rbac": None,
     "rbac-policy": None,
@@ -1380,6 +1419,255 @@ class Wc029KeyVersion(_StrictAcceptanceModel):
         return self
 
 
+class Wc029ServiceBusQueueCoordinate(_StrictAcceptanceModel):
+    namespace_resource_id: str = Field(
+        alias="namespaceResourceId",
+        min_length=1,
+        max_length=2048,
+    )
+    namespace: str = Field(min_length=1, max_length=256)
+    queue_name: str = Field(alias="queueName", min_length=1, max_length=128)
+
+    @model_validator(mode="after")
+    def validate_coordinate(self) -> Wc029ServiceBusQueueCoordinate:
+        match = _SERVICE_BUS_NAMESPACE_RESOURCE_ID_PATTERN.fullmatch(self.namespace_resource_id)
+        _validate_fixed_text(
+            self.namespace,
+            label="Service Bus namespace",
+            maximum_length=256,
+        )
+        _validate_fixed_text(
+            self.queue_name,
+            label="Service Bus queue name",
+            maximum_length=128,
+        )
+        if (
+            match is None
+            or self.namespace != self.namespace.casefold()
+            or self.namespace != f"{match.group('namespace').casefold()}.servicebus.windows.net"
+        ):
+            raise ValueError(
+                "Service Bus namespace resource ID and fully qualified namespace must match"
+            )
+        return self
+
+    @property
+    def coordinate_key(self) -> tuple[str, str, str]:
+        return (
+            self.namespace_resource_id.casefold(),
+            self.namespace.casefold(),
+            self.queue_name.casefold(),
+        )
+
+
+class Wc029GlobalCaptureArtifactRequirement(_StrictAcceptanceModel):
+    artifact_id: str = Field(
+        alias="artifactId",
+        pattern=r"^[a-z0-9][a-z0-9._-]{0,127}$",
+    )
+    evidence_class: GlobalCaptureEvidenceClass = Field(alias="evidenceClass")
+    deployment_id: str | None = Field(
+        default=None,
+        alias="deploymentId",
+        pattern=r"^[a-z0-9][a-z0-9._-]{0,63}$",
+    )
+    preflight_kind: PreflightKind | None = Field(
+        default=None,
+        alias="preflightKind",
+    )
+    queue_scope: Literal["baseline", "final"] | None = Field(
+        default=None,
+        alias="queueScope",
+    )
+    endpoint_id: str | None = Field(
+        default=None,
+        alias="endpointId",
+        pattern=r"^[a-z0-9][a-z0-9._-]{0,63}$",
+    )
+    endpoint_path: str | None = Field(
+        default=None,
+        alias="endpointPath",
+        min_length=1,
+        max_length=512,
+    )
+
+    @model_validator(mode="after")
+    def validate_requirement(self) -> Wc029GlobalCaptureArtifactRequirement:
+        deployment_evidence = self.evidence_class in {
+            "deployment-plan",
+            "deployment-what-if",
+            "deployment-output",
+            "deployment-readback",
+        }
+        requires_deployment_id = deployment_evidence or (
+            self.evidence_class == "preflight-result" and self.preflight_kind == "what-if"
+        )
+        if requires_deployment_id != (self.deployment_id is not None):
+            raise ValueError("global capture deployment evidence requires exactly one deploymentId")
+        if self.evidence_class == "preflight-result":
+            if self.preflight_kind == "what-if":
+                if self.deployment_id is None:
+                    raise ValueError("global what-if capture requirement needs its deploymentId")
+            elif self.preflight_kind == "rbac":
+                if self.deployment_id is not None:
+                    raise ValueError("global RBAC capture requirement cannot claim a deploymentId")
+            else:
+                raise ValueError(
+                    "global preflight capture requirement needs an exact preflightKind"
+                )
+        elif self.preflight_kind is not None:
+            raise ValueError("preflightKind is valid only for preflight capture evidence")
+        if (self.evidence_class == "queue-state") != (self.queue_scope is not None):
+            raise ValueError("queueScope is valid only for global queue capture evidence")
+        if self.evidence_class == "url-probe":
+            if self.endpoint_id is None or self.endpoint_path is None:
+                raise ValueError(
+                    "URL probe capture requirements need an endpointId and endpointPath"
+                )
+            if (
+                not self.endpoint_path.startswith("/")
+                or "//" in self.endpoint_path
+                or "?" in self.endpoint_path
+                or "#" in self.endpoint_path
+                or "\\" in self.endpoint_path
+            ):
+                raise ValueError("endpointPath must be one exact absolute URL path")
+        elif self.endpoint_id is not None or self.endpoint_path is not None:
+            raise ValueError("endpoint coordinates are valid only for URL probe evidence")
+        return self
+
+    @property
+    def semantic_key(
+        self,
+    ) -> tuple[
+        GlobalCaptureEvidenceClass,
+        str | None,
+        PreflightKind | None,
+        Literal["baseline", "final"] | None,
+        str | None,
+        str | None,
+    ]:
+        return (
+            self.evidence_class,
+            self.deployment_id,
+            self.preflight_kind,
+            self.queue_scope,
+            self.endpoint_id,
+            self.endpoint_path,
+        )
+
+
+class Wc029GlobalCapturePolicy(_StrictAcceptanceModel):
+    maximum_capture_window_seconds: int = Field(
+        alias="maximumCaptureWindowSeconds",
+        ge=60,
+        le=7 * 24 * 60 * 60,
+    )
+    artifacts: tuple[Wc029GlobalCaptureArtifactRequirement, ...] = Field(
+        min_length=1,
+        max_length=MAX_EVIDENCE_FILES,
+    )
+    service_bus_queues: tuple[Wc029ServiceBusQueueCoordinate, ...] = Field(
+        alias="serviceBusQueues",
+        min_length=1,
+        max_length=32,
+    )
+
+    @model_validator(mode="after")
+    def validate_policy(self) -> Wc029GlobalCapturePolicy:
+        artifact_ids = tuple(item.artifact_id for item in self.artifacts)
+        if artifact_ids != tuple(sorted(artifact_ids)) or len(artifact_ids) != len(
+            set(artifact_ids)
+        ):
+            raise ValueError(
+                "global capture artifact requirements must use unique sorted artifact IDs"
+            )
+        semantic_keys = tuple(item.semantic_key for item in self.artifacts)
+        if len(semantic_keys) != len(set(semantic_keys)):
+            raise ValueError("global capture artifact requirements must be semantically unique")
+        queue_keys = tuple(item.coordinate_key for item in self.service_bus_queues)
+        if queue_keys != tuple(sorted(queue_keys)) or len(queue_keys) != len(set(queue_keys)):
+            raise ValueError("Service Bus queue coordinates must be unique and canonically sorted")
+        return self
+
+
+class Wc029MonitoringCollectorVersion(_StrictAcceptanceModel):
+    contract_artifact_id: str = Field(
+        alias="contractArtifactId",
+        pattern=r"^[a-z0-9][a-z0-9._-]{0,127}$",
+    )
+    contract_artifact_sha256: str = Field(
+        alias="contractArtifactSha256",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    contract_digest: str = Field(
+        alias="contractDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    maximum_evidence_age_seconds: int = Field(
+        alias="maximumEvidenceAgeSeconds",
+        ge=60,
+        le=900,
+    )
+    signing_key_vault_key_id: str = Field(
+        alias="signingKeyVaultKeyId",
+        min_length=1,
+        max_length=512,
+    )
+    signing_key_name: str = Field(
+        alias="signingKeyName",
+        pattern=r"^[A-Za-z0-9-]{1,127}$",
+    )
+    signing_key_version: str = Field(
+        alias="signingKeyVersion",
+        pattern=r"^[A-Fa-f0-9]{32}$",
+    )
+    public_key_fingerprint: str = Field(
+        alias="publicKeyFingerprint",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    key_enabled: bool = Field(alias="keyEnabled")
+    key_activated_at: UtcDateTime = Field(alias="keyActivatedAt")
+    key_retired_at: UtcDateTime | None = Field(
+        default=None,
+        alias="keyRetiredAt",
+    )
+    key_expires_at: UtcDateTime | None = Field(
+        default=None,
+        alias="keyExpiresAt",
+    )
+
+    @model_validator(mode="after")
+    def validate_collector_version(self) -> Wc029MonitoringCollectorVersion:
+        _validate_digest(
+            self.contract_artifact_sha256,
+            label="monitoring collector contractArtifactSha256",
+        )
+        _validate_digest(
+            self.contract_digest,
+            label="monitoring collector contractDigest",
+        )
+        _validate_digest(
+            self.public_key_fingerprint,
+            label="monitoring collector publicKeyFingerprint",
+        )
+        _validate_versioned_key_id(self.signing_key_vault_key_id)
+        key_parts = [
+            part for part in urlsplit(self.signing_key_vault_key_id).path.split("/") if part
+        ]
+        if self.signing_key_name != key_parts[-2] or self.signing_key_version != key_parts[-1]:
+            raise ValueError(
+                "monitoring collector key name and version do not match its Key Vault key ID"
+            )
+        if (self.key_retired_at is not None and self.key_retired_at <= self.key_activated_at) or (
+            self.key_expires_at is not None and self.key_expires_at <= self.key_activated_at
+        ):
+            raise ValueError(
+                "monitoring collector key retirement and expiry must follow activation"
+            )
+        return self
+
+
 class Wc029VersionInventory(_StrictAcceptanceModel):
     schema_version: Literal["athena.wc029VersionInventory.v1"] = Field(alias="schemaVersion")
     source_commit: str = Field(alias="sourceCommit", pattern=r"^[a-f0-9]{40}$")
@@ -1404,6 +1692,8 @@ class Wc029VersionInventory(_StrictAcceptanceModel):
         min_length=len(REQUIRED_SCENARIO_CLASSES),
         max_length=len(REQUIRED_SCENARIO_CLASSES),
     )
+    global_capture: Wc029GlobalCapturePolicy = Field(alias="globalCapture")
+    monitoring_collector: Wc029MonitoringCollectorVersion = Field(alias="monitoringCollector")
     manifest: Wc029ManifestVersion
     keys: tuple[Wc029KeyVersion, ...] = Field(min_length=1, max_length=32)
 
@@ -1522,6 +1812,85 @@ class Wc029VersionInventory(_StrictAcceptanceModel):
             sorted(item.endpoint_id for item in self.endpoints)
         ):
             raise ValueError("endpoints must be sorted by endpointId")
+        expected_global_capture_semantics: set[
+            tuple[
+                GlobalCaptureEvidenceClass,
+                str | None,
+                PreflightKind | None,
+                Literal["baseline", "final"] | None,
+                str | None,
+                str | None,
+            ]
+        ] = {
+            ("effective-rbac", None, None, None, None, None),
+            ("preflight-result", None, "rbac", None, None, None),
+            ("queue-state", None, None, "baseline", None, None),
+            ("queue-state", None, None, "final", None, None),
+        }
+        for deployment in self.deployments:
+            expected_global_capture_semantics.update(
+                {
+                    (
+                        "deployment-plan",
+                        deployment.deployment_id,
+                        None,
+                        None,
+                        None,
+                        None,
+                    ),
+                    (
+                        "deployment-what-if",
+                        deployment.deployment_id,
+                        None,
+                        None,
+                        None,
+                        None,
+                    ),
+                    (
+                        "deployment-output",
+                        deployment.deployment_id,
+                        None,
+                        None,
+                        None,
+                        None,
+                    ),
+                    (
+                        "deployment-readback",
+                        deployment.deployment_id,
+                        None,
+                        None,
+                        None,
+                        None,
+                    ),
+                    (
+                        "preflight-result",
+                        deployment.deployment_id,
+                        "what-if",
+                        None,
+                        None,
+                        None,
+                    ),
+                }
+            )
+        for endpoint in self.endpoints:
+            expected_global_capture_semantics.update(
+                (
+                    "url-probe",
+                    None,
+                    None,
+                    None,
+                    endpoint.endpoint_id,
+                    path,
+                )
+                for path in endpoint.allowed_paths
+            )
+        if {
+            item.semantic_key for item in self.global_capture.artifacts
+        } != expected_global_capture_semantics:
+            raise ValueError(
+                "trusted global capture policy must cover the exact security-critical "
+                "dynamic evidence set"
+            )
         if tuple(item.boundary_id for item in self.rbac_boundaries) != tuple(
             sorted(item.boundary_id for item in self.rbac_boundaries)
         ):
@@ -1605,6 +1974,20 @@ class Wc029VersionInventory(_StrictAcceptanceModel):
         }
         if {item.purpose for item in self.keys} != required_key_purposes:
             raise ValueError("trusted inventory must contain every independent signing purpose")
+        monitoring_key = next(item for item in self.keys if item.purpose == "monitoring")
+        monitoring_key_parts = [
+            part for part in urlsplit(monitoring_key.key_vault_key_id).path.split("/") if part
+        ]
+        if (
+            self.monitoring_collector.signing_key_vault_key_id != monitoring_key.key_vault_key_id
+            or self.monitoring_collector.signing_key_name != monitoring_key_parts[-2]
+            or self.monitoring_collector.signing_key_version != monitoring_key_parts[-1]
+            or self.monitoring_collector.public_key_fingerprint
+            != monitoring_key.public_key_fingerprint
+        ):
+            raise ValueError(
+                "monitoring collector trust does not match the exact monitoring key inventory"
+            )
         manifest_artifact_ids = {
             self.manifest.manifest_artifact_id,
             self.manifest.authority_artifact_id,
@@ -1612,6 +1995,32 @@ class Wc029VersionInventory(_StrictAcceptanceModel):
         }
         if len(manifest_artifact_ids) != 3:
             raise ValueError("manifest publication artifact IDs must be distinct")
+        reserved_artifact_ids = {
+            *manifest_artifact_ids,
+            self.monitoring_collector.contract_artifact_id,
+            *(item.public_key_artifact_id for item in self.keys),
+        }
+        if reserved_artifact_ids & {item.artifact_id for item in self.global_capture.artifacts}:
+            raise ValueError(
+                "dynamic global capture requirements cannot reference static trust artifacts"
+            )
+        deployment_subscriptions = {item.subscription_id.casefold() for item in self.deployments}
+        if any(
+            cast(
+                re.Match[str],
+                _SERVICE_BUS_NAMESPACE_RESOURCE_ID_PATTERN.fullmatch(
+                    coordinate.namespace_resource_id
+                ),
+            )
+            .group("subscription")
+            .casefold()
+            not in deployment_subscriptions
+            for coordinate in self.global_capture.service_bus_queues
+        ):
+            raise ValueError(
+                "Service Bus queue coordinates must belong to an inventoried "
+                "deployment subscription"
+            )
         return self
 
 
@@ -2312,6 +2721,150 @@ class Wc029JobPlatformCaptureAttestation(_StrictAcceptanceModel):
     )
 
 
+class Wc029GlobalCaptureArtifactBinding(_StrictAcceptanceModel):
+    artifact_id: str = Field(
+        alias="artifactId",
+        pattern=r"^[a-z0-9][a-z0-9._-]{0,127}$",
+    )
+    evidence_class: GlobalCaptureEvidenceClass = Field(alias="evidenceClass")
+    content_sha256: str = Field(
+        alias="contentSha256",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+
+    @field_validator("content_sha256")
+    @classmethod
+    def validate_content_digest(cls, value: str) -> str:
+        return _validate_digest(
+            value,
+            label="global capture artifact contentSha256",
+        )
+
+
+class Wc029GlobalCaptureManifest(_StrictAcceptanceModel):
+    schema_version: Literal["athena.wc029GlobalCaptureManifest.v1"] = Field(alias="schemaVersion")
+    acceptance_id: str = Field(
+        alias="acceptanceId",
+        pattern=r"^wc029-acceptance-[a-z0-9][a-z0-9._-]{0,95}$",
+    )
+    run_id: str = Field(
+        alias="runId",
+        pattern=r"^wc029-run-[a-f0-9]{32}$",
+    )
+    approved_inventory_sha256: str = Field(
+        alias="approvedInventorySha256",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    job_inventory_id: str = Field(
+        alias="jobInventoryId",
+        pattern=r"^[a-z0-9][a-z0-9._-]{0,63}$",
+    )
+    execution_id: str = Field(
+        alias="executionId",
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+    )
+    execution_artifact_id: str = Field(
+        alias="executionArtifactId",
+        pattern=r"^[a-z0-9][a-z0-9._-]{0,127}$",
+    )
+    execution_digest: str = Field(
+        alias="executionDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    execution_artifact_sha256: str = Field(
+        alias="executionArtifactSha256",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    readback_artifact_id: str = Field(
+        alias="readbackArtifactId",
+        pattern=r"^[a-z0-9][a-z0-9._-]{0,127}$",
+    )
+    readback_digest: str = Field(
+        alias="readbackDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    readback_artifact_sha256: str = Field(
+        alias="readbackArtifactSha256",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    capture_started_at: UtcDateTime = Field(alias="captureStartedAt")
+    capture_completed_at: UtcDateTime = Field(alias="captureCompletedAt")
+    artifacts: tuple[Wc029GlobalCaptureArtifactBinding, ...] = Field(
+        min_length=1,
+        max_length=MAX_EVIDENCE_FILES,
+    )
+    manifest_digest: str = Field(
+        alias="manifestDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+
+    def _digest_payload(self) -> dict[str, object]:
+        payload = self.model_dump(mode="json", by_alias=True, exclude_none=True)
+        payload.pop("manifestDigest")
+        return payload
+
+    @model_validator(mode="after")
+    def validate_manifest(self) -> Wc029GlobalCaptureManifest:
+        for label, digest in (
+            ("approvedInventorySha256", self.approved_inventory_sha256),
+            ("executionDigest", self.execution_digest),
+            ("executionArtifactSha256", self.execution_artifact_sha256),
+            ("readbackDigest", self.readback_digest),
+            ("readbackArtifactSha256", self.readback_artifact_sha256),
+            ("manifestDigest", self.manifest_digest),
+        ):
+            _validate_digest(digest, label=f"global capture {label}")
+        artifact_ids = tuple(item.artifact_id for item in self.artifacts)
+        if artifact_ids != tuple(sorted(artifact_ids)) or len(artifact_ids) != len(
+            set(artifact_ids)
+        ):
+            raise ValueError("global capture artifacts must be unique and sorted")
+        if self.execution_artifact_id == self.readback_artifact_id or {
+            self.execution_artifact_id,
+            self.readback_artifact_id,
+        } & set(artifact_ids):
+            raise ValueError("global capture cannot self-reference its Job execution or read-back")
+        if self.capture_completed_at <= self.capture_started_at:
+            raise ValueError("global capture window must have positive duration")
+        if self.manifest_digest != compute_artifact_digest(self._digest_payload()):
+            raise ValueError("manifestDigest does not bind the global capture manifest")
+        return self
+
+
+class Wc029GlobalCaptureAttestation(_StrictAcceptanceModel):
+    schema_version: Literal["athena.wc029GlobalCaptureAttestation.v1"] = Field(
+        alias="schemaVersion"
+    )
+    acceptance_id: str = Field(
+        alias="acceptanceId",
+        pattern=r"^wc029-acceptance-[a-z0-9][a-z0-9._-]{0,95}$",
+    )
+    run_id: str = Field(
+        alias="runId",
+        pattern=r"^wc029-run-[a-f0-9]{32}$",
+    )
+    manifest_digest: str = Field(
+        alias="manifestDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    signature_algorithm: Literal["RS256"] = Field(alias="signatureAlgorithm")
+    key_vault_key_id: str = Field(
+        alias="keyVaultKeyId",
+        min_length=1,
+        max_length=512,
+    )
+    signed_preimage_digest: str = Field(
+        alias="signedPreimageDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    detached_signature: str = Field(
+        alias="detachedSignature",
+        pattern=r"^[A-Za-z0-9_-]+$",
+        min_length=1,
+        max_length=8192,
+    )
+
+
 class Wc029PreflightResultEvidence(_StrictAcceptanceModel):
     schema_version: Literal["athena.wc029PreflightResult.v1"] = Field(alias="schemaVersion")
     kind: PreflightKind
@@ -2634,6 +3187,11 @@ class Wc029ManifestCitationEvidence(_StrictAcceptanceModel):
 
 
 class Wc029QueueState(_StrictAcceptanceModel):
+    namespace_resource_id: str = Field(
+        alias="namespaceResourceId",
+        min_length=1,
+        max_length=2048,
+    )
     namespace: str = Field(min_length=1, max_length=256)
     queue_name: str = Field(alias="queueName", min_length=1, max_length=128)
     active_message_count: Literal[0] = Field(alias="activeMessageCount")
@@ -2644,6 +3202,23 @@ class Wc029QueueState(_StrictAcceptanceModel):
     @classmethod
     def validate_queue_text(cls, value: str) -> str:
         return _validate_fixed_text(value, label="queue coordinate", maximum_length=256)
+
+    @model_validator(mode="after")
+    def validate_coordinate(self) -> Wc029QueueState:
+        Wc029ServiceBusQueueCoordinate(
+            namespaceResourceId=self.namespace_resource_id,
+            namespace=self.namespace,
+            queueName=self.queue_name,
+        )
+        return self
+
+    @property
+    def coordinate_key(self) -> tuple[str, str, str]:
+        return (
+            self.namespace_resource_id.casefold(),
+            self.namespace.casefold(),
+            self.queue_name.casefold(),
+        )
 
 
 class Wc029QueueStateEvidence(_StrictAcceptanceModel):
@@ -2674,9 +3249,7 @@ class Wc029QueueStateEvidence(_StrictAcceptanceModel):
             self.scenario_id is not None or self.scenario_execution_id is not None
         ):
             raise ValueError("global queue evidence cannot claim a scenario execution")
-        keys = tuple(
-            (item.namespace.casefold(), item.queue_name.casefold()) for item in self.queues
-        )
+        keys = tuple(item.coordinate_key for item in self.queues)
         if keys != tuple(sorted(keys)) or len(keys) != len(set(keys)):
             raise ValueError("queue evidence must contain unique sorted queue coordinates")
         return self
@@ -3352,6 +3925,10 @@ class Wc029AcceptanceEvidenceIndex(_StrictAcceptanceModel):
         alias="acceptanceId",
         pattern=r"^wc029-acceptance-[a-z0-9][a-z0-9._-]{0,95}$",
     )
+    run_id: str = Field(
+        alias="runId",
+        pattern=r"^wc029-run-[a-f0-9]{32}$",
+    )
     version_inventory_artifact_id: str = Field(
         alias="versionInventoryArtifactId",
         pattern=r"^[a-z0-9][a-z0-9._-]{0,127}$",
@@ -3426,9 +4003,15 @@ class Wc029AcceptanceEvidenceIndex(_StrictAcceptanceModel):
             )
         singleton_classes: tuple[EvidenceClass, ...] = (
             "version-inventory",
+            "monitoring-collector-contract",
             "published-manifest",
             "publication-authority",
             "publication-authority-attestation",
+            "job-execution",
+            "job-readback",
+            "job-platform-attestation",
+            "global-capture-manifest",
+            "global-capture-attestation",
             "effective-rbac",
             "rbac-policy",
         )
@@ -3698,6 +4281,13 @@ class Wc029AcceptanceEvidenceRecord(_StrictAcceptanceModel):
         alias="schemaVersion"
     )
     acceptance_id: str = Field(alias="acceptanceId")
+    run_id: str = Field(alias="runId")
+    capture_started_at: UtcDateTime = Field(alias="captureStartedAt")
+    capture_completed_at: UtcDateTime = Field(alias="captureCompletedAt")
+    global_capture_manifest_digest: str = Field(
+        alias="globalCaptureManifestDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
     validation_mode: Literal["offline-contract-digest-and-signature"] = Field(
         alias="validationMode"
     )
@@ -3741,6 +4331,12 @@ class Wc029AcceptanceEvidenceRecord(_StrictAcceptanceModel):
             raise ValueError("global artifact IDs must be sorted")
         if self.artifact_count != len(self.artifacts):
             raise ValueError("artifactCount does not match aggregate artifacts")
+        if self.capture_completed_at <= self.capture_started_at:
+            raise ValueError("aggregate capture window must have positive duration")
+        _validate_digest(
+            self.global_capture_manifest_digest,
+            label="globalCaptureManifestDigest",
+        )
         if self.aggregate_digest != compute_artifact_digest(self._digest_payload()):
             raise ValueError("aggregateDigest does not bind the canonical acceptance record")
         if len(self.canonical_bytes()) > MAX_RECORD_BYTES:
@@ -3761,6 +4357,7 @@ class _LoadedArtifact:
 _KNOWN_MODELS: dict[str, type[BaseModel]] = {
     VERSION_INVENTORY_SCHEMA_VERSION: Wc029VersionInventory,
     SIGNING_PUBLIC_KEY_SCHEMA_VERSION: Wc029SigningPublicKeyEvidence,
+    MONITORING_COLLECTOR_CONTRACT_SCHEMA_VERSION: MonitoringCollectorContract,
     PUBLISHED_MANIFEST_SCHEMA_VERSION: Wc029PublishedManifestEvidence,
     PUBLICATION_AUTHORITY_SCHEMA_VERSION: Wc029PublicationAuthorityEvidence,
     PUBLICATION_AUTHORITY_ATTESTATION_SCHEMA_VERSION: (Wc029PublicationAuthorityAttestation),
@@ -3770,6 +4367,8 @@ _KNOWN_MODELS: dict[str, type[BaseModel]] = {
     JOB_EXECUTION_SCHEMA_VERSION: Wc029JobExecutionEvidence,
     JOB_READBACK_SCHEMA_VERSION: Wc029JobReadbackEvidence,
     JOB_PLATFORM_CAPTURE_ATTESTATION_SCHEMA_VERSION: (Wc029JobPlatformCaptureAttestation),
+    GLOBAL_CAPTURE_MANIFEST_SCHEMA_VERSION: Wc029GlobalCaptureManifest,
+    GLOBAL_CAPTURE_ATTESTATION_SCHEMA_VERSION: Wc029GlobalCaptureAttestation,
     PREFLIGHT_RESULT_SCHEMA_VERSION: Wc029PreflightResultEvidence,
     SCENARIO_PLAN_SCHEMA_VERSION: Wc029ScenarioPlanEvidence,
     RESOURCE_STATE_SCHEMA_VERSION: Wc029ResourceStateEvidence,
@@ -5236,6 +5835,89 @@ def _load_public_keys(
     return public_keys
 
 
+@dataclass(frozen=True, slots=True)
+class _MonitoringEvidenceTrust:
+    reviewed_contract: MonitoringCollectorContract
+    trusted_key_anchor: TrustedKeyAnchor
+    trusted_key_record: TrustedKeyRecord
+
+
+def _validate_monitoring_collector_trust(
+    inventory: Wc029VersionInventory,
+    artifacts: Mapping[str, _LoadedArtifact],
+) -> _MonitoringEvidenceTrust:
+    configured = inventory.monitoring_collector
+    contract_artifact = artifacts.get(configured.contract_artifact_id)
+    monitoring_key = next(
+        (item for item in inventory.keys if item.purpose == "monitoring"),
+        None,
+    )
+    if (
+        contract_artifact is None
+        or contract_artifact.declaration.evidence_class != "monitoring-collector-contract"
+        or monitoring_key is None
+    ):
+        raise Wc029AcceptanceEvidenceError(
+            "reviewed monitoring collector contract or key inventory is missing"
+        )
+    contract = _require_model(
+        contract_artifact,
+        MonitoringCollectorContract,
+    )
+    if (
+        contract_artifact.record.content_sha256 != configured.contract_artifact_sha256
+        or contract.compute_artifact_digest_value() != configured.contract_digest
+        or contract.maximum_evidence_age_seconds != configured.maximum_evidence_age_seconds
+        or contract.signing_key_resource_id != configured.signing_key_vault_key_id
+        or monitoring_key.key_vault_key_id != configured.signing_key_vault_key_id
+        or monitoring_key.public_key_fingerprint != configured.public_key_fingerprint
+    ):
+        raise Wc029AcceptanceEvidenceError(
+            "monitoring collector contract and key do not match approved inventory"
+        )
+    key_artifact = artifacts.get(monitoring_key.public_key_artifact_id)
+    if key_artifact is None or key_artifact.declaration.evidence_class != "signing-public-key":
+        raise Wc029AcceptanceEvidenceError("monitoring collector public-key evidence is missing")
+    key_evidence = _require_model(
+        key_artifact,
+        Wc029SigningPublicKeyEvidence,
+    )
+    if (
+        key_evidence.key_vault_key_id != configured.signing_key_vault_key_id
+        or key_evidence.public_key_fingerprint != configured.public_key_fingerprint
+    ):
+        raise Wc029AcceptanceEvidenceError(
+            "monitoring collector public key does not match approved inventory"
+        )
+    try:
+        anchor = TrustedKeyAnchor.from_key_vault_key_id(
+            configured.signing_key_vault_key_id,
+            public_key_fingerprint=configured.public_key_fingerprint,
+        )
+        if (
+            anchor.key_name != configured.signing_key_name
+            or anchor.key_version != configured.signing_key_version
+        ):
+            raise ValueError("monitoring collector key name or version is not exact")
+        record = TrustedKeyRecord(
+            anchor=anchor,
+            public_key=key_evidence.rsa_public_key(),
+            enabled=configured.key_enabled,
+            activated_at=configured.key_activated_at,
+            retired_at=configured.key_retired_at,
+            expires_at=configured.key_expires_at,
+        )
+    except (TypeError, ValueError) as exc:
+        raise Wc029AcceptanceEvidenceError(
+            "monitoring collector key temporal status is invalid"
+        ) from exc
+    return _MonitoringEvidenceTrust(
+        reviewed_contract=contract,
+        trusted_key_anchor=anchor,
+        trusted_key_record=record,
+    )
+
+
 def _validate_signed_artifacts(
     inventory: Wc029VersionInventory,
     artifacts: Mapping[str, _LoadedArtifact],
@@ -5483,6 +6165,34 @@ def _validate_signed_artifacts(
                 public_key,
                 preimage=capture_statement.canonical_bytes(),
                 signature=capture_attestation.detached_signature,
+                standard_base64=False,
+                artifact_id=artifact.declaration.artifact_id,
+            )
+        elif evidence_class == "global-capture-attestation":
+            global_capture_attestation = _require_model(
+                artifact,
+                Wc029GlobalCaptureAttestation,
+            )
+            global_capture_manifest = _require_model(
+                cast(_LoadedArtifact, subject),
+                Wc029GlobalCaptureManifest,
+            )
+            if (
+                global_capture_attestation.acceptance_id != global_capture_manifest.acceptance_id
+                or global_capture_attestation.run_id != global_capture_manifest.run_id
+                or global_capture_attestation.manifest_digest
+                != global_capture_manifest.manifest_digest
+                or global_capture_attestation.key_vault_key_id != key.key_vault_key_id
+                or global_capture_attestation.signed_preimage_digest
+                != sha256_hex(global_capture_manifest.canonical_bytes())
+            ):
+                raise Wc029AcceptanceEvidenceError(
+                    "global capture attestation does not bind the exact signed manifest"
+                )
+            _verify_signature(
+                public_key,
+                preimage=global_capture_manifest.canonical_bytes(),
+                signature=global_capture_attestation.detached_signature,
                 standard_base64=False,
                 artifact_id=artifact.declaration.artifact_id,
             )
@@ -5861,6 +6571,247 @@ def _validate_job_evidence(
         )
 
 
+def _validate_queue_coordinates(
+    inventory: Wc029VersionInventory,
+    artifacts: Mapping[str, _LoadedArtifact],
+) -> None:
+    expected = tuple(
+        (
+            item.namespace_resource_id,
+            item.namespace,
+            item.queue_name,
+        )
+        for item in inventory.global_capture.service_bus_queues
+    )
+    for artifact in artifacts.values():
+        if artifact.declaration.evidence_class != "queue-state":
+            continue
+        queue_state = _require_model(
+            artifact,
+            Wc029QueueStateEvidence,
+        )
+        actual = tuple(
+            (
+                item.namespace_resource_id,
+                item.namespace,
+                item.queue_name,
+            )
+            for item in queue_state.queues
+        )
+        if actual != expected:
+            raise Wc029AcceptanceEvidenceError(
+                "baseline, scenario, and final queue captures must use the exact "
+                "inventoried Service Bus namespace and entity coordinates"
+            )
+
+
+def _global_capture_requirement_matches(
+    requirement: Wc029GlobalCaptureArtifactRequirement,
+    artifact: _LoadedArtifact,
+) -> bool:
+    declaration = artifact.declaration
+    if declaration.evidence_class != requirement.evidence_class:
+        return False
+    if requirement.evidence_class in {
+        "deployment-plan",
+        "deployment-what-if",
+        "deployment-output",
+        "deployment-readback",
+    }:
+        return declaration.deployment_id == requirement.deployment_id
+    if requirement.evidence_class == "preflight-result":
+        result = _require_model(
+            artifact,
+            Wc029PreflightResultEvidence,
+        )
+        return (
+            declaration.preflight_kind == requirement.preflight_kind
+            and result.kind == requirement.preflight_kind
+            and result.deployment_id == requirement.deployment_id
+        )
+    if requirement.evidence_class == "queue-state":
+        queue = _require_model(
+            artifact,
+            Wc029QueueStateEvidence,
+        )
+        return (
+            declaration.queue_scope == requirement.queue_scope
+            and queue.capture_scope == requirement.queue_scope
+        )
+    if requirement.evidence_class == "url-probe":
+        probe = _require_model(
+            artifact,
+            Wc029UrlProbeEvidence,
+        )
+        return (
+            probe.endpoint_id == requirement.endpoint_id
+            and urlsplit(probe.url).path == requirement.endpoint_path
+        )
+    return requirement.evidence_class == "effective-rbac"
+
+
+def _validate_global_capture(
+    index: Wc029AcceptanceEvidenceIndex,
+    inventory: Wc029VersionInventory,
+    artifacts: Mapping[str, _LoadedArtifact],
+    *,
+    approved_inventory_sha256: str,
+) -> Wc029GlobalCaptureManifest:
+    owners = _artifact_owners(index)
+    global_artifacts = tuple(
+        _require_loaded_artifact(
+            artifacts,
+            artifact_id,
+            label="global capture",
+        )
+        for artifact_id in index.global_artifact_ids
+    )
+    manifest_artifact = next(
+        item
+        for item in global_artifacts
+        if item.declaration.evidence_class == "global-capture-manifest"
+    )
+    manifest = _require_model(
+        manifest_artifact,
+        Wc029GlobalCaptureManifest,
+    )
+    attestation_artifact = next(
+        item
+        for item in global_artifacts
+        if item.declaration.evidence_class == "global-capture-attestation"
+    )
+    execution_artifact = next(
+        item for item in global_artifacts if item.declaration.evidence_class == "job-execution"
+    )
+    readback_artifact = next(
+        item for item in global_artifacts if item.declaration.evidence_class == "job-readback"
+    )
+    platform_attestation_artifact = next(
+        item
+        for item in global_artifacts
+        if item.declaration.evidence_class == "job-platform-attestation"
+    )
+    execution = _require_model(
+        execution_artifact,
+        Wc029JobExecutionEvidence,
+    )
+    readback = _require_model(
+        readback_artifact,
+        Wc029JobReadbackEvidence,
+    )
+    approved_job = next(item for item in inventory.jobs if item.purpose == "global-acceptance")
+    self_reference_ids = {
+        manifest_artifact.declaration.artifact_id,
+        attestation_artifact.declaration.artifact_id,
+        execution_artifact.declaration.artifact_id,
+        readback_artifact.declaration.artifact_id,
+        platform_attestation_artifact.declaration.artifact_id,
+    }
+    manifest_binding_ids = {item.artifact_id for item in manifest.artifacts}
+    readback_reference_ids = {item.artifact_id for item in readback.result_artifacts}
+    if self_reference_ids & (manifest_binding_ids | readback_reference_ids):
+        raise Wc029AcceptanceEvidenceError(
+            "global Job capture cannot contain self-digested references"
+        )
+
+    requirements = {item.artifact_id: item for item in inventory.global_capture.artifacts}
+    if manifest_binding_ids != set(requirements):
+        raise Wc029AcceptanceEvidenceError(
+            "signed global capture manifest does not cover the exact "
+            "trusted-inventory-defined artifact set"
+        )
+    manifest_bindings = {item.artifact_id: item for item in manifest.artifacts}
+    for artifact_id, requirement in requirements.items():
+        bound_artifact = artifacts.get(artifact_id)
+        binding = manifest_bindings[artifact_id]
+        if (
+            bound_artifact is None
+            or owners.get(artifact_id) is not None
+            or binding.evidence_class != requirement.evidence_class
+            or binding.content_sha256 != bound_artifact.record.content_sha256
+            or not _global_capture_requirement_matches(
+                requirement,
+                bound_artifact,
+            )
+        ):
+            raise Wc029AcceptanceEvidenceError(
+                "signed global capture manifest contains a missing, extra, "
+                "substituted, or stale artifact binding"
+            )
+    readback_bindings = {
+        item.artifact_id: item.content_sha256 for item in readback.result_artifacts
+    }
+    expected_bindings = {item.artifact_id: item.content_sha256 for item in manifest.artifacts}
+    if readback_bindings != expected_bindings:
+        raise Wc029AcceptanceEvidenceError(
+            "global Job read-back does not contain the exact signed capture artifact set"
+        )
+    if (
+        manifest.acceptance_id != index.acceptance_id
+        or manifest.run_id != index.run_id
+        or manifest.approved_inventory_sha256 != approved_inventory_sha256
+        or manifest.job_inventory_id != approved_job.job_id
+        or manifest.job_inventory_id != execution.job_inventory_id
+        or manifest.job_inventory_id != readback.job_inventory_id
+        or manifest.execution_id != execution.execution_id
+        or manifest.execution_id != readback.execution_id
+        or manifest.execution_artifact_id != execution_artifact.declaration.artifact_id
+        or manifest.execution_digest != execution.execution_digest
+        or manifest.execution_artifact_sha256 != execution_artifact.record.content_sha256
+        or manifest.readback_artifact_id != readback_artifact.declaration.artifact_id
+        or manifest.readback_digest != readback.readback_digest
+        or manifest.readback_artifact_sha256 != readback_artifact.record.content_sha256
+        or attestation_artifact.declaration.binds_artifact_id
+        != manifest_artifact.declaration.artifact_id
+    ):
+        raise Wc029AcceptanceEvidenceError(
+            "signed global capture manifest does not bind the exact acceptance "
+            "run, approved inventory, and global Job"
+        )
+
+    timestamped_evidence: list[UtcDateTime] = []
+    for artifact_id in requirements:
+        artifact = artifacts[artifact_id]
+        model = artifact.model
+        if isinstance(model, Wc029DeploymentReadbackEvidence):
+            timestamped_evidence.append(model.observed_at)
+        elif isinstance(model, Wc029QueueStateEvidence):
+            timestamped_evidence.append(model.captured_at)
+        elif isinstance(model, Wc029UrlProbeEvidence):
+            timestamped_evidence.append(model.observed_at)
+    for scenario in index.scenarios:
+        selected = _scenario_artifacts_by_class(scenario, artifacts)
+        scenario_manifest = _require_model(
+            selected["scenario-execution-manifest"],
+            Wc029ScenarioExecutionManifest,
+        )
+        timestamped_evidence.extend(
+            (
+                scenario_manifest.phase_windows[0].started_at,
+                scenario_manifest.phase_windows[-1].completed_at,
+            )
+        )
+    expected_capture_start = min(timestamped_evidence)
+    expected_capture_completion = max(timestamped_evidence)
+    if (
+        manifest.capture_started_at != expected_capture_start
+        or manifest.capture_completed_at != expected_capture_completion
+        or (manifest.capture_completed_at - manifest.capture_started_at).total_seconds()
+        > inventory.global_capture.maximum_capture_window_seconds
+        or not (
+            execution.started_at
+            <= manifest.capture_started_at
+            < manifest.capture_completed_at
+            <= execution.completed_at
+            <= readback.observed_at
+        )
+    ):
+        raise Wc029AcceptanceEvidenceError(
+            "signed global capture window does not exactly contain the acceptance run"
+        )
+    return manifest
+
+
 def _validate_url_probes(
     inventory: Wc029VersionInventory,
     artifacts: Mapping[str, _LoadedArtifact],
@@ -6102,6 +7053,16 @@ def _monitoring_bundle_digest(request: CorrelationRequest) -> str:
     return sha256_hex(request.monitoring_bundle.canonical_bytes())
 
 
+def _assert_current_correlation_catalog() -> None:
+    try:
+        assert_catalog_digest()
+        assert_contract_compatibility()
+    except RuntimeError as exc:
+        raise Wc029AcceptanceEvidenceError(
+            "repository correlation catalog and contracts are not compatible"
+        ) from exc
+
+
 def _require_current_correlation_request(
     request: CorrelationRequest,
 ) -> CorrelationRequest:
@@ -6109,6 +7070,21 @@ def _require_current_correlation_request(
     if canonical.schema_version != CORRELATION_REQUEST_SCHEMA_VERSION:
         raise Wc029AcceptanceEvidenceError(
             "correlation request does not use the repository's exact production schema"
+        )
+    if canonical.rule_catalog_digest != CORRELATION_RULE_CATALOG_DIGEST:
+        raise Wc029AcceptanceEvidenceError(
+            "correlation request does not use the repository's exact production rule catalog"
+        )
+    return canonical
+
+
+def _require_current_correlation_report(
+    report: CorrelationReport,
+) -> CorrelationReport:
+    canonical = CorrelationReport.model_validate_json(report.canonical_bytes())
+    if canonical.rule_catalog_digest != CORRELATION_RULE_CATALOG_DIGEST:
+        raise Wc029AcceptanceEvidenceError(
+            "correlation report does not use the repository's exact production rule catalog"
         )
     return canonical
 
@@ -6119,6 +7095,31 @@ def _require_current_incident_bound_request(
     canonical = IncidentBoundCorrelationRequest.model_validate_json(bound_request.canonical_bytes())
     _require_current_correlation_request(canonical.correlation_request)
     return canonical
+
+
+def _verify_monitoring_handoff_trust(
+    request: CorrelationRequest,
+    monitoring: MonitoringEvidenceHandoff,
+    monitoring_trust: _MonitoringEvidenceTrust,
+) -> None:
+    request = _require_current_correlation_request(request)
+    try:
+        verify_monitoring_evidence_handoff_attestation(
+            monitoring,
+            as_of=request.trusted_as_of,
+            reviewed_collector_contract=monitoring_trust.reviewed_contract,
+            trusted_key_anchor=monitoring_trust.trusted_key_anchor,
+            key_resolver=lambda anchor: (
+                monitoring_trust.trusted_key_record
+                if anchor == monitoring_trust.trusted_key_anchor
+                else None
+            ),
+        )
+    except ValueError as exc:
+        raise Wc029AcceptanceEvidenceError(
+            "monitoring evidence is stale, replayed, or not bound to the exact "
+            "reviewed collector contract, maximum age, and key validity"
+        ) from exc
 
 
 def _validate_monitoring_freshness(
@@ -7078,6 +8079,7 @@ def _validate_correlation_request_context(
     execution_manifest: Wc029ScenarioExecutionManifest,
 ) -> None:
     request = _require_current_correlation_request(request)
+    report = _require_current_correlation_report(report)
     monitoring_bundle_digest = _monitoring_bundle_digest(request)
     _validate_correlation_request_plan_binding(
         request,
@@ -7139,6 +8141,7 @@ def _validate_scenario_evidence(
     index: Wc029AcceptanceEvidenceIndex,
     inventory: Wc029VersionInventory,
     artifacts: Mapping[str, _LoadedArtifact],
+    monitoring_trust: _MonitoringEvidenceTrust,
 ) -> None:
     capabilities = {item.scenario_class: item for item in inventory.scenario_capabilities}
     for scenario in index.scenarios:
@@ -7325,6 +8328,11 @@ def _validate_scenario_evidence(
         monitoring = _require_model(
             selected["monitoring-evidence"],
             MonitoringEvidenceHandoff,
+        )
+        _verify_monitoring_handoff_trust(
+            request,
+            monitoring,
+            monitoring_trust,
         )
         monitoring_bundle_digest = _validate_monitoring_freshness(
             request,
@@ -7683,6 +8691,7 @@ def _validate_specialized_evidence(
     index: Wc029AcceptanceEvidenceIndex,
     inventory: Wc029VersionInventory,
     artifacts: Mapping[str, _LoadedArtifact],
+    monitoring_trust: _MonitoringEvidenceTrust,
 ) -> None:
     owners = _artifact_owners(index)
     scenario_by_id = {item.scenario_id: item for item in index.scenarios}
@@ -7729,9 +8738,15 @@ def _validate_specialized_evidence(
                 )
     _validate_preflight_evidence(inventory, artifacts)
     _validate_job_evidence(index, inventory, artifacts)
+    _validate_queue_coordinates(inventory, artifacts)
     _validate_url_probes(inventory, artifacts)
     _validate_publication_authority(inventory, artifacts)
-    _validate_scenario_evidence(index, inventory, artifacts)
+    _validate_scenario_evidence(
+        index,
+        inventory,
+        artifacts,
+        monitoring_trust,
+    )
     _validate_global_chronology(index, inventory, artifacts)
 
 
@@ -7758,6 +8773,7 @@ def aggregate_acceptance_evidence(
 ) -> Wc029AcceptanceEvidenceRecord:
     """Build one canonical WC-029 record without network or Azure operations."""
 
+    _assert_current_correlation_catalog()
     root = Path(evidence_root)
     try:
         index_relative = _validate_relative_file(index_file)
@@ -7832,7 +8848,22 @@ def aggregate_acceptance_evidence(
 
     _validate_deployment_evidence(inventory, loaded)
     _validate_signed_artifacts(inventory, loaded)
-    _validate_specialized_evidence(index, inventory, loaded)
+    monitoring_trust = _validate_monitoring_collector_trust(
+        inventory,
+        loaded,
+    )
+    _validate_specialized_evidence(
+        index,
+        inventory,
+        loaded,
+        monitoring_trust,
+    )
+    global_capture_manifest = _validate_global_capture(
+        index,
+        inventory,
+        loaded,
+        approved_inventory_sha256=approved_inventory_sha256,
+    )
 
     source_index = Wc029SourceIndexRecord(
         path=index_relative,
@@ -7848,6 +8879,10 @@ def aggregate_acceptance_evidence(
     draft = Wc029AcceptanceEvidenceRecord.model_construct(
         schema_version=ACCEPTANCE_RECORD_SCHEMA_VERSION,
         acceptance_id=index.acceptance_id,
+        run_id=index.run_id,
+        capture_started_at=global_capture_manifest.capture_started_at,
+        capture_completed_at=global_capture_manifest.capture_completed_at,
+        global_capture_manifest_digest=global_capture_manifest.manifest_digest,
         validation_mode="offline-contract-digest-and-signature",
         azure_mutation_performed=False,
         incident_evidence_synthesized=False,
@@ -8237,6 +9272,8 @@ __all__ = [
     "ACCEPTANCE_RECORD_SCHEMA_VERSION",
     "CORRELATION_ONLY_REPORT_ATTESTATION_SCHEMA_VERSION",
     "DEPLOYMENT_READBACK_SCHEMA_VERSION",
+    "GLOBAL_CAPTURE_ATTESTATION_SCHEMA_VERSION",
+    "GLOBAL_CAPTURE_MANIFEST_SCHEMA_VERSION",
     "INCIDENT_OMISSION_SCHEMA_VERSION",
     "JOB_EXECUTION_SCHEMA_VERSION",
     "JOB_PLATFORM_CAPTURE_ATTESTATION_SCHEMA_VERSION",
@@ -8275,6 +9312,11 @@ __all__ = [
     "Wc029DeploymentVersion",
     "Wc029EndpointVersion",
     "Wc029EvidenceFileDeclaration",
+    "Wc029GlobalCaptureArtifactBinding",
+    "Wc029GlobalCaptureArtifactRequirement",
+    "Wc029GlobalCaptureAttestation",
+    "Wc029GlobalCaptureManifest",
+    "Wc029GlobalCapturePolicy",
     "Wc029ImageVersion",
     "Wc029IncidentOmission",
     "Wc029IncidentOccurrenceContinuity",
@@ -8286,6 +9328,7 @@ __all__ = [
     "Wc029KeyVersion",
     "Wc029ManifestCitationEvidence",
     "Wc029ManifestVersion",
+    "Wc029MonitoringCollectorVersion",
     "Wc029MutationReceipt",
     "Wc029PreflightResultEvidence",
     "Wc029PublishedClause",
@@ -8306,6 +9349,7 @@ __all__ = [
     "Wc029ScenarioPhaseWindow",
     "Wc029ScenarioPlanEvidence",
     "Wc029ScenarioPhases",
+    "Wc029ServiceBusQueueCoordinate",
     "Wc029SigningPublicKeyEvidence",
     "Wc029UrlProbeEvidence",
     "Wc029VersionInventory",

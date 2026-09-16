@@ -14,10 +14,18 @@ The harness:
 - validates an exact allowlisted schema for every non-Azure artifact class;
 - requires the exact inventory file SHA-256 through the out-of-band
   `--approved-inventory-sha256` argument before trusting any deployment, key, manifest,
-  capability, endpoint, or RBAC declaration;
+  capability, endpoint, Service Bus coordinate, collector contract, or RBAC declaration;
 - reuses the existing WC-029 what-if and RBAC evaluators against the captured raw inputs;
 - verifies captured RSA public-key fingerprints and every captured signed artifact offline,
   including schema-specific signed preimages and exact versioned Key Vault key IDs;
+- invokes the WC-026 catalog-integrity and contract-compatibility assertions and requires every
+  canonical request and report to use the imported production rule-catalog digest;
+- invokes the shared WC-024 monitoring-handoff verifier at each request's trusted `trustedAsOf`
+  against the inventory-pinned collector contract, maximum evidence age, exact key version,
+  fingerprint, activation, enablement, retirement, and expiry status;
+- requires a separately signed global-capture manifest plus the platform-attested global Job
+  read-back to cover the same exact inventory-defined dynamic artifact set, acceptance/run IDs,
+  approved inventory digest, and capture window;
 - rejects incomplete, duplicate, unlisted, linked, escaping, malformed, noncanonical, oversized,
   or internally inconsistent inputs; and
 - opens every validated file through a stable no-follow handle before reading any bytes, then
@@ -82,6 +90,10 @@ wc029-capture/
   platform/
     job-execution.json
     job-readback.json
+    job-platform-attestation.json
+    global-capture-manifest.json
+    global-capture-attestation.json
+    monitoring-collector-contract.json
     effective-rbac.json
     reviewed-rbac-policy.json
     what-if-preflight.json
@@ -121,9 +133,17 @@ The index names exactly one canonical `athena.wc029VersionInventory.v1` artifact
   complete execution-template/configuration digest, expected attached managed-identity resource
   set, image RepoDigest, and trusted platform-capture anchor;
 - every approved HTTPS endpoint origin and exact probed path;
+- the exact Service Bus namespace ARM ID, matching fully qualified namespace, and queue entity
+  coordinates required in every baseline, scenario, and final queue receipt;
 - every managed-identity boundary, forbidden role set, and forbidden scope set whose effective
   RBAC must be present;
 - every scenario target/action capability and whether a deployed IncidentState producer exists;
+- the exact security-critical dynamic global artifact roles and IDs that the global Job must
+  capture: every deployment parameter plan, what-if, output, read-back and what-if receipt,
+  effective RBAC and RBAC receipt, every endpoint/path probe, and the baseline/final queues;
+- the reviewed `MonitoringCollectorContract` artifact byte digest and canonical contract digest,
+  `maximumEvidenceAgeSeconds`, exact monitoring Key Vault key ID/name/version/fingerprint, and
+  enabled/activation/retirement/expiry status;
 - the exact published canonical manifest artifact, approved `PublishedRuntimeContextBinding`,
   authority artifact, independent authority attestation, effective clause set, semantic version,
   resolved profile digest, dependency graph digest, and full dependency-path/coverage-bound
@@ -168,6 +188,13 @@ Global evidence must contain:
   binds the exact execution/read-back artifact bytes, execution ID, Job ARM ID, subscription and
   resource group, purpose, configuration digest, attached identities, image RepoDigest, start/end
   timestamps, platform statuses, capture record, and approved capture anchor;
+- one canonical `athena.wc029GlobalCaptureManifest.v1` and independent `job-capture` signature.
+  The manifest binds the exact acceptance ID, run ID, approved inventory SHA-256, global Job
+  execution/read-back IDs and byte digests, exact capture start/end, and a non-optional SHA-256
+  for every inventory-required dynamic artifact. The platform-attested Job read-back must contain
+  exactly the same artifact/digest map. Missing, extra, substituted, stale, scenario-scoped, or
+  self-digested references fail even when the manifest is re-signed;
+- the exact reviewed `athena.wc024MonitoringCollectorContract.v2` artifact pinned by the inventory;
 - one canonical successful HTTPS URL probe for every inventoried endpoint/path coordinate;
 - captured effective RBAC covering exactly the inventoried principals;
 - the reviewed non-vacuous RBAC separation policy, with one exact rule for every approved
@@ -175,6 +202,10 @@ Global evidence must contain:
 - digest-bound successful `what-if` and `rbac` preflight results;
 - a baseline zero-count queue capture; and
 - a final zero-count queue capture.
+
+Every queue receipt, including the incident-producing scenario drain, must contain exactly the
+same inventory-pinned namespace ARM ID, fully qualified Service Bus namespace, and queue name.
+Changing only one capture to another valid Service Bus namespace or entity is not acceptable.
 
 The harness does not reimplement preflight policy. It invokes the repository's existing
 `evaluate_what_if` and `evaluate_role_assignments` functions on the captured raw evidence and
@@ -225,12 +256,23 @@ inside `IncidentBoundCorrelationRequest`. Legacy WC-026 requests are not an acce
 When the production contract advances, a bundle must use the newly imported exact version; merely
 adding another locally accepted version is forbidden.
 
+The aggregator also invokes `assert_catalog_digest()` and `assert_contract_compatibility()` and
+requires both the request and report `ruleCatalogDigest` to equal the imported
+`CORRELATION_RULE_CATALOG_DIGEST`. A mutually consistent request/report pair built with an obsolete,
+test, or caller-selected catalog digest is rejected.
+
 The plan and signed execution manifest also bind the canonical WC-028 monitoring-bundle SHA-256.
 The harness requires that digest to equal the handoff evidence digest and the request inventory
 digest, and globally deduplicates it across scenarios in addition to the handoff and collection ID.
 `observedStart`, `observedEnd`, `collectedAt`, and the signed collector handoff time must all follow
 the mutation, remain ordered, and fall inside the signed observe phase. A newly signed or renamed
 handoff around previously captured bundle bytes is stale evidence, not a new observation.
+
+For every scenario, the aggregator calls
+`verify_monitoring_evidence_handoff_attestation(..., as_of=request.trustedAsOf)` with the exact
+reviewed collector contract and an inventory-derived `TrustedKeyRecord`. Contract substitution,
+evidence older than the contract maximum, a disabled/not-yet-active/retired/expired key, an
+unapproved key ID or version, and a fingerprint mismatch all fail closed.
 
 Every signed phase window has positive duration and is strictly separated from the following
 window. Mutation, recovery, recovered-state capture, Job start, Job completion, Job read-back, and
@@ -350,6 +392,10 @@ Harness-owned canonical receipts include:
   SHA-256. Query strings and fragments are forbidden.
 - `athena.wc029JobExecution.v1` and `athena.wc029JobReadback.v1`: exact successful execution,
   source commit, digest-pinned image, result artifact digests, and post-run state.
+- `athena.wc029GlobalCaptureManifest.v1` and
+  `athena.wc029GlobalCaptureAttestation.v1`: the separately signed, inventory-exact global capture
+  set, approved inventory digest, acceptance/run identity, global Job binding, and exact bounded
+  capture window.
 - `athena.wc029ScenarioPlan.v1`, `athena.wc029MutationReceipt.v1`, and
   `athena.wc029RecoveryAction.v1`: one target-bound plan/apply/recover chain.
 - the deployed `athena_context.contracts.CORRELATION_REQUEST_SCHEMA_VERSION` and canonical
@@ -417,7 +463,7 @@ contains exact byte and canonical-JSON SHA-256 values for the index and every ev
 relative paths only, sorted artifact/scenario references, the full version inventory, and explicit
 `validationMode=offline-contract-digest-and-signature`, `azureMutationPerformed=false`, and
 `incidentEvidenceSynthesized=false` guardrails. It also records the out-of-band approved inventory
-digest.
+digest, signed run ID, exact capture start/end, and global-capture manifest digest.
 
 Output publication uses an exclusive staging file followed by a no-replace hard-link commit. Once
 the final digest-named link succeeds, staging cleanup failure cannot turn the committed record into

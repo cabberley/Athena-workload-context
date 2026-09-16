@@ -76,6 +76,7 @@ from athena_context.contracts.change_ingestion import (
     change_evidence_attestation_preimage,
 )
 from athena_context.contracts.monitoring import monitoring_handoff_preimage
+from athena_context.correlation.rules import CORRELATION_RULE_CATALOG_DIGEST
 from athena_context.fixtures import load_canonical_manifest
 from athena_context.monitoring_collection import (
     CommittedMonitoringCollection,
@@ -83,7 +84,7 @@ from athena_context.monitoring_collection import (
     build_collected_correlation_request,
 )
 from test_presentation_asset_gateway import _resolved_feed_v2_source_fixture
-from test_wc024_monitoring_contract import _trusted_signed_handoff
+from test_wc024_monitoring_contract import _collector_contract, _trusted_signed_handoff
 from test_wc026_correlation import _test_service
 from test_wc026_correlation_contract import (
     DB_ID,
@@ -126,6 +127,13 @@ _JOB_CAPTURE_ANCHOR_RESOURCE_ID = (
     "resourceGroups/rg-athena-wc029-synthetic/providers/Microsoft.Storage/"
     "storageAccounts/athenawc029synthetic/blobServices/default/containers/job-captures"
 )
+_SERVICE_BUS_NAMESPACE_RESOURCE_ID = (
+    "/subscriptions/00000000-0000-0000-0000-000000000000/"
+    "resourceGroups/rg-athena-wc029-synthetic/providers/Microsoft.ServiceBus/"
+    "namespaces/athena-wc029-synthetic"
+)
+_ACCEPTANCE_ID = "wc029-acceptance-synthetic-001"
+_RUN_ID = "wc029-run-" + ("9" * 32)
 _TARGETS = {
     scenario_class: (
         "/subscriptions/00000000-0000-0000-0000-000000000000/"
@@ -924,6 +932,9 @@ def _trusted_incident_assets(
     *,
     monitoring_key: KeyMaterial | None = None,
     monitoring_private_key: rsa.RSAPrivateKey | None = None,
+    rule_catalog_digest: str = CORRELATION_RULE_CATALOG_DIGEST,
+    monitoring_contract_digest: str | None = None,
+    monitoring_handoff_age_seconds: int = 60,
 ) -> IncidentAssets:
     fixture = _resolved_feed_v2_source_fixture()
     payloads = _schema_payloads(fixture)
@@ -1029,9 +1040,11 @@ def _trusted_incident_assets(
         correlation_request = _correlation_request_for_context(
             publication.manifest.context_binding,
             trusted_as_of=source_report.as_of,
-            rule_catalog_digest=sha256_hex("web-tier-failure:rule-catalog"),
             monitoring_key=monitoring_key,
             monitoring_private_key=monitoring_private_key,
+            rule_catalog_digest=rule_catalog_digest,
+            monitoring_contract_digest=monitoring_contract_digest,
+            monitoring_handoff_age_seconds=monitoring_handoff_age_seconds,
         )
     incident_bound_request = _incident_bound_request_for_state(
         correlation_request,
@@ -1744,18 +1757,58 @@ def _wc028_coverage_scopes_for_path(path_id: str) -> tuple[Any, ...]:
     )
 
 
+def _request_with_rule_catalog_digest(
+    request: CorrelationRequest,
+    rule_catalog_digest: str,
+) -> CorrelationRequest:
+    inventory_payload = request.evidence_inventory.model_dump(
+        mode="python",
+        by_alias=True,
+        exclude={"inventory_digest"},
+    )
+    inventory_payload["ruleCatalogDigest"] = rule_catalog_digest
+    inventory = type(request.evidence_inventory)(
+        **inventory_payload,
+        inventoryDigest=compute_artifact_digest(_json_value(inventory_payload)),
+    )
+    request_payload = request.model_dump(
+        mode="python",
+        by_alias=True,
+        exclude={"request_id", "request_digest", "evidence_inventory"},
+    )
+    request_payload.update(
+        {
+            "ruleCatalogDigest": rule_catalog_digest,
+            "evidenceInventory": inventory,
+        }
+    )
+    request_digest = compute_artifact_digest(_json_value(request_payload))
+    return CorrelationRequest(
+        **request_payload,
+        requestId=("request-" + request_digest.removeprefix("sha256:")[:32]),
+        requestDigest=request_digest,
+    )
+
+
 def _correlation_request_for_context(
     context_binding: PublishedRuntimeContextBinding,
     *,
     trusted_as_of: datetime,
-    rule_catalog_digest: str,
     monitoring_key: KeyMaterial,
     monitoring_private_key: rsa.RSAPrivateKey,
+    rule_catalog_digest: str = CORRELATION_RULE_CATALOG_DIGEST,
+    monitoring_contract_digest: str | None = None,
+    monitoring_handoff_age_seconds: int = 60,
     change_artifact: ChangeEvidenceArtifact | None = None,
     additional_change_artifacts: tuple[ChangeEvidenceArtifact, ...] = (),
     stale_bundle: bool = False,
 ) -> CorrelationRequest:
     real_prepared, real_request = _wc028_request_template()
+    selected_monitoring_contract_digest = (
+        real_request.monitoring_bundle.monitoring_contract_digest
+        if monitoring_contract_digest is None
+        else monitoring_contract_digest
+    )
     intent_reference = real_request.monitoring_bundle.monitoring_intent_reference
     if intent_reference is None:
         raise AssertionError("real WC-028 request must contain monitoring intent evidence")
@@ -1922,7 +1975,7 @@ def _correlation_request_for_context(
     monitoring_bundle = MonitoringEvidenceBundle(
         schemaVersion=MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION,
         workloadId=real_request.monitoring_bundle.workload_id,
-        monitoringContractDigest=(real_request.monitoring_bundle.monitoring_contract_digest),
+        monitoringContractDigest=selected_monitoring_contract_digest,
         monitoringIntentReference=intent_reference,
         collectedAt=trusted_as_of - timedelta(minutes=2),
         observedStart=bundle_observed_start,
@@ -1937,7 +1990,7 @@ def _correlation_request_for_context(
         "schemaVersion": "athena.wc024MonitoringEvidenceHandoff.v1",
         "collectorContractDigest": monitoring_bundle.monitoring_contract_digest,
         "collectionId": collection_id,
-        "observedAt": trusted_as_of - timedelta(minutes=1),
+        "observedAt": trusted_as_of - timedelta(seconds=monitoring_handoff_age_seconds),
         "evidence": VersionPinnedBlobReference(
             name=f"wc024-monitoring/{collection_id}/evidence.json",
             version=real_request.monitoring_handoff.evidence.version,
@@ -2014,7 +2067,7 @@ def _correlation_request_for_context(
         monitoring_handoff=monitoring_handoff,
         change_handoffs=change_handoffs,
     )
-    return build_collected_correlation_request(
+    request = build_collected_correlation_request(
         prepared,
         committed,
         context_binding=context_binding,
@@ -2023,6 +2076,12 @@ def _correlation_request_for_context(
         trusted_as_of=trusted_as_of,
         expires_at=trusted_as_of + timedelta(seconds=20),
     )
+    if rule_catalog_digest != request.rule_catalog_digest:
+        return _request_with_rule_catalog_digest(
+            request,
+            rule_catalog_digest,
+        )
+    return request
 
 
 def _incident_bound_request_for_state(
@@ -2173,6 +2232,7 @@ def _job_execution(
     input_digest: str = "sha256:" + ("f" * 64),
     phase: str | None = None,
     started_at: datetime = _NOW,
+    completed_at: datetime | None = None,
 ) -> acceptance.Wc029JobExecutionEvidence:
     if job_version is None:
         purpose = "global-acceptance" if scope == "global" else "scenario-recovery-verification"
@@ -2199,7 +2259,7 @@ def _job_execution(
         ),
         "attachedIdentityResourceIds": (job_version.expected_attached_identity_resource_ids),
         "startedAt": started_at,
-        "completedAt": started_at + timedelta(minutes=1),
+        "completedAt": completed_at or started_at + timedelta(minutes=1),
         "status": "Succeeded",
         "exitCode": 0,
     }
@@ -2323,6 +2383,77 @@ def _job_platform_capture_attestation(
         signatureAlgorithm="RS256",
         keyVaultKeyId=key.key_id,
         signedPreimageDigest=sha256_hex(statement.canonical_bytes()),
+        detachedSignature=signature,
+    )
+
+
+def _global_capture_manifest(
+    *,
+    approved_inventory_sha256: str,
+    requirements: tuple[acceptance.Wc029GlobalCaptureArtifactRequirement, ...],
+    artifact_digests: dict[str, str],
+    execution_artifact_id: str,
+    execution: acceptance.Wc029JobExecutionEvidence,
+    readback_artifact_id: str,
+    readback: acceptance.Wc029JobReadbackEvidence,
+    capture_started_at: datetime,
+    capture_completed_at: datetime,
+) -> acceptance.Wc029GlobalCaptureManifest:
+    return _digest_bound_model(
+        acceptance.Wc029GlobalCaptureManifest,
+        {
+            "schemaVersion": acceptance.GLOBAL_CAPTURE_MANIFEST_SCHEMA_VERSION,
+            "acceptanceId": _ACCEPTANCE_ID,
+            "runId": _RUN_ID,
+            "approvedInventorySha256": approved_inventory_sha256,
+            "jobInventoryId": execution.job_inventory_id,
+            "executionId": execution.execution_id,
+            "executionArtifactId": execution_artifact_id,
+            "executionDigest": execution.execution_digest,
+            "executionArtifactSha256": artifact_digests[execution_artifact_id],
+            "readbackArtifactId": readback_artifact_id,
+            "readbackDigest": readback.readback_digest,
+            "readbackArtifactSha256": artifact_digests[readback_artifact_id],
+            "captureStartedAt": capture_started_at,
+            "captureCompletedAt": capture_completed_at,
+            "artifacts": tuple(
+                acceptance.Wc029GlobalCaptureArtifactBinding(
+                    artifactId=requirement.artifact_id,
+                    evidenceClass=requirement.evidence_class,
+                    contentSha256=artifact_digests[requirement.artifact_id],
+                )
+                for requirement in requirements
+            ),
+        },
+        digest_field="manifestDigest",
+    )
+
+
+def _global_capture_attestation(
+    manifest: acceptance.Wc029GlobalCaptureManifest,
+    *,
+    key: KeyMaterial,
+    private_key: rsa.RSAPrivateKey,
+) -> acceptance.Wc029GlobalCaptureAttestation:
+    signature = (
+        base64.urlsafe_b64encode(
+            private_key.sign(
+                manifest.canonical_bytes(),
+                padding.PKCS1v15(),
+                hashes.SHA256(),
+            )
+        )
+        .decode("ascii")
+        .rstrip("=")
+    )
+    return acceptance.Wc029GlobalCaptureAttestation(
+        schemaVersion=acceptance.GLOBAL_CAPTURE_ATTESTATION_SCHEMA_VERSION,
+        acceptanceId=manifest.acceptance_id,
+        runId=manifest.run_id,
+        manifestDigest=manifest.manifest_digest,
+        signatureAlgorithm="RS256",
+        keyVaultKeyId=key.key_id,
+        signedPreimageDigest=sha256_hex(manifest.canonical_bytes()),
         detachedSignature=signature,
     )
 
@@ -2583,6 +2714,7 @@ def _queue_state(
         capturedAt=captured_at,
         queues=(
             acceptance.Wc029QueueState(
+                namespaceResourceId=_SERVICE_BUS_NAMESPACE_RESOURCE_ID,
                 namespace="athena-wc029-synthetic.servicebus.windows.net",
                 queueName="incident-notification-outbox",
                 activeMessageCount=0,
@@ -3337,7 +3469,8 @@ def _build_bundle(tmp_path: Path) -> BundleFixture:
 
     index = {
         "schemaVersion": acceptance.ACCEPTANCE_INDEX_SCHEMA_VERSION,
-        "acceptanceId": "wc029-acceptance-synthetic-001",
+        "acceptanceId": _ACCEPTANCE_ID,
+        "runId": _RUN_ID,
         "versionInventoryArtifactId": "version-inventory",
         "artifacts": declarations,
         "globalArtifactIds": global_ids,
@@ -3353,7 +3486,19 @@ def _build_bundle(tmp_path: Path) -> BundleFixture:
     )
 
 
-def _build_bundle(tmp_path: Path) -> BundleFixture:
+def _build_bundle(
+    tmp_path: Path,
+    *,
+    rule_catalog_digest: str = CORRELATION_RULE_CATALOG_DIGEST,
+    monitoring_maximum_evidence_age_seconds: int = 600,
+    monitoring_handoff_age_seconds: int = 60,
+    monitoring_contract_digest_override: str | None = None,
+    use_unapproved_monitoring_signer: bool = False,
+    monitoring_key_enabled: bool = True,
+    monitoring_key_activated_at: datetime = datetime(2026, 1, 1, tzinfo=UTC),
+    monitoring_key_retired_at: datetime | None = None,
+    monitoring_key_expires_at: datetime | None = None,
+) -> BundleFixture:
     root = tmp_path / "evidence"
     output = tmp_path / "records"
     root.mkdir(parents=True)
@@ -3370,10 +3515,42 @@ def _build_bundle(tmp_path: Path) -> BundleFixture:
         "monitoring",
         "2",
     )
+    base_monitoring_contract = _collector_contract()
+    monitoring_contract_payload = base_monitoring_contract.model_dump(
+        mode="python",
+        by_alias=True,
+    )
+    monitoring_contract_payload.update(
+        {
+            "signingKeyResourceId": monitoring_key.key_id,
+            "maximumEvidenceAgeSeconds": monitoring_maximum_evidence_age_seconds,
+        }
+    )
+    reviewed_monitoring_contract = type(base_monitoring_contract).model_validate(
+        monitoring_contract_payload
+    )
+    reviewed_monitoring_contract_digest = (
+        reviewed_monitoring_contract.compute_artifact_digest_value()
+    )
+    captured_monitoring_contract_digest = (
+        reviewed_monitoring_contract_digest
+        if monitoring_contract_digest_override is None
+        else monitoring_contract_digest_override
+    )
+    collector_signing_key = monitoring_key
+    collector_signing_private = monitoring_private
+    if use_unapproved_monitoring_signer:
+        collector_signing_key, collector_signing_private = _private_key_material(
+            "monitoring-obsolete",
+            "8",
+        )
     incident = _trusted_incident_assets(
         publication,
-        monitoring_key=monitoring_key,
-        monitoring_private_key=monitoring_private,
+        monitoring_key=collector_signing_key,
+        monitoring_private_key=collector_signing_private,
+        rule_catalog_digest=rule_catalog_digest,
+        monitoring_contract_digest=captured_monitoring_contract_digest,
+        monitoring_handoff_age_seconds=monitoring_handoff_age_seconds,
     )
     scenario_time_order = (
         "web-tier-failure",
@@ -3446,6 +3623,13 @@ def _build_bundle(tmp_path: Path) -> BundleFixture:
         if global_evidence:
             global_ids.append(artifact_id)
         return artifact_id
+
+    monitoring_contract_id = add(
+        "monitoring-collector-contract",
+        "monitoring-collector-contract",
+        reviewed_monitoring_contract,
+        global_evidence=True,
+    )
 
     for purpose in sorted(keys):
         key = keys[purpose]
@@ -3598,6 +3782,90 @@ def _build_bundle(tmp_path: Path) -> BundleFixture:
                 upstreamHandoffs=(),
             )
         )
+    endpoints = (
+        acceptance.Wc029EndpointVersion(
+            endpointId="presentation",
+            origin="https://athena.synthetic.invalid",
+            allowedPaths=("/healthz", "/runtime-manifest.json"),
+        ),
+    )
+    global_capture_requirements: list[acceptance.Wc029GlobalCaptureArtifactRequirement] = [
+        acceptance.Wc029GlobalCaptureArtifactRequirement(
+            artifactId="effective-rbac",
+            evidenceClass="effective-rbac",
+        ),
+        acceptance.Wc029GlobalCaptureArtifactRequirement(
+            artifactId="rbac-preflight",
+            evidenceClass="preflight-result",
+            preflightKind="rbac",
+        ),
+        acceptance.Wc029GlobalCaptureArtifactRequirement(
+            artifactId="queue-baseline",
+            evidenceClass="queue-state",
+            queueScope="baseline",
+        ),
+        acceptance.Wc029GlobalCaptureArtifactRequirement(
+            artifactId="queue-final",
+            evidenceClass="queue-state",
+            queueScope="final",
+        ),
+        acceptance.Wc029GlobalCaptureArtifactRequirement(
+            artifactId="probe-health",
+            evidenceClass="url-probe",
+            endpointId="presentation",
+            endpointPath="/healthz",
+        ),
+        acceptance.Wc029GlobalCaptureArtifactRequirement(
+            artifactId="probe-runtime-manifest",
+            evidenceClass="url-probe",
+            endpointId="presentation",
+            endpointPath="/runtime-manifest.json",
+        ),
+    ]
+    for deployment in deployments:
+        deployment_id = deployment.deployment_id
+        for suffix, evidence_class in (
+            ("plan", "deployment-plan"),
+            ("what-if", "deployment-what-if"),
+            ("output", "deployment-output"),
+            ("readback", "deployment-readback"),
+        ):
+            global_capture_requirements.append(
+                acceptance.Wc029GlobalCaptureArtifactRequirement(
+                    artifactId=f"{deployment_id}-{suffix}",
+                    evidenceClass=evidence_class,
+                    deploymentId=deployment_id,
+                )
+            )
+        global_capture_requirements.append(
+            acceptance.Wc029GlobalCaptureArtifactRequirement(
+                artifactId=(
+                    "what-if-preflight"
+                    if deployment_id == "foundation"
+                    else f"{deployment_id}-what-if-preflight"
+                ),
+                evidenceClass="preflight-result",
+                deploymentId=deployment_id,
+                preflightKind="what-if",
+            )
+        )
+    global_capture_policy = acceptance.Wc029GlobalCapturePolicy(
+        maximumCaptureWindowSeconds=5 * 24 * 60 * 60,
+        artifacts=tuple(
+            sorted(
+                global_capture_requirements,
+                key=lambda item: item.artifact_id,
+            )
+        ),
+        serviceBusQueues=(
+            acceptance.Wc029ServiceBusQueueCoordinate(
+                namespaceResourceId=_SERVICE_BUS_NAMESPACE_RESOURCE_ID,
+                namespace="athena-wc029-synthetic.servicebus.windows.net",
+                queueName="incident-notification-outbox",
+            ),
+        ),
+    )
+    monitoring_key_parts = [part for part in monitoring_key.key_id.split("/") if part]
     inventory = acceptance.Wc029VersionInventory(
         schemaVersion=acceptance.VERSION_INVENTORY_SCHEMA_VERSION,
         sourceCommit=_SOURCE_COMMIT,
@@ -3609,16 +3877,25 @@ def _build_bundle(tmp_path: Path) -> BundleFixture:
             ),
         ),
         jobs=_job_versions(),
-        endpoints=(
-            acceptance.Wc029EndpointVersion(
-                endpointId="presentation",
-                origin="https://athena.synthetic.invalid",
-                allowedPaths=("/healthz", "/runtime-manifest.json"),
-            ),
-        ),
+        endpoints=endpoints,
         rbacBoundaries=(rbac_boundary,),
         capabilityDeploymentId="foundation",
         scenarioCapabilities=capabilities,
+        globalCapture=global_capture_policy,
+        monitoringCollector=acceptance.Wc029MonitoringCollectorVersion(
+            contractArtifactId=monitoring_contract_id,
+            contractArtifactSha256=artifact_digests[monitoring_contract_id],
+            contractDigest=reviewed_monitoring_contract_digest,
+            maximumEvidenceAgeSeconds=(reviewed_monitoring_contract.maximum_evidence_age_seconds),
+            signingKeyVaultKeyId=monitoring_key.key_id,
+            signingKeyName=monitoring_key_parts[-2],
+            signingKeyVersion=monitoring_key_parts[-1],
+            publicKeyFingerprint=monitoring_key.fingerprint,
+            keyEnabled=monitoring_key_enabled,
+            keyActivatedAt=monitoring_key_activated_at,
+            keyRetiredAt=monitoring_key_retired_at,
+            keyExpiresAt=monitoring_key_expires_at,
+        ),
         manifest=acceptance.Wc029ManifestVersion(
             manifestId=publication.manifest.manifest_id,
             manifestVersion=publication.manifest.manifest_version,
@@ -3662,7 +3939,6 @@ def _build_bundle(tmp_path: Path) -> BundleFixture:
     )
     approved_inventory_sha256 = artifact_digests[inventory_id]
 
-    capability_readback_id = ""
     for deployment_index, deployment in enumerate(inventory.deployments):
         deployment_id = deployment.deployment_id
         what_if_id = add(
@@ -3745,8 +4021,6 @@ def _build_bundle(tmp_path: Path) -> BundleFixture:
             deployment_id=deployment_id,
             binds_artifact_id=handoff_id,
         )
-        if deployment_id == inventory.capability_deployment_id:
-            capability_readback_id = readback_id
         add(
             (
                 "what-if-preflight"
@@ -3852,10 +4126,14 @@ def _build_bundle(tmp_path: Path) -> BundleFixture:
         global_evidence=True,
     )
     global_job = next(item for item in inventory.jobs if item.purpose == "global-acceptance")
+    capture_started_at = _SCENARIO_BASE - timedelta(hours=4)
+    capture_completed_at = _NOW + timedelta(minutes=10)
     global_execution = _job_execution(
         execution_id="foundation-execution",
         scope="global",
         job_version=global_job,
+        started_at=capture_started_at,
+        completed_at=capture_completed_at + timedelta(minutes=1),
     )
     global_execution_id = add(
         "global-job-execution",
@@ -3867,9 +4145,10 @@ def _build_bundle(tmp_path: Path) -> BundleFixture:
         global_execution,
         result_artifacts=[
             (
-                capability_readback_id,
-                artifact_digests[capability_readback_id],
-            ),
+                requirement.artifact_id,
+                artifact_digests[requirement.artifact_id],
+            )
+            for requirement in inventory.global_capture.artifacts
         ],
     )
     global_readback_id = add(
@@ -3893,6 +4172,34 @@ def _build_bundle(tmp_path: Path) -> BundleFixture:
         ),
         global_evidence=True,
         binds_artifact_id=global_readback_id,
+    )
+    global_capture_manifest = _global_capture_manifest(
+        approved_inventory_sha256=approved_inventory_sha256,
+        requirements=inventory.global_capture.artifacts,
+        artifact_digests=artifact_digests,
+        execution_artifact_id=global_execution_id,
+        execution=global_execution,
+        readback_artifact_id=global_readback_id,
+        readback=global_readback,
+        capture_started_at=capture_started_at,
+        capture_completed_at=capture_completed_at,
+    )
+    global_capture_manifest_id = add(
+        "global-capture-manifest",
+        "global-capture-manifest",
+        global_capture_manifest,
+        global_evidence=True,
+    )
+    add(
+        "global-capture-attestation",
+        "global-capture-attestation",
+        _global_capture_attestation(
+            global_capture_manifest,
+            key=job_capture_key,
+            private_key=job_capture_private,
+        ),
+        global_evidence=True,
+        binds_artifact_id=global_capture_manifest_id,
     )
 
     capability_by_class = {item.scenario_class: item for item in capabilities}
@@ -3943,12 +4250,17 @@ def _build_bundle(tmp_path: Path) -> BundleFixture:
             scenario_request = _correlation_request_for_context(
                 publication.manifest.context_binding,
                 trusted_as_of=scenario_report_times[scenario_class],
-                rule_catalog_digest=sha256_hex(f"{scenario_class}:rule-catalog"),
-                monitoring_key=monitoring_key,
-                monitoring_private_key=monitoring_private,
+                monitoring_key=collector_signing_key,
+                monitoring_private_key=collector_signing_private,
+                rule_catalog_digest=rule_catalog_digest,
+                monitoring_contract_digest=captured_monitoring_contract_digest,
+                monitoring_handoff_age_seconds=monitoring_handoff_age_seconds,
                 change_artifact=(change if scenario_class == "nsg-connectivity-loss" else None),
             )
-            if scenario_class == "nsg-connectivity-loss":
+            if (
+                scenario_class == "nsg-connectivity-loss"
+                and rule_catalog_digest == CORRELATION_RULE_CATALOG_DIGEST
+            ):
                 service = _test_service(scenario_request)
                 scenario_report = service.validate_result(service.correlate(scenario_request))
             else:
@@ -4525,7 +4837,8 @@ def _build_bundle(tmp_path: Path) -> BundleFixture:
 
     index = {
         "schemaVersion": acceptance.ACCEPTANCE_INDEX_SCHEMA_VERSION,
-        "acceptanceId": "wc029-acceptance-synthetic-001",
+        "acceptanceId": _ACCEPTANCE_ID,
+        "runId": _RUN_ID,
         "versionInventoryArtifactId": "version-inventory",
         "artifacts": declarations,
         "globalArtifactIds": global_ids,
@@ -4702,6 +5015,44 @@ def _refresh_global_job_capture_attestation(
         private_key=bundle.private_keys["job-capture"],
     )
     _write(bundle.artifact_paths[attestation_id], attestation)
+
+
+def _refresh_global_job_result_reference(
+    bundle: BundleFixture,
+    artifact_id: str,
+) -> None:
+    readback_path = bundle.artifact_paths["global-job-readback"]
+    readback = _read_json(readback_path)
+    matching = [item for item in readback["resultArtifacts"] if item["artifactId"] == artifact_id]
+    if len(matching) != 1:
+        raise AssertionError("global Job fixture must contain one exact result reference")
+    matching[0]["contentSha256"] = sha256_hex(bundle.artifact_paths[artifact_id].read_bytes())
+    readback_payload = dict(readback)
+    readback_payload.pop("readbackDigest")
+    readback["readbackDigest"] = compute_artifact_digest(readback_payload)
+    _write(readback_path, readback)
+    _refresh_global_job_capture_attestation(bundle)
+
+
+def _write_resigned_global_capture_manifest(
+    bundle: BundleFixture,
+    manifest_document: dict[str, Any],
+) -> None:
+    payload = dict(manifest_document)
+    payload.pop("manifestDigest", None)
+    payload["manifestDigest"] = compute_artifact_digest(payload)
+    payload["artifacts"] = tuple(payload["artifacts"])
+    manifest = acceptance.Wc029GlobalCaptureManifest.model_validate(payload)
+    _write(bundle.artifact_paths["global-capture-manifest"], manifest)
+    attestation = _global_capture_attestation(
+        manifest,
+        key=bundle.keys["job-capture"],
+        private_key=bundle.private_keys["job-capture"],
+    )
+    _write(
+        bundle.artifact_paths["global-capture-attestation"],
+        attestation,
+    )
 
 
 def _rewrite_global_job_chain(
@@ -5423,6 +5774,246 @@ def test_global_job_requires_trusted_platform_capture_attestation(
         match="platform capture attestation",
     ):
         _aggregate(fabricated)
+
+
+@pytest.mark.parametrize(
+    "artifact_id",
+    [
+        "effective-rbac",
+        "queue-final",
+    ],
+)
+def test_global_job_rejects_dynamic_evidence_changed_outside_signed_capture(
+    tmp_path: Path,
+    artifact_id: str,
+) -> None:
+    bundle = _build_bundle(tmp_path / artifact_id)
+    artifact_path = bundle.artifact_paths[artifact_id]
+    if artifact_id == "effective-rbac":
+        document = json.loads(artifact_path.read_text(encoding="utf-8"))
+        assert isinstance(document, list)
+        document[0]["scope"] = (
+            "/subscriptions/00000000-0000-0000-0000-000000000000/"
+            "resourceGroups/rg-athena-wc029-synthetic/providers/"
+            "Microsoft.Storage/storageAccounts/synthetic/blobServices/"
+            "default/containers/alternate-evidence"
+        )
+        _write(artifact_path, document)
+        preflight_path = bundle.artifact_paths["rbac-preflight"]
+        preflight = _read_json(preflight_path)
+        preflight["inputSha256"] = sha256_hex(artifact_path.read_bytes())
+        _write(preflight_path, preflight)
+    else:
+        document = _read_json(artifact_path)
+        document["capturedAt"] = (_NOW + timedelta(minutes=9)).isoformat().replace("+00:00", "Z")
+        _write(artifact_path, document)
+
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="Job read-back result artifact reference|signed global capture",
+    ):
+        _aggregate(bundle)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing",
+        "extra",
+        "substituted",
+        "self",
+    ],
+)
+def test_resigned_global_capture_manifest_requires_exact_inventory_set(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    bundle = _build_bundle(tmp_path / mutation)
+    manifest = _read_json(bundle.artifact_paths["global-capture-manifest"])
+    bindings = manifest["artifacts"]
+    if mutation == "missing":
+        bindings.pop(0)
+    elif mutation == "extra":
+        bindings.append(
+            {
+                "artifactId": "rbac-policy",
+                "evidenceClass": "effective-rbac",
+                "contentSha256": sha256_hex(bundle.artifact_paths["rbac-policy"].read_bytes()),
+            }
+        )
+    elif mutation == "substituted":
+        binding = next(item for item in bindings if item["artifactId"] == "foundation-readback")
+        binding.update(
+            {
+                "artifactId": "rbac-policy",
+                "evidenceClass": "effective-rbac",
+                "contentSha256": sha256_hex(bundle.artifact_paths["rbac-policy"].read_bytes()),
+            }
+        )
+    else:
+        bindings.append(
+            {
+                "artifactId": "global-capture-manifest",
+                "evidenceClass": "effective-rbac",
+                "contentSha256": "sha256:" + ("f" * 64),
+            }
+        )
+    bindings.sort(key=lambda item: item["artifactId"])
+    _write_resigned_global_capture_manifest(bundle, manifest)
+
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="exact trusted-inventory-defined|self-digested",
+    ):
+        _aggregate(bundle)
+
+
+def test_resigned_global_job_readback_requires_exact_capture_manifest_set(
+    tmp_path: Path,
+) -> None:
+    bundle = _build_bundle(tmp_path)
+    readback_path = bundle.artifact_paths["global-job-readback"]
+    readback = _read_json(readback_path)
+    readback["resultArtifacts"] = [
+        item for item in readback["resultArtifacts"] if item["artifactId"] != "foundation-readback"
+    ]
+    readback_payload = dict(readback)
+    readback_payload.pop("readbackDigest")
+    readback["readbackDigest"] = compute_artifact_digest(readback_payload)
+    _write(readback_path, readback)
+    _refresh_global_job_capture_attestation(bundle)
+
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="exact signed capture artifact set",
+    ):
+        _aggregate(bundle)
+
+
+@pytest.mark.parametrize(
+    ("artifact_id", "scenario_class"),
+    [
+        ("queue-baseline", None),
+        ("scenario-web-tier-failure-queue", "web-tier-failure"),
+        ("queue-final", None),
+    ],
+)
+def test_queue_captures_require_exact_inventory_bound_service_bus_coordinates(
+    tmp_path: Path,
+    artifact_id: str,
+    scenario_class: str | None,
+) -> None:
+    bundle = _build_bundle(tmp_path / artifact_id)
+    queue_path = bundle.artifact_paths[artifact_id]
+    queue = _read_json(queue_path)
+    queue["queues"][0].update(
+        {
+            "namespaceResourceId": (
+                "/subscriptions/00000000-0000-0000-0000-000000000000/"
+                "resourceGroups/rg-athena-wc029-synthetic/providers/"
+                "Microsoft.ServiceBus/namespaces/athena-wc029-substituted"
+            ),
+            "namespace": "athena-wc029-substituted.servicebus.windows.net",
+        }
+    )
+    _write(queue_path, queue)
+    if scenario_class is None:
+        _refresh_global_job_result_reference(bundle, artifact_id)
+    else:
+        _refresh_scenario_execution_binding(bundle, scenario_class)
+
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="exact inventoried Service Bus namespace and entity coordinates",
+    ):
+        _aggregate(bundle)
+
+
+def test_aggregation_rejects_arbitrary_request_and_report_rule_catalog(
+    tmp_path: Path,
+) -> None:
+    arbitrary_digest = sha256_hex("obsolete-test-correlation-catalog")
+    bundle = _build_bundle(
+        tmp_path,
+        rule_catalog_digest=arbitrary_digest,
+    )
+    request = CorrelationRequest.model_validate_json(
+        bundle.artifact_paths["scenario-disk-capacity-pressure-correlation-request"].read_bytes()
+    )
+    report = CorrelationReport.model_validate_json(
+        bundle.artifact_paths["scenario-disk-capacity-pressure-report"].read_bytes()
+    )
+    assert request.rule_catalog_digest == arbitrary_digest
+    assert report.rule_catalog_digest == arbitrary_digest
+
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="exact production rule catalog",
+    ):
+        _aggregate(bundle)
+
+
+def test_aggregation_invokes_catalog_contract_compatibility_assertions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle = _build_bundle(tmp_path)
+
+    def incompatible() -> None:
+        raise RuntimeError("synthetic incompatible catalog")
+
+    monkeypatch.setattr(
+        acceptance,
+        "assert_contract_compatibility",
+        incompatible,
+    )
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="catalog and contracts are not compatible",
+    ):
+        _aggregate(bundle)
+
+
+@pytest.mark.parametrize(
+    "builder_overrides",
+    [
+        {
+            "monitoring_contract_digest_override": sha256_hex(
+                "obsolete-monitoring-collector-contract"
+            )
+        },
+        {
+            "monitoring_maximum_evidence_age_seconds": 60,
+            "monitoring_handoff_age_seconds": 61,
+        },
+        {"use_unapproved_monitoring_signer": True},
+        {"monitoring_key_enabled": False},
+        {
+            "monitoring_key_expires_at": datetime(
+                2026,
+                9,
+                10,
+                1,
+                59,
+                tzinfo=UTC,
+            )
+        },
+    ],
+)
+def test_aggregation_rejects_obsolete_stale_or_unapproved_monitoring_collector(
+    tmp_path: Path,
+    builder_overrides: dict[str, object],
+) -> None:
+    bundle = _build_bundle(
+        tmp_path,
+        **builder_overrides,
+    )
+
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="monitoring evidence.*reviewed collector|inventoried signing key",
+    ):
+        _aggregate(bundle)
 
 
 @pytest.mark.parametrize(
@@ -7334,6 +7925,16 @@ def test_deployment_baseline_proof_and_final_queue_chronology_is_ordered(
     baseline_queue = _read_json(every_readback.artifact_paths["queue-baseline"])
     readback["observedAt"] = baseline_queue["capturedAt"]
     _write(readback_path, readback)
+    global_job_path = every_readback.artifact_paths["global-job-readback"]
+    global_job = _read_json(global_job_path)
+    for reference in global_job["resultArtifacts"]:
+        if reference["artifactId"] == "monitoring-foundation-readback":
+            reference["contentSha256"] = sha256_hex(readback_path.read_bytes())
+    global_job_payload = dict(global_job)
+    global_job_payload.pop("readbackDigest")
+    global_job["readbackDigest"] = compute_artifact_digest(global_job_payload)
+    _write(global_job_path, global_job)
+    _refresh_global_job_capture_attestation(every_readback)
     with pytest.raises(
         acceptance.Wc029AcceptanceEvidenceError,
         match="global deployment, baseline, scenario, and final chronology",
@@ -7368,6 +7969,16 @@ def test_deployment_baseline_proof_and_final_queue_chronology_is_ordered(
         "Z",
     )
     _write(final_path, final_queue)
+    global_job_path = final.artifact_paths["global-job-readback"]
+    global_job = _read_json(global_job_path)
+    for reference in global_job["resultArtifacts"]:
+        if reference["artifactId"] == "queue-final":
+            reference["contentSha256"] = sha256_hex(final_path.read_bytes())
+    global_job_payload = dict(global_job)
+    global_job_payload.pop("readbackDigest")
+    global_job["readbackDigest"] = compute_artifact_digest(global_job_payload)
+    _write(global_job_path, global_job)
+    _refresh_global_job_capture_attestation(final)
     with pytest.raises(
         acceptance.Wc029AcceptanceEvidenceError,
         match="global deployment, baseline, scenario, and final chronology",
