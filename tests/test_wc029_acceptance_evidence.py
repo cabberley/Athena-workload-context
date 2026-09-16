@@ -22,6 +22,7 @@ from athena_context.contracts import (
     ActiveIncidentIndex,
     ActiveIncidentIndexAttestation,
     ChangeEvidenceArtifact,
+    ChangeEvidencePersistenceHandoff,
     CorrelationReport,
     CorrelationRequest,
     DependencyPath,
@@ -50,6 +51,7 @@ from athena_context.contracts import (
     IncidentStateAttestation,
     MonitoringEvidenceBundle,
     MonitoringEvidenceHandoff,
+    NetworkFlowObservation,
     PublishedContextAuthority,
     PublishedCorrelationReportAssetReference,
     PublishedCorrelationReportAttestation,
@@ -82,8 +84,11 @@ from athena_context.monitoring_collection import (
 )
 from test_presentation_asset_gateway import _resolved_feed_v2_source_fixture
 from test_wc024_monitoring_contract import _trusted_signed_handoff
+from test_wc026_correlation import _test_service
 from test_wc026_correlation_contract import (
     DB_ID,
+    NSG_ID,
+    NSG_RULE_ID,
     WEB_ID,
     _change_pair,
     _hypothesis,
@@ -458,7 +463,16 @@ def _publication_assets() -> tuple[PublicationAssets, rsa.RSAPrivateKey]:
         "sourceRoleRef": "web",
         "targetRoleRef": "database-primary",
         "relationshipIds": (relationship.relationship_id,),
-        "resourceIds": tuple(sorted((DB_ID.lower(), WEB_ID.lower()))),
+        "resourceIds": tuple(
+            sorted(
+                (
+                    DB_ID.lower(),
+                    WEB_ID.lower(),
+                    NSG_ID.lower(),
+                    NSG_RULE_ID.lower(),
+                )
+            )
+        ),
     }
     dependency_path_digest = compute_artifact_digest(_json_value(dependency_path_payload))
     dependency_path = DependencyPath(
@@ -467,6 +481,7 @@ def _publication_assets() -> tuple[PublicationAssets, rsa.RSAPrivateKey]:
         pathDigest=dependency_path_digest,
     )
     request_template = _request(dependency_paths=(dependency_path,))
+    coverage_scopes = _wc028_coverage_scopes_for_path(dependency_path.path_id)
     workload_id = request_template.monitoring_bundle.workload_id
     context_binding_payload: dict[str, object] = {
         "workloadId": workload_id,
@@ -477,8 +492,8 @@ def _publication_assets() -> tuple[PublicationAssets, rsa.RSAPrivateKey]:
         "resolvedProfileDigest": resolved_profile.resolved_profile_digest,
         "dependencyGraphDigest": dependency_graph_digest,
         "dependencyPaths": (dependency_path,),
-        "requiredCoverageScopeDigests": (
-            request_template.monitoring_bundle.expected_coverage_scope_digests
+        "requiredCoverageScopeDigests": tuple(
+            sorted({item.scope_digest for item in coverage_scopes})
         ),
     }
     context_binding_payload_digest = compute_artifact_digest(_json_value(context_binding_payload))
@@ -1611,12 +1626,28 @@ def _trusted_incident_assets(
 
 def _signed_change(
     occurred_at: datetime | None = None,
-) -> tuple[ChangeEvidenceArtifact, KeyMaterial]:
-    source, _ = _change_pair(occurred_at=occurred_at)
-    key, private_key = _private_key_material("change", "8")
-    preimage = canonicalize_json(change_evidence_attestation_preimage(source.evidence)).encode(
-        "utf-8"
+    *,
+    change_suffix: str = "001",
+    key: KeyMaterial | None = None,
+    private_key: rsa.RSAPrivateKey | None = None,
+    source_digest: str | None = None,
+    changed_properties: dict[str, tuple[str, str]] | None = None,
+) -> tuple[ChangeEvidenceArtifact, KeyMaterial, rsa.RSAPrivateKey]:
+    source, _ = _change_pair(
+        occurred_at=occurred_at,
+        change_suffix=change_suffix,
+        changed_properties=changed_properties,
     )
+    if (key is None) != (private_key is None):
+        raise ValueError("change key and private key must be supplied together")
+    if key is None or private_key is None:
+        key, private_key = _private_key_material("change", "8")
+    evidence = source.evidence
+    if source_digest is not None:
+        evidence_payload = evidence.model_dump(mode="python", by_alias=True)
+        evidence_payload["sourceDigest"] = source_digest
+        evidence = type(evidence).model_validate(evidence_payload)
+    preimage = canonicalize_json(change_evidence_attestation_preimage(evidence)).encode("utf-8")
     signature = base64.b64encode(
         private_key.sign(
             preimage,
@@ -1625,13 +1656,14 @@ def _signed_change(
         )
     ).decode("ascii")
     payload = source.model_dump(mode="python", by_alias=True)
+    payload["evidence"] = evidence
     payload["attestation"] = {
         **source.attestation.model_dump(mode="python", by_alias=True),
         "keyVaultKeyId": key.key_id,
         "signedPreimageDigest": sha256_hex(preimage),
         "signature": signature,
     }
-    return ChangeEvidenceArtifact.model_validate(payload), key
+    return ChangeEvidenceArtifact.model_validate(payload), key, private_key
 
 
 def _signed_monitoring(
@@ -1689,6 +1721,29 @@ def _wc028_request_template() -> tuple[
     return prepared, request
 
 
+def _wc028_scope_for_path(scope: Any, path_id: str) -> Any:
+    scope_payload = scope.model_dump(
+        mode="python",
+        by_alias=True,
+        exclude={"scope_id", "scope_digest"},
+    )
+    if scope_payload.get("pathId") is not None:
+        scope_payload["pathId"] = path_id
+    scope_digest = compute_artifact_digest(_json_value(scope_payload))
+    return type(scope)(
+        **scope_payload,
+        scopeId=("coverage-scope-" + scope_digest.removeprefix("sha256:")[:32]),
+        scopeDigest=scope_digest,
+    )
+
+
+def _wc028_coverage_scopes_for_path(path_id: str) -> tuple[Any, ...]:
+    _prepared, request = _wc028_request_template()
+    return tuple(
+        _wc028_scope_for_path(item.scope, path_id) for item in request.monitoring_bundle.coverage
+    )
+
+
 def _correlation_request_for_context(
     context_binding: PublishedRuntimeContextBinding,
     *,
@@ -1696,39 +1751,32 @@ def _correlation_request_for_context(
     rule_catalog_digest: str,
     monitoring_key: KeyMaterial,
     monitoring_private_key: rsa.RSAPrivateKey,
+    change_artifact: ChangeEvidenceArtifact | None = None,
+    additional_change_artifacts: tuple[ChangeEvidenceArtifact, ...] = (),
     stale_bundle: bool = False,
 ) -> CorrelationRequest:
-    source = _request(
-        dependency_paths=context_binding.dependency_paths,
-        rule_catalog_digest=rule_catalog_digest,
-    )
     real_prepared, real_request = _wc028_request_template()
     intent_reference = real_request.monitoring_bundle.monitoring_intent_reference
     if intent_reference is None:
         raise AssertionError("real WC-028 request must contain monitoring intent evidence")
-    control_provenance = next(
-        item.control_provenance
-        for item in real_request.monitoring_bundle.observations
-        if item.control_provenance is not None
-    )
     interval_by_state = (
         {
-            "healthy": (
+            "previous": (
                 trusted_as_of - timedelta(minutes=14),
                 trusted_as_of - timedelta(minutes=13),
             ),
-            "unhealthy": (
+            "current": (
                 trusted_as_of - timedelta(minutes=12),
                 trusted_as_of - timedelta(minutes=11),
             ),
         }
         if stale_bundle
         else {
-            "healthy": (
+            "previous": (
                 trusted_as_of - timedelta(minutes=8),
                 trusted_as_of - timedelta(minutes=6),
             ),
-            "unhealthy": (
+            "current": (
                 trusted_as_of - timedelta(minutes=5),
                 trusted_as_of - timedelta(minutes=3),
             ),
@@ -1737,18 +1785,27 @@ def _correlation_request_for_context(
     bundle_observed_start = min(item[0] for item in interval_by_state.values())
     bundle_observed_end = max(item[1] for item in interval_by_state.values())
     observations = []
-    query_execution_digests: list[str] = []
-    for observation in source.monitoring_bundle.observations:
-        observed_start, observed_end = interval_by_state[observation.state]
-        query_execution_digest = compute_artifact_digest(
-            {
-                "schemaVersion": "athena.wc028MonitoringQueryExecution.v1",
-                "ruleCatalogDigest": rule_catalog_digest,
-                "sourceObservationDigest": observation.observation_digest,
-                "observedStart": observed_start,
-                "observedEnd": observed_end,
-            }
+    observation_id_map: dict[str, str] = {}
+    query_execution_digest_map: dict[str, str] = {}
+    for observation in real_request.monitoring_bundle.observations:
+        interval = (
+            "previous"
+            if observation.observed_end <= real_request.incident_anchor.observed_start
+            else "current"
         )
+        observed_start, observed_end = interval_by_state[interval]
+        query_execution_digest = None
+        if observation.query_execution_digest is not None:
+            query_execution_digest = compute_artifact_digest(
+                {
+                    "schemaVersion": "athena.wc028MonitoringQueryExecution.v1",
+                    "ruleCatalogDigest": rule_catalog_digest,
+                    "sourceObservationDigest": observation.observation_digest,
+                    "observedStart": observed_start,
+                    "observedEnd": observed_end,
+                }
+            )
+            query_execution_digest_map[observation.query_execution_digest] = query_execution_digest
         observation_payload = observation.model_dump(
             mode="python",
             by_alias=True,
@@ -1758,52 +1815,121 @@ def _correlation_request_for_context(
             {
                 "observedStart": observed_start,
                 "observedEnd": observed_end,
-                "controlProvenance": control_provenance,
                 "queryExecutionDigest": query_execution_digest,
             }
         )
+        if "pathId" in observation_payload:
+            observation_payload["pathId"] = context_binding.dependency_paths[0].path_id
+        if isinstance(observation, NetworkFlowObservation):
+            if change_artifact is None:
+                observation_payload.update(
+                    {
+                        "effectiveRuleAttribution": False,
+                        "attributionMethod": None,
+                        "causalEffect": None,
+                        "attributionProofDigest": None,
+                        "matchedChangeKey": None,
+                        "matchedChangeEvidenceId": None,
+                        "matchedChangeArtifactDigest": None,
+                        "matchedPropertyPaths": (),
+                    }
+                )
+            else:
+                change_digest = sha256_hex(change_artifact.canonical_bytes())
+                change_evidence = change_artifact.evidence
+                observation_payload.update(
+                    {
+                        "ruleResourceId": change_evidence.target_resource_id,
+                        "effectiveRuleAttribution": True,
+                        "attributionMethod": "ipFlowVerify",
+                        "causalEffect": "introducedDenyForTuple",
+                        "attributionProofDigest": compute_artifact_digest(
+                            {
+                                "changeArtifactDigest": change_digest,
+                                "changeKey": change_evidence.change_key,
+                                "ruleResourceId": change_evidence.target_resource_id,
+                                "sourceDigest": change_evidence.source_digest,
+                            }
+                        ),
+                        "matchedChangeKey": change_evidence.change_key,
+                        "matchedChangeEvidenceId": change_evidence.evidence_id,
+                        "matchedChangeArtifactDigest": change_digest,
+                        "matchedPropertyPaths": tuple(
+                            item.path
+                            for item in change_evidence.changed_properties
+                            if item.path in set(observation.matched_property_paths)
+                        ),
+                    }
+                )
         observation_digest = compute_artifact_digest(_json_value(observation_payload))
-        observations.append(
-            type(observation)(
-                **observation_payload,
-                observationId=("obs-" + observation_digest.removeprefix("sha256:")[:32]),
-                observationDigest=observation_digest,
+        current_observation = type(observation)(
+            **observation_payload,
+            observationId=("obs-" + observation_digest.removeprefix("sha256:")[:32]),
+            observationDigest=observation_digest,
+        )
+        observations.append(current_observation)
+        observation_id_map[observation.observation_id] = current_observation.observation_id
+    observations = sorted(observations, key=lambda item: item.observation_id)
+    coverage_items = []
+    for coverage in real_request.monitoring_bundle.coverage:
+        interval = (
+            "previous"
+            if coverage.coverage_end <= real_request.incident_anchor.observed_start
+            else "current"
+        )
+        coverage_payload = coverage.model_dump(
+            mode="python",
+            by_alias=True,
+            exclude={"coverage_id", "coverage_digest"},
+        )
+        coverage_payload.update(
+            {
+                "coverageStart": interval_by_state[interval][0],
+                "coverageEnd": interval_by_state[interval][1],
+                "scope": _wc028_scope_for_path(
+                    coverage.scope,
+                    context_binding.dependency_paths[0].path_id,
+                ),
+                "queryExecutionDigests": (
+                    None
+                    if coverage.query_execution_digests is None
+                    else tuple(
+                        sorted(
+                            query_execution_digest_map[item]
+                            for item in coverage.query_execution_digests
+                        )
+                    )
+                ),
+            }
+        )
+        coverage_digest = compute_artifact_digest(_json_value(coverage_payload))
+        coverage_items.append(
+            type(coverage)(
+                **coverage_payload,
+                coverageId=("coverage-" + coverage_digest.removeprefix("sha256:")[:32]),
+                coverageDigest=coverage_digest,
             )
         )
-        query_execution_digests.append(query_execution_digest)
-    observations = sorted(observations, key=lambda item: item.observation_id)
-
-    coverage = source.monitoring_bundle.coverage[0]
-    coverage_payload = coverage.model_dump(
-        mode="python",
-        by_alias=True,
-        exclude={"coverage_id", "coverage_digest"},
-    )
-    coverage_payload.update(
-        {
-            "coverageStart": bundle_observed_start,
-            "coverageEnd": bundle_observed_end,
-            "controlProvenance": control_provenance,
-            "queryExecutionDigests": tuple(sorted(query_execution_digests)),
-        }
-    )
-    coverage_digest = compute_artifact_digest(_json_value(coverage_payload))
-    current_coverage = type(coverage)(
-        **coverage_payload,
-        coverageId=("coverage-" + coverage_digest.removeprefix("sha256:")[:32]),
-        coverageDigest=coverage_digest,
+    coverage_items = sorted(
+        coverage_items,
+        key=lambda item: (
+            item.family,
+            item.coverage_start.isoformat(),
+            item.coverage_end.isoformat(),
+            item.scope.scope_digest,
+        ),
     )
     monitoring_bundle = MonitoringEvidenceBundle(
         schemaVersion=MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION,
-        workloadId=source.monitoring_bundle.workload_id,
-        monitoringContractDigest=source.monitoring_bundle.monitoring_contract_digest,
+        workloadId=real_request.monitoring_bundle.workload_id,
+        monitoringContractDigest=(real_request.monitoring_bundle.monitoring_contract_digest),
         monitoringIntentReference=intent_reference,
         collectedAt=trusted_as_of - timedelta(minutes=2),
         observedStart=bundle_observed_start,
         observedEnd=bundle_observed_end,
         observations=tuple(observations),
-        coverage=(current_coverage,),
-        expectedCoverageScopeDigests=(source.monitoring_bundle.expected_coverage_scope_digests),
+        coverage=tuple(coverage_items),
+        expectedCoverageScopeDigests=(context_binding.required_coverage_scope_digests),
     )
     monitoring_bundle_digest = sha256_hex(monitoring_bundle.canonical_bytes())
     collection_id = "wc024-" + monitoring_bundle_digest.removeprefix("sha256:")[:12]
@@ -1814,7 +1940,7 @@ def _correlation_request_for_context(
         "observedAt": trusted_as_of - timedelta(minutes=1),
         "evidence": VersionPinnedBlobReference(
             name=f"wc024-monitoring/{collection_id}/evidence.json",
-            version=source.monitoring_handoff.evidence.version,
+            version=real_request.monitoring_handoff.evidence.version,
             contentDigest=monitoring_bundle_digest,
         ).model_dump(mode="python", by_alias=True),
     }
@@ -1835,29 +1961,64 @@ def _correlation_request_for_context(
             ).decode("ascii"),
         },
     )
-    previous = next(item for item in observations if item.state == "healthy")
-    current = next(item for item in observations if item.state == "unhealthy")
+    previous_evidence_id = real_request.incident_anchor.previous_state_evidence[0].evidence_id
+    current_evidence_ids = tuple(
+        item.evidence_id for item in real_request.incident_anchor.current_state_evidence
+    )
+    change_artifacts = tuple(
+        sorted(
+            (
+                *(() if change_artifact is None else (change_artifact,)),
+                *additional_change_artifacts,
+            ),
+            key=lambda item: sha256_hex(item.canonical_bytes()),
+        )
+    )
+    change_handoffs = (
+        ()
+        if not change_artifacts
+        else tuple(
+            ChangeEvidencePersistenceHandoff(
+                schemaVersion="athena.changeEvidencePersistenceHandoff.v1",
+                evidenceId=item.evidence.evidence_id,
+                deduplicationKey=item.evidence.deduplication_key,
+                changeKey=item.evidence.change_key,
+                artifact=VersionPinnedBlobReference(
+                    name=(
+                        "change-evidence/"
+                        f"{item.evidence.deduplication_key.removeprefix('sha256:')}/"
+                        "evidence.json"
+                    ),
+                    version=real_request.monitoring_handoff.evidence.version,
+                    contentDigest=sha256_hex(item.canonical_bytes()),
+                ),
+            )
+            for item in change_artifacts
+        )
+    )
     prepared = PreparedMonitoringCollection(
         intent_id=real_prepared.intent_id,
         intent_digest=real_prepared.intent_digest,
         context_binding_digest=context_binding.binding_digest,
         monitoring_intent_reference=real_prepared.monitoring_intent_reference,
         monitoring_bundle=monitoring_bundle,
-        change_artifacts=source.change_artifacts,
-        incident_resource_id=source.incident_anchor.affected_resource_id,
-        previous_health_observation_id=previous.observation_id,
-        current_health_observation_ids=(current.observation_id,),
-        current_health_state="unhealthy",
+        change_artifacts=change_artifacts,
+        incident_resource_id=real_request.incident_anchor.affected_resource_id,
+        previous_health_observation_id=observation_id_map[previous_evidence_id],
+        current_health_observation_ids=tuple(
+            observation_id_map[item] for item in current_evidence_ids
+        ),
+        current_health_state=real_request.incident_anchor.current_state,
     )
     committed = CommittedMonitoringCollection(
         monitoring_handoff=monitoring_handoff,
-        change_handoffs=source.change_handoffs,
+        change_handoffs=change_handoffs,
     )
     return build_collected_correlation_request(
         prepared,
         committed,
         context_binding=context_binding,
-        incident_revision=source.incident_revision,
+        incident_revision=real_request.incident_revision,
         issued_at=trusted_as_of - timedelta(minutes=11, seconds=30),
         trusted_as_of=trusted_as_of,
         expires_at=trusted_as_of + timedelta(seconds=20),
@@ -2609,7 +2770,7 @@ def _build_bundle(tmp_path: Path) -> BundleFixture:
 
     incident = _incident_assets()
     monitoring, _, monitoring_anchor, monitoring_record = _trusted_signed_handoff()
-    change, change_key = _signed_change()
+    change, change_key, _change_private = _signed_change()
     monitoring_key = KeyMaterial(
         purpose="monitoring",
         key_id=monitoring_anchor.key_vault_key_id,
@@ -3222,8 +3383,8 @@ def _build_bundle(tmp_path: Path) -> BundleFixture:
         scenario_class: incident.report.as_of + timedelta(hours=2 * index)
         for index, scenario_class in enumerate(scenario_time_order)
     }
-    change, change_key = _signed_change(
-        scenario_report_times["nsg-connectivity-loss"] - timedelta(minutes=2)
+    change, change_key, change_private = _signed_change(
+        scenario_report_times["nsg-connectivity-loss"] - timedelta(minutes=7)
     )
     scenario_key, scenario_private = _private_key_material(
         "scenario-authority",
@@ -3785,17 +3946,22 @@ def _build_bundle(tmp_path: Path) -> BundleFixture:
                 rule_catalog_digest=sha256_hex(f"{scenario_class}:rule-catalog"),
                 monitoring_key=monitoring_key,
                 monitoring_private_key=monitoring_private,
+                change_artifact=(change if scenario_class == "nsg-connectivity-loss" else None),
             )
-            scenario_report, _ = _rebind_report_assets(
-                incident.report,
-                incident.report_attestation,
-                correlation_request=scenario_request,
-                active_state=incident.active_state,
-                active_state_attestation=incident.active_state_attestation,
-                authority=publication.authority.authority,
-                key=incident.keys["report"],
-                private_key=incident.private_keys["report"],
-            )
+            if scenario_class == "nsg-connectivity-loss":
+                service = _test_service(scenario_request)
+                scenario_report = service.validate_result(service.correlate(scenario_request))
+            else:
+                scenario_report, _ = _rebind_report_assets(
+                    incident.report,
+                    incident.report_attestation,
+                    correlation_request=scenario_request,
+                    active_state=incident.active_state,
+                    active_state_attestation=incident.active_state_attestation,
+                    authority=publication.authority.authority,
+                    key=incident.keys["report"],
+                    private_key=incident.private_keys["report"],
+                )
             scenario_report_attestation = _correlation_only_report_attestation(
                 scenario_request,
                 scenario_report,
@@ -4374,6 +4540,7 @@ def _build_bundle(tmp_path: Path) -> BundleFixture:
         keys=keys,
         private_keys={
             **incident.private_keys,
+            "change": change_private,
             "job-capture": job_capture_private,
             "monitoring": monitoring_private,
             "scenario-authority": scenario_private,
@@ -6563,10 +6730,20 @@ def test_report_and_attestation_require_the_accepted_context_binding(
             "scenario-web-tier-failure-incident-active-attestation"
         ].read_bytes()
     )
-    wrong_context = _request(
-        dependency_paths=published_manifest.context_binding.dependency_paths
-    ).context_binding
-    assert isinstance(wrong_context, PublishedRuntimeContextBinding)
+    wrong_context_payload = published_manifest.context_binding.model_dump(
+        mode="python",
+        by_alias=True,
+        exclude={"binding_digest"},
+    )
+    wrong_context_payload["publicationAuthorityReference"] = (
+        published_manifest.context_binding.publication_authority_reference.model_copy(
+            update={"version": "synthetic-other-authority-version"}
+        )
+    )
+    wrong_context = PublishedRuntimeContextBinding(
+        **wrong_context_payload,
+        bindingDigest=compute_artifact_digest(_json_value(wrong_context_payload)),
+    )
     wrong_request = _correlation_request_for_context(
         wrong_context,
         trusted_as_of=request.trusted_as_of,
@@ -6719,6 +6896,196 @@ def test_acceptance_uses_exact_current_wc028_correlation_contract() -> None:
         match="exact production schema",
     ):
         acceptance._require_current_correlation_request(_request())
+
+
+def test_selected_nsg_change_is_exactly_bound_to_the_canonical_request(
+    tmp_path: Path,
+) -> None:
+    bundle = _build_bundle(tmp_path / "valid")
+    scenario_class = "nsg-connectivity-loss"
+    prefix = f"scenario-{scenario_class}"
+    change = ChangeEvidenceArtifact.model_validate_json(
+        bundle.artifact_paths[f"{prefix}-change"].read_bytes()
+    )
+    request = CorrelationRequest.model_validate_json(
+        bundle.artifact_paths[f"{prefix}-correlation-request"].read_bytes()
+    )
+    plan = acceptance.Wc029ScenarioPlanEvidence.model_validate_json(
+        bundle.artifact_paths[f"{prefix}-plan"].read_bytes()
+    )
+    inventory = acceptance.Wc029VersionInventory.model_validate_json(
+        bundle.artifact_paths["version-inventory"].read_bytes()
+    )
+    capability = next(
+        item for item in inventory.scenario_capabilities if item.scenario_class == scenario_class
+    )
+    acceptance._validate_selected_change_evidence(
+        change,
+        request,
+        plan,
+        capability,
+    )
+    change_b, _key, _private = _signed_change(
+        change.evidence.occurred_at,
+        change_suffix="002",
+        key=bundle.keys["change"],
+        private_key=bundle.private_keys["change"],
+    )
+    coexisting_request = _correlation_request_for_context(
+        request.context_binding,
+        trusted_as_of=request.trusted_as_of,
+        rule_catalog_digest=request.rule_catalog_digest,
+        monitoring_key=bundle.keys["monitoring"],
+        monitoring_private_key=bundle.private_keys["monitoring"],
+        change_artifact=change,
+        additional_change_artifacts=(change_b,),
+    )
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="exact canonical request",
+    ):
+        acceptance._validate_selected_change_evidence(
+            change,
+            coexisting_request,
+            plan,
+            capability,
+        )
+
+    mixed_change, _key, _private = _signed_change(
+        change.evidence.occurred_at,
+        change_suffix="003",
+        key=bundle.keys["change"],
+        private_key=bundle.private_keys["change"],
+        changed_properties={
+            "properties.access": ("Allow", "Deny"),
+            "properties.description": ("old", "new"),
+        },
+    )
+    mixed_request = _correlation_request_for_context(
+        request.context_binding,
+        trusted_as_of=request.trusted_as_of,
+        rule_catalog_digest=request.rule_catalog_digest,
+        monitoring_key=bundle.keys["monitoring"],
+        monitoring_private_key=bundle.private_keys["monitoring"],
+        change_artifact=mixed_change,
+    )
+    acceptance._validate_selected_change_evidence(
+        mixed_change,
+        mixed_request,
+        plan.model_copy(update={"change_request_digest": mixed_change.evidence.source_digest}),
+        capability,
+    )
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="exact canonical request",
+    ):
+        acceptance._validate_selected_change_evidence(
+            change,
+            request,
+            plan,
+            capability.model_copy(
+                update={"incident_producer_schema_version": ("athena.incidentState.v1")}
+            ),
+        )
+
+    unrelated = _build_bundle(tmp_path / "unrelated")
+    selected_path = unrelated.artifact_paths[f"{prefix}-change"]
+    selected = ChangeEvidenceArtifact.model_validate_json(selected_path.read_bytes())
+    change_b, _key, _private = _signed_change(
+        selected.evidence.occurred_at,
+        change_suffix="002",
+        key=unrelated.keys["change"],
+        private_key=unrelated.private_keys["change"],
+        source_digest=selected.evidence.source_digest,
+    )
+    assert change_b.evidence.evidence_id != selected.evidence.evidence_id
+    assert change_b.evidence.change_key == selected.evidence.change_key
+    assert change_b.evidence.source_digest == selected.evidence.source_digest
+    _write(selected_path, change_b)
+    _refresh_scenario_execution_binding(unrelated, scenario_class)
+
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="exact canonical request",
+    ):
+        _aggregate(unrelated)
+
+
+def test_incident_detection_requires_mutation_causality(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle = _build_bundle(tmp_path)
+    prefix = "scenario-web-tier-failure"
+    mutation = acceptance.Wc029MutationReceipt.model_validate_json(
+        bundle.artifact_paths[f"{prefix}-mutation"].read_bytes()
+    )
+    active_state = IncidentState.model_validate_json(
+        bundle.artifact_paths[f"{prefix}-incident-active"].read_bytes()
+    )
+    manifest = acceptance.Wc029ScenarioExecutionManifest.model_validate_json(
+        bundle.artifact_paths[f"{prefix}-execution-manifest"].read_bytes()
+    )
+    calls = 0
+    real_validator = acceptance._validate_incident_detection_causality
+
+    def tracked_validator(
+        captured_mutation: acceptance.Wc029MutationReceipt,
+        captured_state: IncidentState,
+        captured_manifest: acceptance.Wc029ScenarioExecutionManifest,
+    ) -> None:
+        nonlocal calls
+        calls += 1
+        real_validator(
+            captured_mutation,
+            captured_state,
+            captured_manifest,
+        )
+
+    monkeypatch.setattr(
+        acceptance,
+        "_validate_incident_detection_causality",
+        tracked_validator,
+    )
+    _aggregate(bundle)
+    assert calls == 1
+
+    preexisting = active_state.model_copy(
+        update={
+            "detected_at": mutation.applied_at - timedelta(seconds=1),
+            "updated_at": active_state.updated_at,
+        }
+    )
+    assert preexisting.updated_at > mutation.applied_at
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="predates or coincides",
+    ):
+        real_validator(mutation, preexisting, manifest)
+
+    windows = list(manifest.phase_windows)
+    windows[2] = windows[2].model_copy(
+        update={"started_at": active_state.detected_at + timedelta(seconds=1)}
+    )
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="detection falls outside the signed observe",
+    ):
+        real_validator(
+            mutation,
+            active_state,
+            manifest.model_copy(update={"phase_windows": tuple(windows)}),
+        )
+
+
+def test_runbook_uses_the_deployed_correlation_contract_version() -> None:
+    runbook = (
+        Path(__file__).parents[1] / "docs" / "operations" / "wc029-acceptance-evidence.md"
+    ).read_text(encoding="utf-8")
+
+    assert "athena.wc026CorrelationRequest.v2" not in runbook
+    assert "CORRELATION_REQUEST_SCHEMA_VERSION" in runbook
+    assert "deployed contract package" in runbook
 
 
 def test_monitoring_bundle_freshness_rejects_fresh_wrapper_around_stale_bytes(

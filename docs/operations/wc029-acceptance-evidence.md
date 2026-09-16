@@ -352,10 +352,12 @@ Harness-owned canonical receipts include:
   source commit, digest-pinned image, result artifact digests, and post-run state.
 - `athena.wc029ScenarioPlan.v1`, `athena.wc029MutationReceipt.v1`, and
   `athena.wc029RecoveryAction.v1`: one target-bound plan/apply/recover chain.
-- `athena.wc026CorrelationRequest.v2` and
-  `athena.wc027IncidentBoundCorrelationRequest.v1`: the exact digest-bound request, accepted
-  published runtime context, monitoring handoff, active incident subject, and signed request
-  binding consumed by the report.
+- the deployed `athena_context.contracts.CORRELATION_REQUEST_SCHEMA_VERSION` and canonical
+  `IncidentBoundCorrelationRequest`: the exact production request emitted by the deployed WC-028
+  collector, accepted published runtime context, monitoring bundle/handoff, active incident
+  subject, and signed request binding consumed by the report. Operators must obtain the version
+  from the deployed contract package; this runbook deliberately does not prescribe a stale wire
+  literal.
 - `athena.wc029ScenarioExecutionManifest.v1` and its independent RSA attestation: complete
   execution lineage and positive, strictly separated phase windows for every scenario artifact.
 - `athena.wc029PublishedManifest.v1`, `athena.wc029PublicationAuthority.v1`, and its independent

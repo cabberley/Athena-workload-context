@@ -48,6 +48,7 @@ from athena_context.contracts import (
     IncidentState,
     IncidentStateAttestation,
     MonitoringEvidenceHandoff,
+    NetworkFlowObservation,
     PublishedContextAuthority,
     PublishedCorrelationReportAttestation,
     PublishedCorrelationReportStatement,
@@ -3577,8 +3578,8 @@ class Wc029AcceptanceEvidenceIndex(_StrictAcceptanceModel):
             phase_counts["observe"]["change-evidence"] != 1
         ):
             raise ValueError("NSG connectivity evidence requires an exact change artifact")
-        if scenario.scenario_class != "nsg-connectivity-loss" and all_counts["change-evidence"] > 1:
-            raise ValueError("a scenario cannot contain duplicate change evidence")
+        if scenario.scenario_class != "nsg-connectivity-loss" and all_counts["change-evidence"]:
+            raise ValueError("change evidence is permitted only for NSG connectivity loss")
         omission_count = phase_counts["observe"]["incident-omission"]
         if omission_count > 1:
             raise ValueError("a scenario cannot contain duplicate incident omission evidence")
@@ -6162,6 +6163,90 @@ def _validate_monitoring_freshness(
     return bundle_digest
 
 
+def _validate_selected_change_evidence(
+    change: ChangeEvidenceArtifact,
+    request: CorrelationRequest,
+    plan: Wc029ScenarioPlanEvidence,
+    capability: Wc029ScenarioCapability,
+) -> None:
+    request = _require_current_correlation_request(request)
+    change_digest = sha256_hex(change.canonical_bytes())
+    evidence = change.evidence
+    matching_artifacts = tuple(
+        item
+        for item in request.change_artifacts
+        if item.canonical_bytes() == change.canonical_bytes()
+    )
+    matching_handoffs = tuple(
+        item
+        for item in request.change_handoffs
+        if (
+            item.evidence_id == evidence.evidence_id
+            and item.deduplication_key == evidence.deduplication_key
+            and item.change_key == evidence.change_key
+            and item.artifact.content_digest == change_digest
+        )
+    )
+    if (
+        capability.evidence_mode != "correlation-only"
+        or plan.evidence_mode != "correlation-only"
+        or plan.change_request_digest != evidence.source_digest
+        or len(request.change_artifacts) != 1
+        or len(request.change_handoffs) != 1
+        or request.evidence_inventory.change_artifact_digests != (change_digest,)
+        or len(matching_artifacts) != 1
+        or len(matching_handoffs) != 1
+    ):
+        raise Wc029AcceptanceEvidenceError(
+            "selected NSG change evidence does not bind the exact canonical request"
+        )
+    handoff = matching_handoffs[0]
+    if request.evidence_inventory.source_references.count(handoff.artifact) != 1:
+        raise Wc029AcceptanceEvidenceError(
+            "selected NSG change handoff is not unique in the immutable request inventory"
+        )
+    matching_citations = tuple(
+        item
+        for item in request.evidence_index
+        if (
+            item.evidence_id == evidence.evidence_id
+            and item.family == "resourceChange"
+            and item.evidence_digest == change_digest
+            and item.source_reference == handoff.artifact
+            and item.resource_ids == (evidence.target_resource_id,)
+            and item.observed_start == evidence.occurred_at
+            and item.observed_end == evidence.occurred_at
+        )
+    )
+    resource_change_citations = tuple(
+        item for item in request.evidence_index if item.family == "resourceChange"
+    )
+    matching_attributions = tuple(
+        item
+        for item in request.monitoring_bundle.observations
+        if (
+            isinstance(item, NetworkFlowObservation)
+            and item.effective_rule_attribution
+            and item.matched_change_artifact_digest == change_digest
+            and item.matched_change_evidence_id == evidence.evidence_id
+            and item.matched_change_key == evidence.change_key
+            and item.rule_resource_id == evidence.target_resource_id
+            and bool(item.matched_property_paths)
+            and set(item.matched_property_paths).issubset(
+                {changed.path for changed in evidence.changed_properties}
+            )
+        )
+    )
+    if (
+        len(resource_change_citations) != 1
+        or len(matching_citations) != 1
+        or len(matching_attributions) != 1
+    ):
+        raise Wc029AcceptanceEvidenceError(
+            "selected NSG change evidence lacks exact effective-rule attribution"
+        )
+
+
 def _require_incident_state_digest(state: IncidentState) -> None:
     if state.result_digest != sha256_hex(incident_state_signature_preimage(state)):
         raise Wc029AcceptanceEvidenceError(
@@ -6482,6 +6567,23 @@ def _validate_feed_state_timing(
         raise Wc029AcceptanceEvidenceError(
             f"{label} feed state, pointer, and index chronology is not exact"
         )
+
+
+def _validate_incident_detection_causality(
+    mutation: Wc029MutationReceipt,
+    active_state: IncidentState,
+    execution_manifest: Wc029ScenarioExecutionManifest,
+) -> None:
+    if mutation.applied_at >= active_state.detected_at:
+        raise Wc029AcceptanceEvidenceError(
+            "active incident predates or coincides with the scenario mutation"
+        )
+    _require_in_phase(
+        execution_manifest,
+        "observe",
+        active_state.detected_at,
+        label="active IncidentState detection",
+    )
 
 
 def _validate_scenario_lifecycle(
@@ -7266,10 +7368,12 @@ def _validate_scenario_evidence(
                 selected["change-evidence"],
                 ChangeEvidenceArtifact,
             )
-            if change.evidence.source_digest != plan.change_request_digest:
-                raise Wc029AcceptanceEvidenceError(
-                    "change evidence does not bind the trusted scenario request"
-                )
+            _validate_selected_change_evidence(
+                change,
+                request,
+                plan,
+                capability,
+            )
             _require_in_phase(
                 execution_manifest,
                 "observe",
@@ -7281,6 +7385,14 @@ def _validate_scenario_evidence(
                 "observe",
                 change.evidence.received_at,
                 label="change receipt",
+            )
+        elif (
+            request.change_artifacts
+            or request.change_handoffs
+            or request.evidence_inventory.change_artifact_digests
+        ):
+            raise Wc029AcceptanceEvidenceError(
+                "non-NSG scenario request contains unrelated change evidence"
             )
 
         _require_in_phase(
@@ -7369,6 +7481,11 @@ def _validate_scenario_evidence(
         active_state = _require_model(
             selected["incident-state-active"],
             IncidentState,
+        )
+        _validate_incident_detection_causality(
+            mutation,
+            active_state,
+            execution_manifest,
         )
         resolved_state = _require_model(
             selected["incident-state-resolved"],
