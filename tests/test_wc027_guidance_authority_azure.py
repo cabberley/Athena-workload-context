@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from datetime import timedelta
+
 import pytest
 from azure.core import MatchConditions
-from azure.core.exceptions import ResourceExistsError
+from azure.core.exceptions import ResourceExistsError, ServiceResponseError
 from azure.data.tables import UpdateMode
 
 from athena_context.contracts import GuidancePublicationRequestDeliveryBudget
@@ -11,6 +13,7 @@ from athena_context.guidance.azure import (
     AzureServiceBusGuidanceAuthorityTrigger,
     AzureTableGuidanceAuthorityActivationStore,
 )
+from test_wc026_correlation_contract import NOW
 from test_wc027_guidance_authority_publisher import _publisher, _request
 
 _DELIVERY_BUDGET = GuidancePublicationRequestDeliveryBudget.reviewed()
@@ -27,6 +30,7 @@ class _Table:
         self.entity = None
         self.create_conflict = False
         self.update_call = None
+        self.update_then_fail = False
 
     def create_entity(self, *, entity):
         if self.create_conflict:
@@ -37,6 +41,9 @@ class _Table:
     def update_entity(self, **kwargs):
         self.update_call = kwargs
         self.entity = _Entity(kwargs["entity"], etag='"etag-2"')
+        if self.update_then_fail:
+            self.update_then_fail = False
+            raise ServiceResponseError("synthetic uncertain update")
         return {"etag": '"etag-2"'}
 
     def get_entity(self, *, partition_key, row_key):
@@ -53,11 +60,26 @@ class _Sender:
         self.messages.append(message)
 
 
-def _activation_and_binding():
-    fixture, publisher, writer, _activation, trigger, _correlation, _incident = (
-        _publisher()
+def _activation_and_binding(*, legacy_deadline: bool = False):
+    (
+        fixture,
+        publisher,
+        writer,
+        _activation,
+        trigger,
+        _correlation,
+        _incident,
+    ) = _publisher(
+        correlation_expires_at=(
+            NOW + timedelta(minutes=10)
+            if legacy_deadline
+            else NOW + timedelta(minutes=15)
+        )
     )
-    request = _request(fixture)
+    request = _request(
+        fixture,
+        bound_effective_deadline=not legacy_deadline,
+    )
     receipt = publisher.publish(request, now=request.evaluated_at)
     binding = trigger.calls[0][0]
     assert writer.payloads[receipt.binding_reference.name] == binding.canonical_bytes()
@@ -80,7 +102,7 @@ def test_activation_table_create_read_and_etag_cas_are_exact() -> None:
     read = store.read_current(incident_id=activation.incident_id)
     updated = store.compare_and_swap(activation, expected_etag=created.etag)
     activation_update_call = table.update_call
-    submitted = store.mark_trigger_submitted(
+    materialized = store.mark_feed_materialized(
         activation,
         expected_etag=updated.etag,
     )
@@ -88,12 +110,44 @@ def test_activation_table_create_read_and_etag_cas_are_exact() -> None:
     assert read == created
     assert updated.etag == '"etag-2"'
     assert updated.trigger_delivery_status == "pending"
-    assert submitted.trigger_delivery_status == "submitted"
+    assert materialized.trigger_delivery_status == "materialized"
     assert activation_update_call["mode"] is UpdateMode.REPLACE
     assert activation_update_call["etag"] == '"etag-1"'
     assert activation_update_call["match_condition"] is MatchConditions.IfNotModified
     assert table.update_call["etag"] == '"etag-2"'
-    assert table.entity["triggerDeliveryStatus"] == "submitted"
+    assert table.entity["triggerDeliveryStatus"] == "materialized"
+
+
+def test_activation_materialization_recovers_an_uncertain_committed_update() -> None:
+    activation, _binding = _activation_and_binding()
+    table = _Table()
+    store = _table_store(table)
+    created = store.compare_and_swap(activation, expected_etag=None)
+    table.update_then_fail = True
+
+    materialized = store.mark_feed_materialized(
+        activation,
+        expected_etag=created.etag,
+    )
+
+    assert materialized.activation == activation
+    assert materialized.trigger_delivery_status == "materialized"
+    assert table.entity["triggerDeliveryStatus"] == "materialized"
+
+
+def test_published_submitted_activation_row_is_recovered_as_pending() -> None:
+    activation, binding = _activation_and_binding(legacy_deadline=True)
+    table = _Table()
+    store = _table_store(table)
+    store.compare_and_swap(activation, expected_etag=None)
+    table.entity["triggerDeliveryStatus"] = "submitted"
+
+    recovered = store.read_current(incident_id=activation.incident_id)
+
+    assert recovered is not None
+    assert recovered.activation == activation
+    assert recovered.trigger_delivery_status == "pending"
+    assert activation.finish_before > binding.incident_bound_request.correlation_request.expires_at
 
 
 def test_activation_table_create_conflict_fails_closed() -> None:

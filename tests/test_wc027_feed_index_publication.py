@@ -879,32 +879,45 @@ def test_azure_publisher_uploads_attestation_before_etag_cas(
     calls: list[tuple[str, object]] = []
 
     class _Blob:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
         def upload_blob(self, payload: bytes, **kwargs):
-            calls.append(("index", (payload, kwargs)))
-            return {"version_id": "new-index-version"}
+            label = "index" if self.name == FEED_V2_INDEX_BLOB_NAME else "attestation"
+            calls.append((label, (payload, kwargs)))
+            return {"version_id": f"new-{label}-version"}
 
     class _Container:
         @staticmethod
         def get_blob_client(name: str):
-            assert name == FEED_V2_INDEX_BLOB_NAME
-            return _Blob()
+            assert name in {
+                FEED_V2_INDEX_BLOB_NAME,
+                request.index.index_attestation_path.removeprefix("./"),
+            }
+            return _Blob(name)
 
     publisher = object.__new__(AzureBlobIncidentFeedIndexPublisher)
     publisher._container = _Container()
-    monkeypatch.setattr(
-        AzureBlobIncidentFeedIndexPublisher,
-        "_create_or_recover_attestation",
-        lambda _self, _request: calls.append(("attestation", _request.attestation)),
-    )
     monkeypatch.setattr(
         AzureBlobIncidentFeedIndexPublisher,
         "read_current",
         lambda _self: winner,
     )
 
-    assert publisher.compare_and_swap(request) == winner
-    assert [name for name, _value in calls] == ["attestation", "index"]
-    _, (_payload, kwargs) = calls[1]
+    assert (
+        publisher.compare_and_swap(
+            request,
+            before_irreversible_write=lambda: calls.append(("guard", None)),
+        )
+        == winner
+    )
+    assert [name for name, _value in calls] == [
+        "guard",
+        "attestation",
+        "guard",
+        "index",
+    ]
+    _, (_payload, kwargs) = calls[3]
     assert kwargs["etag"] == '"expected-etag"'
     assert kwargs["match_condition"] is MatchConditions.IfNotModified
 

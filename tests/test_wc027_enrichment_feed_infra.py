@@ -15,6 +15,13 @@ BLOB_READER_RBAC = (
 KEY_VERIFIER_RBAC = (
     ROOT / "infra" / "wc027-enrichment-feed-runtime" / "modules" / "key-verifier-rbac.bicep"
 )
+GUIDANCE_ACTIVATION_MATERIALIZER_RBAC = (
+    ROOT
+    / "infra"
+    / "wc027-enrichment-feed-runtime"
+    / "modules"
+    / "guidance-activation-materializer-rbac.bicep"
+)
 
 STORAGE_BLOB_DATA_CONTRIBUTOR_ROLE_ID = "ba92f5b4-2d11-453d-a403-e96b0029c9fe"
 
@@ -546,6 +553,7 @@ def test_wc027_runtime_configuration_is_derived_from_referenced_resources() -> N
 def test_wc027_source_readers_and_key_verifier_are_exact_and_non_mutating() -> None:
     source = RUNTIME.read_text(encoding="utf-8")
     blob_reader = BLOB_READER_RBAC.read_text(encoding="utf-8")
+    activation_materializer = GUIDANCE_ACTIVATION_MATERIALIZER_RBAC.read_text(encoding="utf-8")
 
     for module_name in (
         "monitoringSourceReader",
@@ -580,6 +588,26 @@ def test_wc027_source_readers_and_key_verifier_are_exact_and_non_mutating() -> N
     assert "principalId: identity.properties.principalId" in key_verifier
     assert "param identityPrincipalId" not in key_verifier
 
+    assert (
+        "module guidanceActivationMaterializerRbac "
+        "'modules/guidance-activation-materializer-rbac.bicep'" in source
+    )
+    assert (
+        "Microsoft.Storage/storageAccounts/tableServices/tables/entities/read"
+        in activation_materializer
+    )
+    assert (
+        "Microsoft.Storage/storageAccounts/tableServices/tables/entities/update/action"
+        in activation_materializer
+    )
+    for forbidden in (
+        "tables/entities/add/action",
+        "tables/entities/delete",
+        "tables/write",
+        "tables/delete",
+    ):
+        assert forbidden not in activation_materializer
+
 
 def test_wc027_job_identity_map_and_rbac_share_exact_resources() -> None:
     source = RUNTIME.read_text(encoding="utf-8")
@@ -595,6 +623,7 @@ def test_wc027_job_identity_map_and_rbac_share_exact_resources() -> None:
         "feedV2ProducerReaderIdentity",
         "feedV2WriterIdentity",
         "registryWriterIdentity",
+        "guidanceActivationReaderIdentity",
         "trustReaderIdentity",
         "monitoringReaderIdentity",
         "changeReaderIdentity",
@@ -631,6 +660,7 @@ def test_wc027_job_identity_map_and_rbac_share_exact_resources() -> None:
         "contextAuthorityReaderIdentity",
         "monitoringIntentReaderIdentity",
         "guidanceAuthorityReaderIdentity",
+        "guidanceActivationReaderIdentity",
     ):
         assert f"identityResourceId: {identity}.id" in source
 
@@ -640,6 +670,8 @@ def test_wc027_job_identity_map_and_rbac_share_exact_resources() -> None:
 
     # Readiness evidence tags/outputs are emitted for the root deployment.
     assert "bindingEvidenceDigest: bindingEvidenceDigest" in source
+    assert "guidanceActivationMaterializerRoleId" in source
+    assert "guidanceActivationMaterializerAssignmentId" in source
     assert (
         "output attachedIdentityResourceIds array = validatedAttachedIdentityResourceIds" in source
     )

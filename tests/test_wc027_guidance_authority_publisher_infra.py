@@ -6,6 +6,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 PUBLISHER = ROOT / "infra" / "wc027-guidance-authority-publisher" / "main.bicep"
 RUNTIME = ROOT / "infra" / "wc027-enrichment-feed-runtime" / "main.bicep"
+REQUEST_PRODUCER = ROOT / "infra" / "wc027-guidance-publication-request-producer" / "main.bicep"
 ROOT_DEPLOYMENT = ROOT / "infra" / "wc013-live-acceptance" / "main.bicep"
 BLOB_CREATOR = (
     ROOT
@@ -335,6 +336,7 @@ def test_acr_pull_role_matches_registry_permission_mode_and_object_id_seed() -> 
         "identity.properties.principalId == identityPrincipalId",
         "expectedRegistryRoleAssignmentMode",
         "principalObjectId: validatedIdentityPrincipalId",
+        "repositoryName: validatedRepositoryName",
     ):
         assert expected in orchestrator
 
@@ -344,11 +346,82 @@ def test_acr_pull_role_matches_registry_permission_mode_and_object_id_seed() -> 
         "registry.id",
         "principalObjectId",
         "roleDefinitionId",
+        "repositoryName",
         "principalId: principalObjectId",
         "principalType: 'ServicePrincipal'",
+        "conditionVersion: '2.0'",
+        "Microsoft.ContainerRegistry/registries/repositories/content/read",
+        "Microsoft.ContainerRegistry/registries/repositories/metadata/read",
+        "@Request[Microsoft.ContainerRegistry/registries/repositories:name]",
+        "StringEqualsIgnoreCase",
     ):
         assert expected in assignment
     assert "identityResourceId" not in assignment
+
+
+@pytest.mark.parametrize(
+    ("requested_repository", "allowed"),
+    (
+        ("athena/wc027-guidance-authority-publisher", True),
+        ("ATHENA/WC027-GUIDANCE-AUTHORITY-PUBLISHER", True),
+        ("athena/wc027-guidance-authority-publisher-copy", False),
+        ("athena/wc027-guidance-publication-request-producer", False),
+        ("other/wc027-guidance-authority-publisher", False),
+    ),
+)
+def test_abac_repository_reader_denies_cross_repository_access(
+    requested_repository: str,
+    allowed: bool,
+) -> None:
+    assignment = ACR_ASSIGNMENT.read_text(encoding="utf-8")
+    expected_repository = "athena/wc027-guidance-authority-publisher"
+    expected_condition = (
+        "var exactRepositoryCondition = "
+        "'((!(ActionMatches{\\'Microsoft.ContainerRegistry/registries/"
+        "repositories/content/read\\'}) AND "
+        "!(ActionMatches{\\'Microsoft.ContainerRegistry/registries/"
+        "repositories/metadata/read\\'})) OR "
+        "(@Request[Microsoft.ContainerRegistry/registries/repositories:name] "
+        "StringEqualsIgnoreCase \\'${repositoryName}\\'))'"
+    )
+
+    assert expected_condition in assignment
+    assert "conditionVersion: '2.0'" in assignment
+    assert "condition: exactRepositoryCondition" in assignment
+    assert "roleAssignmentMode == 'AbacRepositoryPermissions'" in assignment
+    assert "StringStartsWith" not in assignment
+    assert (requested_repository.casefold() == expected_repository.casefold()) is allowed
+
+
+def test_each_wc027_job_passes_its_exact_image_repository_to_acr_rbac() -> None:
+    sources = (
+        (
+            RUNTIME.read_text(encoding="utf-8"),
+            "athena/wc027-enrichment-feed-producer",
+        ),
+        (
+            PUBLISHER.read_text(encoding="utf-8"),
+            "athena/wc027-guidance-authority-publisher",
+        ),
+        (
+            REQUEST_PRODUCER.read_text(encoding="utf-8"),
+            "athena/wc027-guidance-publication-request-producer",
+        ),
+    )
+
+    for source, repository_name in sources:
+        assert f"var imageRepositoryName = '{repository_name}'" in source
+        assert "repositoryName: imageRepositoryName" in source
+        assert "imagePullRoleDefinitionId" in source
+    assignment = ACR_ASSIGNMENT.read_text(encoding="utf-8")
+    assignment_seed = assignment.split(
+        "resource pullAssignment",
+        maxsplit=1,
+    )[1].split(
+        "scope: registry",
+        maxsplit=1,
+    )[0]
+    assert "repositoryName" not in assignment_seed
 
 
 def test_publisher_digest_pull_readiness_is_bounded_and_activation_gated() -> None:
@@ -508,7 +581,9 @@ def test_runtime_requires_current_activation_and_logical_binding_key() -> None:
     assert "param guidanceBindingLogicalKeyId string" in source
     assert "tableName: guidanceActivation.name" in source
     assert "keyId: guidanceBindingLogicalKeyId" in source
-    assert "storageTableDataReaderRoleDefinitionId" in source
+    assert "guidanceActivationMaterializerRbac" in source
+    assert "guidanceActivationMaterializerRoleId" in source
+    assert "guidanceActivationMaterializerAssignmentId" in source
     assert "runtimeTrustDomainFingerprints" in source
     assert "validatedTrustDomainMetadata" in source
     assert "trust-domain public key fingerprints must be distinct" in source

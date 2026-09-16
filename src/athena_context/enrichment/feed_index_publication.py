@@ -120,6 +120,8 @@ class IncidentFeedIndexPublisherPort(Protocol):
     def compare_and_swap(
         self,
         request: IncidentFeedIndexCommitRequest,
+        *,
+        before_irreversible_write: Callable[[], None] | None = None,
     ) -> IncidentFeedIndexSnapshot: ...
 
 
@@ -155,6 +157,7 @@ class IncidentFeedIndexPublicationService:
         self,
         *,
         published_at: UtcDateTime,
+        before_irreversible_write: Callable[[], None] | None = None,
     ) -> IncidentFeedIndexPublicationReceipt:
         _require_canonical_timestamp(published_at)
         for _attempt in range(MAX_FEED_V2_PUBLICATION_ATTEMPTS):
@@ -163,6 +166,7 @@ class IncidentFeedIndexPublicationService:
             candidate, attestation, projection = self._build_candidate(
                 source=source,
                 published_at=effective_published_at,
+                before_irreversible_write=before_irreversible_write,
             )
             current = self.publisher.read_current()
             current_pointers: dict[
@@ -195,6 +199,7 @@ class IncidentFeedIndexPublicationService:
                         candidate, attestation, projection = self._build_candidate(
                             source=source,
                             published_at=repair_published_at,
+                            before_irreversible_write=before_irreversible_write,
                         )
                 else:
                     decision = self._classify_current(
@@ -204,17 +209,21 @@ class IncidentFeedIndexPublicationService:
                         source=source,
                     )
                     if decision == "accept":
-                        self.registry.prune_expired(projection.prune_plan)
+                        self._prune_expired(
+                            projection,
+                            before_irreversible_write=before_irreversible_write,
+                        )
                         return self._receipt(current)
                     if decision == "retry":
                         continue
             try:
-                committed = self.publisher.compare_and_swap(
+                committed = self._compare_and_swap(
                     IncidentFeedIndexCommitRequest(
                         index=candidate,
                         attestation=attestation,
                         expected_etag=None if current is None else current.etag,
-                    )
+                    ),
+                    before_irreversible_write=before_irreversible_write,
                 )
             except IncidentFeedIndexPublicationConflictError:
                 winner = self.publisher.read_current()
@@ -226,7 +235,10 @@ class IncidentFeedIndexPublicationService:
                     )
                     if winner.index.canonical_bytes() == candidate.canonical_bytes():
                         if winner_is_authoritative:
-                            self.registry.prune_expired(projection.prune_plan)
+                            self._prune_expired(
+                                projection,
+                                before_irreversible_write=before_irreversible_write,
+                            )
                             return self._receipt(winner)
                         continue
                     if not winner_is_authoritative:
@@ -238,7 +250,10 @@ class IncidentFeedIndexPublicationService:
                         source=source,
                     )
                     if decision == "accept":
-                        self.registry.prune_expired(projection.prune_plan)
+                        self._prune_expired(
+                            projection,
+                            before_irreversible_write=before_irreversible_write,
+                        )
                         return self._receipt(winner)
                 continue
             committed_pointers = self._verify_snapshot(committed)
@@ -252,7 +267,10 @@ class IncidentFeedIndexPublicationService:
                 pointers=committed_pointers,
             ):
                 continue
-            self.registry.prune_expired(projection.prune_plan)
+            self._prune_expired(
+                projection,
+                before_irreversible_write=before_irreversible_write,
+            )
             return self._receipt(committed)
         raise IncidentFeedIndexPublicationConflictError(
             "feed v2 publication did not converge within its bounded retry limit"
@@ -263,6 +281,7 @@ class IncidentFeedIndexPublicationService:
         *,
         source: ActiveIncidentIndexSnapshot,
         published_at: UtcDateTime,
+        before_irreversible_write: Callable[[], None] | None = None,
     ) -> tuple[
         IncidentFeedIndexV2,
         IncidentFeedIndexAttestationV2,
@@ -271,6 +290,7 @@ class IncidentFeedIndexPublicationService:
         projection = self._project_registry(
             source=source,
             published_at=published_at,
+            before_irreversible_write=before_irreversible_write,
         )
         index = build_incident_feed_index_v2(
             active=projection.active,
@@ -411,8 +431,12 @@ class IncidentFeedIndexPublicationService:
         *,
         source: ActiveIncidentIndexSnapshot,
         published_at: UtcDateTime,
+        before_irreversible_write: Callable[[], None] | None = None,
     ) -> IncidentFeedRegistryProjection:
-        records = self._read_verified_registry_records(published_at=published_at)
+        records = self._read_verified_registry_records(
+            published_at=published_at,
+            before_irreversible_write=before_irreversible_write,
+        )
         current_incidents: dict[str, CurrentIncidentStateSnapshot] = {}
         for incident_id in sorted({record.entry.incident_id for record in records}):
             current = self.current_incident_reader.read_current_incident_state(
@@ -436,8 +460,15 @@ class IncidentFeedIndexPublicationService:
         self,
         *,
         published_at: UtcDateTime,
+        before_irreversible_write: Callable[[], None] | None = None,
     ) -> tuple[IncidentFeedRegistryRecord, ...]:
-        records = self.registry.list_records(as_of=published_at)
+        if before_irreversible_write is None:
+            records = self.registry.list_records(as_of=published_at)
+        else:
+            records = self.registry.list_records(
+                as_of=published_at,
+                before_irreversible_write=before_irreversible_write,
+            )
         for record in records:
             pointer, attestation = self._read_pointer_assets(record.entry)
             if pointer != record.pointer or attestation != record.pointer_attestation:
@@ -445,6 +476,33 @@ class IncidentFeedIndexPublicationService:
                     "feed registry immutable asset does not match its retained record"
                 )
         return records
+
+    def _compare_and_swap(
+        self,
+        request: IncidentFeedIndexCommitRequest,
+        *,
+        before_irreversible_write: Callable[[], None] | None = None,
+    ) -> IncidentFeedIndexSnapshot:
+        if before_irreversible_write is None:
+            return self.publisher.compare_and_swap(request)
+        return self.publisher.compare_and_swap(
+            request,
+            before_irreversible_write=before_irreversible_write,
+        )
+
+    def _prune_expired(
+        self,
+        projection: IncidentFeedRegistryProjection,
+        *,
+        before_irreversible_write: Callable[[], None] | None = None,
+    ) -> None:
+        if before_irreversible_write is None:
+            self.registry.prune_expired(projection.prune_plan)
+        else:
+            self.registry.prune_expired(
+                projection.prune_plan,
+                before_irreversible_write=before_irreversible_write,
+            )
 
     def _read_pointer_assets(
         self,

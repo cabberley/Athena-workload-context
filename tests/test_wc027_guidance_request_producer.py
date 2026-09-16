@@ -22,6 +22,8 @@ from athena_context.contracts import (
     sha256_hex,
 )
 from athena_context.guidance import (
+    GuidanceAuthorityDeliveryExpiredError,
+    GuidanceAuthorityOccurrenceConflictError,
     GuidanceAuthoritySourceNotReadyError,
     GuidancePublicationRequestDeliveryBudget,
     GuidancePublicationRequestProducer,
@@ -44,7 +46,7 @@ from athena_context.guidance.request_production import (
     load_wc027_guidance_publication_request_producer_configuration,
     run_wc027_guidance_publication_request_producer_worker,
 )
-from test_wc026_correlation_contract import _request
+from test_wc026_correlation_contract import NOW, _request
 from test_wc027_enrichment_feed_runtime import (
     _bicep_generated_publisher_configuration,
 )
@@ -229,7 +231,13 @@ def _producer(
     incident_key_vault_key_id: str | None = None,
     clock=None,
 ):
-    fixture = _fixture()
+    fixture = _fixture(
+        correlation_expires_at=(
+            request.correlation_request.expires_at
+            if request is not None
+            else NOW + timedelta(minutes=15)
+        )
+    )
     selected_request = request or fixture.guidance_binding.incident_bound_request
     selected_incident_authority = incident_authority or _IncidentAuthority(
         fixture.publication_reader
@@ -282,6 +290,16 @@ def _stable_evaluated_at(request, occurrence):
     )
 
 
+def _publication_request_expires_at(
+    request: IncidentBoundCorrelationRequest,
+    evaluated_at: datetime,
+) -> datetime:
+    return min(
+        evaluated_at + timedelta(minutes=5),
+        (request.correlation_request.expires_at - _DELIVERY_BUDGET.finish_before_extension),
+    )
+
+
 def test_producer_builds_signs_persists_revalidates_and_enqueues_only_request() -> None:
     (
         fixture,
@@ -303,13 +321,14 @@ def test_producer_builds_signs_persists_revalidates_and_enqueues_only_request() 
     assert publication_request.incident_bound_request == request
     assert publication_request.incident_occurrence == occurrence
     assert publication_request.evaluated_at == evaluated_at
-    assert publication_request.expires_at == min(
-        evaluated_at + timedelta(minutes=5),
-        request.correlation_request.expires_at,
+    assert publication_request.expires_at == _publication_request_expires_at(
+        request,
+        evaluated_at,
     )
     assert publication_request.finish_before == _DELIVERY_BUDGET.finish_before(
         publication_request.expires_at
     )
+    assert publication_request.finish_before <= request.correlation_request.expires_at
     assert publication_request.requested_actions == ("investigationCheck",)
     assert publication_request.request_attestation.key_id == _REQUEST_KEY_ID
     assert len(signer.calls) == 1
@@ -349,6 +368,37 @@ def test_producer_builds_signs_persists_revalidates_and_enqueues_only_request() 
             at=publication_request.evaluated_at,
         )
     )
+
+
+def test_producer_rejects_nested_correlation_window_that_cannot_cover_delivery() -> None:
+    fixture = _fixture()
+    request = fixture.guidance_binding.incident_bound_request
+    (
+        _fixture_value,
+        _request_value,
+        producer,
+        _signer,
+        _request_verifier,
+        _incident,
+        _context,
+        outbox,
+        sender,
+    ) = _producer(request=request)
+
+    with pytest.raises(
+        GuidanceAuthoritySourceNotReadyError,
+        match="remaining lifetime required before persistence",
+    ):
+        producer.produce(
+            request,
+            now=_stable_evaluated_at(
+                request,
+                fixture.incident_publication.occurrence,
+            ),
+        )
+
+    assert outbox.calls == []
+    assert sender.calls == []
 
 
 @pytest.mark.parametrize(
@@ -410,15 +460,15 @@ def test_invalid_key_signature_draft_or_stale_input_has_zero_output_io(
 
 
 def test_end_to_end_budget_below_minimum_has_zero_outbox_writes_and_sends() -> None:
-    fixture = _fixture()
+    fixture = _fixture(correlation_expires_at=NOW + timedelta(minutes=15))
     request = fixture.guidance_binding.incident_bound_request
     evaluated_at = _stable_evaluated_at(
         request,
         fixture.incident_publication.occurrence,
     )
-    expires_at = min(
-        evaluated_at + timedelta(minutes=5),
-        request.correlation_request.expires_at,
+    expires_at = _publication_request_expires_at(
+        request,
+        evaluated_at,
     )
     (
         _fixture_value,
@@ -446,15 +496,15 @@ def test_end_to_end_budget_below_minimum_has_zero_outbox_writes_and_sends() -> N
 
 
 def test_end_to_end_budget_accepts_exact_minimum_before_persistence_and_send() -> None:
-    fixture = _fixture()
+    fixture = _fixture(correlation_expires_at=NOW + timedelta(minutes=15))
     request = fixture.guidance_binding.incident_bound_request
     evaluated_at = _stable_evaluated_at(
         request,
         fixture.incident_publication.occurrence,
     )
-    expires_at = min(
-        evaluated_at + timedelta(minutes=5),
-        request.correlation_request.expires_at,
+    expires_at = _publication_request_expires_at(
+        request,
+        evaluated_at,
     )
     operation_times = iter(
         (
@@ -533,15 +583,15 @@ def test_reviewed_delivery_budget_timeline_leaves_exact_processing_phase() -> No
 
 
 def test_end_to_end_budget_is_rechecked_immediately_before_enqueue() -> None:
-    fixture = _fixture()
+    fixture = _fixture(correlation_expires_at=NOW + timedelta(minutes=15))
     request = fixture.guidance_binding.incident_bound_request
     evaluated_at = _stable_evaluated_at(
         request,
         fixture.incident_publication.occurrence,
     )
-    expires_at = min(
-        evaluated_at + timedelta(minutes=5),
-        request.correlation_request.expires_at,
+    expires_at = _publication_request_expires_at(
+        request,
+        evaluated_at,
     )
     operation_times = iter(
         (
@@ -1847,6 +1897,158 @@ def test_publisher_worker_requires_exact_immutable_outbox_evidence(
         assert publisher.calls == []
     assert len(outbox_reader.calls) == expected_outbox_reads
     assert events[:2] == ["clock", "parse"]
+
+
+@pytest.mark.parametrize(
+    "terminal_error",
+    (
+        GuidanceAuthorityOccurrenceConflictError,
+        GuidanceAuthorityDeliveryExpiredError,
+    ),
+)
+def test_publisher_worker_dead_letters_terminal_delivery_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_error: type[RuntimeError],
+) -> None:
+    import azure.identity
+    import azure.servicebus
+
+    (
+        fixture,
+        incident_bound_request,
+        producer,
+        _signer,
+        _request_verifier,
+        _incident,
+        _context,
+        _outbox,
+        _sender,
+    ) = _producer()
+    produced = producer.produce(
+        incident_bound_request,
+        now=_stable_evaluated_at(
+            incident_bound_request,
+            fixture.incident_publication.occurrence,
+        ),
+    )
+    request = produced.request
+    message = SimpleNamespace(
+        body=(request.canonical_bytes(),),
+        content_type="application/json",
+        message_id=request.request_id,
+        session_id=request.incident_bound_request.incident_subject.incident_id,
+        application_properties=guidance_publication_request_broker_properties(
+            request,
+            outbox_reference=produced.outbox_reference,
+            delivery_budget=_DELIVERY_BUDGET,
+        ),
+        locked_until_utc=request.finish_before,
+    )
+    configuration = Wc027GuidanceAuthorityPublisherConfiguration.model_validate_json(
+        json.dumps(_bicep_generated_publisher_configuration())
+    )
+
+    class _Credential:
+        def __init__(self, *, client_id: str) -> None:
+            self.client_id = client_id
+
+    class _Receiver:
+        def __init__(self) -> None:
+            self.session = SimpleNamespace(locked_until_utc=request.finish_before)
+            self.abandoned = []
+            self.completed = []
+            self.dead_lettered = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def receive_messages(self, **_kwargs):
+            return [message]
+
+        def complete_message(self, selected) -> None:
+            self.completed.append(selected)
+
+        def abandon_message(self, selected) -> None:
+            self.abandoned.append(selected)
+
+        def dead_letter_message(self, selected, **kwargs) -> None:
+            self.dead_lettered.append((selected, kwargs))
+
+    class _QueueSender:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    receiver = _Receiver()
+
+    class _Client:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def get_queue_receiver(self, **_kwargs):
+            return receiver
+
+        def get_queue_sender(self, **_kwargs):
+            return _QueueSender()
+
+    class _TerminalPublisher:
+        def recover_trigger_delivery(self, _selected, *, now) -> bool:
+            del now
+            raise terminal_error("synthetic terminal delivery failure")
+
+        def publish(self, _selected, *, now) -> None:
+            del now
+            raise AssertionError("terminal recovery must not republish")
+
+    monkeypatch.setattr(
+        azure.identity,
+        "ManagedIdentityCredential",
+        _Credential,
+    )
+    monkeypatch.setattr(azure.servicebus, "ServiceBusClient", _Client)
+    monkeypatch.setattr(
+        guidance_production,
+        "validate_guidance_publication_request_broker_metadata",
+        lambda *_args, **_kwargs: produced.outbox_reference,
+    )
+    monkeypatch.setattr(
+        guidance_production,
+        "verify_guidance_publication_request_outbox",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        guidance_production,
+        "build_wc027_guidance_authority_publisher",
+        lambda *_args, **_kwargs: _TerminalPublisher(),
+    )
+    monkeypatch.setattr(
+        guidance_production,
+        "_utc_now_milliseconds",
+        lambda: request.evaluated_at,
+    )
+
+    processed = run_wc027_guidance_authority_publisher_worker(
+        configuration=configuration,
+        max_wait_time_seconds=1,
+    )
+
+    assert processed is False
+    assert receiver.abandoned == []
+    assert receiver.completed == []
+    assert len(receiver.dead_lettered) == 1
+    assert receiver.dead_lettered[0][0] is message
+    assert receiver.dead_lettered[0][1]["reason"] == "AthenaWc027GuidanceAuthorityTerminal"
 
 
 @pytest.mark.parametrize("failure_point", ("trigger", "completion"))

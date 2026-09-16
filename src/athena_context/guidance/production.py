@@ -61,6 +61,8 @@ from athena_context.guidance.azure import (
 )
 from athena_context.guidance.publication import (
     GuidanceAuthorityActivationConflictError,
+    GuidanceAuthorityDeliveryExpiredError,
+    GuidanceAuthorityOccurrenceConflictError,
     GuidanceAuthorityPublisher,
     GuidanceAuthoritySourceNotReadyError,
     parse_guidance_authority_publication_request,
@@ -888,6 +890,22 @@ def run_wc027_guidance_authority_publisher_worker(
                 )
                 == "settled"
             )
+        except (
+            GuidanceAuthorityDeliveryExpiredError,
+            GuidanceAuthorityOccurrenceConflictError,
+        ):
+            _settle_publisher_message(
+                receiver,
+                message,
+                action="dead_letter",
+                now=_utc_now_milliseconds(),
+                reason="AthenaWc027GuidanceAuthorityTerminal",
+                error_description=(
+                    "the signed occurrence already has a different immutable "
+                    "guidance activation or its effective delivery deadline expired"
+                ),
+            )
+            return False
         except (
             GuidanceAuthorityActivationConflictError,
             GuidanceAuthoritySourceNotReadyError,

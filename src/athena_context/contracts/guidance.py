@@ -344,13 +344,16 @@ class GuidancePublicationRequestDeliveryBudget(_StrictGuidanceModel):
             + self.feed_delivery_jitter_seconds
         )
 
-    def finish_before(self, request_expires_at: datetime) -> datetime:
+    @property
+    def finish_before_extension(self) -> timedelta:
         return (
-            request_expires_at
-            + self.feed_trigger_recovery
+            self.feed_trigger_recovery
             + self.feed_minimum_remaining_lifetime
             + timedelta(seconds=self.feed_delivery_jitter_seconds)
         )
+
+    def finish_before(self, request_expires_at: datetime) -> datetime:
+        return request_expires_at + self.finish_before_extension
 
     def publisher_request_time_to_live_seconds(
         self,
@@ -1032,6 +1035,13 @@ class GuidanceAuthorityPublicationRequest(_StrictGuidanceModel):
     @classmethod
     def validate_actions(cls, values: tuple[str, ...]) -> tuple[str, ...]:
         return _sorted_unique(values, "requestedActions")
+
+    @property
+    def effective_finish_before(self) -> UtcDateTime:
+        return min(
+            self.finish_before,
+            self.incident_bound_request.correlation_request.expires_at,
+        )
 
     @model_validator(mode="after")
     def validate_request(self) -> GuidanceAuthorityPublicationRequest:

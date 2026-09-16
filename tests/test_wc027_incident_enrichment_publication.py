@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 
 import pytest
 
@@ -167,7 +168,13 @@ class _Fixture:
     authority_reader: _Reader
 
 
-def _fixture(*, selected_runbook: bool = False) -> _Fixture:
+def _fixture(
+    *,
+    selected_runbook: bool = False,
+    correlation_issued_at: datetime | None = None,
+    correlation_trusted_as_of: datetime | None = None,
+    correlation_expires_at: datetime | None = None,
+) -> _Fixture:
     if selected_runbook:
         option = _option()
         guidance_binding = _binding(
@@ -189,7 +196,11 @@ def _fixture(*, selected_runbook: bool = False) -> _Fixture:
             ),
         )
     else:
-        correlation_request = _request()
+        correlation_request = _request(
+            issued_at=correlation_issued_at,
+            trusted_as_of=correlation_trusted_as_of,
+            expires_at=correlation_expires_at,
+        )
         correlation_service = _test_service(correlation_request)
         verified_report = correlation_service.correlate(correlation_request)
         guidance_binding = _binding(

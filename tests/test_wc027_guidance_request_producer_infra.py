@@ -334,11 +334,14 @@ def test_request_producer_image_pull_uses_validated_cross_rg_registry_scope() ->
         "param registryRoleAssignmentMode string",
         "param receiverIdentityPrincipalId string",
         "identityPrincipalId: receiverIdentityPrincipalId",
+        "repositoryName: imageRepositoryName",
+        "var imageRepositoryName = 'athena/wc027-guidance-publication-request-producer'",
         "expectedRegistryRoleAssignmentMode: registryRoleAssignmentMode",
         "guid(",
         "registry.id",
         "receiverIdentityPrincipalId",
         "imagePullRoleDefinitionId",
+        "imageRepositoryName",
     ):
         assert expected in source
 

@@ -247,7 +247,7 @@ class AzureTableGuidanceAuthorityActivationStore:
             trigger_delivery_status="pending",
         )
 
-    def mark_trigger_submitted(
+    def mark_feed_materialized(
         self,
         activation: PublishedGuidanceAuthorityActivation,
         *,
@@ -258,7 +258,7 @@ class AzureTableGuidanceAuthorityActivationStore:
             "RowKey": activation.incident_id,
             "activationDigest": activation.activation_digest,
             "payload": activation.canonical_bytes().decode("utf-8"),
-            "triggerDeliveryStatus": "submitted",
+            "triggerDeliveryStatus": "materialized",
         }
         try:
             metadata = self._table.update_entity(
@@ -269,12 +269,25 @@ class AzureTableGuidanceAuthorityActivationStore:
             )
         except (ResourceModifiedError, ResourceNotFoundError) as exc:
             raise GuidanceAuthorityActivationConflictError(
-                "guidance trigger delivery status CAS conflict"
+                "guidance feed materialization status CAS conflict"
             ) from exc
+        except (
+            HttpResponseError,
+            ServiceRequestError,
+            ServiceResponseError,
+        ):
+            current = self.read_current(incident_id=activation.incident_id)
+            if (
+                current is None
+                or current.activation != activation
+                or current.trigger_delivery_status != "materialized"
+            ):
+                raise
+            return current
         return GuidanceAuthorityActivationSnapshot(
             activation=activation,
             etag=self._operation_etag(metadata),
-            trigger_delivery_status="submitted",
+            trigger_delivery_status="materialized",
         )
 
     def _snapshot(
@@ -287,18 +300,20 @@ class AzureTableGuidanceAuthorityActivationStore:
         activation = PublishedGuidanceAuthorityActivation.model_validate_json(
             payload
         )
+        stored_status = entity.get("triggerDeliveryStatus")
         if (
             activation.incident_id != entity.get("RowKey")
             or activation.activation_digest != entity.get("activationDigest")
             or payload.encode("utf-8") != activation.canonical_bytes()
-            or entity.get("triggerDeliveryStatus")
-            not in {"pending", "submitted"}
+            or stored_status not in {"pending", "submitted", "materialized"}
         ):
             raise ValueError("guidance activation row is not canonical")
         return GuidanceAuthorityActivationSnapshot(
             activation=activation,
             etag=self._entity_etag(entity),
-            trigger_delivery_status=entity["triggerDeliveryStatus"],
+            trigger_delivery_status=(
+                "pending" if stored_status == "submitted" else stored_status
+            ),
         )
 
     @staticmethod

@@ -2,6 +2,8 @@ from athena_context.guidance.engine import build_incident_guidance
 from athena_context.guidance.publication import (
     GuidanceAuthorityActivationConflictError,
     GuidanceAuthorityActivationSnapshot,
+    GuidanceAuthorityDeliveryExpiredError,
+    GuidanceAuthorityOccurrenceConflictError,
     GuidanceAuthorityPublicationReceipt,
     GuidanceAuthorityPublisher,
     GuidanceAuthoritySourceNotReadyError,
@@ -27,7 +29,9 @@ from athena_context.guidance.request_publication import (
 __all__ = [
     "GuidanceAuthorityActivationConflictError",
     "GuidanceAuthorityActivationSnapshot",
+    "GuidanceAuthorityDeliveryExpiredError",
     "GuidanceIncidentAuthoritySnapshot",
+    "GuidanceAuthorityOccurrenceConflictError",
     "GuidanceAuthorityPublisher",
     "GuidanceAuthorityPublicationReceipt",
     "GuidanceAuthoritySourceNotReadyError",

@@ -295,9 +295,12 @@ class GuidancePublicationRequestProducer:
             occurrence.published_at,
             context_authority.published_at,
         )
+        latest_request_expiry = (
+            correlation_request.expires_at - self.delivery_budget.finish_before_extension
+        )
         expires_at = min(
             evaluated_at + _MAX_PUBLICATION_REQUEST_LIFETIME,
-            correlation_request.expires_at,
+            latest_request_expiry,
         )
         if (
             evaluated_at < correlation_request.issued_at

@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from azure.core.exceptions import ServiceResponseError
 
 import athena_context.enrichment.production as production
 from athena_context.contracts import (
@@ -111,9 +112,16 @@ class _Activation:
         occurrence,
         *,
         delivery_budget: GuidancePublicationRequestDeliveryBudget = _DELIVERY_BUDGET,
+        legacy_deadline: bool = False,
     ) -> None:
+        correlation_expires_at = binding.incident_bound_request.correlation_request.expires_at
         publication_request_expires_at = (
-            binding.incident_bound_request.correlation_request.expires_at
+            min(
+                binding.evaluated_at + timedelta(minutes=5),
+                correlation_expires_at,
+            )
+            if legacy_deadline
+            else correlation_expires_at - delivery_budget.finish_before_extension
         )
         finish_before = delivery_budget.finish_before(publication_request_expires_at)
         payload = {
@@ -175,9 +183,25 @@ class _Activation:
             ),
             etag='"synthetic"',
         )
+        self.materialize_calls = 0
+        self.commit_materialization_then_fail_once = False
 
     def read_current(self, *, incident_id: str):
         assert incident_id == self.snapshot.activation.incident_id
+        return self.snapshot
+
+    def mark_feed_materialized(self, activation, *, expected_etag):
+        self.materialize_calls += 1
+        assert activation == self.snapshot.activation
+        assert expected_etag == self.snapshot.etag
+        self.snapshot = GuidanceAuthorityActivationSnapshot(
+            activation=activation,
+            etag=f'"synthetic-materialized-{self.materialize_calls}"',
+            trigger_delivery_status="materialized",
+        )
+        if self.commit_materialization_then_fail_once:
+            self.commit_materialization_then_fail_once = False
+            raise ServiceResponseError("synthetic uncertain materialization commit")
         return self.snapshot
 
 
@@ -198,11 +222,18 @@ class _Feed:
         self._service = service
         self._operations = operations
 
-    def publish(self, enrichment_publication, *, published_at):
+    def publish(
+        self,
+        enrichment_publication,
+        *,
+        published_at,
+        before_irreversible_write=None,
+    ):
         self._operations.append("feed.start")
         result = self._service.publish(
             enrichment_publication,
             published_at=published_at,
+            before_irreversible_write=before_irreversible_write,
         )
         self._operations.append("feed.complete")
         return result
@@ -213,8 +244,16 @@ class _Notification:
         self.operations = operations
         self.calls = 0
 
-    def publish(self, *, incident_id: str, verified_at):
+    def publish(
+        self,
+        *,
+        incident_id: str,
+        verified_at,
+        before_irreversible_write=None,
+    ):
         del verified_at
+        if before_irreversible_write is not None:
+            before_irreversible_write()
         self.operations.append("notification")
         self.calls += 1
         notification = SimpleNamespace(incident_id=incident_id)
@@ -841,6 +880,7 @@ def _runtime(
     *,
     fail_feed_pointer_once: bool = False,
     clock=None,
+    legacy_activation: bool = False,
 ):
     fixture = _fixture()
     operations: list[str] = []
@@ -881,6 +921,7 @@ def _runtime(
         guidance_activation=_Activation(
             fixture.guidance_binding,
             fixture.incident_publication.occurrence,
+            legacy_deadline=legacy_activation,
         ),
         enrichment_publication=_Enrichment(enrichment, operations),
         feed_publication=_Feed(feed, operations),
@@ -926,6 +967,7 @@ def test_runtime_orders_correlation_enrichment_feed_then_notification() -> None:
     assert operations.index("feed.complete") < operations.index("notification")
     assert notification.calls == 1
     assert receipt.binding_id == fixture.guidance_binding.binding_id
+    assert runtime.guidance_activation.snapshot.trigger_delivery_status == "materialized"
 
 
 @pytest.mark.parametrize(
@@ -976,6 +1018,56 @@ def test_runtime_enforces_exact_feed_processing_boundary(
 
 @pytest.mark.parametrize(
     ("remaining_seconds", "should_publish"),
+    ((60, True), (59, False)),
+)
+def test_runtime_uses_nested_expiry_for_published_head_activation(
+    remaining_seconds: int,
+    should_publish: bool,
+) -> None:
+    (
+        fixture,
+        runtime,
+        store,
+        writer,
+        registry,
+        index,
+        notification,
+        operations,
+        _binding_verifier,
+        _incident_authority,
+    ) = _runtime(legacy_activation=True)
+    activation = runtime.guidance_activation.snapshot.activation
+    nested_expiry = fixture.guidance_binding.incident_bound_request.correlation_request.expires_at
+    assert activation.finish_before > nested_expiry
+    published_at = nested_expiry - timedelta(seconds=remaining_seconds)
+
+    if should_publish:
+        runtime.publish(
+            fixture.guidance_binding,
+            published_at=published_at,
+        )
+        assert notification.calls == 1
+        assert runtime.guidance_activation.snapshot.trigger_delivery_status == "materialized"
+    else:
+        with pytest.raises(
+            Wc027EnrichmentSourceNotReadyError,
+            match="feed processing window",
+        ):
+            runtime.publish(
+                fixture.guidance_binding,
+                published_at=published_at,
+            )
+        assert operations == []
+        assert store.calls == []
+        assert writer.values == {}
+        assert registry.records == {}
+        assert index.calls == 0
+        assert notification.calls == 0
+        assert runtime.guidance_activation.snapshot.trigger_delivery_status == "pending"
+
+
+@pytest.mark.parametrize(
+    ("remaining_seconds", "should_publish"),
     ((15, True), (14, False)),
 )
 def test_runtime_rechecks_finish_before_before_irreversible_writes(
@@ -991,7 +1083,7 @@ def test_runtime_rechecks_finish_before_before_irreversible_writes(
         registry,
         index,
         notification,
-        operations,
+        _operations,
         _binding_verifier,
         _incident_authority,
     ) = _runtime(clock=lambda: clock_values[0])
@@ -1014,12 +1106,77 @@ def test_runtime_rechecks_finish_before_before_irreversible_writes(
                 fixture.guidance_binding,
                 published_at=published_at,
             )
-        assert "enrichment.start" not in operations
         assert store.calls == []
         assert writer.values == {}
         assert registry.records == {}
         assert index.calls == 0
         assert notification.calls == 0
+
+
+@pytest.mark.parametrize(
+    (
+        "completed_writes",
+        "enrichment_write_count",
+        "feed_write_count",
+        "registry_record_count",
+        "index_write_count",
+        "notification_count",
+    ),
+    (
+        (0, 0, 0, 0, 0, 0),
+        (1, 1, 0, 0, 0, 0),
+        (5, 5, 0, 0, 0, 0),
+        (6, 6, 0, 0, 0, 0),
+        (7, 6, 1, 0, 0, 0),
+        (8, 6, 2, 0, 0, 0),
+        (9, 6, 2, 1, 0, 0),
+        (10, 6, 2, 1, 1, 0),
+        (11, 6, 2, 1, 1, 1),
+    ),
+)
+def test_runtime_resamples_deadline_before_each_irreversible_write(
+    completed_writes: int,
+    enrichment_write_count: int,
+    feed_write_count: int,
+    registry_record_count: int,
+    index_write_count: int,
+    notification_count: int,
+) -> None:
+    clock_values: list[object] = []
+    (
+        fixture,
+        runtime,
+        store,
+        writer,
+        registry,
+        index,
+        notification,
+        operations,
+        _binding_verifier,
+        _incident_authority,
+    ) = _runtime(clock=lambda: clock_values.pop(0))
+    activation = runtime.guidance_activation
+    finish_before = activation.snapshot.activation.finish_before
+    valid = finish_before - timedelta(seconds=15)
+    expired = finish_before - timedelta(seconds=14)
+    clock_values.extend([valid] * completed_writes)
+    clock_values.append(expired)
+
+    with pytest.raises(
+        Wc027EnrichmentSourceNotReadyError,
+        match="irreversible-write margin",
+    ):
+        runtime.publish(
+            fixture.guidance_binding,
+            published_at=finish_before - timedelta(seconds=60),
+        )
+
+    assert len(store.calls) == enrichment_write_count
+    assert len(writer.values) == feed_write_count
+    assert len(registry.records) == registry_record_count
+    assert len(index._receipts) == index_write_count
+    assert activation.snapshot.trigger_delivery_status == "pending"
+    assert notification.calls == notification_count
 
 
 def test_feed_trigger_metadata_binds_the_complete_delivery_budget() -> None:
@@ -1308,6 +1465,51 @@ def test_runtime_retry_recovers_partial_feed_without_early_notification() -> Non
     assert receipt.notification.notification.incident_id == (
         fixture.incident_publication.incident_id
     )
+
+
+def test_runtime_recovers_idempotently_after_uncertain_materialization_commit() -> None:
+    (
+        fixture,
+        runtime,
+        store,
+        writer,
+        registry,
+        _index,
+        notification,
+        _operations,
+        _binding_verifier,
+        _incident_authority,
+    ) = _runtime()
+    activation = runtime.guidance_activation
+    activation.commit_materialization_then_fail_once = True
+
+    with pytest.raises(
+        ServiceResponseError,
+        match="uncertain materialization commit",
+    ):
+        runtime.publish(
+            fixture.guidance_binding,
+            published_at=PUBLISHED_AT,
+        )
+
+    persisted_enrichment = dict(store.values)
+    persisted_feed = dict(writer.values)
+    persisted_registry = dict(registry.records)
+    assert activation.snapshot.trigger_delivery_status == "materialized"
+    assert activation.materialize_calls == 1
+    assert notification.calls == 1
+
+    receipt = runtime.publish(
+        fixture.guidance_binding,
+        published_at=PUBLISHED_AT,
+    )
+
+    assert dict(store.values) == persisted_enrichment
+    assert dict(writer.values) == persisted_feed
+    assert dict(registry.records) == persisted_registry
+    assert activation.materialize_calls == 1
+    assert notification.calls == 2
+    assert receipt.binding_id == fixture.guidance_binding.binding_id
 
 
 def test_trigger_requires_exact_canonical_signed_binding_bytes() -> None:

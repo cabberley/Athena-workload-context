@@ -819,9 +819,31 @@ def _put(
     record: IncidentFeedRegistryRecord,
     *,
     authority: CurrentIncidentStateSnapshot,
+    before_irreversible_write=None,
 ) -> None:
     registry._current_incident_reader.current[record.entry.incident_id] = authority
-    registry.put(record, authority=authority)
+    registry.put(
+        record,
+        authority=authority,
+        before_irreversible_write=before_irreversible_write,
+    )
+
+
+def test_azure_registry_guards_capacity_and_record_writes_individually() -> None:
+    table = _Table()
+    registry = _azure_registry(table)
+    active = _record(1, lifecycle="active")
+    guards: list[str] = []
+
+    _put(
+        registry,
+        active,
+        authority=_authority(1, lifecycle="active"),
+        before_irreversible_write=lambda: guards.append("guard"),
+    )
+
+    assert guards == ["guard", "guard"]
+    assert registry.list_records(as_of=NOW) == (active,)
 
 
 def test_azure_registry_is_idempotent_and_rejects_stale_updates() -> None:
@@ -1052,9 +1074,14 @@ def test_azure_registry_prunes_expired_rows() -> None:
     )
     with pytest.raises(TypeError, match="dataclass"):
         replace(projection.prune_plan, records=())
-    registry.prune_expired(projection.prune_plan)
+    guards: list[str] = []
+    registry.prune_expired(
+        projection.prune_plan,
+        before_irreversible_write=lambda: guards.append("guard"),
+    )
 
     assert registry.list_records(as_of=NOW) == ()
+    assert guards == ["guard"]
     assert table.delete_count == 1
     assert table.entities["__feed_v2_capacity__"]["retainedCount"] == 0
 

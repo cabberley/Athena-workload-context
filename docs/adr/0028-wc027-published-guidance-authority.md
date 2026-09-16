@@ -71,11 +71,13 @@ profile, dependency graph, context payload, publication record, and audit-head b
 
 `evaluatedAt` is derived deterministically from stable signed inputs: the maximum of the
 correlation request `trustedAsOf`, current occurrence `publishedAt`, and published-context
-authority `publishedAt`. It is never derived from wall-clock time. Expiry is the earlier of five
-minutes after that stable time or the nested correlation expiry. The producer signs with a
-dedicated request-signing identity, normalizes the detached signature with the same guidance
-signing rules as the publisher, and immediately verifies it using a separate exact-key public-key
-reader identity.
+authority `publishedAt`. It is never derived from wall-clock time. Request expiry is the earlier
+of five minutes after that stable time or the latest instant whose complete downstream
+`finishBefore` extension remains within the nested correlation expiry. A correlation window that
+cannot cover the reviewed producer minimum and downstream phases fails closed. The producer signs
+with a dedicated request-signing identity, normalizes the detached signature with the same
+guidance signing rules as the publisher, and immediately verifies it using a separate exact-key
+public-key reader identity.
 
 Before enqueue, the producer create-or-recovers the exact canonical request in an isolated
 immutable Blob outbox. Its logical path is keyed only by the signed occurrence ID, so an identical
@@ -110,20 +112,36 @@ configured delivery budget. After publisher KEDA polling, cold start, and Servic
 publication must retain the exact 60-second processing phase. The signed activation establishes an
 independent feed-delivery timeline with one signed absolute `finishBefore` deadline derived from
 request expiry, the 300-second recovery allowance, complete 150-second feed phase, and 30-second
-jitter margin. The activation is the durable trigger outbox and binds the immutable binding
-reference, deterministic trigger message ID, `triggerDeliveryPending=true`, `finishBefore`, and
-delivery budget. The publisher
-requires a fresh CAS margin before commit, submits the trigger after CAS with
+jitter margin without exceeding the nested correlation expiry. The activation is the durable
+trigger outbox and binds the immutable binding reference, deterministic trigger message ID,
+`triggerDeliveryPending=true`, `finishBefore`, and delivery budget. The publisher requires a fresh
+trusted-clock deadline guard immediately before each immutable authority write, immutable binding
+write, activation CAS, and trigger send, then submits the trigger after CAS with
 `floor(finishBefore - now - feedProcessingMargin)`, and completes its input only after submission
 returns. Definite or uncertain submission failure is retryable; replay exact-reads the same
 committed activation and immutable binding, resubmits the same message identity, and performs no
 second CAS—even after request expiry. The feed checks the processing reserve at start and a fresh
-irreversible-write margin before each write.
+irreversible-write margin directly before each enrichment artifact create/recover, feed pointer
+and attestation create/recover, registry transaction, feed-index attestation/index CAS,
+activation-materialization CAS, expiry-prune transaction, and notification send.
 
 The activation Table row stores a separate ETag-protected trigger-delivery status. CAS creates
-`pending`; a confirmed deterministic send changes only that row to `submitted`. Uncertain send or
-status-update outcomes retain/recover `pending` and resend the same message, while `submitted`
-allows input settlement without another send.
+`pending`, and confirmed or uncertain trigger submission leaves it `pending` so publisher replay
+can resend the same duplicate-detected message. After the feed pointer, attestation, registry
+record, and feed index are durably materialized, a separately authorized runtime identity
+conditionally changes only the same activation row to `materialized`. That identity has entity
+read/update permission only—no add or delete. The update occurs only after the deterministic
+notification is durably enqueued, so notification or marker uncertainty keeps recovery live.
+Publisher replay treats `materialized` as complete and does not resend. Existing rows written by
+the published head as `submitted` normalize to recoverable `pending` during reads. Their immutable
+signed bytes remain valid, while operational checks cap the effective deadline at the earlier of
+stored `finishBefore` and nested correlation expiry, preventing upgrade-time permanent rejection
+without allowing work beyond trusted correlation authority. The immutable occurrence-keyed request
+slot is not renewable: a different activation for the same occurrence remains conflict-closed even
+after expiry, and a new signed occurrence is required before guidance/feed state can change.
+The publisher dead-letters that permanent occurrence conflict and irreversible effective-deadline
+exhaustion with one lock-aware terminal disposition, while transient source, ETag, and transport
+failures retain the existing abandon/recovery behavior.
 
 The initial production publisher emits only the deterministic zero-option authority with
 `noMatchingControl`. It first create-or-recovers the immutable authority Blob, then signs and
@@ -169,9 +187,13 @@ read/add/update permission, and its binding signer has only exact-key sign permi
 The publisher validates the ACR ID canonically and scopes its image-pull module to the exact parsed
 registry subscription and resource group. It detects the registry permission mode and selects
 `AcrPull` only for legacy RBAC registries or `Container Registry Repository Reader` for
-ABAC-repository-permissions registries. Role-assignment identity is seeded by the managed
-identity's principal object ID. Root readiness additionally requires bounded, actual
-managed-identity pull evidence for the exact digest.
+ABAC-repository-permissions registries. Every ABAC Repository Reader assignment uses condition
+version `2.0` and the documented request repository-name attribute with
+`StringEqualsIgnoreCase` against the one exact digest-pinned repository. The deterministic
+registry/principal/role assignment seed is intentionally unchanged from the published head so the
+condition updates the existing assignment in place instead of leaving a registry-wide grant.
+Root readiness additionally requires bounded, actual managed-identity pull evidence for the exact
+digest.
 
 ## Consequences
 

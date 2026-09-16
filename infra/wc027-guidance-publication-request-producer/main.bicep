@@ -268,7 +268,8 @@ resource registry 'Microsoft.ContainerRegistry/registries@2025-11-01' existing =
 }
 
 var expectedRegistryServer = '${toLower(registry.name)}.azurecr.io'
-var imagePrefix = '${expectedRegistryServer}/athena/wc027-guidance-publication-request-producer@sha256:'
+var imageRepositoryName = 'athena/wc027-guidance-publication-request-producer'
+var imagePrefix = '${expectedRegistryServer}/${imageRepositoryName}@sha256:'
 var imageDigest = replace(producerImage, imagePrefix, '')
 var imageDigestWithoutDigits = replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(
   imageDigest,
@@ -573,6 +574,7 @@ module producerImagePull '../wc027-enrichment-feed-runtime/modules/acr-pull-rbac
     registryName: registry.name
     identityResourceId: receiverIdentity.id
     identityPrincipalId: receiverIdentityPrincipalId
+    repositoryName: imageRepositoryName
     expectedRegistryRoleAssignmentMode: registryRoleAssignmentMode
   }
 }

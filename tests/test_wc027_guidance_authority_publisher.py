@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import timedelta
 
 import pytest
@@ -16,9 +17,12 @@ from athena_context.contracts import (
 from athena_context.guidance import (
     GuidanceAuthorityActivationConflictError,
     GuidanceAuthorityActivationSnapshot,
+    GuidanceAuthorityDeliveryExpiredError,
+    GuidanceAuthorityOccurrenceConflictError,
     GuidanceAuthorityPublisher,
     GuidanceAuthoritySourceNotReadyError,
 )
+from test_wc026_correlation_contract import NOW
 from test_wc027_incident_enrichment_publication import (
     _SIGNATURE,
     _fixture,
@@ -52,18 +56,25 @@ def _request(
     *,
     evaluated_at=None,
     lifetime: timedelta = timedelta(minutes=5),
+    bound_effective_deadline: bool = True,
+    incident_occurrence=None,
 ) -> GuidanceAuthorityPublicationRequest:
     binding = fixture.guidance_binding
     correlation_request = binding.incident_bound_request.correlation_request
     evaluated_at = evaluated_at or binding.evaluated_at
+    latest_request_expiry = (
+        correlation_request.expires_at - _DELIVERY_BUDGET.finish_before_extension
+        if bound_effective_deadline
+        else correlation_request.expires_at
+    )
     expires_at = min(
         evaluated_at + lifetime,
-        correlation_request.expires_at,
+        latest_request_expiry,
     )
     payload = {
         "schemaVersion": "athena.wc027GuidanceAuthorityPublicationRequest.v1",
         "incidentBoundRequest": binding.incident_bound_request,
-        "incidentOccurrence": fixture.incident_publication.occurrence,
+        "incidentOccurrence": incident_occurrence or fixture.incident_publication.occurrence,
         "requestedActions": ("investigationCheck",),
         "evaluatedAt": evaluated_at,
         "expiresAt": expires_at,
@@ -154,7 +165,7 @@ class _ActivationStore:
     def __init__(self, events: list[str] | None = None) -> None:
         self.snapshot = None
         self.cas_calls = 0
-        self.mark_calls = 0
+        self.materialize_calls = 0
         self.conflict = False
         self.commit_then_fail_once = False
         self.events = events if events is not None else []
@@ -183,14 +194,14 @@ class _ActivationStore:
             raise RuntimeError("synthetic uncertain activation commit")
         return self.snapshot
 
-    def mark_trigger_submitted(self, activation, *, expected_etag):
-        self.mark_calls += 1
+    def mark_feed_materialized(self, activation, *, expected_etag):
+        self.materialize_calls += 1
         assert self.snapshot.activation == activation
         assert self.snapshot.etag == expected_etag
         self.snapshot = GuidanceAuthorityActivationSnapshot(
             activation=activation,
-            etag=f'"etag-submitted-{self.mark_calls}"',
-            trigger_delivery_status="submitted",
+            etag=f'"etag-materialized-{self.materialize_calls}"',
+            trigger_delivery_status="materialized",
         )
         return self.snapshot
 
@@ -214,8 +225,15 @@ def _publisher(
     verifier=None,
     incident_key_vault_key_id: str | None = None,
     clock=None,
+    correlation_issued_at=None,
+    correlation_trusted_as_of=None,
+    correlation_expires_at=None,
 ):
-    fixture = _fixture()
+    fixture = _fixture(
+        correlation_issued_at=correlation_issued_at,
+        correlation_trusted_as_of=correlation_trusted_as_of,
+        correlation_expires_at=(correlation_expires_at or NOW + timedelta(minutes=15)),
+    )
     writer = _Writer()
     events: list[str] = []
     activation = _ActivationStore(events)
@@ -259,18 +277,16 @@ def test_publisher_accepts_distinct_logical_and_physical_lifecycle_key_ids() -> 
     request = _request(fixture)
 
     receipt = publisher.publish(request, now=request.evaluated_at)
+    incident_subject = request.incident_bound_request.incident_subject
+    expected_key_vault_key_id = incident_subject.incident_state_attestation.key_vault_key_id
 
     assert publisher.incident_key_id == _INCIDENT_LOGICAL_KEY_ID
-    assert (
-        publisher.incident_key_vault_key_id
-        == request.incident_bound_request.incident_subject
-        .incident_state_attestation.key_vault_key_id
-    )
+    assert publisher.incident_key_vault_key_id == expected_key_vault_key_id
     assert receipt.binding_reference.name in writer.payloads
     assert activation.cas_calls == 1
     assert len(trigger.calls) == 1
-    assert activation.mark_calls == 1
-    assert activation.snapshot.trigger_delivery_status == "submitted"
+    assert activation.materialize_calls == 0
+    assert activation.snapshot.trigger_delivery_status == "pending"
 
 
 def test_publisher_creates_signs_activates_and_enqueues_deterministically() -> None:
@@ -294,16 +310,20 @@ def test_publisher_creates_signs_activates_and_enqueues_deterministically() -> N
     assert incident.calls == 20
     assert [call[0].binding_id for call in trigger.calls] == [
         first.activation.binding_id,
+        first.activation.binding_id,
     ]
     expected_ttl = _DELIVERY_BUDGET.feed_trigger_time_to_live_seconds(
         finish_before=first.activation.finish_before,
         at=request.evaluated_at,
     )
-    assert [call[1] for call in trigger.calls] == [expected_ttl]
-    assert [call[2] for call in trigger.calls] == [_DELIVERY_BUDGET]
-    assert trigger.events == ["cas", "trigger"]
-    assert activation.mark_calls == 1
-    assert activation.snapshot.trigger_delivery_status == "submitted"
+    assert [call[1] for call in trigger.calls] == [expected_ttl, expected_ttl]
+    assert [call[2] for call in trigger.calls] == [
+        _DELIVERY_BUDGET,
+        _DELIVERY_BUDGET,
+    ]
+    assert trigger.events == ["cas", "trigger", "trigger"]
+    assert activation.materialize_calls == 0
+    assert activation.snapshot.trigger_delivery_status == "pending"
     assert first.activation.trigger_message_id == first.activation.binding_id
     assert first.activation.trigger_delivery_pending is True
     assert first.activation.delivery_budget == _DELIVERY_BUDGET
@@ -334,6 +354,8 @@ def test_publisher_derives_independent_feed_delivery_window() -> None:
     request = _request(fixture)
     operation_times = iter(
         (
+            request.expires_at - timedelta(seconds=60),
+            request.expires_at - timedelta(seconds=60),
             request.expires_at - timedelta(seconds=60),
             request.expires_at - timedelta(seconds=60),
         )
@@ -367,9 +389,39 @@ def test_publisher_derives_independent_feed_delivery_window() -> None:
     assert activation.cas_calls == 1
 
 
+def test_publisher_caps_published_head_deadline_at_nested_correlation_expiry() -> None:
+    fixture, publisher, _writer, _activation, trigger, _correlation, _incident = _publisher(
+        correlation_expires_at=NOW + timedelta(minutes=10)
+    )
+    request = _request(
+        fixture,
+        bound_effective_deadline=False,
+    )
+    nested_expiry = request.incident_bound_request.correlation_request.expires_at
+
+    receipt = publisher.publish(request, now=request.evaluated_at)
+
+    assert request.finish_before > nested_expiry
+    assert request.effective_finish_before == nested_expiry
+    assert receipt.activation.finish_before == request.finish_before
+    assert trigger.calls[0][1] == (
+        _DELIVERY_BUDGET.feed_trigger_time_to_live_seconds(
+            finish_before=nested_expiry,
+            at=request.evaluated_at,
+        )
+    )
+
+
 def test_publisher_requires_reviewed_margin_immediately_before_cas() -> None:
     fixture = _fixture()
     request = _request(fixture)
+    operation_times = iter(
+        (
+            request.evaluated_at,
+            request.evaluated_at,
+            request.expires_at - timedelta(seconds=4),
+        )
+    )
     (
         _fixture_value,
         publisher,
@@ -378,9 +430,7 @@ def test_publisher_requires_reviewed_margin_immediately_before_cas() -> None:
         trigger,
         _correlation,
         _incident,
-    ) = _publisher(
-        clock=lambda: request.expires_at - timedelta(seconds=4)
-    )
+    ) = _publisher(clock=lambda: next(operation_times))
 
     with pytest.raises(
         GuidanceAuthoritySourceNotReadyError,
@@ -393,6 +443,66 @@ def test_publisher_requires_reviewed_margin_immediately_before_cas() -> None:
 
     assert activation.cas_calls == 0
     assert trigger.calls == []
+
+
+@pytest.mark.parametrize(
+    (
+        "stage",
+        "expected_writer_calls",
+        "expected_cas_calls",
+        "expected_trigger_calls",
+        "error_match",
+    ),
+    (
+        ("authority", 0, 0, 0, "authority artifact write"),
+        ("binding", 1, 0, 0, "binding artifact write"),
+        ("cas", 2, 0, 0, "authority CAS"),
+        ("trigger", 2, 1, 0, "recovery deadline expired"),
+    ),
+)
+def test_publisher_resamples_deadline_before_each_irreversible_write(
+    stage: str,
+    expected_writer_calls: int,
+    expected_cas_calls: int,
+    expected_trigger_calls: int,
+    error_match: str,
+) -> None:
+    fixture = _fixture(correlation_expires_at=NOW + timedelta(minutes=15))
+    request = _request(fixture)
+    trigger_deadline = (
+        request.finish_before
+        - _DELIVERY_BUDGET.feed_minimum_remaining_lifetime
+        - timedelta(seconds=_DELIVERY_BUDGET.feed_delivery_jitter_seconds)
+    )
+    valid = request.evaluated_at
+    invalid_before_request_write = request.expires_at - timedelta(seconds=4)
+    invalid_before_trigger = trigger_deadline + timedelta(milliseconds=1)
+    stage_times = {
+        "authority": (invalid_before_request_write,),
+        "binding": (valid, invalid_before_request_write),
+        "cas": (valid, valid, invalid_before_request_write),
+        "trigger": (valid, valid, valid, invalid_before_trigger),
+    }
+    operation_times = iter(stage_times[stage])
+    (
+        _fixture_value,
+        publisher,
+        writer,
+        activation,
+        trigger,
+        _correlation,
+        _incident,
+    ) = _publisher(clock=lambda: next(operation_times))
+
+    with pytest.raises(
+        GuidanceAuthoritySourceNotReadyError,
+        match=error_match,
+    ):
+        publisher.publish(request, now=request.evaluated_at)
+
+    assert len(writer.calls) == expected_writer_calls
+    assert activation.cas_calls == expected_cas_calls
+    assert len(trigger.calls) == expected_trigger_calls
 
 
 def test_uncertain_trigger_acceptance_recovers_from_committed_activation() -> None:
@@ -416,8 +526,8 @@ def test_uncertain_trigger_acceptance_recovers_from_committed_activation() -> No
     assert recovered is True
     assert activation.cas_calls == 1
     assert len(trigger.calls) == 2
-    assert activation.mark_calls == 1
-    assert activation.snapshot.trigger_delivery_status == "submitted"
+    assert activation.materialize_calls == 0
+    assert activation.snapshot.trigger_delivery_status == "pending"
     assert writer.read_calls == [activation.snapshot.activation.binding_reference]
     assert trigger.calls[0][0].binding_id == trigger.calls[1][0].binding_id
 
@@ -444,8 +554,8 @@ def test_uncertain_activation_commit_recovers_without_duplicate_trigger() -> Non
     assert recovered is True
     assert activation.cas_calls == 1
     assert len(trigger.calls) == 1
-    assert activation.mark_calls == 1
-    assert activation.snapshot.trigger_delivery_status == "submitted"
+    assert activation.materialize_calls == 0
+    assert activation.snapshot.trigger_delivery_status == "pending"
     assert writer.read_calls == [activation.snapshot.activation.binding_reference]
 
 
@@ -496,7 +606,7 @@ def test_committed_trigger_recovery_rejects_expired_deadline() -> None:
     )
 
     with pytest.raises(
-        GuidanceAuthoritySourceNotReadyError,
+        GuidanceAuthorityDeliveryExpiredError,
         match="recovery deadline expired",
     ):
         publisher.recover_trigger_delivery(
@@ -507,12 +617,16 @@ def test_committed_trigger_recovery_rejects_expired_deadline() -> None:
     assert trigger.calls == []
 
 
-def test_submitted_trigger_status_settles_without_duplicate_resend() -> None:
+def test_materialized_trigger_status_settles_without_duplicate_resend() -> None:
     fixture, publisher, writer, activation, trigger, _correlation, _incident = (
         _publisher()
     )
     request = _request(fixture)
     publisher.publish(request, now=request.evaluated_at)
+    activation.mark_feed_materialized(
+        activation.snapshot.activation,
+        expected_etag=activation.snapshot.etag,
+    )
     original_calls = list(trigger.calls)
 
     recovered = publisher.recover_trigger_delivery(
@@ -523,7 +637,7 @@ def test_submitted_trigger_status_settles_without_duplicate_resend() -> None:
     assert recovered is True
     assert trigger.calls == original_calls
     assert writer.read_calls == []
-    assert activation.snapshot.trigger_delivery_status == "submitted"
+    assert activation.snapshot.trigger_delivery_status == "materialized"
 
 
 def test_invalid_outer_signature_causes_zero_external_io() -> None:
@@ -587,6 +701,105 @@ def test_concurrent_activation_fails_closed_without_enqueue() -> None:
     assert activation.snapshot is None
 
 
+def test_different_request_for_same_occurrence_remains_conflict_closed() -> None:
+    fixture, publisher, _writer, activation, trigger, _correlation, _incident = _publisher()
+    first_request = _request(
+        fixture,
+        lifetime=timedelta(minutes=4),
+    )
+    second_request = _request(
+        fixture,
+        lifetime=timedelta(minutes=5),
+    )
+    publisher.publish(
+        first_request,
+        now=first_request.evaluated_at,
+    )
+
+    with pytest.raises(
+        GuidanceAuthorityOccurrenceConflictError,
+        match="already owns this occurrence",
+    ):
+        publisher.publish(
+            second_request,
+            now=second_request.evaluated_at,
+        )
+
+    assert activation.cas_calls == 1
+    assert len(trigger.calls) == 1
+
+
+def test_same_occurrence_remains_conflict_closed_after_effective_expiry() -> None:
+    (
+        old_fixture,
+        old_publisher,
+        writer,
+        activation,
+        trigger,
+        _old_correlation,
+        old_incident,
+    ) = _publisher(
+        correlation_expires_at=NOW
+        + timedelta(
+            minutes=4,
+            seconds=30,
+        )
+    )
+    old_request = _request(
+        old_fixture,
+        bound_effective_deadline=False,
+    )
+    old_receipt = old_publisher.publish(
+        old_request,
+        now=old_request.evaluated_at,
+    )
+    old_nested_expiry = old_request.incident_bound_request.correlation_request.expires_at
+    stored_expiry = old_receipt.activation.expires_at
+    assert old_nested_expiry < stored_expiry
+    new_issued_at = stored_expiry - timedelta(seconds=30)
+    new_trusted_as_of = stored_expiry
+    new_correlation_expiry = new_issued_at + timedelta(minutes=15)
+
+    (
+        new_fixture,
+        new_publisher,
+        _new_writer,
+        _new_activation,
+        _new_trigger,
+        _new_correlation,
+        _new_incident,
+    ) = _publisher(
+        correlation_issued_at=new_issued_at,
+        correlation_trusted_as_of=new_trusted_as_of,
+        correlation_expires_at=new_correlation_expiry,
+    )
+    new_publisher = replace(
+        new_publisher,
+        artifact_writer=writer,
+        activation_store=activation,
+        trigger=trigger,
+        incident_authority=old_incident,
+    )
+    new_request = _request(
+        new_fixture,
+        incident_occurrence=old_fixture.incident_publication.occurrence,
+    )
+    probe = stored_expiry + timedelta(milliseconds=1)
+    assert stored_expiry < probe < new_request.expires_at
+
+    with pytest.raises(
+        GuidanceAuthorityOccurrenceConflictError,
+        match="already owns this occurrence",
+    ):
+        new_publisher.publish(
+            new_request,
+            now=probe,
+        )
+
+    assert activation.cas_calls == 1
+    assert len(trigger.calls) == 1
+
+
 def test_source_change_before_activation_is_retryable_without_enqueue() -> None:
     fixture, publisher, _writer, activation, trigger, _correlation, incident = (
         _publisher()
@@ -599,34 +812,6 @@ def test_source_change_before_activation_is_retryable_without_enqueue() -> None:
 
     assert activation.cas_calls == 0
     assert trigger.calls == []
-
-
-def test_expired_undelivered_activation_can_be_safely_replaced() -> None:
-    fixture, publisher, _writer, activation, trigger, _correlation, _incident = (
-        _publisher()
-    )
-    first_request = _request(fixture, lifetime=timedelta(minutes=5))
-    first = publisher.publish(first_request, now=first_request.evaluated_at)
-    activation.snapshot = GuidanceAuthorityActivationSnapshot(
-        activation=first.activation.model_copy(
-            update={
-                "expires_at": first_request.evaluated_at
-                - timedelta(milliseconds=1)
-            }
-        ),
-        etag=activation.snapshot.etag,
-    )
-    fresh_request = _request(
-        fixture,
-        evaluated_at=first_request.evaluated_at,
-        lifetime=timedelta(minutes=4),
-    )
-
-    second = publisher.publish(fresh_request, now=fresh_request.evaluated_at)
-
-    assert second.activation != first.activation
-    assert activation.cas_calls == 2
-    assert len(trigger.calls) == 2
 
 
 def test_request_is_strict_and_does_not_accept_caller_selected_outputs() -> None:
@@ -685,6 +870,18 @@ def test_request_finish_before_must_match_reviewed_absolute_deadline() -> None:
 
     with pytest.raises(ValidationError, match="bounded validity"):
         GuidanceAuthorityPublicationRequest.model_validate(payload)
+
+
+def test_request_effective_deadline_cannot_outlive_nested_correlation_expiry() -> None:
+    fixture = _fixture(correlation_expires_at=NOW + timedelta(minutes=10))
+    request = _request(
+        fixture,
+        bound_effective_deadline=False,
+    )
+    nested_expiry = request.incident_bound_request.correlation_request.expires_at
+
+    assert request.finish_before > nested_expiry
+    assert request.effective_finish_before == nested_expiry
 
 
 def test_activation_model_rejects_non_binding_asset_path() -> None:

@@ -90,6 +90,9 @@ from athena_context.eventing.runtime import AzureServiceBusNotificationOutbox
 from athena_context.guidance.azure import (
     AzureTableGuidanceAuthorityActivationStore,
 )
+from athena_context.guidance.publication import (
+    GuidanceAuthorityActivationConflictError,
+)
 from athena_context.presentation_assets import (
     PresentationAssetReadResult,
     PresentationAssetUnavailableError,
@@ -1096,6 +1099,7 @@ def run_wc027_enrichment_feed_worker(
             receiver.complete_message(message)
             return True
         except (
+            GuidanceAuthorityActivationConflictError,
             Wc027EnrichmentSourceNotReadyError,
             NotificationV2SourceNotReadyError,
             IncidentFeedRegistryIncompleteError,

@@ -62,8 +62,9 @@ Before any output write, the worker:
 6. reads the exact version-pinned `PublishedContextAuthority` from `context-authority` and requires
    canonical bytes, reference digest, manifest/profile/dependency/context payload, publication
    record, and audit-head equality; and
-7. derives `evaluatedAt` as the maximum signed publication/trust time and bounds expiry to the
-   earlier of five minutes or the nested correlation expiry.
+7. derives `evaluatedAt` as the maximum signed publication/trust time and bounds request expiry to
+   the earlier of five minutes or the latest instant whose derived `finishBefore` does not exceed
+   the nested correlation expiry.
 
 The request-signing identity has exact-key sign-only RBAC. A distinct identity reads the exact
 public key and immediately verifies the normalized detached signature before any outbox write.
@@ -94,10 +95,13 @@ publisher KEDA polling, cold start, and managed-identity Service Bus setup plus 
 publisher processing. A request below the boundary is abandoned without reserving or writing its
 occurrence-keyed outbox path. If revalidation or producer sender setup consumes the budget, the
 persisted request is not sent and the input is abandoned. A request with exactly 150 seconds
-remaining is eligible to persist and send. After persistence, the worker revalidates lifecycle and
-context authority, establishes the managed-identity Service Bus sender, resamples the trusted
-clock, and only then constructs/sends the message. The signed request carries one absolute
-`finishBefore` deadline, which the activation must copy unchanged. The request hop uses
+remaining is eligible to persist and send. If the signed correlation window cannot cover that
+minimum plus the complete downstream `finishBefore` extension, production fails closed without an
+outbox write. After persistence, the worker revalidates lifecycle and context authority,
+establishes the managed-identity Service Bus sender, resamples the trusted clock, and only then
+constructs/sends the message. The signed request carries one absolute `finishBefore` deadline,
+which the activation must copy unchanged and which can never outlive the nested correlation
+expiry. The request hop uses
 `floor(finishBefore - now - downstreamMargin)`, where the downstream margin reserves publisher
 processing, the full feed phase, and delivery jitter. Sender creation cannot complete the input
 delivery. The request is sent to the existing
@@ -137,7 +141,10 @@ Regression tests assert both versions and the SDK inheritance contract:
 - one shared upstream exact-public-key reader for the incident and correlation-binding keys;
 - separate exact-key request signer and request public-key reader identities;
 - ACR pull for the event-trigger identity, deployed at the exact validated subscription and
-  resource group parsed from `registryResourceId`;
+  resource group parsed from `registryResourceId`; ABAC-mode Repository Reader assignments use
+  condition version `2.0` and an exact case-insensitive repository-name condition, while legacy
+  registries retain `AcrPull`; the existing deterministic assignment ID is preserved so an
+  unconditioned published assignment is updated in place rather than left behind;
 - generated non-secret strict configuration and deterministic RBAC evidence; and
 - a publisher handoff containing the existing output queue, sender identity, exact request key
   binding, producer Job resource ID, and configuration digest.
@@ -151,25 +158,48 @@ aliases cannot bypass the separation.
 The strict producer, publisher, and enrichment/feed configurations carry the same reviewed
 delivery budget. Broker metadata binds every phase. After publisher cold start and Service Bus
 setup, the publisher requires the exact 60-second processing phase before creating authority and
-the reviewed CAS margin immediately before commit. The signed activation establishes one
-independent `finishBefore` deadline derived deterministically from request expiry, the 300-second
-recovery allowance, the 150-second feed phase, and a 30-second delivery-jitter margin. It is the
-durable trigger outbox and binds the immutable binding reference, deterministic trigger
-`MessageId`, `triggerDeliveryPending=true`, all budget components, and `finishBefore`.
+the reviewed CAS margin immediately before commit. A fresh trusted-clock guard also runs directly
+before each immutable authority write, immutable binding write, activation CAS, and trigger send.
+The signed activation establishes one independent `finishBefore` deadline derived
+deterministically from request expiry, the 300-second recovery allowance, the 150-second feed
+phase, and a 30-second delivery-jitter margin, while remaining at or before the nested correlation
+expiry. It is the durable trigger outbox and binds the immutable binding reference, deterministic
+trigger `MessageId`, `triggerDeliveryPending=true`, all budget components, and `finishBefore`.
 After CAS, the publisher submits that exact message to the duplicate-detecting feed queue. A
 definite or uncertain send failure abandons the publisher request; replay may continue after the
 request itself expires, reads the same activation and exact binding version, and resubmits the same
 `MessageId` without another CAS. Each trigger TTL is
 `floor(finishBefore - now - feedProcessingMargin)`. An uncertain CAS that actually committed is
 recovered in the same way. The publisher completes its input only after trigger submission
-returns. The feed checks the processing reserve at start and a fresh 15-second margin immediately
-before each irreversible enrichment, feed, or notification write.
+returns. The feed checks the processing reserve at start and threads one trusted-clock guard down
+to every irreversible operation: each enrichment artifact create/recover, feed pointer and
+attestation create/recover, registry capacity/update transaction, feed-index attestation and index
+CAS, activation-materialization CAS, expiry-prune transaction, and notification send.
 
-The activation Table row separately stores a CAS-protected delivery status. New activations start
-as `pending`; only a confirmed trigger submission updates the same exact activation row to
-`submitted`. Uncertain sends or status updates leave/recover `pending` and resend the identical
-message. A later publisher-input retry that reads `submitted` completes without another trigger
-send.
+The activation Table row separately stores a CAS-protected delivery status. New activations remain
+`pending` after confirmed or uncertain trigger submission so publisher replay can resend the
+identical duplicate-detected message until the feed is durably materialized. Only the feed runtime,
+after the exact feed pointer, attestation, registry record, and feed index are present and the
+deterministic notification has been durably enqueued, may conditionally update the same activation
+row to `materialized`. A later publisher-input retry that reads `materialized` completes without
+another trigger send. If notification or marker persistence is uncertain, the row remains
+recoverable and the same feed and notification identities replay idempotently. The runtime
+identity has only Table entity read/update permission for this marker—no add, delete, or table
+administration.
+Rows written by the previously published implementation with `triggerDeliveryStatus=submitted`
+are read as recoverable `pending` rows, so the upgrade neither dead-letters nor strands existing
+activations before the feed proves materialization. Previously signed requests whose stored
+`finishBefore` exceeded their nested correlation expiry are accepted only through the same trusted
+signature path; all operational TTL, freshness, and write checks use the earlier nested expiry as
+their effective deadline. The occurrence-keyed outbox remains authoritative: after that effective
+deadline, a different request cannot renew the same occurrence. A new signed incident occurrence
+is required, preserving immutable request and feed-registry identity.
+
+Publisher settlement distinguishes permanent from transient outcomes. A different immutable
+activation for the same occurrence, or an exhausted effective trigger-recovery deadline, is
+lock-aware dead-lettered once as `AthenaWc027GuidanceAuthorityTerminal`. ETag races, source
+unavailability, and transport uncertainty remain retryable and are abandoned once under the
+existing one-disposition settlement rule.
 
 Deploy the authority publisher first with the dedicated producer sender identity as the only
 value in `requestSubmitterIdentityResourceIds`; the queue-owning publisher module grants that

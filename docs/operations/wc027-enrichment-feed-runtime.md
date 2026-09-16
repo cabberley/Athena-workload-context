@@ -158,17 +158,30 @@ or notification state.
 
 The signed activation derives one absolute `finishBefore` deadline from request expiry plus the
 300-second recovery allowance, complete 150-second feed phase, and 30-second jitter margin. The
-activation is the durable trigger outbox and binds the immutable binding reference, trigger
-`MessageId`, `triggerDeliveryPending=true`, `finishBefore`, and delivery budget. The publisher sends only after CAS, using
+producer caps request expiry so this effective deadline cannot outlive the nested correlation
+expiry. The activation is the durable trigger outbox and binds the immutable binding reference,
+trigger `MessageId`, `triggerDeliveryPending=true`, `finishBefore`, and delivery budget. The
+publisher sends only after CAS, using
 `floor(finishBefore - now - feedProcessingMargin)` for each trigger TTL. If CAS or trigger
 submission is uncertain, replay exact-reads the activation and binding outbox—even after request
 expiry—and resubmits the same deterministic message without a second activation; duplicate
-detection contains uncertain acceptance. The runtime rechecks `finishBefore` immediately before
-each irreversible write.
+detection contains uncertain acceptance. The runtime threads a fresh `finishBefore` guard directly
+to each irreversible artifact upload, Table transaction, feed-index attestation/index CAS,
+activation-materialization CAS, expiry-prune transaction, and notification send.
 
-The activation row's CAS-protected transport status is `pending` until a confirmed trigger send,
-then `submitted`. The signed activation remains immutable; the status update can only refer to the
-same activation digest and ETag.
+The activation row's CAS-protected delivery status remains `pending` after trigger submission.
+Publisher replay therefore remains recoverable and resends the same duplicate-detected message
+until the feed runtime has durably materialized the exact feed pointer, attestation, registry
+record, and feed index and durably enqueued the deterministic notification. The runtime then changes
+only the same activation digest and ETag to `materialized`; its custom Table role permits entity
+read/update but not add, delete, or table administration. Notification or marker uncertainty
+therefore leaves a recoverable row and replays the same idempotent identities. The signed activation
+remains immutable. Legacy rows carrying the previously published `submitted` transport value are
+normalized to recoverable `pending` on read and can converge on `materialized` without migration
+downtime. Legacy signed activations may retain their original later `finishBefore` bytes, but
+runtime processing, TTL, and write guards use `min(finishBefore, nestedCorrelation.expiresAt)`.
+No different binding may replace the same occurrence after that effective deadline; replacement
+requires a new signed occurrence, so an existing feed-registry row cannot be silently repurposed.
 
 The publisher verifies the outer request and nested lifecycle, subject, and correlation-binding
 signatures; confirms the exact current signed occurrence and active index; recomputes correlation;
@@ -178,6 +191,13 @@ binding ID to the feed queue. The initial implementation intentionally publishes
 zero-option `noMatchingControl` authority.
 
 All correlation source readers and upstream authority keys remain separately governed resources.
+For ACR registries in `AbacRepositoryPermissions` mode, each WC-027 Job receives `Container
+Registry Repository Reader` only with condition version `2.0` and an exact
+`StringEqualsIgnoreCase` request-repository condition for that Job's digest-pinned repository.
+Sibling, prefix-alias, and cross-component repositories remain denied. Legacy registries retain
+the existing registry-scoped `AcrPull` assignment. The role-assignment GUID remains the published
+registry/principal/role seed so ABAC deployment updates the prior assignment in place and cannot
+leave a registry-wide Repository Reader grant behind.
 The module grants each configured reader only its exact container with `Blob.List` denied, and
 grants the trust-reader identity only exact-key read/verify data actions on the configured
 verification keys. Publisher authority and activation destinations are derived from the embedded

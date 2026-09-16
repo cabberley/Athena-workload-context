@@ -56,6 +56,7 @@ class IncidentFeedIndexPublicationPort(Protocol):
         self,
         *,
         published_at: UtcDateTime,
+        before_irreversible_write: Callable[[], None] | None = None,
     ) -> IncidentFeedIndexPublicationReceipt: ...
 
 
@@ -110,6 +111,7 @@ class IncidentEnrichmentFeedPublicationService:
         enrichment_publication: IncidentEnrichmentPublicationReceipt,
         *,
         published_at: UtcDateTime,
+        before_irreversible_write: Callable[[], None] | None = None,
     ) -> IncidentEnrichmentFeedPublicationReceipt:
         if type(enrichment_publication) is not IncidentEnrichmentPublicationReceipt:
             raise TypeError(
@@ -169,13 +171,15 @@ class IncidentEnrichmentFeedPublicationService:
             _artifact_request(
                 f"{prefix}/feed-pointer.json",
                 pointer_bytes,
-            )
+            ),
+            before_irreversible_write=before_irreversible_write,
         )
         attestation_reference = self._write_asset(
             _artifact_request(
                 f"{prefix}/feed-pointer-attestation.json",
                 pointer_attestation.canonical_bytes(),
-            )
+            ),
+            before_irreversible_write=before_irreversible_write,
         )
         entry = IncidentFeedEntryV2(
             incidentId=occurrence.incident_id,
@@ -202,14 +206,16 @@ class IncidentEnrichmentFeedPublicationService:
             record,
             current=current,
             as_of=published_at,
+            before_irreversible_write=before_irreversible_write,
         )
         index_published_at = published_at
         last_conflict: IncidentFeedIndexPublicationConflictError | None = None
         last_winner_published_at: UtcDateTime | None = None
         for _attempt in range(MAX_FEED_V2_PUBLICATION_ATTEMPTS):
             try:
-                index_publication = self.feed_index_publication.publish(
-                    published_at=index_published_at
+                index_publication = self._publish_index(
+                    published_at=index_published_at,
+                    before_irreversible_write=before_irreversible_write,
                 )
             except IncidentFeedIndexPublicationConflictError as exc:
                 last_conflict = exc
@@ -286,7 +292,11 @@ class IncidentEnrichmentFeedPublicationService:
     def _write_asset(
         self,
         request: ArtifactWriteRequest,
+        *,
+        before_irreversible_write: Callable[[], None] | None = None,
     ) -> VersionPinnedBlobReference:
+        if before_irreversible_write is not None:
+            before_irreversible_write()
         reference = self.artifact_writer.create_or_recover(request)
         if (
             type(reference) is not VersionPinnedBlobReference
@@ -302,17 +312,31 @@ class IncidentEnrichmentFeedPublicationService:
         *,
         current: CurrentIncidentStateSnapshot,
         as_of: UtcDateTime,
+        before_irreversible_write: Callable[[], None] | None = None,
     ) -> None:
         failure: IncidentFeedRegistryError | None = None
         try:
-            self.registry.put(
-                record,
-                authority=current,
-            )
+            if before_irreversible_write is None:
+                self.registry.put(
+                    record,
+                    authority=current,
+                )
+            else:
+                self.registry.put(
+                    record,
+                    authority=current,
+                    before_irreversible_write=before_irreversible_write,
+                )
         except IncidentFeedRegistryError as exc:
             failure = exc
         try:
-            records = self.registry.list_records(as_of=as_of)
+            if before_irreversible_write is None:
+                records = self.registry.list_records(as_of=as_of)
+            else:
+                records = self.registry.list_records(
+                    as_of=as_of,
+                    before_irreversible_write=before_irreversible_write,
+                )
         except IncidentFeedRegistryError as recovery_error:
             if failure is not None:
                 raise failure from recovery_error
@@ -339,6 +363,19 @@ class IncidentEnrichmentFeedPublicationService:
             raise failure
         raise IncidentFeedRegistryIncompleteError(
             "feed registry did not durably retain the incident record"
+        )
+
+    def _publish_index(
+        self,
+        *,
+        published_at: UtcDateTime,
+        before_irreversible_write: Callable[[], None] | None = None,
+    ) -> IncidentFeedIndexPublicationReceipt:
+        if before_irreversible_write is None:
+            return self.feed_index_publication.publish(published_at=published_at)
+        return self.feed_index_publication.publish(
+            published_at=published_at,
+            before_irreversible_write=before_irreversible_write,
         )
 
     @staticmethod

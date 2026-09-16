@@ -9,6 +9,11 @@ param identityResourceId string
 @description('Exact principal object ID of the managed identity receiving repository pull access.')
 param identityPrincipalId string
 
+@minLength(1)
+@maxLength(256)
+@description('Exact lowercase ACR repository name containing the digest-pinned image.')
+param repositoryName string
+
 @allowed([
   'LegacyRegistryPermissions'
   'AbacRepositoryPermissions'
@@ -34,6 +39,9 @@ var registryRoleAssignmentMode = registry.properties.roleAssignmentMode == expec
 var validatedIdentityPrincipalId = identity.properties.principalId == identityPrincipalId
   ? identityPrincipalId
   : fail('managed identity principal object ID does not match the reviewed deployment input')
+var validatedRepositoryName = repositoryName == toLower(repositoryName) && !startsWith(repositoryName, '/') && !endsWith(repositoryName, '/') && !contains(repositoryName, '//') && !contains(repositoryName, '@') && !contains(repositoryName, ':') && !contains(repositoryName, '?') && !contains(repositoryName, '#') && !contains(repositoryName, '%')
+  ? repositoryName
+  : fail('repositoryName must identify one exact lowercase ACR repository')
 var pullRoleDefinitionId = registryRoleAssignmentMode == 'LegacyRegistryPermissions'
   ? acrPullRoleDefinitionId
   : registryRoleAssignmentMode == 'AbacRepositoryPermissions'
@@ -46,9 +54,12 @@ module pullAssignment 'acr-pull-role-assignment.bicep' = {
     registryName: registry.name
     principalObjectId: validatedIdentityPrincipalId
     roleDefinitionId: pullRoleDefinitionId
+    roleAssignmentMode: registryRoleAssignmentMode
+    repositoryName: validatedRepositoryName
   }
 }
 
 output roleAssignmentResourceId string = pullAssignment.outputs.roleAssignmentResourceId
 output roleAssignmentMode string = registryRoleAssignmentMode
 output roleDefinitionId string = pullRoleDefinitionId
+output repositoryName string = validatedRepositoryName

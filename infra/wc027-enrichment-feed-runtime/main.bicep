@@ -62,7 +62,7 @@ param feedV2ReaderIdentityResourceId string
 @description('Feed registry Table writer identity resource ID.')
 param registryWriterIdentityResourceId string
 
-@description('Read-only identity resource ID for the current guidance-authority activation row.')
+@description('Identity resource ID that reads the current guidance activation and CAS-marks feed materialization.')
 param guidanceActivationReaderIdentityResourceId string
 
 @description('Trust/public-key reader identity resource ID used for Key Vault Reader and all verification keys.')
@@ -233,7 +233,6 @@ var serviceBusDataReceiverRoleDefinitionId = '4f6c0938-94ea-4d52-8e5a-2e02b7ef8e
 var serviceBusDataSenderRoleDefinitionId = '69a216fc-b8fb-44d8-bc22-1f3c2cd27a39'
 var storageBlobDataReaderRoleDefinitionId = '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1'
 var storageTableDataContributorRoleDefinitionId = '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3'
-var storageTableDataReaderRoleDefinitionId = '76199698-9eea-4c19-bc75-cec21354c6b6'
 var keyVaultCryptoUserRoleDefinitionId = '12338af0-0e69-4776-bea7-57ae8d297424'
 var acrPullRoleDefinitionId = '7f951dda-4ed3-4680-a7ca-43fe172d538d'
 var repositoryReaderRoleDefinitionId = 'b93aa761-3e63-49ed-ac28-beffa264f7ac'
@@ -274,7 +273,8 @@ var guidancePublicationDeliveryBudget = {
 }
 
 var expectedRegistryServer = '${toLower(registry.name)}.azurecr.io'
-var imagePrefix = '${expectedRegistryServer}/athena/wc027-enrichment-feed-producer@sha256:'
+var imageRepositoryName = 'athena/wc027-enrichment-feed-producer'
+var imagePrefix = '${expectedRegistryServer}/${imageRepositoryName}@sha256:'
 var imageDigest = replace(producerImage, imagePrefix, '')
 var imageDigestWithoutDigits = replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(
   imageDigest,
@@ -706,16 +706,12 @@ resource registryWriter 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   }
 }
 
-resource guidanceActivationReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(guidanceActivation.id, guidanceActivationReaderIdentity.id, storageTableDataReaderRoleDefinitionId)
-  scope: guidanceActivation
-  properties: {
-    principalId: guidanceActivationReaderIdentity.properties.principalId
-    principalType: 'ServicePrincipal'
-    roleDefinitionId: subscriptionResourceId(
-      'Microsoft.Authorization/roleDefinitions',
-      storageTableDataReaderRoleDefinitionId
-    )
+module guidanceActivationMaterializerRbac 'modules/guidance-activation-materializer-rbac.bicep' = {
+  name: 'wc027-guidance-feed-materializer'
+  params: {
+    storageAccountName: replayStorage.name
+    tableName: guidanceActivation.name
+    identityResourceId: guidanceActivationReaderIdentity.id
   }
 }
 
@@ -937,6 +933,7 @@ module producerImagePull 'modules/acr-pull-rbac.bicep' = {
     registryName: registry.name
     identityResourceId: brokerIdentity.id
     identityPrincipalId: brokerIdentityPrincipalId
+    repositoryName: imageRepositoryName
     expectedRegistryRoleAssignmentMode: registryRoleAssignmentMode
   }
 }
@@ -1109,6 +1106,8 @@ var guidanceBindingKeyVerifierRoleId = extensionResourceId('/subscriptions/${spl
 var changeKeyVerifierRoleId = extensionResourceId('/subscriptions/${split(changeKeyResourceId, '/')[2]}/resourceGroups/${split(changeKeyResourceId, '/')[4]}', 'Microsoft.Authorization/roleDefinitions', guid(changeKey.id, 'athena-wc027-key-verifier'))
 var monitoringIntentKeyVerifierRoleId = extensionResourceId('/subscriptions/${split(monitoringIntentKeyResourceId, '/')[2]}/resourceGroups/${split(monitoringIntentKeyResourceId, '/')[4]}', 'Microsoft.Authorization/roleDefinitions', guid(monitoringIntentKey.id, 'athena-wc027-key-verifier'))
 var monitoringCollectorKeyVerifierRoleId = extensionResourceId('/subscriptions/${split(monitoringCollectorKeyResourceId, '/')[2]}/resourceGroups/${split(monitoringCollectorKeyResourceId, '/')[4]}', 'Microsoft.Authorization/roleDefinitions', guid(monitoringCollectorKey.id, 'athena-wc027-key-verifier'))
+var guidanceActivationMaterializerRoleId = extensionResourceId(resourceGroup().id, 'Microsoft.Authorization/roleDefinitions', guid(guidanceActivation.id, 'athena-wc027-feed-materializer'))
+var guidanceActivationMaterializerAssignmentId = extensionResourceId(guidanceActivation.id, 'Microsoft.Authorization/roleAssignments', guid(guidanceActivation.id, guidanceActivationReaderIdentity.id, guidanceActivationMaterializerRoleId))
 
 var coreRbacResourceIds = [
   triggerReceiver.id
@@ -1133,7 +1132,8 @@ var coreRbacResourceIds = [
   extensionResourceId(monitoringIntentSourceContainer.id, 'Microsoft.Authorization/roleAssignments', guid(monitoringIntentSourceContainer.id, monitoringIntentReaderIdentity.id, storageBlobDataReaderRoleDefinitionId))
   extensionResourceId(guidanceAuthoritySourceContainer.id, 'Microsoft.Authorization/roleAssignments', guid(guidanceAuthoritySourceContainer.id, guidanceAuthorityReaderIdentity.id, storageBlobDataReaderRoleDefinitionId))
   registryWriter.id
-  guidanceActivationReader.id
+  guidanceActivationMaterializerRoleId
+  guidanceActivationMaterializerAssignmentId
   incidentKeyVerifierRoleId
   extensionResourceId(incidentKey.id, 'Microsoft.Authorization/roleAssignments', guid(incidentKey.id, trustReaderIdentity.id, incidentKeyVerifierRoleId))
   correlationBindingKeyVerifierRoleId
