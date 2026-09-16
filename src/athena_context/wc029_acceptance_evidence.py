@@ -27,6 +27,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 from athena_context.artifacts import MAX_ARTIFACT_TRANSFER_BYTES
 from athena_context.contracts import (
+    CORRELATION_REQUEST_SCHEMA_VERSION,
     ActiveIncidentIndex,
     ActiveIncidentIndexAttestation,
     CanonicalWorkloadManifest,
@@ -38,6 +39,7 @@ from athena_context.contracts import (
     IncidentEnrichmentFeedPointer,
     IncidentEnrichmentFeedPointerAttestation,
     IncidentEnrichmentManifest,
+    IncidentFeedEntryV2,
     IncidentFeedIndexAttestationV2,
     IncidentFeedIndexV2,
     IncidentGuidance,
@@ -59,6 +61,7 @@ from athena_context.contracts import (
     sha256_hex,
     validate_correlation_report_binding,
     validate_incident_enrichment_assets,
+    validate_incident_enrichment_feed_pointer_assets,
     validate_incident_enrichment_manifest_binding,
     validate_incident_feed_index_assets,
     validate_incident_guidance_assets,
@@ -364,7 +367,7 @@ _EXPECTED_SCHEMA_BY_CLASS: dict[EvidenceClass, str | None] = {
     "mutation-receipt": MUTATION_RECEIPT_SCHEMA_VERSION,
     "monitoring-evidence": "athena.wc024MonitoringEvidenceHandoff.v1",
     "change-evidence": "athena.changeEvidenceArtifact.v1",
-    "correlation-request": "athena.wc026CorrelationRequest.v2",
+    "correlation-request": CORRELATION_REQUEST_SCHEMA_VERSION,
     "correlation-report": "athena.wc026CorrelationReport.v1",
     "correlation-report-attestation": ("athena.wc027PublishedCorrelationReportAttestation.v1"),
     "correlation-only-report-attestation": (CORRELATION_ONLY_REPORT_ATTESTATION_SCHEMA_VERSION),
@@ -2397,6 +2400,10 @@ class Wc029ScenarioPlanEvidence(_StrictAcceptanceModel):
         alias="monitoringRequestDigest",
         pattern=r"^sha256:[a-f0-9]{64}$",
     )
+    monitoring_bundle_digest: str = Field(
+        alias="monitoringBundleDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
     correlation_context_binding_digest: str = Field(
         alias="correlationContextBindingDigest",
         pattern=r"^sha256:[a-f0-9]{64}$",
@@ -2997,6 +3004,10 @@ class Wc029ScenarioExecutionManifest(_StrictAcceptanceModel):
         alias="monitoringRequestDigest",
         pattern=r"^sha256:[a-f0-9]{64}$",
     )
+    monitoring_bundle_digest: str = Field(
+        alias="monitoringBundleDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
     correlation_request_digest: str = Field(
         alias="correlationRequestDigest",
         pattern=r"^sha256:[a-f0-9]{64}$",
@@ -3090,9 +3101,10 @@ class Wc029ScenarioExecutionManifest(_StrictAcceptanceModel):
             "verify": 4,
         }
         keys = tuple((item.phase, item.artifact_id) for item in self.artifacts)
+        artifact_ids = tuple(item.artifact_id for item in self.artifacts)
         if keys != tuple(sorted(keys, key=lambda item: (phase_rank[item[0]], item[1]))) or len(
-            keys
-        ) != len(set(keys)):
+            artifact_ids
+        ) != len(set(artifact_ids)):
             raise ValueError("scenario artifact bindings must be unique and sorted")
         if self.manifest_digest != compute_artifact_digest(self._digest_payload()):
             raise ValueError("manifestDigest does not bind scenario execution")
@@ -3771,7 +3783,7 @@ _KNOWN_MODELS: dict[str, type[BaseModel]] = {
     URL_PROBE_SCHEMA_VERSION: Wc029UrlProbeEvidence,
     "athena.wc024MonitoringEvidenceHandoff.v1": MonitoringEvidenceHandoff,
     "athena.changeEvidenceArtifact.v1": ChangeEvidenceArtifact,
-    "athena.wc026CorrelationRequest.v2": CorrelationRequest,
+    CORRELATION_REQUEST_SCHEMA_VERSION: CorrelationRequest,
     "athena.wc026CorrelationReport.v1": CorrelationReport,
     "athena.incidentState.v1": IncidentState,
     "athena.incidentStateAttestation.v1": IncidentStateAttestation,
@@ -4384,12 +4396,42 @@ def _pinned_file_identity(descriptor: int) -> _PathIdentity:
         ) from exc
 
 
+def _stable_regular_file_identity(
+    path: Path,
+    *,
+    label: str,
+    required_link_count: int,
+) -> _PathIdentity:
+    try:
+        path_stat = path.lstat()
+        identity = (
+            _windows_path_identity(path, path_stat)
+            if os.name == "nt"
+            else _PathIdentity.from_stat(path_stat)
+        )
+    except OSError as exc:
+        raise Wc029AcceptanceEvidenceError(
+            f"{label} cannot be stated or pinned to platform identity"
+        ) from exc
+    if (
+        not stat.S_ISREG(identity.mode)
+        or stat.S_ISLNK(identity.mode)
+        or identity.file_attributes & _REPARSE_POINT
+        or identity.link_count != required_link_count
+    ):
+        raise Wc029AcceptanceEvidenceError(
+            f"{label} is not the expected singly controlled regular file"
+        )
+    return identity
+
+
 def _open_pinned_file(
     path: Path,
     expected: _PathIdentity,
     *,
     parent: _PinnedDirectoryHandle,
     label: str,
+    required_link_count: int = 1,
 ) -> _PinnedFileHandle:
     try:
         if os.name == "nt":
@@ -4426,7 +4468,7 @@ def _open_pinned_file(
                 inode, link_count, attributes = _windows_directory_identity(raw_handle)
                 if (
                     inode != expected.inode
-                    or link_count != 1
+                    or link_count != required_link_count
                     or attributes != expected.file_attributes
                     or attributes & _REPARSE_POINT
                     or attributes & 0x10
@@ -4451,7 +4493,11 @@ def _open_pinned_file(
         with ExitStack() as descriptor_cleanup:
             descriptor_cleanup.callback(os.close, descriptor)
             opened = _pinned_file_identity(descriptor)
-            if opened != expected or not stat.S_ISREG(opened.mode) or opened.link_count != 1:
+            if (
+                opened != expected
+                or not stat.S_ISREG(opened.mode)
+                or opened.link_count != required_link_count
+            ):
                 raise Wc029AcceptanceEvidenceError(
                     f"{label} changed before all file handles were pinned"
                 )
@@ -6051,6 +6097,71 @@ def _monitoring_request_digest(handoff: MonitoringEvidenceHandoff) -> str:
     )
 
 
+def _monitoring_bundle_digest(request: CorrelationRequest) -> str:
+    return sha256_hex(request.monitoring_bundle.canonical_bytes())
+
+
+def _require_current_correlation_request(
+    request: CorrelationRequest,
+) -> CorrelationRequest:
+    canonical = CorrelationRequest.model_validate_json(request.canonical_bytes())
+    if canonical.schema_version != CORRELATION_REQUEST_SCHEMA_VERSION:
+        raise Wc029AcceptanceEvidenceError(
+            "correlation request does not use the repository's exact production schema"
+        )
+    return canonical
+
+
+def _require_current_incident_bound_request(
+    bound_request: IncidentBoundCorrelationRequest,
+) -> IncidentBoundCorrelationRequest:
+    canonical = IncidentBoundCorrelationRequest.model_validate_json(bound_request.canonical_bytes())
+    _require_current_correlation_request(canonical.correlation_request)
+    return canonical
+
+
+def _validate_monitoring_freshness(
+    request: CorrelationRequest,
+    monitoring: MonitoringEvidenceHandoff,
+    mutation: Wc029MutationReceipt,
+    execution_manifest: Wc029ScenarioExecutionManifest,
+) -> str:
+    request = _require_current_correlation_request(request)
+    bundle = request.monitoring_bundle
+    collected_at = bundle.collected_at
+    bundle_digest = _monitoring_bundle_digest(request)
+    if (
+        collected_at is None
+        or _monitoring_request_digest(request.monitoring_handoff)
+        != _monitoring_request_digest(monitoring)
+        or request.evidence_inventory.monitoring_bundle_digest != bundle_digest
+        or monitoring.evidence.content_digest != bundle_digest
+        or not (
+            mutation.applied_at
+            < bundle.observed_start
+            <= bundle.observed_end
+            <= collected_at
+            <= monitoring.observed_at
+        )
+    ):
+        raise Wc029AcceptanceEvidenceError(
+            "monitoring evidence is stale, replayed, or not bound to its exact immutable bundle"
+        )
+    for label, timestamp in (
+        ("monitoring bundle observed start", bundle.observed_start),
+        ("monitoring bundle observed end", bundle.observed_end),
+        ("monitoring bundle collection", collected_at),
+        ("monitoring collector handoff", monitoring.observed_at),
+    ):
+        _require_in_phase(
+            execution_manifest,
+            "observe",
+            timestamp,
+            label=label,
+        )
+    return bundle_digest
+
+
 def _require_incident_state_digest(state: IncidentState) -> None:
     if state.result_digest != sha256_hex(incident_state_signature_preimage(state)):
         raise Wc029AcceptanceEvidenceError(
@@ -6216,6 +6327,8 @@ def _validate_incident_bound_request(
     inventory: Wc029VersionInventory,
     artifacts: Mapping[str, _LoadedArtifact],
 ) -> None:
+    request = _require_current_correlation_request(request)
+    bound_request = _require_current_incident_bound_request(bound_request)
     subject = bound_request.incident_subject
     subject_preimage = incident_correlation_subject_signature_preimage(subject)
     binding_payload = bound_request.model_dump(
@@ -6304,6 +6417,7 @@ def _validate_signed_scenario_execution(
         or execution_manifest.mutation_action_digest != capability.mutation_action_digest
         or execution_manifest.recovery_action_digest != capability.recovery_action_digest
         or execution_manifest.monitoring_request_digest != plan.monitoring_request_digest
+        or execution_manifest.monitoring_bundle_digest != plan.monitoring_bundle_digest
         or execution_manifest.correlation_request_digest != request.request_digest
         or execution_manifest.change_request_digest != plan.change_request_digest
         or execution_manifest.verification_input_digest != plan.verification_input_digest
@@ -6326,9 +6440,9 @@ def _validate_signed_scenario_execution(
         if artifact_id not in excluded_ids
     }
     bindings = {item.artifact_id: item for item in execution_manifest.artifacts}
-    if set(bindings) != expected_ids:
+    if len(bindings) != len(execution_manifest.artifacts) or set(bindings) != expected_ids:
         raise Wc029AcceptanceEvidenceError(
-            "signed scenario execution manifest does not cover every phase artifact"
+            "signed scenario execution manifest contains ambiguous or incomplete artifact bindings"
         )
     phase_by_id = {
         artifact_id: phase
@@ -6350,6 +6464,24 @@ def _validate_signed_scenario_execution(
                 f"signed scenario binding for {artifact_id} is invalid"
             )
     return execution_manifest
+
+
+def _validate_feed_state_timing(
+    state: IncidentState,
+    pointer: IncidentEnrichmentFeedPointer,
+    entry: IncidentFeedEntryV2,
+    feed_index: IncidentFeedIndexV2,
+    *,
+    label: str,
+) -> None:
+    if (
+        pointer.state_updated_at != state.updated_at
+        or entry.updated_at != state.updated_at
+        or not (state.updated_at < pointer.published_at < feed_index.published_at)
+    ):
+        raise Wc029AcceptanceEvidenceError(
+            f"{label} feed state, pointer, and index chronology is not exact"
+        )
 
 
 def _validate_scenario_lifecycle(
@@ -6622,6 +6754,28 @@ def _validate_scenario_lifecycle(
         )
     active_entry = active_entries[0]
     resolved_entry = resolved_entries[0]
+    _validate_feed_state_timing(
+        active_state,
+        active_feed,
+        active_entry,
+        active_feed_index,
+        label="active",
+    )
+    _validate_feed_state_timing(
+        resolved_state,
+        resolved_feed,
+        resolved_entry,
+        resolved_feed_index,
+        label="resolved",
+    )
+    active_feed_attestation = _require_model(
+        selected["feed-active-attestation"],
+        IncidentEnrichmentFeedPointerAttestation,
+    )
+    resolved_feed_attestation = _require_model(
+        selected["feed-resolved-attestation"],
+        IncidentEnrichmentFeedPointerAttestation,
+    )
     active_source_entries = tuple(
         item
         for item in active_source_index.incidents
@@ -6655,6 +6809,20 @@ def _validate_scenario_lifecycle(
     feed_key = next(item for item in inventory.keys if item.purpose == "feed")
     feed_public_key = _load_public_keys(inventory, artifacts)["feed"]
     try:
+        validate_incident_enrichment_feed_pointer_assets(
+            active_entry,
+            active_feed,
+            active_feed_attestation,
+            trusted_key_id=feed_key.key_vault_key_id,
+            signature_verifier=_signature_verifier(feed_public_key),
+        )
+        validate_incident_enrichment_feed_pointer_assets(
+            resolved_entry,
+            resolved_feed,
+            resolved_feed_attestation,
+            trusted_key_id=feed_key.key_vault_key_id,
+            signature_verifier=_signature_verifier(feed_public_key),
+        )
         validate_incident_feed_index_assets(
             active_feed_index,
             _require_model(
@@ -6681,7 +6849,8 @@ def _validate_scenario_lifecycle(
         )
     except ValueError as exc:
         raise Wc029AcceptanceEvidenceError(
-            "v2 feed indexes do not bind authoritative v1 source indexes"
+            "v2 feed indexes do not bind authoritative v1 source indexes "
+            "or exact signed feed-pointer assets"
         ) from exc
     if (
         guidance.source_binding.incident_id != active_state.incident_id
@@ -6695,34 +6864,34 @@ def _validate_scenario_lifecycle(
         or active_feed.lifecycle != "active"
         or active_feed.incident_id != active_state.incident_id
         or active_feed.state_result_digest != active_state.result_digest
+        or active_feed.state_updated_at != active_state.updated_at
         or active_feed.enrichment_asset.manifest_digest != enrichment.manifest_digest
         or active_entry.lifecycle != "active"
         or active_entry.state_result_digest != active_state.result_digest
+        or active_entry.updated_at != active_state.updated_at
+        or not (active_state.updated_at < active_feed.published_at < active_feed_index.published_at)
         or active_entry.feed_pointer_reference.content_digest
         != sha256_hex(active_feed.canonical_bytes())
         or active_entry.feed_pointer_attestation_reference.content_digest
-        != sha256_hex(
-            _require_model(
-                selected["feed-active-attestation"],
-                IncidentEnrichmentFeedPointerAttestation,
-            ).canonical_bytes()
-        )
+        != sha256_hex(active_feed_attestation.canonical_bytes())
         or resolved_feed.lifecycle != "resolved"
         or any(item.incident_id == active_state.incident_id for item in resolved_feed_index.active)
         or resolved_feed_index.published_at < active_feed_index.published_at
         or resolved_feed.incident_id != resolved_state.incident_id
         or resolved_feed.state_result_digest != resolved_state.result_digest
+        or resolved_feed.state_updated_at != resolved_state.updated_at
         or resolved_entry.lifecycle != "resolved"
         or resolved_entry.state_result_digest != resolved_state.result_digest
+        or resolved_entry.updated_at != resolved_state.updated_at
+        or not (
+            resolved_state.updated_at
+            < resolved_feed.published_at
+            < resolved_feed_index.published_at
+        )
         or resolved_entry.feed_pointer_reference.content_digest
         != sha256_hex(resolved_feed.canonical_bytes())
         or resolved_entry.feed_pointer_attestation_reference.content_digest
-        != sha256_hex(
-            _require_model(
-                selected["feed-resolved-attestation"],
-                IncidentEnrichmentFeedPointerAttestation,
-            ).canonical_bytes()
-        )
+        != sha256_hex(resolved_feed_attestation.canonical_bytes())
         or active_notification.lifecycle != "active"
         or active_notification.incident_id != active_state.incident_id
         or active_notification.transition_id != active_state.transition_id
@@ -6806,6 +6975,8 @@ def _validate_correlation_request_context(
     capability: Wc029ScenarioCapability,
     execution_manifest: Wc029ScenarioExecutionManifest,
 ) -> None:
+    request = _require_current_correlation_request(request)
+    monitoring_bundle_digest = _monitoring_bundle_digest(request)
     _validate_correlation_request_plan_binding(
         request,
         plan,
@@ -6853,6 +7024,9 @@ def _validate_correlation_request_context(
         or report_attestation.statement.authority_proof_digest
         != sha256_hex(publication_authority.canonical_bytes())
         or plan.monitoring_request_digest != _monitoring_request_digest(monitoring)
+        or plan.monitoring_bundle_digest != monitoring_bundle_digest
+        or request.evidence_inventory.monitoring_bundle_digest != monitoring_bundle_digest
+        or monitoring.evidence.content_digest != monitoring_bundle_digest
     ):
         raise Wc029AcceptanceEvidenceError(
             "scenario correlation report context does not match accepted publication"
@@ -7050,6 +7224,16 @@ def _validate_scenario_evidence(
             selected["monitoring-evidence"],
             MonitoringEvidenceHandoff,
         )
+        monitoring_bundle_digest = _validate_monitoring_freshness(
+            request,
+            monitoring,
+            mutation,
+            execution_manifest,
+        )
+        if plan.monitoring_bundle_digest != monitoring_bundle_digest:
+            raise Wc029AcceptanceEvidenceError(
+                "scenario plan does not bind the exact immutable monitoring bundle"
+            )
         published_manifest = _require_model(
             _require_loaded_artifact(
                 artifacts,
@@ -7309,6 +7493,7 @@ def _validate_global_chronology(
     correlation_request_digests: list[str] = []
     monitoring_handoff_digests: list[str] = []
     monitoring_collection_ids: list[str] = []
+    monitoring_bundle_digests: list[str] = []
     verification_input_digests: list[str] = []
     report_ids: list[str] = []
     change_request_digests: list[str] = []
@@ -7346,6 +7531,7 @@ def _validate_global_chronology(
         correlation_request_digests.append(request.request_digest)
         monitoring_handoff_digests.append(_monitoring_request_digest(monitoring))
         monitoring_collection_ids.append(monitoring.collection_id)
+        monitoring_bundle_digests.append(_monitoring_bundle_digest(request))
         verification_input_digests.append(plan.verification_input_digest)
         report_ids.append(report.report_id)
         if plan.change_request_digest is not None:
@@ -7356,6 +7542,7 @@ def _validate_global_chronology(
         ("correlation request digests", correlation_request_digests),
         ("monitoring handoff digests", monitoring_handoff_digests),
         ("monitoring collection IDs", monitoring_collection_ids),
+        ("monitoring bundle/evidence digests", monitoring_bundle_digests),
         ("verification input digests", verification_input_digests),
         ("correlation report IDs", report_ids),
         ("change request digests", change_request_digests),
@@ -7455,7 +7642,12 @@ def aggregate_acceptance_evidence(
     """Build one canonical WC-029 record without network or Azure operations."""
 
     root = Path(evidence_root)
-    index_relative = _validate_relative_file(index_file)
+    try:
+        index_relative = _validate_relative_file(index_file)
+    except ValueError as exc:
+        raise Wc029AcceptanceEvidenceError(
+            "acceptance index path is not a bounded portable relative JSON file"
+        ) from exc
     snapshot = _capture_bundle_snapshot(
         root,
         index_relative=index_relative,
@@ -7560,6 +7752,149 @@ def aggregate_acceptance_evidence(
     return Wc029AcceptanceEvidenceRecord.model_validate_json(canonicalize_json(record_payload))
 
 
+def _link_pinned_staging_file(
+    staging_pin: _PinnedFileHandle,
+    *,
+    staging_name: str,
+    filename: str,
+    output_root: Path,
+    output_pin: _PinnedDirectoryHandle,
+) -> None:
+    if os.name == "nt":
+        os.link(staging_pin.path, output_root / filename)
+        return
+    proc_descriptor_path = Path(f"/proc/self/fd/{staging_pin.descriptor}")
+    if not proc_descriptor_path.exists():
+        raise Wc029AcceptanceEvidenceError(
+            "platform cannot publish from the held staging descriptor"
+        )
+    try:
+        os.link(
+            proc_descriptor_path,
+            filename,
+            dst_dir_fd=output_pin.descriptor,
+            follow_symlinks=True,
+        )
+    except FileExistsError:
+        raise
+    except OSError as exc:
+        raise Wc029AcceptanceEvidenceError(
+            "held staging descriptor could not be linked for publication"
+        ) from exc
+
+
+def _create_pinned_staging_file(
+    staging_path: Path,
+    *,
+    staging_name: str,
+    output_pin: _PinnedDirectoryHandle,
+    payload: bytes,
+) -> _PinnedFileHandle:
+    try:
+        if os.name == "nt":
+            kernel32 = _windows_kernel32()
+            create_file = kernel32.CreateFileW
+            create_file.argtypes = [
+                ctypes.c_wchar_p,
+                ctypes.c_ulong,
+                ctypes.c_ulong,
+                ctypes.c_void_p,
+                ctypes.c_ulong,
+                ctypes.c_ulong,
+                ctypes.c_void_p,
+            ]
+            create_file.restype = ctypes.c_void_p
+            raw_handle_value = create_file(
+                str(staging_path),
+                0x80000000 | 0x40000000,
+                0x0001,
+                None,
+                1,
+                0x00000080,
+                None,
+            )
+            invalid_handle = ctypes.c_void_p(-1).value
+            if raw_handle_value in {None, invalid_handle}:
+                error = _windows_last_error()
+                if error in {80, 183}:
+                    raise FileExistsError(
+                        error,
+                        "CreateFileW staging path already exists",
+                    )
+                raise OSError(
+                    error,
+                    "CreateFileW staging creation failed",
+                )
+            raw_handle = int(raw_handle_value)
+            with ExitStack() as raw_cleanup:
+                raw_cleanup.callback(_close_windows_handle, raw_handle)
+                msvcrt = importlib.import_module("msvcrt")
+                descriptor = int(
+                    msvcrt.open_osfhandle(
+                        raw_handle,
+                        os.O_RDWR | getattr(os, "O_BINARY", 0),
+                    )
+                )
+                raw_cleanup.pop_all()
+        else:
+            descriptor = os.open(
+                staging_name,
+                os.O_RDWR
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+                dir_fd=output_pin.descriptor,
+            )
+        with ExitStack() as descriptor_cleanup:
+            descriptor_cleanup.callback(os.close, descriptor)
+            offset = 0
+            while offset < len(payload):
+                written = os.write(descriptor, payload[offset:])
+                if written <= 0:
+                    raise OSError("staging write made no forward progress")
+                offset += written
+            os.fsync(descriptor)
+            identity = _pinned_file_identity(descriptor)
+            if (
+                not stat.S_ISREG(identity.mode)
+                or stat.S_ISLNK(identity.mode)
+                or identity.file_attributes & _REPARSE_POINT
+                or identity.link_count != 1
+                or identity.size != len(payload)
+            ):
+                raise Wc029AcceptanceEvidenceError(
+                    "new acceptance staging descriptor has an invalid identity"
+                )
+            pinned = _PinnedFileHandle(
+                path=staging_path,
+                identity=identity,
+                descriptor=descriptor,
+            )
+            if (
+                _read_pinned_file(
+                    pinned,
+                    maximum_bytes=MAX_RECORD_BYTES,
+                    label="acceptance staging file",
+                )
+                != payload
+            ):
+                raise Wc029AcceptanceEvidenceError(
+                    "acceptance staging descriptor does not contain the exact record bytes"
+                )
+            descriptor_cleanup.pop_all()
+            return pinned
+    except FileExistsError:
+        raise
+    except Wc029AcceptanceEvidenceError:
+        raise
+    except OSError as exc:
+        raise Wc029AcceptanceEvidenceError(
+            "acceptance record staging bytes could not be persisted"
+        ) from exc
+
+
 def write_acceptance_record(
     record: Wc029AcceptanceEvidenceRecord,
     *,
@@ -7594,49 +7929,57 @@ def write_acceptance_record(
             staging_path = output_root / staging_name
             payload = record.canonical_bytes()
 
-            descriptor = -1
+            staging_pin: _PinnedFileHandle | None = None
             try:
-                if os.name == "nt":
-                    with staging_path.open("xb") as stream:
-                        stream.write(payload)
-                        stream.flush()
-                        os.fsync(stream.fileno())
-                else:
-                    descriptor = os.open(
-                        staging_name,
-                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
-                        0o600,
-                        dir_fd=output_pin.descriptor,
-                    )
-                    with os.fdopen(descriptor, "wb", closefd=True) as stream:
-                        descriptor = -1
-                        stream.write(payload)
-                        stream.flush()
-                        os.fsync(stream.fileno())
+                staging_pin = _create_pinned_staging_file(
+                    staging_path,
+                    staging_name=staging_name,
+                    output_pin=output_pin,
+                    payload=payload,
+                )
+                cleanup.callback(staging_pin.close)
             except FileExistsError as exc:
                 raise Wc029AcceptanceEvidenceError(
                     "acceptance staging path unexpectedly already exists"
                 ) from exc
+            except Wc029AcceptanceEvidenceError:
+                if os.name == "nt":
+                    with suppress(OSError):
+                        staging_path.unlink(missing_ok=True)
+                else:
+                    with suppress(OSError):
+                        os.unlink(staging_name, dir_fd=output_pin.descriptor)
+                raise
             except OSError as exc:
                 raise Wc029AcceptanceEvidenceError(
                     "acceptance record staging bytes could not be persisted"
                 ) from exc
-            finally:
-                if descriptor >= 0:
-                    os.close(descriptor)
 
             try:
-                if os.name == "nt":
-                    os.link(staging_path, output_path)
-                else:
-                    os.link(
-                        staging_name,
-                        filename,
-                        src_dir_fd=output_pin.descriptor,
-                        dst_dir_fd=output_pin.descriptor,
-                        follow_symlinks=False,
+                if staging_pin is None:
+                    raise Wc029AcceptanceEvidenceError(
+                        "acceptance staging file was not pinned before publication"
                     )
+                _link_pinned_staging_file(
+                    staging_pin,
+                    staging_name=staging_name,
+                    filename=filename,
+                    output_root=output_root,
+                    output_pin=output_pin,
+                )
+            except Wc029AcceptanceEvidenceError:
+                if staging_pin is not None:
+                    staging_pin.close()
+                if os.name == "nt":
+                    with suppress(OSError):
+                        staging_path.unlink(missing_ok=True)
+                else:
+                    with suppress(OSError):
+                        os.unlink(staging_name, dir_fd=output_pin.descriptor)
+                raise
             except FileExistsError as exc:
+                if staging_pin is not None:
+                    staging_pin.close()
                 if os.name == "nt":
                     with suppress(OSError):
                         staging_path.unlink(missing_ok=True)
@@ -7647,6 +7990,8 @@ def write_acceptance_record(
                     "refusing to overwrite an existing immutable acceptance record"
                 ) from exc
             except OSError as exc:
+                if staging_pin is not None:
+                    staging_pin.close()
                 if os.name == "nt":
                     with suppress(OSError):
                         staging_path.unlink(missing_ok=True)
@@ -7657,6 +8002,43 @@ def write_acceptance_record(
                     "acceptance record could not be created exclusively"
                 ) from exc
 
+            try:
+                output_identity = _stable_regular_file_identity(
+                    output_path,
+                    label="published acceptance record",
+                    required_link_count=2,
+                )
+                pinned_identity = _pinned_file_identity(staging_pin.descriptor)
+                if output_identity != pinned_identity or output_identity.link_count != 2:
+                    raise Wc029AcceptanceEvidenceError(
+                        "published acceptance record is not the held verified staging inode"
+                    )
+                staging_pin.identity = pinned_identity
+                if (
+                    _read_pinned_file(
+                        staging_pin,
+                        maximum_bytes=MAX_RECORD_BYTES,
+                        label="published acceptance record",
+                    )
+                    != payload
+                ):
+                    raise Wc029AcceptanceEvidenceError(
+                        "published acceptance record is not the held verified staging inode"
+                    )
+            except Wc029AcceptanceEvidenceError:
+                staging_pin.close()
+                if os.name == "nt":
+                    with suppress(OSError):
+                        output_path.unlink(missing_ok=True)
+                    with suppress(OSError):
+                        staging_path.unlink(missing_ok=True)
+                else:
+                    with suppress(OSError):
+                        os.unlink(filename, dir_fd=output_pin.descriptor)
+                    with suppress(OSError):
+                        os.unlink(staging_name, dir_fd=output_pin.descriptor)
+                raise
+            staging_pin.close()
             if os.name == "nt":
                 with suppress(OSError):
                     staging_path.unlink()

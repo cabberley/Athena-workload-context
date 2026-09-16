@@ -5,6 +5,7 @@ import json
 import os
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -15,11 +16,12 @@ from pydantic import BaseModel
 
 import athena_context.wc029_acceptance_evidence as acceptance
 from athena_context.contracts import (
+    CORRELATION_REQUEST_SCHEMA_VERSION,
+    MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION,
     ActiveIncidentEntry,
     ActiveIncidentIndex,
     ActiveIncidentIndexAttestation,
     ChangeEvidenceArtifact,
-    CorrelationEvidenceInventory,
     CorrelationReport,
     CorrelationRequest,
     DependencyPath,
@@ -41,12 +43,12 @@ from athena_context.contracts import (
     IncidentGuidanceAssetReference,
     IncidentGuidanceAttestation,
     IncidentGuidanceSourceBinding,
-    IncidentHealthTransition,
     IncidentNotificationEnvelopeV2,
     IncidentNotificationV2,
     IncidentNotificationV2Attestation,
     IncidentState,
     IncidentStateAttestation,
+    MonitoringEvidenceBundle,
     MonitoringEvidenceHandoff,
     PublishedContextAuthority,
     PublishedCorrelationReportAssetReference,
@@ -73,6 +75,11 @@ from athena_context.contracts.change_ingestion import (
 )
 from athena_context.contracts.monitoring import monitoring_handoff_preimage
 from athena_context.fixtures import load_canonical_manifest
+from athena_context.monitoring_collection import (
+    CommittedMonitoringCollection,
+    PreparedMonitoringCollection,
+    build_collected_correlation_request,
+)
 from test_presentation_asset_gateway import _resolved_feed_v2_source_fixture
 from test_wc024_monitoring_contract import _trusted_signed_handoff
 from test_wc026_correlation_contract import (
@@ -83,6 +90,7 @@ from test_wc026_correlation_contract import (
     _report_for,
     _request,
 )
+from test_wc028_monitoring_collection import _execute as _execute_wc028_collection
 
 _NOW = datetime(2026, 9, 14, 4, 0, tzinfo=UTC)
 _SCENARIO_BASE = datetime(2026, 9, 10, 1, 45, tzinfo=UTC)
@@ -1672,6 +1680,15 @@ def _signed_monitoring(
     return MonitoringEvidenceHandoff.model_validate(payload), key, private_key
 
 
+@lru_cache(maxsize=1)
+def _wc028_request_template() -> tuple[
+    PreparedMonitoringCollection,
+    CorrelationRequest,
+]:
+    prepared, _committed, request, _commit = _execute_wc028_collection(direct_attribution=True)
+    return prepared, request
+
+
 def _correlation_request_for_context(
     context_binding: PublishedRuntimeContextBinding,
     *,
@@ -1679,146 +1696,171 @@ def _correlation_request_for_context(
     rule_catalog_digest: str,
     monitoring_key: KeyMaterial,
     monitoring_private_key: rsa.RSAPrivateKey,
+    stale_bundle: bool = False,
 ) -> CorrelationRequest:
     source = _request(
         dependency_paths=context_binding.dependency_paths,
         rule_catalog_digest=rule_catalog_digest,
     )
-    handoff_payload = source.monitoring_handoff.model_dump(
-        mode="python",
-        by_alias=True,
-        exclude={"collector_attestation"},
+    real_prepared, real_request = _wc028_request_template()
+    intent_reference = real_request.monitoring_bundle.monitoring_intent_reference
+    if intent_reference is None:
+        raise AssertionError("real WC-028 request must contain monitoring intent evidence")
+    control_provenance = next(
+        item.control_provenance
+        for item in real_request.monitoring_bundle.observations
+        if item.control_provenance is not None
     )
-    collection_id = (
-        "wc024-"
-        + sha256_hex(f"{rule_catalog_digest}:{trusted_as_of.isoformat()}").removeprefix("sha256:")[
-            :12
-        ]
-    )
-    evidence_reference = source.monitoring_handoff.evidence.model_copy(
-        update={"name": f"wc024-monitoring/{collection_id}/evidence.json"}
-    )
-    handoff_payload["collectionId"] = collection_id
-    handoff_payload["evidence"] = evidence_reference.model_dump(
-        mode="python",
-        by_alias=True,
-    )
-    handoff_payload["observedAt"] = trusted_as_of - timedelta(minutes=1)
-    handoff_preimage = monitoring_handoff_preimage(handoff_payload)
-    handoff_preimage_bytes = canonicalize_json(handoff_preimage).encode("utf-8")
-    handoff_payload["collectorAttestation"] = {
-        "signatureAlgorithm": "RS256",
-        "trustAnchorRef": monitoring_key.key_id,
-        "signedPreimageDigest": compute_artifact_digest(handoff_preimage),
-        "signature": base64.b64encode(
-            monitoring_private_key.sign(
-                handoff_preimage_bytes,
-                padding.PKCS1v15(),
-                hashes.SHA256(),
-            )
-        ).decode("ascii"),
-    }
-    monitoring_handoff = MonitoringEvidenceHandoff.model_validate(handoff_payload)
-    evidence_index = tuple(
-        item.model_copy(update={"source_reference": monitoring_handoff.evidence})
-        if item.source_reference == source.monitoring_handoff.evidence
-        else item
-        for item in source.evidence_index
-    )
-    evidence_by_id = {item.evidence_id: item for item in evidence_index}
-    transition_payload = source.incident_anchor.model_dump(
-        mode="python",
-        by_alias=True,
-        exclude={"transition_id", "transition_digest"},
-    )
-    transition_payload.update(
+    interval_by_state = (
         {
-            "previousStateEvidence": tuple(
-                evidence_by_id[item.evidence_id]
-                for item in source.incident_anchor.previous_state_evidence
+            "healthy": (
+                trusted_as_of - timedelta(minutes=14),
+                trusted_as_of - timedelta(minutes=13),
             ),
-            "currentStateEvidence": tuple(
-                evidence_by_id[item.evidence_id]
-                for item in source.incident_anchor.current_state_evidence
+            "unhealthy": (
+                trusted_as_of - timedelta(minutes=12),
+                trusted_as_of - timedelta(minutes=11),
+            ),
+        }
+        if stale_bundle
+        else {
+            "healthy": (
+                trusted_as_of - timedelta(minutes=8),
+                trusted_as_of - timedelta(minutes=6),
+            ),
+            "unhealthy": (
+                trusted_as_of - timedelta(minutes=5),
+                trusted_as_of - timedelta(minutes=3),
             ),
         }
     )
-    transition_digest = compute_artifact_digest(_json_value(transition_payload))
-    incident_anchor = IncidentHealthTransition(
-        **transition_payload,
-        transitionId=("transition-" + transition_digest.removeprefix("sha256:")[:32]),
-        transitionDigest=transition_digest,
-    )
-    source_references = [
-        monitoring_handoff.evidence,
-        context_binding.publication_authority_reference,
-        *(handoff.artifact for handoff in source.change_handoffs),
-    ]
-    if source.monitoring_bundle.monitoring_intent_reference is not None:
-        source_references.extend(
-            (
-                source.monitoring_bundle.monitoring_intent_reference.intent_reference,
-                source.monitoring_bundle.monitoring_intent_reference.attestation_reference,
+    bundle_observed_start = min(item[0] for item in interval_by_state.values())
+    bundle_observed_end = max(item[1] for item in interval_by_state.values())
+    observations = []
+    query_execution_digests: list[str] = []
+    for observation in source.monitoring_bundle.observations:
+        observed_start, observed_end = interval_by_state[observation.state]
+        query_execution_digest = compute_artifact_digest(
+            {
+                "schemaVersion": "athena.wc028MonitoringQueryExecution.v1",
+                "ruleCatalogDigest": rule_catalog_digest,
+                "sourceObservationDigest": observation.observation_digest,
+                "observedStart": observed_start,
+                "observedEnd": observed_end,
+            }
+        )
+        observation_payload = observation.model_dump(
+            mode="python",
+            by_alias=True,
+            exclude={"observation_id", "observation_digest"},
+        )
+        observation_payload.update(
+            {
+                "observedStart": observed_start,
+                "observedEnd": observed_end,
+                "controlProvenance": control_provenance,
+                "queryExecutionDigest": query_execution_digest,
+            }
+        )
+        observation_digest = compute_artifact_digest(_json_value(observation_payload))
+        observations.append(
+            type(observation)(
+                **observation_payload,
+                observationId=("obs-" + observation_digest.removeprefix("sha256:")[:32]),
+                observationDigest=observation_digest,
             )
         )
-    inventory_payload = source.evidence_inventory.model_dump(
+        query_execution_digests.append(query_execution_digest)
+    observations = sorted(observations, key=lambda item: item.observation_id)
+
+    coverage = source.monitoring_bundle.coverage[0]
+    coverage_payload = coverage.model_dump(
         mode="python",
         by_alias=True,
-        exclude={"inventory_digest"},
+        exclude={"coverage_id", "coverage_digest"},
     )
-    inventory_payload.update(
+    coverage_payload.update(
         {
-            "contextBindingDigest": context_binding.binding_digest,
-            "incidentTransitionDigest": incident_anchor.transition_digest,
-            "monitoringHandoffDigest": (monitoring_handoff.compute_artifact_digest_value()),
-            "evidenceIndexDigest": compute_artifact_digest(
-                [
-                    item.model_dump(
-                        mode="json",
-                        by_alias=True,
-                        exclude_none=True,
-                    )
-                    for item in evidence_index
-                ]
-            ),
-            "sourceReferences": tuple(
-                sorted(
-                    source_references,
-                    key=lambda item: (
-                        item.name,
-                        item.version,
-                        item.content_digest,
-                    ),
+            "coverageStart": bundle_observed_start,
+            "coverageEnd": bundle_observed_end,
+            "controlProvenance": control_provenance,
+            "queryExecutionDigests": tuple(sorted(query_execution_digests)),
+        }
+    )
+    coverage_digest = compute_artifact_digest(_json_value(coverage_payload))
+    current_coverage = type(coverage)(
+        **coverage_payload,
+        coverageId=("coverage-" + coverage_digest.removeprefix("sha256:")[:32]),
+        coverageDigest=coverage_digest,
+    )
+    monitoring_bundle = MonitoringEvidenceBundle(
+        schemaVersion=MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION,
+        workloadId=source.monitoring_bundle.workload_id,
+        monitoringContractDigest=source.monitoring_bundle.monitoring_contract_digest,
+        monitoringIntentReference=intent_reference,
+        collectedAt=trusted_as_of - timedelta(minutes=2),
+        observedStart=bundle_observed_start,
+        observedEnd=bundle_observed_end,
+        observations=tuple(observations),
+        coverage=(current_coverage,),
+        expectedCoverageScopeDigests=(source.monitoring_bundle.expected_coverage_scope_digests),
+    )
+    monitoring_bundle_digest = sha256_hex(monitoring_bundle.canonical_bytes())
+    collection_id = "wc024-" + monitoring_bundle_digest.removeprefix("sha256:")[:12]
+    handoff_payload: dict[str, object] = {
+        "schemaVersion": "athena.wc024MonitoringEvidenceHandoff.v1",
+        "collectorContractDigest": monitoring_bundle.monitoring_contract_digest,
+        "collectionId": collection_id,
+        "observedAt": trusted_as_of - timedelta(minutes=1),
+        "evidence": VersionPinnedBlobReference(
+            name=f"wc024-monitoring/{collection_id}/evidence.json",
+            version=source.monitoring_handoff.evidence.version,
+            contentDigest=monitoring_bundle_digest,
+        ).model_dump(mode="python", by_alias=True),
+    }
+    handoff_preimage = monitoring_handoff_preimage(handoff_payload)
+    handoff_preimage_bytes = canonicalize_json(handoff_preimage).encode("utf-8")
+    monitoring_handoff = MonitoringEvidenceHandoff(
+        **handoff_payload,
+        collectorAttestation={
+            "signatureAlgorithm": "RS256",
+            "trustAnchorRef": monitoring_key.key_id,
+            "signedPreimageDigest": compute_artifact_digest(handoff_preimage),
+            "signature": base64.b64encode(
+                monitoring_private_key.sign(
+                    handoff_preimage_bytes,
+                    padding.PKCS1v15(),
+                    hashes.SHA256(),
                 )
-            ),
-        }
+            ).decode("ascii"),
+        },
     )
-    evidence_inventory = CorrelationEvidenceInventory(
-        **inventory_payload,
-        inventoryDigest=compute_artifact_digest(_json_value(inventory_payload)),
+    previous = next(item for item in observations if item.state == "healthy")
+    current = next(item for item in observations if item.state == "unhealthy")
+    prepared = PreparedMonitoringCollection(
+        intent_id=real_prepared.intent_id,
+        intent_digest=real_prepared.intent_digest,
+        context_binding_digest=context_binding.binding_digest,
+        monitoring_intent_reference=real_prepared.monitoring_intent_reference,
+        monitoring_bundle=monitoring_bundle,
+        change_artifacts=source.change_artifacts,
+        incident_resource_id=source.incident_anchor.affected_resource_id,
+        previous_health_observation_id=previous.observation_id,
+        current_health_observation_ids=(current.observation_id,),
+        current_health_state="unhealthy",
     )
-    request_payload = source.model_dump(
-        mode="python",
-        by_alias=True,
-        exclude={"request_id", "request_digest"},
+    committed = CommittedMonitoringCollection(
+        monitoring_handoff=monitoring_handoff,
+        change_handoffs=source.change_handoffs,
     )
-    request_payload.update(
-        {
-            "issuedAt": (trusted_as_of - timedelta(minutes=11, seconds=30)),
-            "trustedAsOf": trusted_as_of,
-            "expiresAt": trusted_as_of + timedelta(seconds=20),
-            "contextBinding": context_binding,
-            "incidentAnchor": incident_anchor,
-            "monitoringHandoff": monitoring_handoff,
-            "evidenceIndex": evidence_index,
-            "evidenceInventory": evidence_inventory,
-        }
-    )
-    request_digest = compute_artifact_digest(_json_value(request_payload))
-    return CorrelationRequest(
-        **request_payload,
-        requestId=("request-" + request_digest.removeprefix("sha256:")[:32]),
-        requestDigest=request_digest,
+    return build_collected_correlation_request(
+        prepared,
+        committed,
+        context_binding=context_binding,
+        incident_revision=source.incident_revision,
+        issued_at=trusted_as_of - timedelta(minutes=11, seconds=30),
+        trusted_as_of=trusted_as_of,
+        expires_at=trusted_as_of + timedelta(seconds=20),
     )
 
 
@@ -2133,6 +2175,7 @@ def _scenario_plan(
     baseline_state_digest: str,
     planned_at: datetime,
     monitoring_request_digest: str,
+    monitoring_bundle_digest: str,
     correlation_context_binding_digest: str,
     change_request_digest: str | None,
     verification_input_digest: str,
@@ -2162,6 +2205,7 @@ def _scenario_plan(
         "mutationActionDigest": capability.mutation_action_digest,
         "recoveryActionDigest": capability.recovery_action_digest,
         "monitoringRequestDigest": monitoring_request_digest,
+        "monitoringBundleDigest": monitoring_bundle_digest,
         "correlationContextBindingDigest": (correlation_context_binding_digest),
         "correlationRequestIntentNonce": correlation_request_intent_nonce,
         "correlationRequestIntentDigest": correlation_request_intent_digest,
@@ -3803,6 +3847,9 @@ def _build_bundle(tmp_path: Path) -> BundleFixture:
             baseline_state_digest=baseline_state.state_digest,
             planned_at=planned_at,
             monitoring_request_digest=acceptance._monitoring_request_digest(monitoring),
+            monitoring_bundle_digest=sha256_hex(
+                scenario_request.monitoring_bundle.canonical_bytes()
+            ),
             correlation_context_binding_digest=(scenario_request.context_binding.binding_digest),
             change_request_digest=(
                 change.evidence.source_digest if scenario_class == "nsg-connectivity-loss" else None
@@ -4162,6 +4209,9 @@ def _build_bundle(tmp_path: Path) -> BundleFixture:
         )
 
         observe_timestamps = [
+            scenario_request.monitoring_bundle.observed_start,
+            scenario_request.monitoring_bundle.observed_end,
+            scenario_request.monitoring_bundle.collected_at,
             monitoring.observed_at,
             scenario_report.as_of,
         ]
@@ -4250,6 +4300,7 @@ def _build_bundle(tmp_path: Path) -> BundleFixture:
             "mutationActionDigest": capability.mutation_action_digest,
             "recoveryActionDigest": capability.recovery_action_digest,
             "monitoringRequestDigest": (scenario_plan.monitoring_request_digest),
+            "monitoringBundleDigest": scenario_plan.monitoring_bundle_digest,
             "correlationRequestDigest": scenario_request.request_digest,
             "changeRequestDigest": scenario_plan.change_request_digest,
             "verificationInputDigest": (scenario_plan.verification_input_digest),
@@ -5632,6 +5683,113 @@ def test_feed_source_references_bind_exact_captured_state_and_attestation_bytes(
         _aggregate(bundle)
 
 
+def test_shared_feed_pointer_validation_and_exact_state_chronology(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle = _build_bundle(tmp_path)
+    calls: list[str] = []
+    real_validator = acceptance.validate_incident_enrichment_feed_pointer_assets
+
+    def tracked_validator(
+        entry: IncidentFeedEntryV2,
+        pointer: IncidentEnrichmentFeedPointer,
+        attestation: IncidentEnrichmentFeedPointerAttestation,
+        *,
+        trusted_key_id: str,
+        signature_verifier: Any,
+    ) -> None:
+        calls.append(pointer.lifecycle)
+        real_validator(
+            entry,
+            pointer,
+            attestation,
+            trusted_key_id=trusted_key_id,
+            signature_verifier=signature_verifier,
+        )
+
+    monkeypatch.setattr(
+        acceptance,
+        "validate_incident_enrichment_feed_pointer_assets",
+        tracked_validator,
+    )
+    _aggregate(bundle)
+    assert calls == ["active", "resolved"]
+
+    prefix = "scenario-web-tier-failure"
+    cases = (
+        (
+            "active",
+            IncidentState.model_validate_json(
+                bundle.artifact_paths[f"{prefix}-incident-active"].read_bytes()
+            ),
+            IncidentEnrichmentFeedPointer.model_validate_json(
+                bundle.artifact_paths[f"{prefix}-feed-active"].read_bytes()
+            ),
+            IncidentFeedIndexV2.model_validate_json(
+                bundle.artifact_paths[f"{prefix}-feed-index-active"].read_bytes()
+            ),
+        ),
+        (
+            "resolved",
+            IncidentState.model_validate_json(
+                bundle.artifact_paths[f"{prefix}-incident-resolved"].read_bytes()
+            ),
+            IncidentEnrichmentFeedPointer.model_validate_json(
+                bundle.artifact_paths[f"{prefix}-feed-resolved"].read_bytes()
+            ),
+            IncidentFeedIndexV2.model_validate_json(
+                bundle.artifact_paths[f"{prefix}-feed-index-resolved"].read_bytes()
+            ),
+        ),
+    )
+    for lifecycle, state, pointer, feed_index in cases:
+        entry = feed_index.active[0] if lifecycle == "active" else feed_index.recently_resolved[0]
+        acceptance._validate_feed_state_timing(
+            state,
+            pointer,
+            entry,
+            feed_index,
+            label=lifecycle,
+        )
+        invalid_cases = (
+            (
+                pointer.model_copy(
+                    update={"state_updated_at": state.updated_at + timedelta(seconds=1)}
+                ),
+                entry,
+                feed_index,
+            ),
+            (
+                pointer,
+                entry.model_copy(update={"updated_at": state.updated_at + timedelta(seconds=1)}),
+                feed_index,
+            ),
+            (
+                pointer.model_copy(update={"published_at": state.updated_at}),
+                entry,
+                feed_index,
+            ),
+            (
+                pointer,
+                entry,
+                feed_index.model_copy(update={"published_at": pointer.published_at}),
+            ),
+        )
+        for invalid_pointer, invalid_entry, invalid_index in invalid_cases:
+            with pytest.raises(
+                acceptance.Wc029AcceptanceEvidenceError,
+                match=f"{lifecycle} feed state",
+            ):
+                acceptance._validate_feed_state_timing(
+                    state,
+                    invalid_pointer,
+                    invalid_entry,
+                    invalid_index,
+                    label=lifecycle,
+                )
+
+
 @pytest.mark.parametrize(
     "url",
     [
@@ -5898,6 +6056,109 @@ def test_output_write_is_exclusive_and_cleans_failed_staging(
     assert list(failed_output.iterdir()) == []
 
 
+def test_publication_links_the_held_staging_inode_across_path_replacement_race(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle = _build_bundle(tmp_path)
+    record = _aggregate(bundle)
+    real_link = acceptance._link_pinned_staging_file
+    race_attempted = False
+    replacement_blocked = False
+
+    def replace_path_before_link(
+        staging_pin: acceptance._PinnedFileHandle,
+        *,
+        staging_name: str,
+        filename: str,
+        output_root: Path,
+        output_pin: acceptance._PinnedDirectoryHandle,
+    ) -> None:
+        nonlocal race_attempted, replacement_blocked
+        race_attempted = True
+        staging_path = output_root / staging_name
+        try:
+            staging_path.unlink()
+            staging_path.write_bytes(b'{"attackerControlled":true}\n')
+        except OSError:
+            replacement_blocked = True
+        real_link(
+            staging_pin,
+            staging_name=staging_name,
+            filename=filename,
+            output_root=output_root,
+            output_pin=output_pin,
+        )
+
+    monkeypatch.setattr(
+        acceptance,
+        "_link_pinned_staging_file",
+        replace_path_before_link,
+    )
+    if os.name == "nt":
+        output = acceptance.write_acceptance_record(
+            record,
+            output_directory=bundle.output,
+            evidence_root=bundle.root,
+        )
+        assert replacement_blocked
+        assert output.read_bytes() == record.canonical_bytes()
+    else:
+        with pytest.raises(
+            acceptance.Wc029AcceptanceEvidenceError,
+            match="platform cannot publish|held staging descriptor could not be linked",
+        ):
+            acceptance.write_acceptance_record(
+                record,
+                output_directory=bundle.output,
+                evidence_root=bundle.root,
+            )
+        assert not replacement_blocked
+        assert list(bundle.output.iterdir()) == []
+    assert race_attempted
+
+
+def test_failed_final_inode_verification_removes_poisoned_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle = _build_bundle(tmp_path)
+    record = _aggregate(bundle)
+    real_identity = acceptance._stable_regular_file_identity
+
+    def mismatched_final_identity(
+        path: Path,
+        *,
+        label: str,
+        required_link_count: int,
+    ) -> acceptance._PathIdentity:
+        identity = real_identity(
+            path,
+            label=label,
+            required_link_count=required_link_count,
+        )
+        if label == "published acceptance record":
+            return replace(identity, inode=identity.inode + 1)
+        return identity
+
+    monkeypatch.setattr(
+        acceptance,
+        "_stable_regular_file_identity",
+        mismatched_final_identity,
+    )
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="not the held verified staging inode",
+    ):
+        acceptance.write_acceptance_record(
+            record,
+            output_directory=bundle.output,
+            evidence_root=bundle.root,
+        )
+
+    assert list(bundle.output.iterdir()) == []
+
+
 def test_cli_failure_creates_no_record(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -5909,6 +6170,36 @@ def test_cli_failure_creates_no_record(
 
     assert result == 2
     assert json.loads(capsys.readouterr().err)["complete"] is False
+    assert list(bundle.output.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "index_value",
+    [
+        "../acceptance-index.json",
+        "/absolute-index.json",
+        "C:/absolute-index.json",
+        "nested\\acceptance-index.json",
+        "índice.json",
+        "\udcff.json",
+    ],
+)
+def test_index_argument_validation_is_bounded_exit_two(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    index_value: str,
+) -> None:
+    bundle = _build_bundle(tmp_path)
+    arguments = [*_cli_arguments(bundle), "--index", index_value]
+
+    result = acceptance.main(arguments)
+
+    assert result == 2
+    error = json.loads(capsys.readouterr().err)
+    assert error == {
+        "complete": False,
+        "error": ("acceptance index path is not a bounded portable relative JSON file"),
+    }
     assert list(bundle.output.iterdir()) == []
 
 
@@ -6148,7 +6439,7 @@ def test_scenario_mode_is_derived_and_stale_monitoring_is_rejected(
     )
     with pytest.raises(
         acceptance.Wc029AcceptanceEvidenceError,
-        match="context does not match accepted publication",
+        match="stale, replayed, or not bound",
     ):
         _aggregate(stale)
 
@@ -6398,6 +6689,126 @@ def test_report_and_attestation_require_the_accepted_context_binding(
         match="statement does not match exact captured provenance",
     ):
         _aggregate(incident_mismatch)
+
+
+def test_acceptance_uses_exact_current_wc028_correlation_contract() -> None:
+    _prepared, _committed, real_request, _commit = _execute_wc028_collection(
+        direct_attribution=True
+    )
+    publication, _private_key = _publication_assets()
+    incident = _trusted_incident_assets(
+        publication,
+        correlation_request=real_request,
+    )
+
+    assert real_request.schema_version == CORRELATION_REQUEST_SCHEMA_VERSION
+    assert (
+        acceptance._EXPECTED_SCHEMA_BY_CLASS["correlation-request"]
+        == CORRELATION_REQUEST_SCHEMA_VERSION
+    )
+    assert acceptance._require_current_correlation_request(
+        real_request
+    ) == CorrelationRequest.model_validate_json(real_request.canonical_bytes())
+    assert acceptance._require_current_incident_bound_request(
+        incident.incident_bound_request
+    ) == IncidentBoundCorrelationRequest.model_validate_json(
+        incident.incident_bound_request.canonical_bytes()
+    )
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="exact production schema",
+    ):
+        acceptance._require_current_correlation_request(_request())
+
+
+def test_monitoring_bundle_freshness_rejects_fresh_wrapper_around_stale_bytes(
+    tmp_path: Path,
+) -> None:
+    bundle = _build_bundle(tmp_path)
+    scenario_class = "disk-capacity-pressure"
+    prefix = f"scenario-{scenario_class}"
+    request = CorrelationRequest.model_validate_json(
+        bundle.artifact_paths[f"{prefix}-correlation-request"].read_bytes()
+    )
+    mutation = acceptance.Wc029MutationReceipt.model_validate_json(
+        bundle.artifact_paths[f"{prefix}-mutation"].read_bytes()
+    )
+    manifest = acceptance.Wc029ScenarioExecutionManifest.model_validate_json(
+        bundle.artifact_paths[f"{prefix}-execution-manifest"].read_bytes()
+    )
+    stale_request = _correlation_request_for_context(
+        request.context_binding,
+        trusted_as_of=request.trusted_as_of,
+        rule_catalog_digest=request.rule_catalog_digest,
+        monitoring_key=bundle.keys["monitoring"],
+        monitoring_private_key=bundle.private_keys["monitoring"],
+        stale_bundle=True,
+    )
+
+    assert stale_request.monitoring_bundle.observed_end < mutation.applied_at
+    assert stale_request.monitoring_handoff.observed_at > mutation.applied_at
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="stale, replayed, or not bound",
+    ):
+        acceptance._validate_monitoring_freshness(
+            stale_request,
+            stale_request.monitoring_handoff,
+            mutation,
+            manifest,
+        )
+
+
+def test_monitoring_bundle_and_collector_times_are_inside_signed_observe_phase(
+    tmp_path: Path,
+) -> None:
+    bundle = _build_bundle(tmp_path)
+    scenario_class = "disk-capacity-pressure"
+    prefix = f"scenario-{scenario_class}"
+    request = CorrelationRequest.model_validate_json(
+        bundle.artifact_paths[f"{prefix}-correlation-request"].read_bytes()
+    )
+    mutation = acceptance.Wc029MutationReceipt.model_validate_json(
+        bundle.artifact_paths[f"{prefix}-mutation"].read_bytes()
+    )
+    manifest = acceptance.Wc029ScenarioExecutionManifest.model_validate_json(
+        bundle.artifact_paths[f"{prefix}-execution-manifest"].read_bytes()
+    )
+    collected_at = request.monitoring_bundle.collected_at
+    assert collected_at is not None
+    observe_index = 2
+    cases = (
+        (
+            "monitoring bundle observed start",
+            {"started_at": request.monitoring_bundle.observed_start + timedelta(seconds=1)},
+        ),
+        (
+            "monitoring bundle observed end",
+            {"completed_at": request.monitoring_bundle.observed_end - timedelta(seconds=1)},
+        ),
+        (
+            "monitoring bundle collection",
+            {"completed_at": collected_at - timedelta(seconds=1)},
+        ),
+        (
+            "monitoring collector handoff",
+            {"completed_at": request.monitoring_handoff.observed_at - timedelta(seconds=1)},
+        ),
+    )
+    for label, update in cases:
+        windows = list(manifest.phase_windows)
+        windows[observe_index] = windows[observe_index].model_copy(update=update)
+        out_of_phase = manifest.model_copy(update={"phase_windows": tuple(windows)})
+        with pytest.raises(
+            acceptance.Wc029AcceptanceEvidenceError,
+            match=label,
+        ):
+            acceptance._validate_monitoring_freshness(
+                request,
+                request.monitoring_handoff,
+                mutation,
+                out_of_phase,
+            )
 
 
 def test_correlation_request_target_intent_and_phase_timing_are_bound(
@@ -7570,6 +7981,34 @@ def test_snapshot_rejects_directory_handle_exhaustion_inputs(
         _aggregate(total_characters)
 
 
+def test_signed_manifest_artifact_ids_are_globally_unique_across_phases(
+    tmp_path: Path,
+) -> None:
+    bundle = _build_bundle(tmp_path)
+    manifest = acceptance.Wc029ScenarioExecutionManifest.model_validate_json(
+        bundle.artifact_paths["scenario-disk-capacity-pressure-execution-manifest"].read_bytes()
+    )
+    artifacts = list(manifest.artifacts)
+    plan_binding = next(item for item in artifacts if item.phase == "plan")
+    apply_index = next(index for index, item in enumerate(artifacts) if item.phase == "apply")
+    artifacts[apply_index] = artifacts[apply_index].model_copy(
+        update={"artifact_id": plan_binding.artifact_id}
+    )
+    payload = manifest.model_dump(
+        mode="python",
+        by_alias=True,
+        exclude={"manifest_digest"},
+    )
+    payload["artifacts"] = tuple(artifacts)
+
+    with pytest.raises(ValueError, match="unique and sorted"):
+        _digest_bound_model(
+            acceptance.Wc029ScenarioExecutionManifest,
+            payload,
+            digest_field="manifestDigest",
+        )
+
+
 def test_phase_windows_and_lifecycle_timestamps_are_strictly_ordered(
     tmp_path: Path,
 ) -> None:
@@ -7724,6 +8163,7 @@ def test_scenario_execution_intervals_and_request_identities_are_global(
         "correlation request digests",
         "monitoring handoff digests",
         "monitoring collection IDs",
+        "monitoring bundle/evidence digests",
     ):
         with pytest.raises(
             acceptance.Wc029AcceptanceEvidenceError,

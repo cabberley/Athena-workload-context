@@ -219,6 +219,19 @@ must equal both the plan and trusted capability targets. Request issuance belong
 is retained by the later signed execution manifest and report lineage, not by the precommit plan,
 and is not used as a substitute for the earlier intent commitment.
 
+The accepted correlation request schema is imported from the repository's
+`CORRELATION_REQUEST_SCHEMA_VERSION` and parsed through the canonical `CorrelationRequest` nested
+inside `IncidentBoundCorrelationRequest`. Legacy WC-026 requests are not an acceptance fallback.
+When the production contract advances, a bundle must use the newly imported exact version; merely
+adding another locally accepted version is forbidden.
+
+The plan and signed execution manifest also bind the canonical WC-028 monitoring-bundle SHA-256.
+The harness requires that digest to equal the handoff evidence digest and the request inventory
+digest, and globally deduplicates it across scenarios in addition to the handoff and collection ID.
+`observedStart`, `observedEnd`, `collectedAt`, and the signed collector handoff time must all follow
+the mutation, remain ordered, and fall inside the signed observe phase. A newly signed or renamed
+handoff around previously captured bundle bytes is stale evidence, not a new observation.
+
 Every signed phase window has positive duration and is strictly separated from the following
 window. Mutation, recovery, recovered-state capture, Job start, Job completion, Job read-back, and
 recovery proof timestamps must be strictly increasing; equal timestamps fail.
@@ -226,6 +239,10 @@ recovery proof timestamps must be strictly increasing; equal timestamps fail.
 Signed scenario execution intervals are sorted globally and must be strictly non-overlapping.
 Scenario execution IDs, monitoring/correlation request identities, verification inputs, report
 IDs, and change-request identities must be globally unique.
+
+Artifact IDs inside a signed scenario-execution manifest are globally unique across all phases.
+The `(phase, artifactId)` ordering cannot hide the same artifact ID in two phases, and the runtime
+lookup map must retain exactly as many entries as the signed artifact list.
 
 The monitoring identity is the digest of the complete canonical handoff, including `collectionId`,
 `observedAt`, the exact immutable evidence reference, and the collector attestation. Both that
@@ -297,7 +314,12 @@ not chosen by the index. The harness verifies:
   incident-producing scenario; and
 - each active and resolved feed pointer's `sourceStateReference` and
   `sourceStateAttestationReference` content digests against the exact captured IncidentState and
-  attestation bytes.
+  attestation bytes;
+- the shared `validate_incident_enrichment_feed_pointer_assets` validator for both active and
+  resolved pointers; and
+- exact equality between the captured IncidentState `updatedAt`, feed-pointer `stateUpdatedAt`,
+  and feed-index entry `updatedAt`, with strict state publication → pointer publication → feed
+  index publication chronology.
 
 Runtime verification remains required before capture; offline verification is a second acceptance
 check, not a replacement.
@@ -359,6 +381,11 @@ Every scan, pin, open, stat, and platform-identity `OSError` is likewise transla
 races cannot leak a partially acquired handle. The CLI reports these failures with exit code `2`
 and creates no acceptance record.
 
+The `--index` value is validated as a bounded portable relative JSON path before any snapshot
+operation. Traversal, absolute Windows/POSIX paths, alternate separators, NULs, and non-portable
+encodings become the same bounded domain failure and CLI exit code `2`; raw `ValueError` and
+tracebacks are not exposed.
+
 ## Run
 
 ```powershell
@@ -392,7 +419,11 @@ digest.
 
 Output publication uses an exclusive staging file followed by a no-replace hard-link commit. Once
 the final digest-named link succeeds, staging cleanup failure cannot turn the committed record into
-a reported failure.
+a reported failure. The fsynced staging inode remains open and verified while publication occurs.
+Where the platform supports descriptor-based linking the held descriptor is used; otherwise the
+staging path is revalidated immediately before linking. Before success, the final link's inode/file
+ID and exact bytes are compared with the still-held staging handle, so replacing the staging path
+cannot publish attacker-selected bytes.
 
 Archive the closed input directory and content-addressed output together under the approved release
 retention policy. Any later byte change produces a different digest and requires a new record.
