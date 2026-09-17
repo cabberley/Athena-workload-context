@@ -287,9 +287,17 @@ window. Mutation, recovery, recovered-state capture, Job start, Job completion, 
 recovery proof timestamps must be strictly increasing; equal timestamps fail.
 
 Every signed scenario-execution manifest also binds the exact acceptance ID, run ID, and
-out-of-band approved inventory digest. A cryptographically valid scenario from another acceptance
-run is rejected even when its inventory, evidence, and timestamps otherwise match. The canonical
-ordered scenario-set digest rejects missing, extra, reordered, or substituted scenarios.
+out-of-band approved inventory digest. It additionally binds an acceptance-run lineage digest
+derived from global Job coordinates known when capture starts: the inventory ID, platform
+execution ID, input digest, resource ID, and start time. The later platform attestation binds those
+same coordinates into the exact completed execution and read-back. Every signed scenario artifact
+binding contains its own digest over that run lineage, scenario/execution ID, phase, artifact ID,
+exact bytes, and trusted input digest. The scenario attestation, canonical scenario-set digest,
+signed global-capture manifest, and final acceptance record all retain the same run lineage. A
+cryptographically valid scenario from an earlier global Job execution is therefore rejected even
+if acceptance/run labels are reused and every old scenario artifact and signature remains valid.
+The canonical ordered scenario-set digest also rejects missing, extra, reordered, or substituted
+scenarios.
 
 Signed scenario execution intervals are sorted globally and must be strictly non-overlapping.
 Scenario execution IDs, monitoring/correlation request identities, verification inputs, report
@@ -408,8 +416,8 @@ Harness-owned canonical receipts include:
   source commit, digest-pinned image, result artifact digests, and post-run state.
 - `athena.wc029GlobalCaptureManifest.v1` and
   `athena.wc029GlobalCaptureAttestation.v1`: the separately signed, inventory-exact global capture
-  set, approved inventory digest, acceptance/run identity, global Job binding, and exact bounded
-  capture window.
+  set, approved inventory digest, acceptance/run identity, exact global Job execution-derived run
+  lineage, global Job binding, and exact bounded capture window.
 - `athena.wc029ScenarioPlan.v1`, `athena.wc029MutationReceipt.v1`, and
   `athena.wc029RecoveryAction.v1`: one target-bound plan/apply/recover chain.
 - the deployed `athena_context.contracts.CORRELATION_REQUEST_SCHEMA_VERSION` and canonical
@@ -419,8 +427,9 @@ Harness-owned canonical receipts include:
   from the deployed contract package; this runbook deliberately does not prescribe a stale wire
   literal.
 - `athena.wc029ScenarioExecutionManifest.v1` and its independent RSA attestation: complete
-  execution lineage, acceptance/run/inventory identity, and positive, strictly separated phase
-  windows for every scenario artifact.
+  execution lineage, acceptance/run/inventory identity, exact global Job execution-derived run
+  lineage, artifact-specific run-lineage digests, and positive, strictly separated phase windows
+  for every scenario artifact.
 - `athena.wc029PublishedManifest.v1`, `athena.wc029PublicationAuthority.v1`, and its independent
   attestation: an exact `CanonicalWorkloadManifest`, native approved-profile resolution, the exact
   shared `PublishedRuntimeContextBinding`, recomputed resolved-profile/dependency/full-authority
@@ -452,7 +461,9 @@ tracebacks are not exposed.
 Final acceptance-record digesting, canonical encoding, UTF-8 encoding, size checks, and Pydantic
 validation are translated to `Wc029AcceptanceEvidenceError`. A low record-size limit or final
 validation/encoding failure returns CLI exit code `2`, emits bounded JSON without a traceback, and
-creates no output record.
+creates no output record. Immutable publication re-serializes and revalidates the final model
+against the same canonical byte limit before deriving its filename or writing staging bytes, so a
+constructed, copied, or otherwise invalid record cannot bypass the CLI error boundary.
 
 ## Run
 

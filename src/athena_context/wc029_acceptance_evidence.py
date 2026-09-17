@@ -24,6 +24,7 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic_core import PydanticSerializationError
 
 from athena_context.artifacts import MAX_ARTIFACT_TRANSFER_BYTES
 from athena_context.contracts import (
@@ -88,6 +89,8 @@ from athena_context.wc029_preflight import (
 
 ACCEPTANCE_INDEX_SCHEMA_VERSION = "athena.wc029AcceptanceEvidenceIndex.v1"
 ACCEPTANCE_RECORD_SCHEMA_VERSION = "athena.wc029AcceptanceEvidenceRecord.v1"
+ACCEPTANCE_RUN_LINEAGE_SCHEMA_VERSION = "athena.wc029AcceptanceRunLineage.v1"
+SCENARIO_ARTIFACT_LINEAGE_SCHEMA_VERSION = "athena.wc029ScenarioArtifactLineage.v1"
 VERSION_INVENTORY_SCHEMA_VERSION = "athena.wc029VersionInventory.v1"
 SIGNING_PUBLIC_KEY_SCHEMA_VERSION = "athena.wc029SigningPublicKey.v1"
 PUBLISHED_MANIFEST_SCHEMA_VERSION = "athena.wc029PublishedManifest.v1"
@@ -2817,6 +2820,10 @@ class Wc029ScenarioSetEntry(_StrictAcceptanceModel):
         alias="scenarioExecutionId",
         pattern=r"^wc029-execution-[a-f0-9]{32}$",
     )
+    run_lineage_digest: str = Field(
+        alias="runLineageDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
     manifest_digest: str = Field(
         alias="manifestDigest",
         pattern=r"^sha256:[a-f0-9]{64}$",
@@ -2830,6 +2837,10 @@ class Wc029ScenarioSetEntry(_StrictAcceptanceModel):
 
     @model_validator(mode="after")
     def validate_entry(self) -> Wc029ScenarioSetEntry:
+        _validate_digest(
+            self.run_lineage_digest,
+            label="scenario-set runLineageDigest",
+        )
         _validate_digest(
             self.manifest_digest,
             label="scenario-set manifestDigest",
@@ -2855,6 +2866,10 @@ class Wc029GlobalCaptureManifest(_StrictAcceptanceModel):
     )
     approved_inventory_sha256: str = Field(
         alias="approvedInventorySha256",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    run_lineage_digest: str = Field(
+        alias="runLineageDigest",
         pattern=r"^sha256:[a-f0-9]{64}$",
     )
     job_inventory_id: str = Field(
@@ -2913,6 +2928,7 @@ class Wc029GlobalCaptureManifest(_StrictAcceptanceModel):
     def validate_manifest(self) -> Wc029GlobalCaptureManifest:
         for label, digest in (
             ("approvedInventorySha256", self.approved_inventory_sha256),
+            ("runLineageDigest", self.run_lineage_digest),
             ("executionDigest", self.execution_digest),
             ("executionArtifactSha256", self.execution_artifact_sha256),
             ("readbackDigest", self.readback_digest),
@@ -2949,6 +2965,10 @@ class Wc029GlobalCaptureAttestation(_StrictAcceptanceModel):
     run_id: str = Field(
         alias="runId",
         pattern=r"^wc029-run-[a-f0-9]{32}$",
+    )
+    run_lineage_digest: str = Field(
+        alias="runLineageDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
     )
     manifest_digest: str = Field(
         alias="manifestDigest",
@@ -3523,6 +3543,10 @@ class Wc029ScenarioArtifactBinding(_StrictAcceptanceModel):
         alias="inputDigest",
         pattern=r"^sha256:[a-f0-9]{64}$",
     )
+    artifact_lineage_digest: str = Field(
+        alias="artifactLineageDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
 
 
 class Wc029IncidentOccurrenceContinuity(_StrictAcceptanceModel):
@@ -3665,6 +3689,10 @@ class Wc029ScenarioExecutionManifest(_StrictAcceptanceModel):
         alias="approvedInventoryDigest",
         pattern=r"^sha256:[a-f0-9]{64}$",
     )
+    run_lineage_digest: str = Field(
+        alias="runLineageDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
     scenario_execution_id: str = Field(
         alias="scenarioExecutionId",
         pattern=r"^wc029-execution-[a-f0-9]{32}$",
@@ -3755,6 +3783,10 @@ class Wc029ScenarioExecutionManifest(_StrictAcceptanceModel):
             self.approved_inventory_digest,
             label="scenario approvedInventoryDigest",
         )
+        _validate_digest(
+            self.run_lineage_digest,
+            label="scenario runLineageDigest",
+        )
         phases = tuple(item.phase for item in self.phase_windows)
         expected_phases: tuple[ScenarioPhase, ...] = (
             "plan",
@@ -3812,9 +3844,21 @@ class Wc029ScenarioExecutionAttestation(_StrictAcceptanceModel):
     schema_version: Literal["athena.wc029ScenarioExecutionAttestation.v1"] = Field(
         alias="schemaVersion"
     )
+    acceptance_id: str = Field(
+        alias="acceptanceId",
+        pattern=r"^wc029-acceptance-[a-z0-9][a-z0-9._-]{0,95}$",
+    )
+    run_id: str = Field(
+        alias="runId",
+        pattern=r"^wc029-run-[a-f0-9]{32}$",
+    )
     scenario_execution_id: str = Field(
         alias="scenarioExecutionId",
         pattern=r"^wc029-execution-[a-f0-9]{32}$",
+    )
+    run_lineage_digest: str = Field(
+        alias="runLineageDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
     )
     manifest_digest: str = Field(
         alias="manifestDigest",
@@ -4424,6 +4468,10 @@ class Wc029AcceptanceEvidenceRecord(_StrictAcceptanceModel):
         alias="globalCaptureManifestDigest",
         pattern=r"^sha256:[a-f0-9]{64}$",
     )
+    run_lineage_digest: str = Field(
+        alias="runLineageDigest",
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
     validation_mode: Literal["offline-contract-digest-and-signature"] = Field(
         alias="validationMode"
     )
@@ -4473,6 +4521,10 @@ class Wc029AcceptanceEvidenceRecord(_StrictAcceptanceModel):
             self.global_capture_manifest_digest,
             label="globalCaptureManifestDigest",
         )
+        _validate_digest(
+            self.run_lineage_digest,
+            label="runLineageDigest",
+        )
         if self.aggregate_digest != compute_artifact_digest(self._digest_payload()):
             raise ValueError("aggregateDigest does not bind the canonical acceptance record")
         if len(self.canonical_bytes()) > MAX_RECORD_BYTES:
@@ -4488,6 +4540,56 @@ class _LoadedArtifact:
     canonical_json: bytes
     record: Wc029EvidenceArtifactRecord
     model: BaseModel | None
+
+
+def _acceptance_run_lineage_digest(
+    *,
+    acceptance_id: str,
+    run_id: str,
+    approved_inventory_sha256: str,
+    execution: Wc029JobExecutionEvidence,
+) -> str:
+    execution_started_at = cast(
+        str,
+        execution.model_dump(mode="json", by_alias=True)["startedAt"],
+    )
+    return compute_artifact_digest(
+        {
+            "schemaVersion": ACCEPTANCE_RUN_LINEAGE_SCHEMA_VERSION,
+            "acceptanceId": acceptance_id,
+            "runId": run_id,
+            "approvedInventorySha256": approved_inventory_sha256,
+            "globalJobInventoryId": execution.job_inventory_id,
+            "globalJobExecutionId": execution.execution_id,
+            "globalJobInputDigest": execution.input_digest,
+            "globalJobResourceId": execution.job_resource_id.casefold().rstrip("/"),
+            "globalJobStartedAt": execution_started_at,
+        }
+    )
+
+
+def _scenario_artifact_run_lineage_digest(
+    *,
+    acceptance_run_lineage_digest: str,
+    scenario_id: str,
+    scenario_execution_id: str,
+    artifact_id: str,
+    phase: ScenarioPhase,
+    content_sha256: str,
+    input_digest: str,
+) -> str:
+    return compute_artifact_digest(
+        {
+            "schemaVersion": SCENARIO_ARTIFACT_LINEAGE_SCHEMA_VERSION,
+            "acceptanceRunLineageDigest": acceptance_run_lineage_digest,
+            "scenarioId": scenario_id,
+            "scenarioExecutionId": scenario_execution_id,
+            "artifactId": artifact_id,
+            "phase": phase,
+            "contentSha256": content_sha256,
+            "inputDigest": input_digest,
+        }
+    )
 
 
 _KNOWN_MODELS: dict[str, type[BaseModel]] = {
@@ -6324,6 +6426,8 @@ def _validate_signed_artifacts(
             if (
                 global_capture_attestation.acceptance_id != global_capture_manifest.acceptance_id
                 or global_capture_attestation.run_id != global_capture_manifest.run_id
+                or global_capture_attestation.run_lineage_digest
+                != global_capture_manifest.run_lineage_digest
                 or global_capture_attestation.manifest_digest
                 != global_capture_manifest.manifest_digest
                 or global_capture_attestation.key_vault_key_id != key.key_vault_key_id
@@ -6507,8 +6611,11 @@ def _validate_signed_artifacts(
                 Wc029ScenarioExecutionManifest,
             )
             if (
-                execution_attestation.scenario_execution_id
+                execution_attestation.acceptance_id != execution_manifest.acceptance_id
+                or execution_attestation.run_id != execution_manifest.run_id
+                or execution_attestation.scenario_execution_id
                 != execution_manifest.scenario_execution_id
+                or execution_attestation.run_lineage_digest != execution_manifest.run_lineage_digest
                 or execution_attestation.manifest_digest != execution_manifest.manifest_digest
                 or execution_attestation.signed_preimage_digest
                 != sha256_hex(execution_manifest.canonical_bytes())
@@ -6844,6 +6951,12 @@ def _validate_global_capture(
         Wc029JobReadbackEvidence,
     )
     approved_job = next(item for item in inventory.jobs if item.purpose == "global-acceptance")
+    expected_run_lineage_digest = _acceptance_run_lineage_digest(
+        acceptance_id=index.acceptance_id,
+        run_id=index.run_id,
+        approved_inventory_sha256=approved_inventory_sha256,
+        execution=execution,
+    )
     self_reference_ids = {
         manifest_artifact.declaration.artifact_id,
         attestation_artifact.declaration.artifact_id,
@@ -6905,6 +7018,7 @@ def _validate_global_capture(
         manifest.acceptance_id != index.acceptance_id
         or manifest.run_id != index.run_id
         or manifest.approved_inventory_sha256 != approved_inventory_sha256
+        or manifest.run_lineage_digest != expected_run_lineage_digest
         or manifest.job_inventory_id != approved_job.job_id
         or manifest.job_inventory_id != execution.job_inventory_id
         or manifest.job_inventory_id != readback.job_inventory_id
@@ -7126,7 +7240,12 @@ def _canonical_scenario_set_digest(
             Wc029ScenarioExecutionAttestation,
         )
         if (
-            manifest.scenario_class != scenario.scenario_class
+            manifest.acceptance_id != index.acceptance_id
+            or manifest.run_id != index.run_id
+            or attestation.acceptance_id != manifest.acceptance_id
+            or attestation.run_id != manifest.run_id
+            or attestation.run_lineage_digest != manifest.run_lineage_digest
+            or manifest.scenario_class != scenario.scenario_class
             or manifest.scenario_id != scenario.scenario_id
             or attestation.scenario_execution_id != manifest.scenario_execution_id
             or attestation.manifest_digest != manifest.manifest_digest
@@ -7139,6 +7258,7 @@ def _canonical_scenario_set_digest(
                 scenarioClass=scenario.scenario_class,
                 scenarioId=scenario.scenario_id,
                 scenarioExecutionId=manifest.scenario_execution_id,
+                runLineageDigest=manifest.run_lineage_digest,
                 manifestDigest=manifest.manifest_digest,
                 attestationDigest=selected["scenario-execution-attestation"].record.content_sha256,
                 intervalStartedAt=manifest.phase_windows[0].started_at,
@@ -7705,6 +7825,7 @@ def _validate_signed_scenario_execution(
     acceptance_id: str,
     run_id: str,
     approved_inventory_digest: str,
+    run_lineage_digest: str,
 ) -> Wc029ScenarioExecutionManifest:
     plan = _require_model(
         selected["scenario-plan"],
@@ -7726,10 +7847,14 @@ def _validate_signed_scenario_execution(
         execution_manifest.acceptance_id != acceptance_id
         or execution_manifest.run_id != run_id
         or execution_manifest.approved_inventory_digest != approved_inventory_digest
+        or execution_manifest.run_lineage_digest != run_lineage_digest
+        or execution_attestation.acceptance_id != acceptance_id
+        or execution_attestation.run_id != run_id
+        or execution_attestation.run_lineage_digest != run_lineage_digest
     ):
         raise Wc029AcceptanceEvidenceError(
             "signed scenario execution manifest does not bind the exact "
-            "acceptance run and approved inventory"
+            "acceptance run lineage and approved inventory"
         )
     if (
         execution_attestation.scenario_execution_id != execution_manifest.scenario_execution_id
@@ -7784,15 +7909,39 @@ def _validate_signed_scenario_execution(
             artifact_id,
             label="signed scenario execution manifest",
         )
+        expected_input_digest = _scenario_artifact_input_digest(
+            bound,
+            plan=plan,
+        )
+        expected_run_lineage_digest = _scenario_artifact_run_lineage_digest(
+            acceptance_run_lineage_digest=run_lineage_digest,
+            scenario_id=scenario.scenario_id,
+            scenario_execution_id=execution_manifest.scenario_execution_id,
+            artifact_id=artifact_id,
+            phase=phase_by_id[artifact_id],
+            content_sha256=bound.record.content_sha256,
+            input_digest=expected_input_digest,
+        )
         if (
             binding.phase != phase_by_id[artifact_id]
             or binding.content_sha256 != bound.record.content_sha256
-            or binding.input_digest != _scenario_artifact_input_digest(bound, plan=plan)
+            or binding.input_digest != expected_input_digest
+            or binding.artifact_lineage_digest != expected_run_lineage_digest
         ):
             raise Wc029AcceptanceEvidenceError(
                 f"signed scenario binding for {artifact_id} is invalid"
             )
     return execution_manifest
+
+
+def _validate_resolved_source_index_chronology(
+    resolved_state: IncidentState,
+    resolved_source_index: ActiveIncidentIndex,
+) -> None:
+    if resolved_source_index.published_at < resolved_state.updated_at:
+        raise Wc029AcceptanceEvidenceError(
+            "resolved authoritative source index predates the resolved IncidentState"
+        )
 
 
 def _validate_feed_state_timing(
@@ -8083,6 +8232,10 @@ def _validate_scenario_lifecycle(
     resolved_source_index = _require_model(
         selected["source-index-resolved"],
         ActiveIncidentIndex,
+    )
+    _validate_resolved_source_index_chronology(
+        resolved_state,
+        resolved_source_index,
     )
     active_notification = _require_model(
         selected["notification-active"],
@@ -8401,6 +8554,22 @@ def _validate_scenario_evidence(
     monitoring_trust: _MonitoringEvidenceTrust,
 ) -> None:
     capabilities = {item.scenario_class: item for item in inventory.scenario_capabilities}
+    approved_inventory_digest = artifacts[index.version_inventory_artifact_id].record.content_sha256
+    global_execution_artifact = next(
+        artifacts[artifact_id]
+        for artifact_id in index.global_artifact_ids
+        if artifacts[artifact_id].declaration.evidence_class == "job-execution"
+    )
+    global_execution = _require_model(
+        global_execution_artifact,
+        Wc029JobExecutionEvidence,
+    )
+    run_lineage_digest = _acceptance_run_lineage_digest(
+        acceptance_id=index.acceptance_id,
+        run_id=index.run_id,
+        approved_inventory_sha256=approved_inventory_digest,
+        execution=global_execution,
+    )
     for scenario in index.scenarios:
         capability = capabilities[scenario.scenario_class]
         if scenario.evidence_mode != capability.evidence_mode:
@@ -8448,9 +8617,8 @@ def _validate_scenario_evidence(
             artifacts,
             acceptance_id=index.acceptance_id,
             run_id=index.run_id,
-            approved_inventory_digest=artifacts[
-                index.version_inventory_artifact_id
-            ].record.content_sha256,
+            approved_inventory_digest=approved_inventory_digest,
+            run_lineage_digest=run_lineage_digest,
         )
         if (
             plan.scenario_id != scenario.scenario_id
@@ -8790,6 +8958,10 @@ def _validate_scenario_evidence(
             selected["source-index-resolved"],
             ActiveIncidentIndex,
         )
+        _validate_resolved_source_index_chronology(
+            resolved_state,
+            resolved_source_index,
+        )
         resolved_notification = _require_model(
             selected["notification-resolved"],
             IncidentNotificationEnvelopeV2,
@@ -9027,6 +9199,59 @@ def _sorted_scenario(scenario: Wc029ScenarioEvidence) -> Wc029ScenarioEvidence:
     )
 
 
+def _validate_final_acceptance_record_bytes(
+    payload: bytes,
+) -> Wc029AcceptanceEvidenceRecord:
+    if len(payload) > MAX_RECORD_BYTES:
+        raise Wc029AcceptanceEvidenceError(
+            "final acceptance record exceeds its bounded byte budget"
+        )
+    try:
+        record = Wc029AcceptanceEvidenceRecord.model_validate_json(payload)
+        canonical_payload = record.canonical_bytes()
+    except (
+        PydanticSerializationError,
+        ValidationError,
+        RecursionError,
+        TypeError,
+        ValueError,
+        UnicodeEncodeError,
+        OverflowError,
+    ) as exc:
+        raise Wc029AcceptanceEvidenceError(
+            "final acceptance record failed closed validation"
+        ) from exc
+    if len(canonical_payload) > MAX_RECORD_BYTES:
+        raise Wc029AcceptanceEvidenceError(
+            "final acceptance record exceeds its bounded byte budget"
+        )
+    if canonical_payload != payload:
+        raise Wc029AcceptanceEvidenceError(
+            "final acceptance record is not exact canonical contract bytes"
+        )
+    return record
+
+
+def _canonical_final_acceptance_record(
+    record: Wc029AcceptanceEvidenceRecord,
+) -> tuple[Wc029AcceptanceEvidenceRecord, bytes]:
+    try:
+        payload = record.canonical_bytes()
+    except (
+        PydanticSerializationError,
+        ValidationError,
+        RecursionError,
+        TypeError,
+        ValueError,
+        UnicodeEncodeError,
+        OverflowError,
+    ) as exc:
+        raise Wc029AcceptanceEvidenceError(
+            "final acceptance record could not be encoded safely"
+        ) from exc
+    return _validate_final_acceptance_record_bytes(payload), payload
+
+
 def aggregate_acceptance_evidence(
     evidence_root: Path,
     *,
@@ -9146,6 +9371,7 @@ def aggregate_acceptance_evidence(
             capture_started_at=global_capture_manifest.capture_started_at,
             capture_completed_at=global_capture_manifest.capture_completed_at,
             global_capture_manifest_digest=global_capture_manifest.manifest_digest,
+            run_lineage_digest=global_capture_manifest.run_lineage_digest,
             validation_mode="offline-contract-digest-and-signature",
             azure_mutation_performed=False,
             incident_evidence_synthesized=False,
@@ -9166,6 +9392,7 @@ def aggregate_acceptance_evidence(
         }
         record_bytes = (canonicalize_json(record_payload) + "\n").encode("utf-8")
     except (
+        PydanticSerializationError,
         ValidationError,
         RecursionError,
         TypeError,
@@ -9180,19 +9407,7 @@ def aggregate_acceptance_evidence(
         raise Wc029AcceptanceEvidenceError(
             "final acceptance record exceeds its bounded byte budget"
         )
-    try:
-        return Wc029AcceptanceEvidenceRecord.model_validate_json(record_bytes)
-    except (
-        ValidationError,
-        RecursionError,
-        TypeError,
-        ValueError,
-        UnicodeEncodeError,
-        OverflowError,
-    ) as exc:
-        raise Wc029AcceptanceEvidenceError(
-            "final acceptance record failed closed validation"
-        ) from exc
+    return _validate_final_acceptance_record_bytes(record_bytes)
 
 
 def _link_pinned_staging_file(
@@ -9346,6 +9561,7 @@ def write_acceptance_record(
 ) -> Path:
     """Create a content-addressed record exclusively outside the captured input root."""
 
+    validated_record, payload = _canonical_final_acceptance_record(record)
     try:
         root, root_identity = _stable_directory_path(
             evidence_root,
@@ -9365,12 +9581,13 @@ def write_acceptance_record(
                     "output directory must be outside the read-only evidence root"
                 )
             filename = (
-                "wc029-acceptance-" + record.aggregate_digest.removeprefix("sha256:") + ".json"
+                "wc029-acceptance-"
+                + validated_record.aggregate_digest.removeprefix("sha256:")
+                + ".json"
             )
             staging_name = f".{filename}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
             output_path = output_root / filename
             staging_path = output_root / staging_name
-            payload = record.canonical_bytes()
 
             staging_pin: _PinnedFileHandle | None = None
             try:

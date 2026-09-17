@@ -2395,6 +2395,7 @@ def _job_platform_capture_attestation(
 def _global_capture_manifest(
     *,
     approved_inventory_sha256: str,
+    run_lineage_digest: str,
     requirements: tuple[acceptance.Wc029GlobalCaptureArtifactRequirement, ...],
     artifact_digests: dict[str, str],
     execution_artifact_id: str,
@@ -2412,6 +2413,7 @@ def _global_capture_manifest(
             "acceptanceId": _ACCEPTANCE_ID,
             "runId": _RUN_ID,
             "approvedInventorySha256": approved_inventory_sha256,
+            "runLineageDigest": run_lineage_digest,
             "jobInventoryId": execution.job_inventory_id,
             "executionId": execution.execution_id,
             "executionArtifactId": execution_artifact_id,
@@ -2460,6 +2462,7 @@ def _scenario_set_digest(
                 scenarioClass=manifest.scenario_class,
                 scenarioId=manifest.scenario_id,
                 scenarioExecutionId=manifest.scenario_execution_id,
+                runLineageDigest=manifest.run_lineage_digest,
                 manifestDigest=manifest.manifest_digest,
                 attestationDigest=artifact_digests[attestation_id],
                 intervalStartedAt=manifest.phase_windows[0].started_at,
@@ -2499,6 +2502,7 @@ def _global_capture_attestation(
         schemaVersion=acceptance.GLOBAL_CAPTURE_ATTESTATION_SCHEMA_VERSION,
         acceptanceId=manifest.acceptance_id,
         runId=manifest.run_id,
+        runLineageDigest=manifest.run_lineage_digest,
         manifestDigest=manifest.manifest_digest,
         signatureAlgorithm="RS256",
         keyVaultKeyId=key.key_id,
@@ -4178,6 +4182,22 @@ def _build_bundle(
     scenario_job = next(
         item for item in inventory.jobs if item.purpose == "scenario-recovery-verification"
     )
+    global_job = next(item for item in inventory.jobs if item.purpose == "global-acceptance")
+    capture_started_at = _SCENARIO_BASE - timedelta(hours=4)
+    capture_completed_at = _NOW + timedelta(minutes=10)
+    global_execution = _job_execution(
+        execution_id="foundation-execution",
+        scope="global",
+        job_version=global_job,
+        started_at=capture_started_at,
+        completed_at=capture_completed_at + timedelta(minutes=1),
+    )
+    run_lineage_digest = acceptance._acceptance_run_lineage_digest(
+        acceptance_id=_ACCEPTANCE_ID,
+        run_id=_RUN_ID,
+        approved_inventory_sha256=approved_inventory_sha256,
+        execution=global_execution,
+    )
     scenarios: list[dict[str, object]] = []
     for scenario_class in acceptance.REQUIRED_SCENARIO_CLASSES:
         capability = capability_by_class[scenario_class]
@@ -4719,16 +4739,26 @@ def _build_bundle(
         }
         for phase, artifact_ids in phases.items():
             for artifact_id in artifact_ids:
+                input_digest = _scenario_input_digest(
+                    artifact_classes[artifact_id],
+                    artifact_values[artifact_id],
+                    content_sha256=artifact_digests[artifact_id],
+                    plan=scenario_plan,
+                )
                 manifest_bindings.append(
                     acceptance.Wc029ScenarioArtifactBinding(
                         artifactId=artifact_id,
                         phase=phase,
                         contentSha256=artifact_digests[artifact_id],
-                        inputDigest=_scenario_input_digest(
-                            artifact_classes[artifact_id],
-                            artifact_values[artifact_id],
+                        inputDigest=input_digest,
+                        artifactLineageDigest=acceptance._scenario_artifact_run_lineage_digest(
+                            acceptance_run_lineage_digest=run_lineage_digest,
+                            scenario_id=scenario_id,
+                            scenario_execution_id=scenario_execution_id,
+                            artifact_id=artifact_id,
+                            phase=phase,
                             content_sha256=artifact_digests[artifact_id],
-                            plan=scenario_plan,
+                            input_digest=input_digest,
                         ),
                     )
                 )
@@ -4743,6 +4773,7 @@ def _build_bundle(
             "acceptanceId": _ACCEPTANCE_ID,
             "runId": _RUN_ID,
             "approvedInventoryDigest": approved_inventory_sha256,
+            "runLineageDigest": run_lineage_digest,
             "scenarioExecutionId": scenario_execution_id,
             "scenarioId": scenario_id,
             "scenarioClass": scenario_class,
@@ -4791,7 +4822,10 @@ def _build_bundle(
             "scenario-execution-attestation",
             acceptance.Wc029ScenarioExecutionAttestation(
                 schemaVersion=(acceptance.SCENARIO_EXECUTION_ATTESTATION_SCHEMA_VERSION),
+                acceptanceId=_ACCEPTANCE_ID,
+                runId=_RUN_ID,
                 scenarioExecutionId=scenario_execution_id,
+                runLineageDigest=run_lineage_digest,
                 manifestDigest=execution_manifest.manifest_digest,
                 signatureAlgorithm="RS256",
                 keyVaultKeyId=scenario_key.key_id,
@@ -4814,16 +4848,6 @@ def _build_bundle(
         scenarios,
         artifact_values,
         artifact_digests,
-    )
-    global_job = next(item for item in inventory.jobs if item.purpose == "global-acceptance")
-    capture_started_at = _SCENARIO_BASE - timedelta(hours=4)
-    capture_completed_at = _NOW + timedelta(minutes=10)
-    global_execution = _job_execution(
-        execution_id="foundation-execution",
-        scope="global",
-        job_version=global_job,
-        started_at=capture_started_at,
-        completed_at=capture_completed_at + timedelta(minutes=1),
     )
     global_execution_id = add(
         "global-job-execution",
@@ -4866,6 +4890,7 @@ def _build_bundle(
     )
     global_capture_manifest = _global_capture_manifest(
         approved_inventory_sha256=approved_inventory_sha256,
+        run_lineage_digest=run_lineage_digest,
         requirements=inventory.global_capture.artifacts,
         artifact_digests=artifact_digests,
         execution_artifact_id=global_execution_id,
@@ -4957,6 +4982,16 @@ def _refresh_scenario_execution_binding(
     plan = acceptance.Wc029ScenarioPlanEvidence.model_validate_json(
         bundle.artifact_paths[plan_id].read_bytes()
     )
+    global_execution_path = bundle.artifact_paths["global-job-execution"]
+    global_execution = acceptance.Wc029JobExecutionEvidence.model_validate_json(
+        global_execution_path.read_bytes()
+    )
+    run_lineage_digest = acceptance._acceptance_run_lineage_digest(
+        acceptance_id=str(bundle.index["acceptanceId"]),
+        run_id=str(bundle.index["runId"]),
+        approved_inventory_sha256=bundle.approved_inventory_sha256,
+        execution=global_execution,
+    )
     manifest_id = next(
         artifact_id
         for artifact_id in scenario["phases"]["verify"]
@@ -4985,16 +5020,26 @@ def _refresh_scenario_execution_binding(
             schema_version = parsed.get("schemaVersion")
             model_type = acceptance._KNOWN_MODELS[schema_version]
             model = model_type.model_validate_json(raw)
+            input_digest = _scenario_input_digest(
+                _declaration(bundle, artifact_id)["evidenceClass"],
+                model,
+                content_sha256=sha256_hex(raw),
+                plan=plan,
+            )
             bindings.append(
                 acceptance.Wc029ScenarioArtifactBinding(
                     artifactId=artifact_id,
                     phase=phase,
                     contentSha256=sha256_hex(raw),
-                    inputDigest=_scenario_input_digest(
-                        _declaration(bundle, artifact_id)["evidenceClass"],
-                        model,
+                    inputDigest=input_digest,
+                    artifactLineageDigest=acceptance._scenario_artifact_run_lineage_digest(
+                        acceptance_run_lineage_digest=run_lineage_digest,
+                        scenario_id=plan.scenario_id,
+                        scenario_execution_id=plan.scenario_execution_id,
+                        artifact_id=artifact_id,
+                        phase=phase,
                         content_sha256=sha256_hex(raw),
-                        plan=plan,
+                        input_digest=input_digest,
                     ),
                 )
             )
@@ -5013,6 +5058,7 @@ def _refresh_scenario_execution_binding(
         exclude={"manifest_digest"},
     )
     payload["artifacts"] = tuple(bindings)
+    payload["runLineageDigest"] = run_lineage_digest
     manifest = _digest_bound_model(
         acceptance.Wc029ScenarioExecutionManifest,
         payload,
@@ -5032,7 +5078,10 @@ def _refresh_scenario_execution_binding(
     )
     attestation = acceptance.Wc029ScenarioExecutionAttestation(
         schemaVersion=(acceptance.SCENARIO_EXECUTION_ATTESTATION_SCHEMA_VERSION),
+        acceptanceId=manifest.acceptance_id,
+        runId=manifest.run_id,
         scenarioExecutionId=manifest.scenario_execution_id,
+        runLineageDigest=manifest.run_lineage_digest,
         manifestDigest=manifest.manifest_digest,
         signatureAlgorithm="RS256",
         keyVaultKeyId=bundle.keys["scenario-authority"].key_id,
@@ -5095,6 +5144,7 @@ def _current_scenario_set_digest(bundle: BundleFixture) -> str:
                 scenarioClass=manifest.scenario_class,
                 scenarioId=manifest.scenario_id,
                 scenarioExecutionId=manifest.scenario_execution_id,
+                runLineageDigest=manifest.run_lineage_digest,
                 manifestDigest=manifest.manifest_digest,
                 attestationDigest=sha256_hex(attestation_path.read_bytes()),
                 intervalStartedAt=manifest.phase_windows[0].started_at,
@@ -5209,8 +5259,17 @@ def _rewrite_global_job_chain(
         bundle,
         capture_anchor_resource_id=capture_anchor_resource_id,
     )
+    run_lineage_digest = acceptance._acceptance_run_lineage_digest(
+        acceptance_id=str(bundle.index["acceptanceId"]),
+        run_id=str(bundle.index["runId"]),
+        approved_inventory_sha256=bundle.approved_inventory_sha256,
+        execution=acceptance.Wc029JobExecutionEvidence.model_validate_json(
+            execution_path.read_bytes()
+        ),
+    )
     manifest_path = bundle.artifact_paths["global-capture-manifest"]
     manifest = _read_json(manifest_path)
+    manifest["runLineageDigest"] = run_lineage_digest
     manifest["executionDigest"] = execution["executionDigest"]
     manifest["executionArtifactSha256"] = sha256_hex(execution_path.read_bytes())
     manifest["readbackDigest"] = readback["readbackDigest"]
@@ -5564,6 +5623,15 @@ def _rewrite_resolved_occurrence_digest_as_active(
         update = binding_updates.get(binding["artifactId"])
         if update is not None:
             binding["contentSha256"], binding["inputDigest"] = update
+        binding["artifactLineageDigest"] = acceptance._scenario_artifact_run_lineage_digest(
+            acceptance_run_lineage_digest=manifest["runLineageDigest"],
+            scenario_id=manifest["scenarioId"],
+            scenario_execution_id=manifest["scenarioExecutionId"],
+            artifact_id=binding["artifactId"],
+            phase=binding["phase"],
+            content_sha256=binding["contentSha256"],
+            input_digest=binding["inputDigest"],
+        )
     manifest.pop("manifestDigest")
     manifest["manifestDigest"] = compute_artifact_digest(manifest)
     manifest_raw = _write(manifest_path, manifest)
@@ -5583,7 +5651,10 @@ def _rewrite_resolved_occurrence_digest_as_active(
         bundle.artifact_paths[f"{prefix}-execution-attestation"],
         acceptance.Wc029ScenarioExecutionAttestation(
             schemaVersion=(acceptance.SCENARIO_EXECUTION_ATTESTATION_SCHEMA_VERSION),
+            acceptanceId=manifest["acceptanceId"],
+            runId=manifest["runId"],
             scenarioExecutionId=manifest["scenarioExecutionId"],
+            runLineageDigest=manifest["runLineageDigest"],
             manifestDigest=manifest["manifestDigest"],
             signatureAlgorithm="RS256",
             keyVaultKeyId=bundle.keys["scenario-authority"].key_id,
@@ -6042,7 +6113,81 @@ def test_signed_scenario_manifest_rejects_cross_run_replay(
 
     with pytest.raises(
         acceptance.Wc029AcceptanceEvidenceError,
-        match="does not bind the exact acceptance run and approved inventory",
+        match="does not bind the exact acceptance run lineage and approved inventory",
+    ):
+        _aggregate(bundle)
+
+
+def test_valid_signed_scenario_cannot_be_replayed_under_new_global_run_lineage(
+    tmp_path: Path,
+) -> None:
+    bundle = _build_bundle(tmp_path)
+    manifest_path = bundle.artifact_paths["scenario-backend-degradation-execution-manifest"]
+    attestation_path = bundle.artifact_paths["scenario-backend-degradation-execution-attestation"]
+    original_manifest = _read_json(manifest_path)
+    original_binding_lineages = {
+        item["artifactId"]: item["artifactLineageDigest"] for item in original_manifest["artifacts"]
+    }
+
+    _rewrite_global_job_chain(
+        bundle,
+        {"executionId": "foundation-execution-retry"},
+    )
+
+    global_execution_path = bundle.artifact_paths["global-job-execution"]
+    global_execution = acceptance.Wc029JobExecutionEvidence.model_validate_json(
+        global_execution_path.read_bytes()
+    )
+    new_run_lineage_digest = acceptance._acceptance_run_lineage_digest(
+        acceptance_id=_ACCEPTANCE_ID,
+        run_id=_RUN_ID,
+        approved_inventory_sha256=bundle.approved_inventory_sha256,
+        execution=global_execution,
+    )
+    assert new_run_lineage_digest != original_manifest["runLineageDigest"]
+
+    replayed_manifest = dict(original_manifest)
+    replayed_manifest["runLineageDigest"] = new_run_lineage_digest
+    replayed_manifest.pop("manifestDigest")
+    replayed_manifest["manifestDigest"] = compute_artifact_digest(replayed_manifest)
+    _write(manifest_path, replayed_manifest)
+    replayed_model = acceptance.Wc029ScenarioExecutionManifest.model_validate_json(
+        manifest_path.read_bytes()
+    )
+    signature = (
+        base64.urlsafe_b64encode(
+            bundle.private_keys["scenario-authority"].sign(
+                replayed_model.canonical_bytes(),
+                padding.PKCS1v15(),
+                hashes.SHA256(),
+            )
+        )
+        .decode("ascii")
+        .rstrip("=")
+    )
+    _write(
+        attestation_path,
+        acceptance.Wc029ScenarioExecutionAttestation(
+            schemaVersion=acceptance.SCENARIO_EXECUTION_ATTESTATION_SCHEMA_VERSION,
+            acceptanceId=replayed_model.acceptance_id,
+            runId=replayed_model.run_id,
+            scenarioExecutionId=replayed_model.scenario_execution_id,
+            runLineageDigest=replayed_model.run_lineage_digest,
+            manifestDigest=replayed_model.manifest_digest,
+            signatureAlgorithm="RS256",
+            keyVaultKeyId=bundle.keys["scenario-authority"].key_id,
+            signedPreimageDigest=sha256_hex(replayed_model.canonical_bytes()),
+            detachedSignature=signature,
+        ),
+    )
+    _refresh_global_scenario_set_binding(bundle)
+
+    assert {
+        item.artifact_id: item.artifact_lineage_digest for item in replayed_model.artifacts
+    } == original_binding_lineages
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="signed scenario binding",
     ):
         _aggregate(bundle)
 
@@ -6081,7 +6226,10 @@ def test_signed_cross_run_scenario_cannot_be_smuggled_as_global_evidence(
     )
     foreign_attestation = acceptance.Wc029ScenarioExecutionAttestation(
         schemaVersion=acceptance.SCENARIO_EXECUTION_ATTESTATION_SCHEMA_VERSION,
+        acceptanceId=foreign_manifest.acceptance_id,
+        runId=foreign_manifest.run_id,
         scenarioExecutionId=foreign_manifest.scenario_execution_id,
+        runLineageDigest=foreign_manifest.run_lineage_digest,
         manifestDigest=foreign_manifest.manifest_digest,
         signatureAlgorithm="RS256",
         keyVaultKeyId=bundle.keys["scenario-authority"].key_id,
@@ -6954,26 +7102,16 @@ def test_resolved_authoritative_source_index_cannot_precede_resolution(
     resolved_state = IncidentState.model_validate_json(
         bundle.artifact_paths["scenario-web-tier-failure-incident-resolved"].read_bytes()
     )
-    resolved_pointer = IncidentEnrichmentFeedPointer.model_validate_json(
-        bundle.artifact_paths["scenario-web-tier-failure-feed-resolved"].read_bytes()
-    )
-    resolved_feed_index = IncidentFeedIndexV2.model_validate_json(
-        bundle.artifact_paths["scenario-web-tier-failure-feed-index-resolved"].read_bytes()
-    )
     pre_resolution_source_index = ActiveIncidentIndex.model_validate_json(
         bundle.artifact_paths["scenario-web-tier-failure-source-index-resolved"].read_bytes()
     ).model_copy(update={"published_at": resolved_state.updated_at - timedelta(seconds=1)})
     with pytest.raises(
         acceptance.Wc029AcceptanceEvidenceError,
-        match="resolved feed state, pointer, and index chronology",
+        match="predates the resolved IncidentState",
     ):
-        acceptance._validate_feed_state_timing(
+        acceptance._validate_resolved_source_index_chronology(
             resolved_state,
-            resolved_pointer,
-            resolved_feed_index.recently_resolved[0],
             pre_resolution_source_index,
-            resolved_feed_index,
-            label="resolved",
         )
     _rewrite_resolved_source_index_published_at(
         bundle,
@@ -6982,10 +7120,7 @@ def test_resolved_authoritative_source_index_cannot_precede_resolution(
 
     with pytest.raises(
         acceptance.Wc029AcceptanceEvidenceError,
-        match=(
-            "resolved source index falls outside the signed verify phase window|"
-            "resolved feed state, pointer, and index chronology"
-        ),
+        match="predates the resolved IncidentState",
     ):
         _aggregate(bundle)
 
@@ -7387,6 +7522,55 @@ def test_low_record_limit_is_bounded_cli_exit_two_without_traceback(
     assert result == 2
     assert "Traceback" not in captured.err
     assert "bounded byte budget" in captured.err
+    assert list(bundle.output.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_error"),
+    [
+        ("validation", "failed closed validation"),
+        ("size", "bounded byte budget"),
+    ],
+)
+def test_publication_revalidates_final_record_inside_bounded_cli_contract(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+    expected_error: str,
+) -> None:
+    bundle = _build_bundle(tmp_path / failure)
+    record = _aggregate(bundle)
+    if failure == "validation":
+        record = record.model_copy(update={"aggregate_digest": "sha256:" + ("f" * 64)})
+    else:
+        monkeypatch.setattr(
+            acceptance,
+            "MAX_RECORD_BYTES",
+            len(record.canonical_bytes()) - 1,
+        )
+
+    def return_prebuilt_record(
+        _evidence_root: Path,
+        *,
+        approved_inventory_sha256: str,
+        index_file: str = "acceptance-index.json",
+    ) -> acceptance.Wc029AcceptanceEvidenceRecord:
+        del approved_inventory_sha256, index_file
+        return record
+
+    monkeypatch.setattr(
+        acceptance,
+        "aggregate_acceptance_evidence",
+        return_prebuilt_record,
+    )
+
+    result = acceptance.main(_cli_arguments(bundle))
+
+    captured = capsys.readouterr()
+    assert result == 2
+    assert "Traceback" not in captured.err
+    assert expected_error in captured.err
     assert list(bundle.output.iterdir()) == []
 
 
