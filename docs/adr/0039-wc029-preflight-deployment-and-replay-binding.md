@@ -197,28 +197,38 @@ Use the following guarded preflight contract:
     record is the staged inode, and then removes the staging name. Empty or partial staging files
     never reserve a final record; binary descriptors enforce the physical 64-KiB bound on Windows;
     malformed final records are corruption, not proof of consumption.
-29. Windows publication uses `MoveFileExW` without replacement and with `MOVEFILE_WRITE_THROUGH`,
-    then opens and fsyncs the securely verified final record before reporting success. A failed
-    post-publication barrier rolls back only the matching published inode and returns a bounded
-    error. One securely opened cross-process ledger lock spans publication, durability, rollback,
-    and existing-record comparison. Its fsynced transaction state names the pending record before
-    publication and returns to idle only after durability succeeds. A failed barrier leaves that
-    durable pending state even when rollback also fails, so another invocation cannot accept the
-    final. Rollback opens are nonblocking and no-follow before inode comparison, so a substituted
-    FIFO or symlink cannot hang cleanup. Platforms without a supported lock, no-overwrite
-    publication, or durability path fail closed.
+29. Windows publication is supported only on a local fixed NTFS volume. Staging and verification
+    handles are opened with `CreateFileW` and `FILE_FLAG_WRITE_THROUGH`; the open staging handle is
+    renamed with `SetFileInformationByHandle(FileRenameInfo)` and `ReplaceIfExists = FALSE`. Success
+    is reported only after a separately opened final handle has the same NTFS file identity, exact
+    expected bytes, secure final path, regular-file type, and a successful final-handle flush.
+    Windows directory fsync is neither available nor claimed. A failed post-rename verification or
+    flush rolls back only the matching published file and returns a bounded error. One securely
+    opened cross-process ledger lock spans publication, durability, rollback, and existing-record
+    comparison. Its fsynced transaction state names the pending record before publication and
+    returns to idle only after durability succeeds. A failed barrier leaves that durable pending
+    state even when rollback also fails, so another invocation cannot accept the final. Rollback
+    opens are nonblocking and no-follow before identity comparison, so a substituted FIFO or
+    symlink cannot hang cleanup. Platforms without a supported lock, no-overwrite publication, or
+    durability path fail closed.
 30. Partial-snapshot tree reconciliation compares every stored dynamic `child_kind` with the
     object/array kind resolved from an ancestor delta at every depth. A partial object such as
     `ipRules: {}` cannot later be represented by `ipRules: []`, including through a higher ancestor
-    value.
-31. Every tenant principal registry is seeded with the all-zero GUID as `SystemDefined` before
-    policy or evidence type claims are registered. Empty deny inventories therefore cannot allow
-    that reserved identity to be reclassified as a service principal or group.
-32. Deny evaluation uses one document-wide deterministic work budget, one canonical
-    management-group/subscription context, and a per-principal access-scope token trie. Each scope
-    token is inserted and queried a constant number of times without tuple-prefix copying. Principal
-    targeting and every deny-scope token traversal are charged; applicable access relationships are
-    resolved without a deny-by-access-by-ancestry scan.
+    value. Unprotected container branches are not silently discarded: unknown containers fail
+    closed, while the permitted flat `tags` and `systemData` metadata objects reject any nested
+    object or array recursively.
+31. Every workload-principal parser rejects the all-zero All Principals GUID before policy or
+    evidence matching, and every tenant principal registry independently reserves it as
+    `SystemDefined`. Empty deny inventories therefore cannot allow that identity to be accepted or
+    reclassified as a service principal, group, effective principal, or client ID.
+32. Deny parsing and evaluation use one document-wide deterministic work budget, one canonical
+    management-group/subscription context, and a per-principal access-scope token trie. Known list
+    sizes are reserved before traversal, each scope token is inserted and queried a constant number
+    of times without tuple-prefix copying, and principal targeting cannot return early before its
+    complete bounded scan is charged. Graph, ARM, and guarded CLI evidence expansion additionally
+    shares explicit document-wide work and request/page-count limits. Applicable access
+    relationships are resolved without a deny-by-access-by-ancestry scan, and every limit fails
+    closed before the corresponding expansion is traversed.
 
 The pure evaluators remain free of storage I/O. One-time consumption belongs to the production CLI
 boundary after parsing, policy evaluation, and bounded rendering succeed but before success or
@@ -248,8 +258,9 @@ blocked output is returned.
   one complete final record and deterministic `FileExistsError` outcomes for the others.
 - Existing consumption names are treated as consumed only when their bounded JSON exactly matches
   the expected consumption record. Empty, partial, malformed, or conflicting finals fail closed.
-- Windows never reports ledger consumption durable unless the write-through publication and
-  post-publication final-handle synchronization both succeed.
+- Windows never reports ledger consumption durable unless local fixed NTFS verification,
+  write-through handle-based no-replace rename, post-rename file-identity and byte checks, and
+  final-handle synchronization all succeed. No Windows directory-fsync guarantee is claimed.
 - The persistent `.wc029-ledger.lock` file serializes the full create/compare transaction across
   processes and stores the fsynced pending/idle publication state; it is workflow state, not a
   consumption record.
@@ -266,11 +277,12 @@ blocked output is returned.
   percent-encoded, path-case, and query-order aliases.
 - Principal types and ARM role-assignment IDs are reconciled once across the complete tenant-wide
   evidence set before authorization or deny findings are evaluated.
-- The All Principals zero GUID is permanently typed `SystemDefined`, even when no deny row mentions
-  it.
+- The All Principals zero GUID is permanently typed `SystemDefined` and is rejected directly from
+  every workload-identity field, even when no deny row mentions it.
 - Large deny inventories stop at a deterministic aggregate work limit; canonical ancestry and scope
   trie indexes avoid repeated tuple scans, quadratic prefix materialization, and all-pairs scope
-  traversal.
+  traversal. Graph/RBAC collection evidence also stops at explicit aggregate work and page/call
+  limits before additional expansion is traversed.
 - Evidence path replacement cannot redirect an already opened descriptor, while growth beyond the
   bound and POSIX symlink or special-file inputs fail deterministically.
 - Deployment-stack and storage-local-user changes remain unavailable rather than bypassing deny,

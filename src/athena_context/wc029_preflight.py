@@ -30,6 +30,8 @@ MAX_VIOLATIONS = 256
 MAX_RENDER_BYTES = 1024 * 1024
 MAX_SEPARATION_RULE_WORK = 100000
 MAX_DENY_EVALUATION_WORK = 500000
+MAX_RBAC_EXPANSION_WORK = 500000
+MAX_RBAC_EVIDENCE_CALLS = 4096
 MAX_PROPERTY_PATH_LENGTH = 4096
 MAX_PROPERTY_PATH_ITEMS = 50000
 MAX_PROPERTY_PATH_CHARACTERS = 4 * 1024 * 1024
@@ -217,6 +219,12 @@ _NON_EFFECTIVE_RESOURCE_METADATA_ROOTS = frozenset(
         "resourceid",
         "systemdata",
         "type",
+    }
+)
+_PARTIAL_SNAPSHOT_FLAT_OBJECT_ROOTS = frozenset(
+    {
+        "systemdata",
+        "tags",
     }
 )
 _PROTECTED_PROPERTY_SCHEMAS: dict[str, tuple[tuple[str, str], ...]] = {
@@ -428,6 +436,10 @@ class _PrincipalTypeRegistry:
         *,
         field_name: str,
     ) -> None:
+        if principal_id == _ALL_PRINCIPALS_ID and principal_type != "systemdefined":
+            raise PreflightInputError(
+                f"{field_name} must not use the All Principals zero GUID as a workload identity"
+            )
         previous_type = self.principal_types.get(principal_id)
         if previous_type is not None and previous_type != principal_type:
             raise PreflightInputError(
@@ -489,11 +501,35 @@ class _DenyEvaluationWorkBudget:
     work: int = 0
 
     def charge(self, amount: int = 1) -> None:
-        self.work += amount
-        if self.work > MAX_DENY_EVALUATION_WORK:
+        if type(amount) is not int or amount < 0:
+            raise ValueError("deny evaluation work charge must be a non-negative integer")
+        if amount > MAX_DENY_EVALUATION_WORK - self.work:
             raise PreflightInputError(
                 "deny-assignment evaluation exceeds its deterministic work budget"
             )
+        self.work += amount
+
+
+@dataclass(slots=True)
+class _RbacExpansionBudget:
+    work: int = 0
+    calls: int = 0
+
+    def charge_work(self, amount: int = 1) -> None:
+        if type(amount) is not int or amount < 0:
+            raise ValueError("RBAC expansion work charge must be a non-negative integer")
+        if amount > MAX_RBAC_EXPANSION_WORK - self.work:
+            raise PreflightInputError("Graph/RBAC expansion exceeds its deterministic work budget")
+        self.work += amount
+
+    def charge_calls(self, amount: int = 1) -> None:
+        if type(amount) is not int or amount < 0:
+            raise ValueError("RBAC evidence call charge must be a non-negative integer")
+        if amount > MAX_RBAC_EVIDENCE_CALLS - self.calls:
+            raise PreflightInputError(
+                "Graph/RBAC evidence exceeds its deterministic call-count limit"
+            )
+        self.calls += amount
 
 
 @dataclass(frozen=True, slots=True)
@@ -885,6 +921,32 @@ def _canonical_guid(value: object, *, field_name: str) -> str:
     if _GUID.fullmatch(guid) is None:
         raise PreflightInputError(f"{field_name} must be a GUID")
     return guid
+
+
+def _canonical_workload_principal_id(value: object, *, field_name: str) -> str:
+    principal_id = _canonical_guid(
+        value,
+        field_name=field_name,
+    )
+    if principal_id == _ALL_PRINCIPALS_ID:
+        raise PreflightInputError(
+            f"{field_name} must not use the All Principals zero GUID as a workload identity"
+        )
+    return principal_id
+
+
+def _normalized_workload_principal_id(value: object, *, field_name: str) -> str:
+    principal_id = _normalized(
+        _require_string(
+            value,
+            field_name=field_name,
+        )
+    )
+    if principal_id == _ALL_PRINCIPALS_ID:
+        raise PreflightInputError(
+            f"{field_name} must not use the All Principals zero GUID as a workload identity"
+        )
+    return principal_id
 
 
 def _length_prefixed(tag: bytes, payload: bytes) -> bytes:
@@ -2754,6 +2816,8 @@ class _ProtectedPropertyEvidence:
         stage: str,
         snapshot: dict[str, Any],
     ) -> None:
+        if not self.entries:
+            return
         root_children = frozenset(
             schema_tokens[0]
             for _, schema_tokens, _ in self.entries
@@ -2767,13 +2831,35 @@ class _ProtectedPropertyEvidence:
         ]
         while stack:
             value, canonical_path = stack.pop()
-            if not self._path_is_protected(canonical_path):
+            protected_path = self._path_is_protected(canonical_path)
+            if protected_path:
+                self._record_partial_snapshot_value(
+                    stage,
+                    canonical_path,
+                    value,
+                )
+            elif isinstance(value, (dict, list)):
+                path_tokens = _property_path_tokens(canonical_path)
+                if not (
+                    isinstance(value, dict)
+                    and len(path_tokens) == 1
+                    and path_tokens[0] in _PARTIAL_SNAPSHOT_FLAT_OBJECT_ROOTS
+                ):
+                    raise PreflightInputError(
+                        "partial snapshot contains an ignored or unknown "
+                        f"container at {canonical_path}"
+                    )
+            else:
                 continue
-            self._record_partial_snapshot_value(
-                stage,
-                canonical_path,
-                value,
-            )
+            if not protected_path:
+                assert isinstance(value, dict)
+                self.budget.charge_lookup(len(value) + 1)
+                if any(isinstance(child, (dict, list)) for child in value.values()):
+                    raise PreflightInputError(
+                        "partial snapshot contains an ignored or unknown "
+                        f"descendant container below {canonical_path}"
+                    )
+                continue
             if isinstance(value, dict):
                 for raw_key, child in reversed(list(value.items())):
                     child_path = _property_child_path(
@@ -2792,8 +2878,16 @@ class _ProtectedPropertyEvidence:
                                 f"protected object {canonical_path} "
                                 "contains a malformed property alias"
                             )
+                        if isinstance(child, (dict, list)):
+                            raise PreflightInputError(
+                                "partial snapshot contains an ignored or unknown "
+                                f"container below {_RESOURCE_ROOT_PATH}"
+                            )
                         continue
-                    if self._path_is_protected(child_path):
+                    if self._path_is_protected(child_path) or isinstance(
+                        child,
+                        (dict, list),
+                    ):
                         stack.append(
                             (
                                 child,
@@ -4473,13 +4567,9 @@ def _parse_rbac_assignment(
             "principalType",
         )
         assigned_principal_fields_supplied = False
-    principal_id = _normalized(
-        _require_string(
-            raw_principal_id,
-            field_name=(
-                "assignedPrincipalId" if assigned_principal_fields_supplied else "principalId"
-            ),
-        )
+    principal_id = _normalized_workload_principal_id(
+        raw_principal_id,
+        field_name=("assignedPrincipalId" if assigned_principal_fields_supplied else "principalId"),
     )
     raw_effective_principal_id = _get_case_insensitive(
         assignment,
@@ -4488,11 +4578,9 @@ def _parse_rbac_assignment(
     effective_principal_id = (
         principal_id
         if raw_effective_principal_id is None
-        else _normalized(
-            _require_string(
-                raw_effective_principal_id,
-                field_name="effectivePrincipalId",
-            )
+        else _normalized_workload_principal_id(
+            raw_effective_principal_id,
+            field_name="effectivePrincipalId",
         )
     )
     if raw_principal_type is None:
@@ -4864,11 +4952,9 @@ def _parse_policy(
                 )
             separation_budget.charge(len(role_names) + len(role_ids) + len(scope_prefixes))
             rule = SeparationRule(
-                principal_id=_normalized(
-                    _require_string(
-                        _get_case_insensitive(item, "principalId"),
-                        field_name="principalId",
-                    )
+                principal_id=_normalized_workload_principal_id(
+                    _get_case_insensitive(item, "principalId"),
+                    field_name="principalId",
                 ),
                 forbidden_role_names=frozenset(
                     _canonical_role_key(
@@ -4921,11 +5007,9 @@ def _parse_policy(
             field_name="expectedPrincipalIds",
             maximum_items=MAX_POLICY_ITEMS,
         ):
-            principal_id = _normalized(
-                _require_string(
-                    raw_principal_id,
-                    field_name="expected principalId",
-                )
+            principal_id = _normalized_workload_principal_id(
+                raw_principal_id,
+                field_name="expected principalId",
             )
             if principal_id in expected_principal_ids:
                 raise PreflightInputError("expectedPrincipalIds contains a duplicate principalId")
@@ -5015,11 +5099,11 @@ def _validate_guarded_assignment_binding(
         raise PreflightInputError(
             f"{field_name} assignedPrincipalType must be Group or ServicePrincipal"
         )
-    _canonical_guid(
+    _canonical_workload_principal_id(
         assignment.principal_id,
         field_name=f"{field_name} assignedPrincipalId",
     )
-    _canonical_guid(
+    _canonical_workload_principal_id(
         assignment.effective_principal_id,
         field_name=f"{field_name} effectivePrincipalId",
     )
@@ -5168,6 +5252,7 @@ def _paged_values(
     next_link_field: str,
     maximum_items: int,
     allowed_host: str,
+    budget: _RbacExpansionBudget,
 ) -> tuple[list[object], tuple[str, ...]]:
     pages = _sequence(
         value,
@@ -5176,6 +5261,8 @@ def _paged_values(
     )
     if not pages:
         raise PreflightInputError(f"{field_name} pages must not be empty")
+    budget.charge_calls(len(pages))
+    budget.charge_work(len(pages) * 2)
     values: list[object] = []
     expected_request_url: str | None = None
     request_urls: list[str] = []
@@ -5203,6 +5290,7 @@ def _paged_values(
             field_name=f"{field_name} page value",
             maximum_items=maximum_items,
         )
+        budget.charge_work(len(page_values))
         if len(values) + len(page_values) > maximum_items:
             raise PreflightInputError(f"{field_name} must contain at most {maximum_items} items")
         values.extend(page_values)
@@ -5291,7 +5379,10 @@ def _derive_management_group_ancestry(
     value: object,
     *,
     target: RbacCollection,
+    budget: _RbacExpansionBudget,
 ) -> tuple[str, ...]:
+    budget.charge_calls(3)
+    budget.charge_work(3)
     hierarchy = _mapping(value, field_name="management-group hierarchy")
     resource_graph = _mapping(
         _get_case_insensitive(hierarchy, "resourceGraph"),
@@ -5391,14 +5482,16 @@ def _derive_management_group_ancestry(
     )
     resource_graph_chain: list[str] = []
     resource_graph_seen: set[str] = set()
-    for raw_ancestor in _sequence(
+    raw_ancestors = _sequence(
         _get_case_insensitive(
             properties,
             "managementGroupAncestorsChain",
         ),
         field_name="managementGroupAncestorsChain",
         maximum_items=MAX_POLICY_ITEMS,
-    ):
+    )
+    budget.charge_work(len(raw_ancestors))
+    for raw_ancestor in raw_ancestors:
         ancestor = _mapping(
             raw_ancestor,
             field_name="Resource Graph management-group ancestor",
@@ -5520,11 +5613,14 @@ def _derive_management_group_ancestry(
     )
 
     parent_by_management_group: dict[str, str | None] = {}
-    for raw_artifact in _sequence(
+    raw_management_groups = _sequence(
         _get_case_insensitive(arm, "managementGroups"),
         field_name="ARM managementGroups",
         maximum_items=MAX_POLICY_ITEMS,
-    ):
+    )
+    budget.charge_calls(len(raw_management_groups))
+    budget.charge_work(len(raw_management_groups) * 2)
+    for raw_artifact in raw_management_groups:
         artifact = _mapping(
             raw_artifact,
             field_name="ARM management-group hierarchy evidence",
@@ -5663,6 +5759,7 @@ def _parse_security_group_membership(
     effective_principal_id: str,
     target: RbacCollection,
     principal_registry: _PrincipalTypeRegistry,
+    budget: _RbacExpansionBudget,
 ) -> frozenset[str]:
     membership = _mapping(value, field_name="Graph group-membership evidence")
     if (
@@ -5687,6 +5784,7 @@ def _parse_security_group_membership(
         next_link_field="@odata.nextLink",
         maximum_items=MAX_ASSIGNMENTS,
         allowed_host="graph.microsoft.com",
+        budget=budget,
     )
     _validate_graph_urls(
         request_urls,
@@ -5700,7 +5798,7 @@ def _parse_security_group_membership(
         if len(request_urls) != 1:
             raise PreflightInputError("getMemberGroups evidence must contain exactly one response")
         for raw_group_id in values:
-            group_id = _canonical_guid(
+            group_id = _canonical_workload_principal_id(
                 raw_group_id,
                 field_name="Graph security-group id",
             )
@@ -5725,7 +5823,7 @@ def _parse_security_group_membership(
                 field_name="Graph transitiveMemberOf @odata.type",
                 maximum_length=128,
             )
-            object_id = _canonical_guid(
+            object_id = _canonical_workload_principal_id(
                 _get_case_insensitive(item, "id"),
                 field_name="Graph transitiveMemberOf id",
             )
@@ -5762,7 +5860,10 @@ def _parse_service_principal(
     effective_principal_id: str,
     target: RbacCollection,
     principal_registry: _PrincipalTypeRegistry,
+    budget: _RbacExpansionBudget,
 ) -> None:
+    budget.charge_calls()
+    budget.charge_work()
     service_principal = _mapping(
         value,
         field_name="Graph service-principal evidence",
@@ -5779,7 +5880,7 @@ def _parse_service_principal(
         != target.tenant_id
     ):
         raise PreflightInputError("Graph service-principal evidence crosses tenants")
-    object_id = _canonical_guid(
+    object_id = _canonical_workload_principal_id(
         _get_case_insensitive(service_principal, "id"),
         field_name="Graph service-principal object id",
     )
@@ -5793,7 +5894,7 @@ def _parse_service_principal(
         "serviceprincipal",
         field_name="Graph service-principal object id",
     )
-    client_id = _canonical_guid(
+    client_id = _canonical_workload_principal_id(
         _get_case_insensitive(service_principal, "appId"),
         field_name="Graph service-principal appId",
     )
@@ -6026,14 +6127,17 @@ def _parse_deny_principals(
     *,
     field_name: str,
     principal_registry: _PrincipalTypeRegistry,
+    budget: _DenyEvaluationWorkBudget,
 ) -> tuple[_TypedPrincipalClaim, ...]:
     principal_ids: set[str] = set()
     principals: list[_TypedPrincipalClaim] = []
-    for raw_principal in _sequence(
+    raw_principals = _sequence(
         value,
         field_name=field_name,
         maximum_items=MAX_ASSIGNMENTS,
-    ):
+    )
+    budget.charge(len(raw_principals))
+    for raw_principal in raw_principals:
         principal = _mapping(
             raw_principal,
             field_name=f"{field_name} entry",
@@ -6096,7 +6200,11 @@ def _parse_optional_deny_condition(
     return condition, condition_version
 
 
-def _validate_deny_permissions(value: object) -> None:
+def _validate_deny_permissions(
+    value: object,
+    *,
+    budget: _DenyEvaluationWorkBudget,
+) -> None:
     permissions = _sequence(
         value,
         field_name="ARM deny-assignment permissions",
@@ -6104,6 +6212,7 @@ def _validate_deny_permissions(value: object) -> None:
     )
     if not permissions:
         raise PreflightInputError("ARM deny-assignment permissions must not be empty")
+    budget.charge(len(permissions))
     has_denied_operation = False
     for raw_permission in permissions:
         permission = _mapping(
@@ -6121,6 +6230,7 @@ def _validate_deny_permissions(value: object) -> None:
                 field_name=f"ARM deny-assignment permission {field_name}",
                 maximum_items=MAX_POLICY_ITEMS,
             )
+            budget.charge(len(raw_values))
             for raw_value in raw_values:
                 value_text = _require_exact_cli_token(
                     raw_value,
@@ -6146,6 +6256,7 @@ def _parse_arm_deny_assignment(
     *,
     collection: RbacCollection,
     principal_registry: _PrincipalTypeRegistry,
+    budget: _DenyEvaluationWorkBudget,
 ) -> DenyAssignment:
     resource = _mapping(
         value,
@@ -6206,6 +6317,7 @@ def _parse_arm_deny_assignment(
         _get_case_insensitive(properties, "principals"),
         field_name="ARM deny-assignment principals",
         principal_registry=principal_registry,
+        budget=budget,
     )
     if not principals:
         raise PreflightInputError("ARM deny-assignment principals must not be empty")
@@ -6213,6 +6325,7 @@ def _parse_arm_deny_assignment(
         _get_case_insensitive(properties, "excludePrincipals"),
         field_name="ARM deny-assignment excludePrincipals",
         principal_registry=principal_registry,
+        budget=budget,
     )
     principal_ids = frozenset(principal.principal_id for principal in principals)
     excluded_principal_ids = frozenset(principal.principal_id for principal in excluded_principals)
@@ -6220,6 +6333,7 @@ def _parse_arm_deny_assignment(
         raise PreflightInputError("ARM deny-assignment principals and exclusions must not overlap")
     _validate_deny_permissions(
         _get_case_insensitive(properties, "permissions"),
+        budget=budget,
     )
     condition, condition_version = _parse_optional_deny_condition(
         properties,
@@ -6245,9 +6359,9 @@ def _build_deny_scope_context(
     *,
     budget: _DenyEvaluationWorkBudget,
 ) -> _DenyScopeContext:
+    budget.charge(len(collection.management_group_ancestry))
     management_group_indexes: dict[str, int] = {}
     for index, scope in enumerate(collection.management_group_ancestry):
-        budget.charge()
         management_group_indexes[scope] = index
     subscription_tokens = _scope_tokens(collection.subscription_scope)
     budget.charge(len(subscription_tokens) + 1)
@@ -6266,13 +6380,13 @@ def _build_deny_access_scope_index(
     scope_trie = _ScopeTrieNode()
     management_group_indexes: list[int] = []
     has_subscription_access = False
+    budget.charge(len(access_scopes))
     for scope in sorted(access_scopes):
         tokens = _scope_tokens(scope)
-        budget.charge()
+        budget.charge(len(tokens) + 1)
         node = scope_trie
         node.has_terminal_descendant = True
         for token in tokens:
-            budget.charge()
             node = node.children.setdefault(
                 token,
                 _ScopeTrieNode(),
@@ -6307,13 +6421,12 @@ def _deny_scope_might_invalidate_access(
     budget: _DenyEvaluationWorkBudget,
 ) -> bool:
     deny_tokens = _scope_tokens(deny.scope)
-    budget.charge()
+    budget.charge(len(deny_tokens) + 2)
     current_node = access_index.scope_trie
     matched_node: _ScopeTrieNode | None = current_node
     if current_node.terminal:
         return True
     for token in deny_tokens:
-        budget.charge()
         next_node = current_node.children.get(token)
         if next_node is None:
             matched_node = None
@@ -6322,7 +6435,6 @@ def _deny_scope_might_invalidate_access(
         matched_node = current_node
         if current_node.terminal:
             return True
-    budget.charge()
     if (
         not deny.do_not_apply_to_child_scopes
         and matched_node is not None
@@ -6356,12 +6468,11 @@ def _deny_targets_effective_principal(
     relevant_principal_ids: frozenset[str],
     budget: _DenyEvaluationWorkBudget,
 ) -> bool:
+    budget.charge(len(deny.excluded_principals) + len(deny.principals))
     for principal in deny.excluded_principals:
-        budget.charge()
         if principal.principal_id in relevant_principal_ids:
             return False
     for principal in deny.principals:
-        budget.charge()
         if (
             principal.principal_id == _ALL_PRINCIPALS_ID
             or principal.principal_id in relevant_principal_ids
@@ -6375,6 +6486,8 @@ def _parse_deny_assignment_evidence(
     *,
     collection: RbacCollection,
     principal_registry: _PrincipalTypeRegistry,
+    expansion_budget: _RbacExpansionBudget,
+    deny_budget: _DenyEvaluationWorkBudget,
 ) -> tuple[DenyAssignment, ...]:
     evidence = _mapping(
         value,
@@ -6453,6 +6566,7 @@ def _parse_deny_assignment_evidence(
             next_link_field="nextLink",
             maximum_items=MAX_ASSIGNMENTS,
             allowed_host="management.azure.com",
+            budget=expansion_budget,
         )
         _validate_arm_deny_assignment_urls(
             request_urls,
@@ -6460,11 +6574,13 @@ def _parse_deny_assignment_evidence(
             collection_type=collection_type,
         )
         collection_assignment_ids: set[str] = set()
+        deny_budget.charge(len(raw_assignments))
         for raw_assignment in raw_assignments:
             assignment = _parse_arm_deny_assignment(
                 raw_assignment,
                 collection=collection,
                 principal_registry=principal_registry,
+                budget=deny_budget,
             )
             if assignment.assignment_id in collection_assignment_ids:
                 raise PreflightInputError(
@@ -6498,6 +6614,7 @@ def _validate_deny_assignments_for_principal(
     scope_context: _DenyScopeContext,
     budget: _DenyEvaluationWorkBudget,
 ) -> None:
+    budget.charge(len(security_group_ids) + len(assignments) + 1)
     relevant_principal_ids = frozenset(
         {
             effective_principal_id,
@@ -6776,7 +6893,7 @@ def _validate_effective_assignment_principal(
     effective_principal_id: str,
     security_group_ids: frozenset[str],
 ) -> None:
-    assigned_principal_id = _canonical_guid(
+    assigned_principal_id = _canonical_workload_principal_id(
         assignment.principal_id,
         field_name="assigned principal ID",
     )
@@ -6800,11 +6917,11 @@ def _register_assignment_principal_types(
     principal_registry: _PrincipalTypeRegistry,
     field_name: str,
 ) -> None:
-    effective_principal_id = _canonical_guid(
+    effective_principal_id = _canonical_workload_principal_id(
         assignment.effective_principal_id,
         field_name=f"{field_name} effectivePrincipalId",
     )
-    assigned_principal_id = _canonical_guid(
+    assigned_principal_id = _canonical_workload_principal_id(
         assignment.principal_id,
         field_name=f"{field_name} assignedPrincipalId",
     )
@@ -6856,6 +6973,7 @@ def _parse_ancestor_role_assignments(
     collection: RbacCollection,
     principal_registry: _PrincipalTypeRegistry,
     assignment_registry: _ArmRoleAssignmentRegistry,
+    budget: _RbacExpansionBudget,
 ) -> list[RbacAssignment]:
     evidence = _mapping(
         value,
@@ -6895,6 +7013,7 @@ def _parse_ancestor_role_assignments(
             next_link_field="nextLink",
             maximum_items=MAX_ASSIGNMENTS,
             allowed_host="management.azure.com",
+            budget=budget,
         )
         _validate_arm_role_assignment_urls(
             request_urls,
@@ -6910,6 +7029,7 @@ def _parse_ancestor_role_assignments(
             for assignment in raw_assignments
         ]
     elif method == "azure-cli":
+        budget.charge_calls()
         exit_code = _get_case_insensitive(evidence, "exitCode")
         if type(exit_code) is not int or exit_code != 0:
             raise PreflightInputError("Azure CLI role-assignment collection did not succeed")
@@ -6918,11 +7038,13 @@ def _parse_ancestor_role_assignments(
             target=collection,
             effective_principal_id=effective_principal_id,
         )
-        for raw_assignment in _sequence(
+        raw_assignments = _sequence(
             _get_case_insensitive(evidence, "value"),
             field_name="Azure CLI role assignments",
             maximum_items=MAX_ASSIGNMENTS,
-        ):
+        )
+        budget.charge_work(len(raw_assignments))
+        for raw_assignment in raw_assignments:
             assignments.append(
                 _parse_cli_role_assignment(
                     raw_assignment,
@@ -6972,6 +7094,7 @@ def _parse_descendant_role_assignments(
     collection: RbacCollection,
     principal_registry: _PrincipalTypeRegistry,
     assignment_registry: _ArmRoleAssignmentRegistry,
+    budget: _RbacExpansionBudget,
 ) -> list[RbacAssignment]:
     evidence = _mapping(
         value,
@@ -6990,16 +7113,18 @@ def _parse_descendant_role_assignments(
             *security_group_ids,
         }
         collected_principal_ids: set[str] = set()
-        for raw_collection in _sequence(
+        raw_collections = _sequence(
             _get_case_insensitive(evidence, "collections"),
             field_name="ARM descendant role-assignment collections",
             maximum_items=MAX_ASSIGNMENTS,
-        ):
+        )
+        budget.charge_work(len(raw_collections))
+        for raw_collection in raw_collections:
             descendant_collection = _mapping(
                 raw_collection,
                 field_name="ARM descendant role-assignment collection",
             )
-            assigned_principal_id = _canonical_guid(
+            assigned_principal_id = _canonical_workload_principal_id(
                 _get_case_insensitive(
                     descendant_collection,
                     "assignedToPrincipalId",
@@ -7053,6 +7178,7 @@ def _parse_descendant_role_assignments(
                 next_link_field="nextLink",
                 maximum_items=MAX_ASSIGNMENTS,
                 allowed_host="management.azure.com",
+                budget=budget,
             )
             _validate_descendant_arm_urls(
                 request_urls,
@@ -7088,6 +7214,7 @@ def _parse_descendant_role_assignments(
                 "effective principal and security groups"
             )
     elif method == "azure-cli":
+        budget.charge_calls()
         exit_code = _get_case_insensitive(evidence, "exitCode")
         if type(exit_code) is not int or exit_code != 0:
             raise PreflightInputError("Azure CLI descendant role collection did not succeed")
@@ -7097,11 +7224,13 @@ def _parse_descendant_role_assignments(
             effective_principal_id=effective_principal_id,
             include_descendants=True,
         )
-        for raw_assignment in _sequence(
+        raw_assignments = _sequence(
             _get_case_insensitive(evidence, "value"),
             field_name="Azure CLI descendant role assignments",
             maximum_items=MAX_ASSIGNMENTS,
-        ):
+        )
+        budget.charge_work(len(raw_assignments))
+        for raw_assignment in raw_assignments:
             assignments.append(
                 _parse_cli_role_assignment(
                     raw_assignment,
@@ -7220,6 +7349,7 @@ def _parse_rbac_evidence(
         raise PreflightInputError(
             "guarded RBAC evidence requires raw target, hierarchy, and principal artifacts"
         )
+    expansion_budget = _RbacExpansionBudget()
     target = _parse_evidence_target(_get_case_insensitive(root, "target"))
     if manifest is not None:
         _validate_rbac_deployment_target(
@@ -7237,6 +7367,7 @@ def _parse_rbac_evidence(
     ancestry = _derive_management_group_ancestry(
         _get_case_insensitive(root, "hierarchy"),
         target=target,
+        budget=expansion_budget,
     )
     if ancestry != policy.target.management_group_ancestry:
         raise PreflightInputError("management-group hierarchy changed from the reviewed policy")
@@ -7260,9 +7391,14 @@ def _parse_rbac_evidence(
         principal_id: {target.resource_group_scope}
         for principal_id in policy.expected_principal_ids
     }
+    expansion_budget.charge_work(
+        len(policy.expected_principal_ids)
+        + len(policy.approved_assignments)
+        + len(policy.allowed_broad_assignments)
+    )
     for expected_principal_id in policy.expected_principal_ids:
         principal_registry.register(
-            _canonical_guid(
+            _canonical_workload_principal_id(
                 expected_principal_id,
                 field_name="expectedPrincipalIds principal",
             ),
@@ -7301,16 +7437,18 @@ def _parse_rbac_evidence(
             str | None,
         ]
     ] = set()
-    for raw_principal in _sequence(
+    raw_principals = _sequence(
         _get_case_insensitive(root, "principals"),
         field_name="RBAC evidence principals",
         maximum_items=MAX_POLICY_ITEMS,
-    ):
+    )
+    expansion_budget.charge_work(len(raw_principals))
+    for raw_principal in raw_principals:
         principal = _mapping(
             raw_principal,
             field_name="RBAC evidence principal",
         )
-        effective_principal_id = _canonical_guid(
+        effective_principal_id = _canonical_workload_principal_id(
             _get_case_insensitive(principal, "effectivePrincipalId"),
             field_name="effectivePrincipalId",
         )
@@ -7327,12 +7465,14 @@ def _parse_rbac_evidence(
             effective_principal_id=effective_principal_id,
             target=target,
             principal_registry=principal_registry,
+            budget=expansion_budget,
         )
         security_group_ids = _parse_security_group_membership(
             _get_case_insensitive(principal, "groupMembership"),
             effective_principal_id=effective_principal_id,
             target=target,
             principal_registry=principal_registry,
+            budget=expansion_budget,
         )
         principal_contexts.append(
             (
@@ -7353,6 +7493,8 @@ def _parse_rbac_evidence(
                 deny_assignment_evidence,
                 collection=target,
                 principal_registry=principal_registry,
+                expansion_budget=expansion_budget,
+                deny_budget=deny_evaluation_budget,
             )
         elif deny_assignment_evidence_digest != current_deny_assignment_digest:
             raise PreflightInputError(
@@ -7375,6 +7517,7 @@ def _parse_rbac_evidence(
                 collection=target,
                 principal_registry=principal_registry,
                 assignment_registry=assignment_registry,
+                budget=expansion_budget,
             ),
             *_parse_descendant_role_assignments(
                 _get_case_insensitive(
@@ -7386,6 +7529,7 @@ def _parse_rbac_evidence(
                 collection=target,
                 principal_registry=principal_registry,
                 assignment_registry=assignment_registry,
+                budget=expansion_budget,
             ),
         ]
         for assignment in principal_assignments:
@@ -7483,11 +7627,11 @@ def evaluate_role_assignments(
                 assignment,
                 field_name="approvedAssignments",
             )
-            _canonical_guid(
+            _canonical_workload_principal_id(
                 assignment.principal_id,
                 field_name="approved assignedPrincipalId",
             )
-            _canonical_guid(
+            _canonical_workload_principal_id(
                 assignment.effective_principal_id,
                 field_name="approved effectivePrincipalId",
             )
@@ -7858,10 +8002,19 @@ def _open_windows_directory_handle(path: Path) -> tuple[int, str]:
 
     kernel32 = vars(ctypes)["WinDLL"]("kernel32", use_last_error=True)
     get_last_error = vars(ctypes)["get_last_error"]
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
     kernel32.CreateFileW.restype = wintypes.HANDLE
     handle = kernel32.CreateFileW(
         os.fspath(path),
-        0,
+        0x00000001,
         0x00000001 | 0x00000002 | 0x00000004,
         None,
         3,
@@ -7879,6 +8032,10 @@ def _open_windows_directory_handle(path: Path) -> tuple[int, str]:
         expected_path = os.path.normcase(os.path.abspath(os.fspath(path)))
         if final_path != expected_path:
             raise PreflightInputError("release ledger directory escaped the trusted path")
+        _validate_windows_local_ntfs_handle(
+            handle_value,
+            final_path=final_path,
+        )
         return handle_value, final_path
     except BaseException:
         kernel32.CloseHandle(wintypes.HANDLE(handle_value))
@@ -7912,33 +8069,196 @@ def _validate_windows_file_descriptor(
         raise PreflightInputError("release ledger record escaped the securely opened directory")
 
 
-def _windows_move_file_no_replace_write_through(
-    source: Path,
-    target: Path,
+def _validate_windows_local_ntfs_handle(
+    handle: int,
+    *,
+    final_path: str,
 ) -> None:
     import ctypes
     from ctypes import wintypes
 
     kernel32 = vars(ctypes)["WinDLL"]("kernel32", use_last_error=True)
     get_last_error = vars(ctypes)["get_last_error"]
-    move_file_ex = kernel32.MoveFileExW
-    move_file_ex.argtypes = [
-        wintypes.LPCWSTR,
-        wintypes.LPCWSTR,
+    kernel32.GetVolumeInformationByHandleW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+        ctypes.POINTER(wintypes.DWORD),
+        ctypes.POINTER(wintypes.DWORD),
+        wintypes.LPWSTR,
         wintypes.DWORD,
     ]
-    move_file_ex.restype = wintypes.BOOL
-    move_file_write_through = 0x00000008
-    if move_file_ex(
-        os.fspath(source),
-        os.fspath(target),
-        move_file_write_through,
+    kernel32.GetVolumeInformationByHandleW.restype = wintypes.BOOL
+    file_system_name = ctypes.create_unicode_buffer(32)
+    if not kernel32.GetVolumeInformationByHandleW(
+        wintypes.HANDLE(handle),
+        None,
+        0,
+        None,
+        None,
+        None,
+        file_system_name,
+        len(file_system_name),
     ):
-        return
-    error = get_last_error()
-    if error in {80, 183}:
-        raise FileExistsError(error, "release ledger record already exists", target)
-    raise OSError(error, "MoveFileExW with MOVEFILE_WRITE_THROUGH failed", target)
+        raise OSError(get_last_error(), "GetVolumeInformationByHandleW failed")
+    kernel32.GetVolumePathNameW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+    ]
+    kernel32.GetVolumePathNameW.restype = wintypes.BOOL
+    volume_path = ctypes.create_unicode_buffer(32768)
+    if not kernel32.GetVolumePathNameW(
+        final_path,
+        volume_path,
+        len(volume_path),
+    ):
+        raise OSError(get_last_error(), "GetVolumePathNameW failed")
+    kernel32.GetDriveTypeW.argtypes = [wintypes.LPCWSTR]
+    kernel32.GetDriveTypeW.restype = wintypes.UINT
+    if (
+        file_system_name.value.casefold() != "ntfs"
+        or kernel32.GetDriveTypeW(volume_path.value) != 3
+    ):
+        raise PreflightInputError("Windows release ledger requires a local fixed NTFS volume")
+
+
+def _open_windows_write_through_file(
+    path: Path,
+    *,
+    create_new: bool,
+    delete_access: bool,
+) -> int:
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    kernel32 = vars(ctypes)["WinDLL"]("kernel32", use_last_error=True)
+    get_last_error = vars(ctypes)["get_last_error"]
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    desired_access = 0x80000000 | 0x40000000
+    if delete_access:
+        desired_access |= 0x00010000
+    handle = kernel32.CreateFileW(
+        os.fspath(path),
+        desired_access,
+        0x00000001 | 0x00000002 | 0x00000004,
+        None,
+        1 if create_new else 3,
+        0x00000080 | 0x00200000 | 0x80000000,
+        None,
+    )
+    invalid_handle = ctypes.c_void_p(-1).value
+    if handle == invalid_handle:
+        error = get_last_error()
+        if create_new and error in {80, 183}:
+            raise FileExistsError(error, "release ledger record already exists", path)
+        raise OSError(error, "CreateFileW failed", path)
+    handle_value = int(handle)
+    try:
+        return int(
+            vars(msvcrt)["open_osfhandle"](
+                handle_value,
+                os.O_RDWR | getattr(os, "O_BINARY", 0),
+            )
+        )
+    except BaseException:
+        kernel32.CloseHandle(wintypes.HANDLE(handle_value))
+        raise
+
+
+def _windows_file_identity(file_descriptor: int) -> tuple[int, int]:
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    class ByHandleFileInformation(ctypes.Structure):
+        _fields_ = [
+            ("FileAttributes", wintypes.DWORD),
+            ("CreationTime", wintypes.FILETIME),
+            ("LastAccessTime", wintypes.FILETIME),
+            ("LastWriteTime", wintypes.FILETIME),
+            ("VolumeSerialNumber", wintypes.DWORD),
+            ("FileSizeHigh", wintypes.DWORD),
+            ("FileSizeLow", wintypes.DWORD),
+            ("NumberOfLinks", wintypes.DWORD),
+            ("FileIndexHigh", wintypes.DWORD),
+            ("FileIndexLow", wintypes.DWORD),
+        ]
+
+    kernel32 = vars(ctypes)["WinDLL"]("kernel32", use_last_error=True)
+    get_last_error = vars(ctypes)["get_last_error"]
+    kernel32.GetFileInformationByHandle.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(ByHandleFileInformation),
+    ]
+    kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
+    handle = vars(msvcrt)["get_osfhandle"](file_descriptor)
+    information = ByHandleFileInformation()
+    if not kernel32.GetFileInformationByHandle(
+        wintypes.HANDLE(handle),
+        ctypes.byref(information),
+    ):
+        raise OSError(get_last_error(), "GetFileInformationByHandle failed")
+    return (
+        int(information.VolumeSerialNumber),
+        (int(information.FileIndexHigh) << 32) | int(information.FileIndexLow),
+    )
+
+
+def _windows_rename_file_no_replace_write_through(
+    file_descriptor: int,
+    target: Path,
+) -> None:
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    target_name = os.fspath(target)
+
+    class FileRenameInfo(ctypes.Structure):
+        _fields_ = [
+            ("ReplaceIfExists", wintypes.BOOLEAN),
+            ("RootDirectory", wintypes.HANDLE),
+            ("FileNameLength", wintypes.DWORD),
+            ("FileName", wintypes.WCHAR * (len(target_name) + 1)),
+        ]
+
+    kernel32 = vars(ctypes)["WinDLL"]("kernel32", use_last_error=True)
+    get_last_error = vars(ctypes)["get_last_error"]
+    kernel32.SetFileInformationByHandle.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    ]
+    kernel32.SetFileInformationByHandle.restype = wintypes.BOOL
+    information = FileRenameInfo()
+    information.ReplaceIfExists = False
+    information.RootDirectory = None
+    information.FileNameLength = len(target_name.encode("utf-16-le"))
+    information.FileName = target_name
+    handle = vars(msvcrt)["get_osfhandle"](file_descriptor)
+    if not kernel32.SetFileInformationByHandle(
+        wintypes.HANDLE(handle),
+        3,
+        ctypes.byref(information),
+        ctypes.sizeof(information),
+    ):
+        error = get_last_error()
+        if error in {80, 183}:
+            raise FileExistsError(error, "release ledger record already exists", target)
+        raise OSError(error, "SetFileInformationByHandle FileRenameInfo failed", target)
 
 
 def _acquire_windows_file_lock(file_descriptor: int) -> Any:
@@ -8214,18 +8534,21 @@ class _SecureLedgerDirectory:
         if self._record_exists(lock_name):
             return
         staging_name = f".wc029-lock-{uuid.uuid4().hex}.tmp"
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
-        if hasattr(os, "O_CLOEXEC"):
-            flags |= os.O_CLOEXEC
         file_descriptor: int | None = None
+        staging_stat: os.stat_result | None = None
+        staging_identity: tuple[int, int] | None = None
+        published = False
         try:
-            file_descriptor = self._open_record(
+            file_descriptor = self._open_windows_write_through_record(
                 staging_name,
-                flags,
-                require_existing=False,
+                create_new=True,
+                delete_access=True,
             )
-            self._verify_file_descriptor(file_descriptor, staging_name)
             rendered = self._lock_state_bytes(None)
+            staging_stat = os.fstat(file_descriptor)
+            if not stat.S_ISREG(staging_stat.st_mode):
+                raise PreflightInputError("release ledger lock staging file must be regular")
+            staging_identity = _windows_file_identity(file_descriptor)
             offset = 0
             while offset < len(rendered):
                 written = os.write(
@@ -8236,19 +8559,31 @@ class _SecureLedgerDirectory:
                     raise OSError("release ledger lock write did not make progress")
                 offset += written
             os.fsync(file_descriptor)
+            try:
+                self._publish_staged_record(
+                    staging_name,
+                    lock_name,
+                    staging_file_descriptor=file_descriptor,
+                )
+                published = True
+            except FileExistsError:
+                return
             os.close(file_descriptor)
             file_descriptor = None
-            with suppress(FileExistsError):
-                _windows_move_file_no_replace_write_through(
-                    self._fallback_file_path(
-                        staging_name,
-                        require_existing=True,
-                    ),
-                    self._fallback_file_path(
-                        lock_name,
-                        require_existing=False,
-                    ),
+            self._verify_published_record(
+                lock_name,
+                staging_stat=staging_stat,
+                expected_content=rendered,
+                windows_identity=staging_identity,
+            )
+        except BaseException:
+            if published and staging_stat is not None:
+                self._rollback_published_record(
+                    lock_name,
+                    staging_stat=staging_stat,
+                    windows_identity=staging_identity,
                 )
+            raise
         finally:
             if file_descriptor is not None:
                 os.close(file_descriptor)
@@ -8344,6 +8679,32 @@ class _SecureLedgerDirectory:
             dir_fd=self._directory_fd,
         )
 
+    def _open_windows_write_through_record(
+        self,
+        name: str,
+        *,
+        create_new: bool,
+        delete_access: bool,
+    ) -> int:
+        if os.name != "nt" or self._directory_fd is not None:
+            raise PreflightInputError(
+                "Windows write-through release-ledger operations are unsupported"
+            )
+        file_descriptor = _open_windows_write_through_file(
+            self._fallback_file_path(
+                name,
+                require_existing=not create_new,
+            ),
+            create_new=create_new,
+            delete_access=delete_access,
+        )
+        try:
+            self._verify_file_descriptor(file_descriptor, name)
+            return file_descriptor
+        except BaseException:
+            os.close(file_descriptor)
+            raise
+
     def _unlink_record(self, name: str) -> None:
         if self._directory_fd is None:
             os.unlink(
@@ -8362,15 +8723,18 @@ class _SecureLedgerDirectory:
         self,
         staging_name: str,
         final_name: str,
+        *,
+        staging_file_descriptor: int | None = None,
     ) -> None:
         try:
             if self._directory_fd is None:
                 if os.name == "nt":
-                    _windows_move_file_no_replace_write_through(
-                        self._fallback_file_path(
-                            staging_name,
-                            require_existing=True,
-                        ),
+                    if staging_file_descriptor is None:
+                        raise PreflightInputError(
+                            "Windows write-through ledger staging handle is unavailable"
+                        )
+                    _windows_rename_file_no_replace_write_through(
+                        staging_file_descriptor,
                         self._fallback_file_path(
                             final_name,
                             require_existing=False,
@@ -8402,18 +8766,14 @@ class _SecureLedgerDirectory:
             ) from exc
 
     def _sync_directory(self) -> None:
-        if self._directory_fd is not None:
-            try:
-                os.fsync(self._directory_fd)
-            except OSError as exc:
-                raise PreflightInputError(
-                    "release ledger directory could not be synchronized"
-                ) from exc
-            return
-        if os.name != "nt":
+        if self._directory_fd is None:
             raise PreflightInputError(
                 "safe release-ledger directory synchronization is unsupported"
             )
+        try:
+            os.fsync(self._directory_fd)
+        except OSError as exc:
+            raise PreflightInputError("release ledger directory could not be synchronized") from exc
 
     @staticmethod
     def _sync_published_record(
@@ -8431,6 +8791,8 @@ class _SecureLedgerDirectory:
         name: str,
         *,
         staging_stat: os.stat_result,
+        expected_content: bytes,
+        windows_identity: tuple[int, int] | None,
     ) -> None:
         flags = os.O_RDWR if os.name == "nt" else os.O_RDONLY
         if hasattr(os, "O_NONBLOCK"):
@@ -8440,20 +8802,45 @@ class _SecureLedgerDirectory:
         if hasattr(os, "O_CLOEXEC"):
             flags |= os.O_CLOEXEC
         flags |= getattr(os, "O_BINARY", 0)
-        file_descriptor = self._open_record(
-            name,
-            flags,
-            require_existing=True,
+        file_descriptor = (
+            self._open_windows_write_through_record(
+                name,
+                create_new=False,
+                delete_access=False,
+            )
+            if os.name == "nt"
+            else self._open_record(
+                name,
+                flags,
+                require_existing=True,
+            )
         )
         try:
             self._verify_file_descriptor(file_descriptor, name)
             published_stat = os.fstat(file_descriptor)
-            if not stat.S_ISREG(published_stat.st_mode) or not os.path.samestat(
-                staging_stat,
-                published_stat,
-            ):
+            same_record = (
+                windows_identity is not None
+                and _windows_file_identity(file_descriptor) == windows_identity
+                if os.name == "nt"
+                else os.path.samestat(staging_stat, published_stat)
+            )
+            if not stat.S_ISREG(published_stat.st_mode) or not same_record:
                 raise PreflightInputError(
                     "release ledger publication did not preserve the staged record"
+                )
+            os.lseek(file_descriptor, 0, os.SEEK_SET)
+            content = bytearray()
+            while len(content) <= len(expected_content):
+                chunk = os.read(
+                    file_descriptor,
+                    len(expected_content) + 1 - len(content),
+                )
+                if not chunk:
+                    break
+                content.extend(chunk)
+            if bytes(content) != expected_content:
+                raise PreflightInputError(
+                    "release ledger publication did not preserve the staged bytes"
                 )
             self._sync_published_record(file_descriptor)
         finally:
@@ -8464,6 +8851,7 @@ class _SecureLedgerDirectory:
         name: str,
         *,
         staging_stat: os.stat_result,
+        windows_identity: tuple[int, int] | None,
     ) -> None:
         flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
         if hasattr(os, "O_NONBLOCK"):
@@ -8478,10 +8866,13 @@ class _SecureLedgerDirectory:
                 require_existing=True,
             )
             self._verify_file_descriptor(file_descriptor, name)
-            if not os.path.samestat(
-                staging_stat,
-                os.fstat(file_descriptor),
-            ):
+            same_record = (
+                windows_identity is not None
+                and _windows_file_identity(file_descriptor) == windows_identity
+                if os.name == "nt"
+                else os.path.samestat(staging_stat, os.fstat(file_descriptor))
+            )
+            if not same_record:
                 return
         except OSError, PreflightInputError:
             return
@@ -8493,7 +8884,8 @@ class _SecureLedgerDirectory:
             PreflightInputError,
         ):
             self._unlink_record(name)
-            self._sync_directory()
+            if os.name != "nt":
+                self._sync_directory()
 
     def create_json(self, name: str, payload: dict[str, object]) -> None:
         if Path(name).name != name:
@@ -8521,10 +8913,18 @@ class _SecureLedgerDirectory:
         for _ in range(8):
             staging_name = f".wc029-{uuid.uuid4().hex}.tmp"
             try:
-                file_descriptor = self._open_record(
-                    staging_name,
-                    flags,
-                    require_existing=False,
+                file_descriptor = (
+                    self._open_windows_write_through_record(
+                        staging_name,
+                        create_new=True,
+                        delete_access=True,
+                    )
+                    if os.name == "nt"
+                    else self._open_record(
+                        staging_name,
+                        flags,
+                        require_existing=False,
+                    )
                 )
                 break
             except FileExistsError:
@@ -8534,12 +8934,15 @@ class _SecureLedgerDirectory:
         journaled = False
         published = False
         staging_stat: os.stat_result | None = None
+        staging_identity: tuple[int, int] | None = None
         try:
             journaled = self._begin_record_publication(name)
             self._verify_file_descriptor(file_descriptor, staging_name)
             staging_stat = os.fstat(file_descriptor)
             if not stat.S_ISREG(staging_stat.st_mode):
                 raise PreflightInputError("release ledger staging record must be a regular file")
+            if os.name == "nt":
+                staging_identity = _windows_file_identity(file_descriptor)
             offset = 0
             while offset < len(rendered):
                 written = os.write(
@@ -8550,25 +8953,30 @@ class _SecureLedgerDirectory:
                     raise OSError("release ledger staging write did not make progress")
                 offset += written
             os.fsync(file_descriptor)
-            if os.name == "nt":
-                os.close(file_descriptor)
-                file_descriptor = None
             self._publish_staged_record(
                 staging_name,
                 name,
+                staging_file_descriptor=file_descriptor,
             )
             published = True
+            if os.name == "nt":
+                os.close(file_descriptor)
+                file_descriptor = None
             self._verify_published_record(
                 name,
                 staging_stat=staging_stat,
+                expected_content=rendered,
+                windows_identity=staging_identity,
             )
-            self._sync_directory()
+            if os.name != "nt":
+                self._sync_directory()
             self._complete_record_publication(name)
         except BaseException:
             if published and staging_stat is not None:
                 self._rollback_published_record(
                     name,
                     staging_stat=staging_stat,
+                    windows_identity=staging_identity,
                 )
             elif journaled:
                 self._complete_record_publication(name)

@@ -109,6 +109,9 @@ cannot be combined into incompatible representations.
 Ancestor deltas are checked against stored container kinds at every resolved depth, so a nested
 partial object cannot be replaced by an array hidden inside a broader `properties` or
 `networkAcls` value.
+An unprotected container in a partial snapshot is never silently ignored. Unknown container roots
+fail closed. The only accepted unprotected containers are the flat `tags` and `systemData` metadata
+objects, and any nested object or array below either one is rejected before delta reconciliation.
 
 Each canonical path is limited to 4096 characters, and one evaluation has bounded aggregate
 generated-path count and character work. Nested path accumulation and wide generated snapshots fail
@@ -177,10 +180,14 @@ complete winner. Staging and reads use binary descriptors, so Windows newline tr
 expand a physically accepted record past 64 KiB. An existing consumption name proves prior use only
 when its JSON exactly matches the expected consumption record; empty, partial, malformed, or
 conflicting finals fail as ledger corruption.
-On Windows, publication uses no-replace `MoveFileExW` with `MOVEFILE_WRITE_THROUGH`, followed by an
-fsync of the securely reopened and inode-verified final record. The final name is rolled back if
-that post-publication barrier fails, and the CLI returns a bounded malformed-input error rather than
-success. Unsupported safe publication primitives fail closed.
+On Windows, the ledger must be on a local fixed NTFS volume. The staging file is opened with
+`CreateFileW` and `FILE_FLAG_WRITE_THROUGH`, then its still-open handle is renamed with
+`SetFileInformationByHandle(FileRenameInfo)` and `ReplaceIfExists = FALSE`. The verifier closes that
+handle, securely reopens the final name with write-through semantics, verifies the same NTFS file
+identity and exact expected bytes, and flushes the final file handle before success. It does not
+claim or attempt a Windows directory fsync. The final name is rolled back if post-rename identity,
+byte, path, regular-file, or flush verification fails, and unsupported filesystems or primitives
+fail closed.
 A persistent, securely opened `.wc029-ledger.lock` file holds an exclusive cross-process lock around
 the complete collection-binding, deployment-binding, and consumption transaction. Its bounded JSON
 state is fsynced to name each pending record before publication and is cleared only after the
@@ -343,8 +350,9 @@ membership, assignment, deny, collection, or page evidence invalidates the artif
 Every typed Graph `transitiveMemberOf` object is registered before non-group objects are excluded
 from the accepted security-group set, so an unfamiliar directory-object type cannot hide a later
 type conflict.
-The registry is pre-seeded with the all-zero All Principals identity as `SystemDefined`; policy,
-identity, membership, or assignment evidence cannot relabel it even when deny inventories are empty.
+Every workload-identity field rejects the all-zero All Principals GUID directly. The registry is
+also pre-seeded with that identity as `SystemDefined`, so policy, identity, membership, assignment,
+or client-ID evidence cannot accept or relabel it even when deny inventories are empty.
 Every normalized ARM or guarded Azure CLI role-assignment row also retains `arm_assignment_id` and
 a digest of its canonical identity-bearing body: principal, principal type, role definition, scope,
 condition, and condition version. Guarded CLI output must retain exact `id` and
@@ -368,11 +376,15 @@ complete transitive security-group IDs, All Principals, exclusions, scope inheri
 effective because the verifier does not evaluate Azure ABAC expressions. A deny that might
 invalidate any approved access blocks the gate; unrelated principals, excluded identities,
 non-inherited ancestor denies, and disjoint scopes do not.
-Deny evaluation builds the canonical management-group and subscription indexes once and a
-token-trie access-scope index once per effective principal. It does not rescan the ancestry tuple,
-materialize every tuple prefix, or compare every deny with every approved scope. Every deny
-principal/exclusion visit, scope token, and relationship lookup consumes one document-wide
-deterministic work budget; overflow is a bounded input failure.
+Deny parsing and evaluation build the canonical management-group and subscription indexes once and
+a token-trie access-scope index once per effective principal. They do not rescan the ancestry tuple,
+materialize every tuple prefix, or compare every deny with every approved scope. Known principal,
+permission, assignment, and scope-list sizes are charged before traversal; each remaining scope
+token and relationship lookup consumes the same document-wide deterministic work budget.
+Graph, ARM, and guarded CLI evidence expansion separately shares explicit aggregate work and
+request/page-count limits across hierarchy, service-principal, membership, deny, ancestor, and
+descendant evidence. Every overflow is a bounded input failure before the corresponding expansion
+is traversed.
 
 The RBAC envelope uses the same bounded timestamps, `collectionRunId`, `deploymentExecutionId`,
 `deploymentTarget`, independently reviewed manifest digest, and trusted release ledger as the

@@ -164,9 +164,13 @@ atomic no-overwrite publication. Orphaned empty/partial staging files never rese
 concurrent writers produce one complete winner, binary descriptors preserve the physical 64-KiB
 bound on Windows, and malformed final consumption records are corruption rather than proof of prior
 use.
-Windows publication uses no-replace `MoveFileExW` with `MOVEFILE_WRITE_THROUGH`, then synchronizes
-the securely verified final record. If that post-publication durability barrier fails, the matching
-final is rolled back and the preflight fails; do not treat it as consumed.
+Windows publication is accepted only on a local fixed NTFS volume. It opens the staging record with
+`CreateFileW` and `FILE_FLAG_WRITE_THROUGH`, renames the open handle through
+`SetFileInformationByHandle(FileRenameInfo)` with `ReplaceIfExists = FALSE`, then securely reopens
+the final name to verify the same file identity and exact bytes before flushing the final handle.
+Windows directory fsync is unsupported and is not claimed. If any post-rename verification or
+durability step fails, the matching final is rolled back and the preflight fails; do not treat it as
+consumed.
 Keep the persistent `.wc029-ledger.lock` file with the release evidence. Its secure cross-process
 lock spans publication, synchronization, rollback, and existing-record comparison. Its fsynced
 pending/idle state remains pending after a failed durability barrier even if rollback also fails, so
@@ -321,6 +325,9 @@ container kind without interpreting omitted fields as absent. Present partial va
 with delta evidence in either order.
 Ancestor delta objects are checked against those stored kinds at every depth; `ipRules: {}` and
 `ipRules: []` are contradictory even when one appears inside a broader ancestor value.
+Unknown unprotected containers in partial snapshots fail closed rather than being discarded. The
+permitted `tags` and `systemData` metadata containers must remain flat; nested objects or arrays
+below either root are rejected recursively.
 All status, change, method, principal/role type, and protected network/access values must be exact
 trimmed ASCII tokens before normalization. Do not repair whitespace or Unicode lookalikes manually.
 
@@ -540,11 +547,13 @@ verifier evaluates the service-principal object ID, every transitive security gr
 condition blocks conservatively because the offline gate does not execute Azure ABAC expressions.
 Missing collections, incomplete pagination, collection disagreement, or a deny that might invalidate
 approved access stops release.
-Deny checks use precomputed ancestry and one canonical access-scope token trie per principal under a
-document-wide deterministic work budget. Large deny/access sets that exceed the bound fail closed
-instead of performing repeated deny-by-scope-by-ancestry scans. Each scope token is processed a
-constant number of times, avoiding quadratic tuple-prefix copying for deep but otherwise valid ARM
-scopes.
+Deny parsing and checks use precomputed ancestry and one canonical access-scope token trie per
+principal under a document-wide deterministic work budget. Known list sizes are reserved before
+traversal, and large deny/access sets that exceed the bound fail closed instead of performing
+repeated deny-by-scope-by-ancestry scans. Each scope token is processed a constant number of times,
+avoiding quadratic tuple-prefix copying for deep but otherwise valid ARM scopes. The complete
+Graph/RBAC artifact also has document-wide expansion-work and request/page-count limits spanning
+hierarchy, service-principal, membership, deny, ancestor, descendant, and guarded CLI evidence.
 
 When the Azure CLI is used instead, retain the exact successful argument list and raw output. The
 equivalent scoped command is:
@@ -601,9 +610,10 @@ principal/exclusion retains its supplied type. Any GUID claimed with different t
 identity, membership, role-assignment, deny, collection, or page evidence requires recollection.
 Retain every typed `transitiveMemberOf` object: the verifier registers its type before excluding
 non-group objects from the accepted security-group set.
-The all-zero All Principals GUID is pre-registered as `SystemDefined` before any reviewed or observed
-principal claim. It cannot be used as an effective service principal or group when deny inventories
-are empty.
+The all-zero All Principals GUID is rejected directly from every workload-identity field and is also
+pre-registered as `SystemDefined` before any reviewed or observed principal claim. It cannot be
+used as an effective service principal, group, assignment principal, or client ID when deny
+inventories are empty.
 Retain every ARM and guarded Azure CLI role-assignment `id` and `type` unchanged. The verifier
 permits the same group-derived ID under multiple effective principals only when the canonical
 identity-bearing body is identical across methods and collections. Non-identity display metadata

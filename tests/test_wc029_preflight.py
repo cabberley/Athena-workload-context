@@ -2126,6 +2126,59 @@ def test_attested_what_if_rejects_partial_snapshot_kind_conflict_from_ancestor_d
         )
 
 
+@pytest.mark.parametrize(
+    "partial_snapshot",
+    [
+        {
+            "tags": {
+                "release": {
+                    "nested": [],
+                }
+            }
+        },
+        {
+            "syntheticUnknown": {
+                "nested": {
+                    "items": [],
+                }
+            }
+        },
+        {
+            "synthetic.unknown": {
+                "nested": {
+                    "items": [],
+                }
+            }
+        },
+    ],
+)
+def test_attested_what_if_rejects_nested_unprotected_partial_snapshot_containers(
+    partial_snapshot: dict[str, object],
+) -> None:
+    change = {
+        "resourceId": _STORAGE_ID,
+        "changeType": "Modify",
+        "before": partial_snapshot,
+        "delta": [
+            {
+                "path": "properties.allowSharedKeyAccess",
+                "propertyChangeType": "Modify",
+                "before": True,
+                "after": False,
+            }
+        ],
+    }
+
+    with pytest.raises(
+        PreflightInputError,
+        match="ignored or unknown .*container",
+    ):
+        _evaluate_attested_what_if(
+            _what_if(change),
+            allowed_change_ids=frozenset({_STORAGE_ID}),
+        )
+
+
 def test_attested_what_if_does_not_treat_partial_snapshot_omission_as_absence() -> None:
     change = {
         "resourceId": _STORAGE_ID,
@@ -6116,6 +6169,20 @@ def test_rbac_rejects_broad_roles_and_allows_exact_exception() -> None:
     )
 
 
+def test_rbac_never_accepts_all_principals_zero_guid_as_workload_identity() -> None:
+    assignment = _assignment(
+        principal_id=_SUBSCRIPTION_ID,
+        role_name="AcrPull",
+        scope=_RG_SCOPE,
+    )
+
+    with pytest.raises(
+        PreflightInputError,
+        match="All Principals zero GUID as a workload identity",
+    ):
+        evaluate_role_assignments([assignment])
+
+
 def test_rbac_case_normalization_and_identity_separation() -> None:
     principal_id = "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA"
     assignment = _assignment(
@@ -7346,6 +7413,8 @@ def test_release_ledger_fsyncs_staging_before_atomic_publication(
         ledger: _SecureLedgerDirectory,
         staging_name: str,
         final_name: str,
+        *,
+        staging_file_descriptor: int | None = None,
     ) -> None:
         assert events == ["fsync"]
         events.append("publish")
@@ -7353,6 +7422,7 @@ def test_release_ledger_fsyncs_staging_before_atomic_publication(
             ledger,
             staging_name,
             final_name,
+            staging_file_descriptor=staging_file_descriptor,
         )
 
     monkeypatch.setattr(os, "fsync", tracked_fsync)
@@ -7377,15 +7447,15 @@ def test_windows_release_ledger_durably_publishes_lock_before_use(
     ledger_path = trusted_root / "ledger"
     ledger_path.mkdir(parents=True)
     published_targets: list[str] = []
-    original_publish = wc029_preflight_module._windows_move_file_no_replace_write_through
+    original_publish = wc029_preflight_module._windows_rename_file_no_replace_write_through
 
-    def tracked_publish(source: Path, target: Path) -> None:
+    def tracked_publish(file_descriptor: int, target: Path) -> None:
         published_targets.append(target.name)
-        original_publish(source, target)
+        original_publish(file_descriptor, target)
 
     monkeypatch.setattr(
         wc029_preflight_module,
-        "_windows_move_file_no_replace_write_through",
+        "_windows_rename_file_no_replace_write_through",
         tracked_publish,
     )
 
@@ -7436,12 +7506,12 @@ def test_windows_release_ledger_requires_post_publication_durability_event(
     ledger_path = trusted_root / "ledger"
     ledger_path.mkdir(parents=True)
     events: list[str] = []
-    original_publish = wc029_preflight_module._windows_move_file_no_replace_write_through
+    original_publish = wc029_preflight_module._windows_rename_file_no_replace_write_through
     original_sync = _SecureLedgerDirectory._sync_published_record
 
-    def tracked_publish(source: Path, target: Path) -> None:
+    def tracked_publish(file_descriptor: int, target: Path) -> None:
         events.append("publish")
-        original_publish(source, target)
+        original_publish(file_descriptor, target)
 
     def tracked_sync(file_descriptor: int) -> None:
         assert events == ["publish"]
@@ -7450,7 +7520,7 @@ def test_windows_release_ledger_requires_post_publication_durability_event(
 
     monkeypatch.setattr(
         wc029_preflight_module,
-        "_windows_move_file_no_replace_write_through",
+        "_windows_rename_file_no_replace_write_through",
         tracked_publish,
     )
     monkeypatch.setattr(
@@ -7463,6 +7533,131 @@ def test_windows_release_ledger_requires_post_publication_durability_event(
         ledger.create_json("durable-windows.json", {"value": "complete"})
 
     assert events == ["publish", "durability"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows post-rename verification regression")
+def test_windows_release_ledger_rejects_post_rename_byte_substitution(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trusted_root = tmp_path / "trusted-root"
+    ledger_path = trusted_root / "ledger"
+    ledger_path.mkdir(parents=True)
+    final_path = ledger_path / "substituted-bytes.json"
+    original_rename = wc029_preflight_module._windows_rename_file_no_replace_write_through
+
+    def rename_then_mutate(file_descriptor: int, target: Path) -> None:
+        original_rename(file_descriptor, target)
+        os.lseek(file_descriptor, 0, os.SEEK_SET)
+        os.write(file_descriptor, b"{}\n")
+        os.ftruncate(file_descriptor, 3)
+        os.fsync(file_descriptor)
+
+    monkeypatch.setattr(
+        wc029_preflight_module,
+        "_windows_rename_file_no_replace_write_through",
+        rename_then_mutate,
+    )
+
+    with (
+        _SecureLedgerDirectory(ledger_path, trusted_root) as ledger,
+        pytest.raises(
+            PreflightInputError,
+            match="did not preserve the staged bytes",
+        ),
+    ):
+        ledger.create_json("substituted-bytes.json", {"value": "complete"})
+
+    assert not final_path.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows post-rename verification regression")
+def test_windows_release_ledger_rejects_post_rename_identity_substitution(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trusted_root = tmp_path / "trusted-root"
+    ledger_path = trusted_root / "ledger"
+    ledger_path.mkdir(parents=True)
+    final_path = ledger_path / "substituted-identity.json"
+    original_identity = wc029_preflight_module._windows_file_identity
+    identity_calls = 0
+
+    def substitute_final_identity(file_descriptor: int) -> tuple[int, int]:
+        nonlocal identity_calls
+        identity_calls += 1
+        volume_serial, file_index = original_identity(file_descriptor)
+        if identity_calls == 2:
+            return volume_serial, file_index + 1
+        return volume_serial, file_index
+
+    monkeypatch.setattr(
+        wc029_preflight_module,
+        "_windows_file_identity",
+        substitute_final_identity,
+    )
+
+    with (
+        _SecureLedgerDirectory(ledger_path, trusted_root) as ledger,
+        pytest.raises(
+            PreflightInputError,
+            match="did not preserve the staged record",
+        ),
+    ):
+        ledger.create_json("substituted-identity.json", {"value": "complete"})
+
+    assert not final_path.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows local NTFS regression")
+def test_windows_release_ledger_fails_closed_without_local_ntfs(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trusted_root = tmp_path / "trusted-root"
+    ledger_path = trusted_root / "ledger"
+    ledger_path.mkdir(parents=True)
+
+    def reject_volume(_handle: int, *, final_path: str) -> None:
+        raise PreflightInputError(f"synthetic non-local volume rejected at {final_path}")
+
+    monkeypatch.setattr(
+        wc029_preflight_module,
+        "_validate_windows_local_ntfs_handle",
+        reject_volume,
+    )
+
+    with (
+        pytest.raises(
+            PreflightInputError,
+            match="synthetic non-local volume rejected",
+        ),
+        _SecureLedgerDirectory(ledger_path, trusted_root),
+    ):
+        pass
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows directory fsync regression")
+def test_windows_release_ledger_never_claims_directory_fsync(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trusted_root = tmp_path / "trusted-root"
+    ledger_path = trusted_root / "ledger"
+    ledger_path.mkdir(parents=True)
+
+    def reject_directory_sync(_ledger: _SecureLedgerDirectory) -> None:
+        raise AssertionError("Windows directory fsync must not be attempted")
+
+    monkeypatch.setattr(
+        _SecureLedgerDirectory,
+        "_sync_directory",
+        reject_directory_sync,
+    )
+
+    with _SecureLedgerDirectory(ledger_path, trusted_root) as ledger:
+        ledger.create_json("no-directory-fsync.json", {"value": "complete"})
+        assert ledger.read_json("no-directory-fsync.json") == {"value": "complete"}
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows durability barrier regression")
@@ -7519,7 +7714,7 @@ def test_windows_release_ledger_serializes_existing_acceptance_with_durability(
     def fail_first_sync(file_descriptor: int) -> None:
         nonlocal sync_calls
         sync_calls += 1
-        if sync_calls == 1:
+        if sync_calls == 2:
             first_barrier_entered.set()
             if not release_first_barrier.wait(timeout=10):
                 raise AssertionError("timed out waiting to release durability barrier")
@@ -7585,6 +7780,8 @@ def test_release_ledger_publication_failure_does_not_poison_retry(
         ledger: _SecureLedgerDirectory,
         staging_name: str,
         final_name: str,
+        *,
+        staging_file_descriptor: int | None = None,
     ) -> None:
         nonlocal publish_attempts
         publish_attempts += 1
@@ -7594,6 +7791,7 @@ def test_release_ledger_publication_failure_does_not_poison_retry(
             ledger,
             staging_name,
             final_name,
+            staging_file_descriptor=staging_file_descriptor,
         )
 
     monkeypatch.setattr(
@@ -7630,7 +7828,7 @@ def test_release_ledger_fails_closed_when_safe_publication_is_unsupported(
         if os.name == "nt":
             monkeypatch.setattr(
                 wc029_preflight_module,
-                "_windows_move_file_no_replace_write_through",
+                "_windows_rename_file_no_replace_write_through",
                 unsupported_link,
             )
         else:
@@ -7696,8 +7894,10 @@ def test_posix_release_ledger_rollback_rejects_substituted_fifo_without_blocking
         name: str,
         *,
         staging_stat: os.stat_result,
+        expected_content: bytes,
+        windows_identity: tuple[int, int] | None,
     ) -> None:
-        del staging_stat
+        del expected_content, staging_stat, windows_identity
         ledger._unlink_record(name)
         os.mkfifo(ledger_path / name)
         raise PreflightInputError("synthetic post-publication verification failure")
@@ -10468,6 +10668,109 @@ def test_deny_evaluation_fails_at_one_document_aggregate_work_bound() -> None:
         )
 
 
+def test_deny_targeting_reserves_the_complete_principal_scan_before_matching() -> None:
+    matching_principal_id = "11111111-1111-1111-1111-111111111111"
+    deny = wc029_preflight_module.DenyAssignment(
+        assignment_id=(
+            f"{_RG_SCOPE}/providers/microsoft.authorization/denyassignments/"
+            "00000000-0000-0000-0000-000000000001"
+        ),
+        scope=_RG_SCOPE,
+        do_not_apply_to_child_scopes=False,
+        principals=(
+            wc029_preflight_module._TypedPrincipalClaim(
+                principal_id=matching_principal_id,
+                principal_type="serviceprincipal",
+            ),
+            wc029_preflight_module._TypedPrincipalClaim(
+                principal_id="22222222-2222-2222-2222-222222222222",
+                principal_type="serviceprincipal",
+            ),
+        ),
+        excluded_principals=(),
+        condition=None,
+        condition_version=None,
+    )
+    budget = wc029_preflight_module._DenyEvaluationWorkBudget(
+        work=wc029_preflight_module.MAX_DENY_EVALUATION_WORK - 1,
+    )
+
+    with pytest.raises(
+        PreflightInputError,
+        match="deny-assignment evaluation exceeds its deterministic work budget",
+    ):
+        wc029_preflight_module._deny_targets_effective_principal(
+            deny,
+            relevant_principal_ids=frozenset({matching_principal_id}),
+            budget=budget,
+        )
+
+
+def test_graph_rbac_page_limits_fail_before_page_traversal() -> None:
+    call_budget = wc029_preflight_module._RbacExpansionBudget(
+        calls=wc029_preflight_module.MAX_RBAC_EVIDENCE_CALLS,
+    )
+    with pytest.raises(
+        PreflightInputError,
+        match="deterministic call-count limit",
+    ):
+        wc029_preflight_module._paged_values(
+            [None],
+            field_name="synthetic Graph evidence",
+            next_link_field="@odata.nextLink",
+            maximum_items=1,
+            allowed_host="graph.microsoft.com",
+            budget=call_budget,
+        )
+
+    work_budget = wc029_preflight_module._RbacExpansionBudget(
+        work=wc029_preflight_module.MAX_RBAC_EXPANSION_WORK - 1,
+    )
+    with pytest.raises(
+        PreflightInputError,
+        match="Graph/RBAC expansion exceeds its deterministic work budget",
+    ):
+        wc029_preflight_module._paged_values(
+            [None],
+            field_name="synthetic Graph evidence",
+            next_link_field="@odata.nextLink",
+            maximum_items=1,
+            allowed_host="graph.microsoft.com",
+            budget=work_budget,
+        )
+
+
+def test_guarded_rbac_applies_one_document_wide_evidence_call_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignment = _guarded_assignment(
+        principal_id=principal_id,
+        role_name="AcrPull",
+        scope=_RG_SCOPE,
+    )
+    evidence = _guarded_evidence([assignment])
+    principal = _first_principal_artifact(evidence)
+    principal["servicePrincipal"] = "must not be traversed after the call limit"
+    monkeypatch.setattr(
+        wc029_preflight_module,
+        "MAX_RBAC_EVIDENCE_CALLS",
+        5,
+    )
+
+    with pytest.raises(
+        PreflightInputError,
+        match="deterministic call-count limit",
+    ):
+        _evaluate_guarded_rbac(
+            evidence,
+            _production_policy(
+                principal_id,
+                expected_assignments=[assignment],
+            ),
+        )
+
+
 @pytest.mark.parametrize(
     ("evidence_kind", "query_suffix", "message"),
     [
@@ -11124,7 +11427,7 @@ def test_guarded_rbac_reserves_all_principals_zero_guid_as_system_defined(
 
     with pytest.raises(
         PreflightInputError,
-        match="tenant-wide principal type systemdefined",
+        match="All Principals zero GUID as a workload identity",
     ):
         _evaluate_guarded_rbac(
             evidence,
@@ -11594,6 +11897,32 @@ def test_guarded_rbac_rejects_client_id_as_effective_principal() -> None:
     with pytest.raises(
         PreflightInputError,
         match="client ID, not an object ID",
+    ):
+        _evaluate_guarded_rbac(
+            evidence,
+            _production_policy(
+                principal_id,
+                expected_assignments=[assignment],
+            ),
+        )
+
+
+def test_guarded_rbac_rejects_all_principals_zero_guid_as_client_id() -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignment = _guarded_assignment(
+        principal_id=principal_id,
+        role_name="AcrPull",
+        scope=_RG_SCOPE,
+    )
+    evidence = _guarded_evidence([assignment])
+    principal = _first_principal_artifact(evidence)
+    service_principal = principal["servicePrincipal"]
+    assert isinstance(service_principal, dict)
+    service_principal["appId"] = _SUBSCRIPTION_ID
+
+    with pytest.raises(
+        PreflightInputError,
+        match="All Principals zero GUID as a workload identity",
     ):
         _evaluate_guarded_rbac(
             evidence,
