@@ -824,11 +824,26 @@ output producerJobResourceId string = producerJob.id
 output producerImage string = validatedProducerImage
 output registryResourceId string = producerImagePull.outputs.registryResourceId
 output registryRoleAssignmentMode string = producerImagePull.outputs.roleAssignmentMode
+output registryAnonymousPullEnabled bool = producerImagePull.outputs.anonymousPullEnabled
 output registryRepositoryName string = producerImagePull.outputs.repositoryName
 output registryPullRoleDefinitionId string = producerImagePull.outputs.roleDefinitionResourceId
 output registryPullRoleAssignmentResourceId string = producerImagePull.outputs.roleAssignmentResourceId
+output registryPullPrincipalId string = validatedReceiverIdentityPrincipalId
 output registryPullConditionVersion string? = producerImagePull.outputs.?conditionVersion
 output registryPullCondition string? = producerImagePull.outputs.?condition
+output deployedRegistryPullBindingJson string = string({
+  schemaVersion: 'athena.wc027AcrPullBinding.v1'
+  registryResourceId: producerImagePull.outputs.registryResourceId
+  image: validatedProducerImage
+  principalId: validatedReceiverIdentityPrincipalId
+  roleAssignmentMode: producerImagePull.outputs.roleAssignmentMode
+  anonymousPullEnabled: producerImagePull.outputs.anonymousPullEnabled
+  repositoryName: producerImagePull.outputs.repositoryName
+  roleDefinitionId: registryPullRoleDefinitionGuid
+  roleAssignmentResourceId: producerImagePull.outputs.roleAssignmentResourceId
+  conditionVersion: producerImagePull.outputs.?conditionVersion
+  condition: producerImagePull.outputs.?condition
+})
 output deployedProducerConfigurationJson string = producerConfigurationJson
 output deployedProducerConfigurationDigest string = startsWith(producerConfigurationDigest, 'sha256:')
   ? producerConfigurationDigest

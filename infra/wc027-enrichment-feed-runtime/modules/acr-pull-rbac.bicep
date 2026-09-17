@@ -33,6 +33,9 @@ var runtimeRegistryResourceId = toLower(registryRuntime.id) == toLower(registryR
 var validatedRoleAssignmentMode = registryRuntime.properties.roleAssignmentMode == registryRoleAssignmentMode
   ? registryRoleAssignmentMode
   : fail('ACR runtime roleAssignmentMode must match the reviewed mode')
+var validatedAnonymousPullEnabled = registryRuntime.properties.?anonymousPullEnabled == false
+  ? false
+  : fail('ACR anonymousPullEnabled must be explicitly false before assigning image-pull access')
 var pullRoleDefinitionGuid = registryRoleAssignmentMode == 'LegacyRegistryPermissions'
   ? acrPullRoleDefinitionId
   : registryRoleAssignmentMode == 'AbacRepositoryPermissions'
@@ -42,9 +45,9 @@ var pullRoleDefinitionResourceId = subscriptionResourceId(
   'Microsoft.Authorization/roleDefinitions',
   pullRoleDefinitionGuid
 )
-var guardedPullRoleDefinitionResourceId = !empty(runtimeRegistryResourceId) && !empty(validatedRoleAssignmentMode)
+var guardedPullRoleDefinitionResourceId = !empty(runtimeRegistryResourceId) && !empty(validatedRoleAssignmentMode) && validatedAnonymousPullEnabled == false
   ? pullRoleDefinitionResourceId
-  : fail('ACR runtime identity and permission mode must be validated before role assignment')
+  : fail('ACR runtime identity, permission mode, and disabled anonymous pull must be validated before role assignment')
 var expectedRegistryServer = '${toLower(last(split(registryResourceId, '/')))}.azurecr.io'
 var imageParts = split(image, '@sha256:')
 var imageRepositoryReference = length(imageParts) == 2 ? imageParts[0] : ''
@@ -99,6 +102,7 @@ output roleAssignmentResourceId string = pullAssignment.id
 output roleDefinitionResourceId string = guardedPullRoleDefinitionResourceId
 output registryResourceId string = runtimeRegistryResourceId
 output roleAssignmentMode string = validatedRoleAssignmentMode
+output anonymousPullEnabled bool = validatedAnonymousPullEnabled
 output repositoryName string = validatedRepositoryName
 output conditionVersion string? = pullConditionVersion
 output condition string? = pullCondition

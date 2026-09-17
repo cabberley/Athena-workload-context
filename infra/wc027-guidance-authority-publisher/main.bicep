@@ -647,6 +647,7 @@ var publisherConfiguration = {
     image: validatedPublisherImage
     repositoryName: publisherImagePull.outputs.repositoryName
     roleAssignmentMode: publisherImagePull.outputs.roleAssignmentMode
+    anonymousPullEnabled: publisherImagePull.outputs.anonymousPullEnabled
     roleDefinitionId: registryPullRoleDefinitionGuid
     roleAssignmentResourceId: publisherImagePull.outputs.roleAssignmentResourceId
     conditionVersion: publisherImagePull.outputs.?conditionVersion
@@ -794,9 +795,11 @@ output publisherImagePullRoleDefinitionId string = registryPullRoleDefinitionGui
 output publisherImagePullRoleAssignmentResourceId string = publisherImagePull.outputs.roleAssignmentResourceId
 output registryResourceId string = publisherImagePull.outputs.registryResourceId
 output registryRoleAssignmentMode string = publisherImagePull.outputs.roleAssignmentMode
+output registryAnonymousPullEnabled bool = publisherImagePull.outputs.anonymousPullEnabled
 output registryRepositoryName string = publisherImagePull.outputs.repositoryName
 output registryPullRoleDefinitionId string = publisherImagePull.outputs.roleDefinitionResourceId
 output registryPullRoleAssignmentResourceId string = publisherImagePull.outputs.roleAssignmentResourceId
+output registryPullPrincipalId string = validatedBrokerIdentityPrincipalId
 output registryPullConditionVersion string? = publisherImagePull.outputs.?conditionVersion
 output registryPullCondition string? = publisherImagePull.outputs.?condition
 output deployedPublisherConfigurationJson string = publisherConfigurationJson

@@ -486,6 +486,11 @@ class GuidanceAuthorityPublisher:
                 required=self.delivery_budget.publisher_cas_margin,
                 phase="authority CAS",
             )
+            self._require_trigger_delivery_window(
+                request,
+                at=operation_now,
+                phase="authority CAS",
+            )
             try:
                 committed = self.activation_store.compare_and_swap(
                     activation,
@@ -705,11 +710,15 @@ class GuidanceAuthorityPublisher:
             and activation.publication_request_id == request.request_id
             and activation.publication_request_digest == request.request_digest
             and activation.activated_at == request.evaluated_at
-            and activation.publication_request_expires_at
-            == request.expires_at
-            and activation.finish_before == request.finish_before
-            and activation.delivery_budget == self.delivery_budget
-            and activation.trigger_message_id == activation.binding_id
+            and activation.request_expires_at == request.expires_at
+            and activation.delivery_finish_before == request.delivery_finish_before
+            and (
+                not activation.has_extended_delivery_binding
+                or (
+                    activation.delivery_budget == self.delivery_budget
+                    and activation.trigger_message_id == activation.binding_id
+                )
+            )
             and activation.activation_attestation.key_id == self.binding_key_id
             and self.binding_signature_verifier(
                 guidance_authority_activation_signature_preimage(activation),
@@ -732,6 +741,24 @@ class GuidanceAuthorityPublisher:
                 f"guidance publication request lacks the reviewed {phase} window"
             )
         return remaining
+
+    def _require_trigger_delivery_window(
+        self,
+        request: GuidanceAuthorityPublicationRequest,
+        *,
+        at: datetime,
+        phase: str,
+    ) -> None:
+        required = (
+            self.delivery_budget.feed_minimum_remaining_lifetime
+            + timedelta(seconds=self.delivery_budget.feed_delivery_jitter_seconds)
+            + self.delivery_budget.publisher_cas_margin
+        )
+        if request.effective_finish_before - at < required:
+            raise GuidanceAuthorityDeliveryExpiredError(
+                f"guidance publication request lacks the reviewed {phase} "
+                "trigger-delivery window"
+            )
 
     def _operation_time(self, fallback: UtcDateTime) -> datetime:
         current = fallback if self.clock is None else self.clock()
@@ -897,9 +924,7 @@ class GuidanceAuthorityPublisher:
         if occurrence is None:
             raise ValueError("current signed incident occurrence is unavailable")
         unsigned_payload: dict[str, object] = {
-            "schemaVersion": (
-                "athena.wc027PublishedGuidanceAuthorityActivation.v1"
-            ),
+            "schemaVersion": "athena.wc027PublishedGuidanceAuthorityActivation.v2",
             "incidentId": current.state.incident_id,
             "incidentStateDigest": current.state.result_digest,
             "occurrenceDigest": occurrence.occurrence_digest,
@@ -913,8 +938,8 @@ class GuidanceAuthorityPublisher:
             "deliveryBudget": self.delivery_budget,
             "activatedAt": request.evaluated_at,
             "publicationRequestExpiresAt": request.expires_at,
-            "finishBefore": request.finish_before,
-            "expiresAt": request.finish_before,
+            "finishBefore": request.delivery_finish_before,
+            "expiresAt": request.delivery_finish_before,
         }
         preimage = _canonical_payload(unsigned_payload)
         signature = normalize_guidance_detached_signature(
@@ -967,6 +992,11 @@ class GuidanceAuthorityPublisher:
             request,
             at=operation_now,
             required=self.delivery_budget.publisher_cas_margin,
+            phase=phase,
+        )
+        self._require_trigger_delivery_window(
+            request,
+            at=operation_now,
             phase=phase,
         )
         reference = self.artifact_writer.create_or_recover(
@@ -1065,7 +1095,7 @@ def guidance_authority_effective_finish_before(
     binding: PublishedGuidanceAuthorityBinding,
 ) -> datetime:
     return min(
-        activation.finish_before,
+        activation.delivery_finish_before,
         binding.incident_bound_request.correlation_request.expires_at,
     )
 
@@ -1078,14 +1108,17 @@ def _guidance_authority_activation_matches_binding(
     signature_verifier: SignatureVerifier,
     expected_delivery_budget: GuidancePublicationRequestDeliveryBudget,
 ) -> bool:
+    extended_delivery_binding_matches = not activation.has_extended_delivery_binding or (
+        activation.trigger_message_id == binding.binding_id
+        and activation.delivery_budget == expected_delivery_budget
+    )
     return (
         activation.activation_attestation.key_id == trusted_key_id
         and activation.incident_id == binding.incident_bound_request.incident_subject.incident_id
         and activation.incident_state_digest
         == binding.incident_bound_request.incident_subject.incident_state_digest
         and activation.binding_id == binding.binding_id
-        and activation.trigger_message_id == binding.binding_id
-        and activation.delivery_budget == expected_delivery_budget
+        and extended_delivery_binding_matches
         and activation.binding_digest == binding.binding_digest
         and activation.binding_reference.name
         == f"guidance-bindings/{binding.binding_id}/binding.json"

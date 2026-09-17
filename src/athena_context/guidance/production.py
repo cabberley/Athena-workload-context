@@ -92,6 +92,7 @@ class _ImagePullBinding:
     image: str
     repository_name: str
     role_assignment_mode: str
+    anonymous_pull_enabled: bool
     role_definition_id: str
     role_assignment_resource_id: str
     condition_version: str | None
@@ -174,6 +175,7 @@ class Wc027GuidanceAuthorityPublisherConfiguration:
                 "image",
                 "repositoryName",
                 "roleAssignmentMode",
+                "anonymousPullEnabled",
                 "roleDefinitionId",
                 "roleAssignmentResourceId",
                 "conditionVersion",
@@ -251,6 +253,10 @@ class Wc027GuidanceAuthorityPublisherConfiguration:
                     image_pull["roleAssignmentMode"],
                     "imagePull.roleAssignmentMode",
                     maximum=64,
+                ),
+                anonymous_pull_enabled=_required_false(
+                    image_pull["anonymousPullEnabled"],
+                    "imagePull.anonymousPullEnabled",
                 ),
                 role_definition_id=_client_id(
                     image_pull["roleDefinitionId"],
@@ -390,6 +396,7 @@ class Wc027GuidanceAuthorityPublisherConfiguration:
             or not repository_name
             or image_pull.repository_name != repository_name
             or image_pull.role_definition_id != expected_role_definition_id
+            or image_pull.anonymous_pull_enabled is not False
             or image_pull.condition_version != expected_condition_version
             or image_pull.condition != expected_condition
             or image_pull.identity_client_id != self.broker_identity_client_id
@@ -631,6 +638,12 @@ def _nullable_text(
     if value is None:
         return None
     return _text(value, name, maximum=maximum)
+
+
+def _required_false(value: object, name: str) -> bool:
+    if value is not False:
+        raise ValueError(f"{name} must be explicitly false")
+    return False
 
 
 def _acr_repository_condition(repository_name: str) -> str:

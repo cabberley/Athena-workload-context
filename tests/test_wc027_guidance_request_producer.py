@@ -318,6 +318,9 @@ def test_producer_builds_signs_persists_revalidates_and_enqueues_only_request() 
     receipt = producer.produce(request, now=evaluated_at)
 
     publication_request = receipt.request
+    assert (
+        publication_request.schema_version == "athena.wc027GuidanceAuthorityPublicationRequest.v2"
+    )
     assert publication_request.incident_bound_request == request
     assert publication_request.incident_occurrence == occurrence
     assert publication_request.evaluated_at == evaluated_at

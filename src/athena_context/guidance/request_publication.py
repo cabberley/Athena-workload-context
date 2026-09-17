@@ -54,7 +54,7 @@ from athena_context.presentation import PresentationSigner
 MAX_WC027_GUIDANCE_REQUEST_INPUT_BYTES = CORRELATION_MAX_CANONICAL_BYTES
 WC027_GUIDANCE_REQUEST_INPUT_SCHEMA_VERSION = "athena.wc027IncidentBoundCorrelationRequest.v1"
 WC027_GUIDANCE_PUBLICATION_REQUEST_SCHEMA_VERSION = (
-    "athena.wc027GuidanceAuthorityPublicationRequest.v1"
+    "athena.wc027GuidanceAuthorityPublicationRequest.v2"
 )
 _REQUEST_OUTBOX_PREFIX = "guidance-publication-requests"
 _MAX_DETACHED_SIGNATURE_CHARS = 8192
@@ -258,7 +258,7 @@ class GuidancePublicationRequestProducer:
                 phase="enqueue",
             )
             time_to_live_seconds = self.delivery_budget.publisher_request_time_to_live_seconds(
-                finish_before=publication_request.finish_before,
+                finish_before=publication_request.delivery_finish_before,
                 at=operation_now,
             )
             if time_to_live_seconds < 1:

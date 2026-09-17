@@ -343,7 +343,11 @@ def test_request_producer_image_pull_uses_validated_cross_rg_registry_scope() ->
         "var producerImageRepositoryName = replace(",
         "registryPullRoleAssignmentId",
         "producerImagePull.outputs.registryResourceId",
+        "producerImagePull.outputs.anonymousPullEnabled",
         "producerImagePull.outputs.repositoryName",
+        "output registryPullPrincipalId string = validatedReceiverIdentityPrincipalId",
+        "output deployedRegistryPullBindingJson string = string({",
+        "athena.wc027AcrPullBinding.v1",
         "producerImagePull.outputs.?conditionVersion",
         "producerImagePull.outputs.?condition",
     ):

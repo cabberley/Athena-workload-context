@@ -145,6 +145,13 @@ param acceptanceImageRegistryServer string
 @maxLength(2048)
 param acceptanceImageRegistryResourceId string
 
+@description('Reviewed role-assignment permissions mode for the acceptance image registry.')
+@allowed([
+  'LegacyRegistryPermissions'
+  'AbacRepositoryPermissions'
+])
+param acceptanceImageRegistryRoleAssignmentMode string
+
 @description('Digest-pinned controller image executed only by the protected GitHub workflow.')
 @minLength(1)
 @maxLength(2048)
@@ -265,6 +272,9 @@ param wc027EnrichmentFeedProducerConfigurationJson string = ''
 @description('Exact digest-pinned image deployed to the WC-027 enrichment/feed producer Job.')
 param wc027EnrichmentFeedProducerImage string = ''
 
+@description('Exact non-secret ACR pull binding JSON emitted by the WC-027 enrichment/feed producer deployment.')
+param wc027EnrichmentFeedProducerImagePullBindingJson string = ''
+
 @description('Explicit confirmation that the separate WC-027 guidance publication-request producer is deployed and ready. False by default keeps the complete production chain fail-closed.')
 param wc027RequestProducerReady bool = false
 
@@ -279,6 +289,9 @@ param wc027RequestProducerConfigurationJson string = ''
 
 @description('Exact digest-pinned image deployed to the guidance publication-request producer Job.')
 param wc027RequestProducerImage string = ''
+
+@description('Exact non-secret ACR pull binding JSON emitted by the guidance publication-request producer deployment.')
+param wc027RequestProducerImagePullBindingJson string = ''
 
 @description('Explicit confirmation that the separately governed PublishedGuidanceAuthorityBinding.v2 publisher is deployed and ready. False by default keeps Notification v2 fail-closed even when a producer Job exists.')
 param wc027PublisherReady bool = false
@@ -295,8 +308,11 @@ param wc027PublisherConfigurationJson string = ''
 @description('Exact digest-pinned image deployed to the guidance-authority publisher Job.')
 param wc027PublisherImage string = ''
 
-@description('Exact JSON emitted by the bounded managed-identity publisher digest-pull readiness check.')
+@description('Exact JSON emitted by the bounded managed-identity publisher digest-pull check, including the complete live effective-ACR-access proof for all three PR #103 identities.')
 param wc027PublisherImagePullEvidenceJson string = ''
+
+@description('Trusted UTC instant used to reject stale WC-027 ACR readiness evidence.')
+param wc027ReadinessEvaluationTimeUtc string = utcNow('yyyy-MM-ddTHH:mm:ss.fffZ')
 
 @description('Confirms the exact legacy WC-016 resources and RBAC were removed and the cleanup script reported zero residuals.')
 param wc016LegacyCleanupConfirmed bool = false
@@ -310,6 +326,13 @@ param presentationImageRegistryServer string
 @minLength(1)
 @maxLength(2048)
 param presentationImageRegistryResourceId string
+
+@description('Reviewed role-assignment permissions mode for the presentation image registry.')
+@allowed([
+  'LegacyRegistryPermissions'
+  'AbacRepositoryPermissions'
+])
+param presentationImageRegistryRoleAssignmentMode string
 
 @description('Reviewed Azure MCP release. Only the existing pinned implementation accepts this value.')
 @allowed([
@@ -412,6 +435,74 @@ var wc027ParsedRequestProducerConfiguration = json(
   empty(wc027RequestProducerConfigurationJson)
     ? '{"deliveryBudget":{"feedColdStartSeconds":0,"feedConnectionSetupSeconds":0,"feedDeliveryJitterSeconds":0,"feedIrreversibleWriteMarginSeconds":0,"feedKedaPollingIntervalSeconds":0,"feedMinimumRemainingLifetimeSeconds":0,"feedProcessingSeconds":0,"feedTriggerRecoverySeconds":0,"minimumRemainingLifetimeSeconds":0,"publisherCasMarginSeconds":0,"publisherColdStartSeconds":0,"publisherConnectionSetupSeconds":0,"publisherKedaPollingIntervalSeconds":0,"publisherMinimumRemainingLifetimeSeconds":0,"publisherProcessingSeconds":0},"deploymentBinding":{"attachedIdentityResourceIds":[],"bindingEvidenceId":"","rbacResourceIds":[]},"requestSigningKey":{"keyFingerprint":"","keyId":"","keyVaultKeyId":""},"serviceBus":{"inputQueueName":"","namespace":"","outputQueueName":"","receiverIdentityResourceId":""}}'
     : wc027RequestProducerConfigurationJson
+)
+var wc027ParsedRequestProducerImagePullBinding = json(
+  empty(wc027RequestProducerImagePullBindingJson)
+    ? '{"anonymousPullEnabled":true,"condition":null,"conditionVersion":null,"image":"","principalId":"","registryResourceId":"","repositoryName":"","roleAssignmentMode":"","roleAssignmentResourceId":"","roleDefinitionId":"","schemaVersion":""}'
+    : wc027RequestProducerImagePullBindingJson
+)
+var wc027RequestProducerImagePullIdentityResourceId = !empty(wc027RequestProducerConfigurationJson)
+  ? wc027ParsedRequestProducerConfiguration.serviceBus.receiverIdentityResourceId
+  : ''
+var wc027RequestProducerImagePullIdentityResourceIdRawSegments = split(
+  wc027RequestProducerImagePullIdentityResourceId,
+  '/'
+)
+var wc027RequestProducerImagePullIdentityResourceIdSegments = concat(
+  wc027RequestProducerImagePullIdentityResourceIdRawSegments,
+  [
+    ''
+    ''
+    ''
+    ''
+    ''
+    ''
+    ''
+    ''
+    ''
+  ]
+)
+var wc027RequestProducerImagePullIdentityResourceIdValid = length(wc027RequestProducerImagePullIdentityResourceIdRawSegments) == 9 && empty(wc027RequestProducerImagePullIdentityResourceIdSegments[0]) && wc027RequestProducerImagePullIdentityResourceIdSegments[1] == 'subscriptions' && !empty(wc027RequestProducerImagePullIdentityResourceIdSegments[2]) && wc027RequestProducerImagePullIdentityResourceIdSegments[3] == 'resourceGroups' && !empty(wc027RequestProducerImagePullIdentityResourceIdSegments[4]) && wc027RequestProducerImagePullIdentityResourceIdSegments[5] == 'providers' && wc027RequestProducerImagePullIdentityResourceIdSegments[6] == 'Microsoft.ManagedIdentity' && wc027RequestProducerImagePullIdentityResourceIdSegments[7] == 'userAssignedIdentities' && !empty(wc027RequestProducerImagePullIdentityResourceIdSegments[8]) && !contains(wc027RequestProducerImagePullIdentityResourceId, '//') && !contains(wc027RequestProducerImagePullIdentityResourceId, '?') && !contains(wc027RequestProducerImagePullIdentityResourceId, '#') && !contains(wc027RequestProducerImagePullIdentityResourceId, '%')
+resource wc027RequestProducerImagePullIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2024-11-30' existing = if (wc027RequestProducerReady && wc027RequestProducerImagePullIdentityResourceIdValid) {
+  name: wc027RequestProducerImagePullIdentityResourceIdSegments[8]
+  scope: resourceGroup(
+    wc027RequestProducerImagePullIdentityResourceIdSegments[2],
+    wc027RequestProducerImagePullIdentityResourceIdSegments[4]
+  )
+}
+var wc027RequestProducerImagePullPrincipalMatches = wc027RequestProducerReady && wc027RequestProducerImagePullIdentityResourceIdValid && !empty(wc027RequestProducerImagePullBindingJson)
+  ? toLower(wc027RequestProducerImagePullIdentity!.properties.principalId) == toLower(wc027ParsedRequestProducerImagePullBinding.principalId)
+  : false
+var wc027RequestProducerImagePullRegistryResourceIdRawSegments = split(
+  wc027ParsedRequestProducerImagePullBinding.registryResourceId,
+  '/'
+)
+var wc027RequestProducerImagePullRegistryResourceIdSegments = concat(
+  wc027RequestProducerImagePullRegistryResourceIdRawSegments,
+  [
+    ''
+    ''
+    ''
+    ''
+    ''
+    ''
+    ''
+    ''
+    ''
+  ]
+)
+var wc027RequestProducerImagePullRegistryResourceIdValid = length(wc027RequestProducerImagePullRegistryResourceIdRawSegments) == 9 && empty(wc027RequestProducerImagePullRegistryResourceIdSegments[0]) && wc027RequestProducerImagePullRegistryResourceIdSegments[1] == 'subscriptions' && !empty(wc027RequestProducerImagePullRegistryResourceIdSegments[2]) && wc027RequestProducerImagePullRegistryResourceIdSegments[3] == 'resourceGroups' && !empty(wc027RequestProducerImagePullRegistryResourceIdSegments[4]) && wc027RequestProducerImagePullRegistryResourceIdSegments[5] == 'providers' && wc027RequestProducerImagePullRegistryResourceIdSegments[6] == 'Microsoft.ContainerRegistry' && wc027RequestProducerImagePullRegistryResourceIdSegments[7] == 'registries' && !empty(wc027RequestProducerImagePullRegistryResourceIdSegments[8]) && !contains(wc027ParsedRequestProducerImagePullBinding.registryResourceId, '//') && !contains(wc027ParsedRequestProducerImagePullBinding.registryResourceId, '?') && !contains(wc027ParsedRequestProducerImagePullBinding.registryResourceId, '#') && !contains(wc027ParsedRequestProducerImagePullBinding.registryResourceId, '%')
+var wc027RequestProducerImagePullRegistryMatchesImage = wc027RequestProducerImagePullRegistryResourceIdValid && first(split(wc027ParsedRequestProducerImagePullBinding.image, '/')) == '${toLower(wc027RequestProducerImagePullRegistryResourceIdSegments[8])}.azurecr.io'
+var wc027RequestProducerImagePullAssignmentScopedToRegistry = wc027RequestProducerImagePullRegistryResourceIdValid && startsWith(
+  toLower(wc027ParsedRequestProducerImagePullBinding.roleAssignmentResourceId),
+  '${toLower(wc027ParsedRequestProducerImagePullBinding.registryResourceId)}/providers/microsoft.authorization/roleassignments/'
+)
+var wc027RequestProducerImagePullAssignmentInDeploymentBinding = !empty(wc027RequestProducerConfigurationJson) && contains(
+  map(
+    wc027ParsedRequestProducerConfiguration.deploymentBinding.rbacResourceIds,
+    resourceId => toLower(resourceId)
+  ),
+  toLower(wc027ParsedRequestProducerImagePullBinding.roleAssignmentResourceId)
 )
 var wc027RequestProducerDeliveryBudget = wc027ParsedRequestProducerConfiguration.deliveryBudget
 var wc027RequestProducerDeliveryBudgetValid = !contains([
@@ -555,9 +646,11 @@ var wc027RequestProducerTagsMatch = wc027RequestProducerReady && wc027RequestPro
       wc027RequestProducerJob!.tags.enrichmentRuntimeConfigurationDigest == wc027EnrichmentFeedProducerConfigurationDigest
     ], false)
   : false
-var validatedWc027RequestProducerReady = wc027RequestProducerReady && !wc027RequestProducerJobResourceIdValid
-  ? fail('wc027RequestProducerJobResourceId must identify one Microsoft.App/jobs resource')
-  : wc027RequestProducerReady && !wc027RequestProducerConfigurationDigestValid
+var validatedWc027RequestProducerReady = wc027RequestProducerReady && !wc027EffectiveAcrAssignmentsVerified
+  ? fail('WC-027 request producer requires PR #102-equivalent full role-definition resolution proving no extra direct, inherited, group-derived, or sibling-registry pull-capable assignment')
+  : wc027RequestProducerReady && !wc027RequestProducerJobResourceIdValid
+    ? fail('wc027RequestProducerJobResourceId must identify one Microsoft.App/jobs resource')
+    : wc027RequestProducerReady && !wc027RequestProducerConfigurationDigestValid
     ? fail('WC-027 request producer requires the exact deployed configuration digest')
     : wc027RequestProducerReady && empty(wc027RequestProducerConfigurationJson)
       ? fail('WC-027 request producer requires the exact deployed configuration JSON')
@@ -649,18 +742,142 @@ var wc027PublisherImageInvalidCharacters = replace(replace(replace(replace(repla
 var wc027PublisherImageValid = wc027PublisherImage == toLower(wc027PublisherImage) && length(wc027PublisherImageDigest) == 64 && empty(wc027PublisherImageInvalidCharacters) && wc027PublisherImageDigest != '0000000000000000000000000000000000000000000000000000000000000000'
 var wc027ParsedPublisherConfiguration = json(
   empty(wc027PublisherConfigurationJson)
-    ? '{"deliveryBudget":{"feedColdStartSeconds":0,"feedConnectionSetupSeconds":0,"feedDeliveryJitterSeconds":0,"feedIrreversibleWriteMarginSeconds":0,"feedKedaPollingIntervalSeconds":0,"feedMinimumRemainingLifetimeSeconds":0,"feedProcessingSeconds":0,"feedTriggerRecoverySeconds":0,"minimumRemainingLifetimeSeconds":0,"publisherCasMarginSeconds":0,"publisherColdStartSeconds":0,"publisherConnectionSetupSeconds":0,"publisherKedaPollingIntervalSeconds":0,"publisherMinimumRemainingLifetimeSeconds":0,"publisherProcessingSeconds":0},"deploymentBinding":{"attachedIdentityResourceIds":[],"bindingEvidenceId":"","rbacResourceIds":[]},"enrichmentRuntimeConfiguration":{},"imagePull":{"condition":null,"conditionVersion":null,"identityClientId":"","identityPrincipalId":"","identityResourceId":"","image":"","registryResourceId":"","registryServer":"","repositoryName":"","roleAssignmentMode":"","roleAssignmentResourceId":"","roleDefinitionId":""},"requestOutbox":{"blobEndpoint":"","containerName":"","identityResourceId":""},"serviceBus":{"brokerIdentityResourceId":"","namespace":"","requestQueueName":"","requestSubmitterIdentityResourceId":""}}'
+    ? '{"deliveryBudget":{"feedColdStartSeconds":0,"feedConnectionSetupSeconds":0,"feedDeliveryJitterSeconds":0,"feedIrreversibleWriteMarginSeconds":0,"feedKedaPollingIntervalSeconds":0,"feedMinimumRemainingLifetimeSeconds":0,"feedProcessingSeconds":0,"feedTriggerRecoverySeconds":0,"minimumRemainingLifetimeSeconds":0,"publisherCasMarginSeconds":0,"publisherColdStartSeconds":0,"publisherConnectionSetupSeconds":0,"publisherKedaPollingIntervalSeconds":0,"publisherMinimumRemainingLifetimeSeconds":0,"publisherProcessingSeconds":0},"deploymentBinding":{"attachedIdentityResourceIds":[],"bindingEvidenceId":"","rbacResourceIds":[]},"enrichmentRuntimeConfiguration":{},"imagePull":{"anonymousPullEnabled":true,"condition":null,"conditionVersion":null,"identityClientId":"","identityPrincipalId":"","identityResourceId":"","image":"","registryResourceId":"","registryServer":"","repositoryName":"","roleAssignmentMode":"","roleAssignmentResourceId":"","roleDefinitionId":""},"requestOutbox":{"blobEndpoint":"","containerName":"","identityResourceId":""},"serviceBus":{"brokerIdentityResourceId":"","namespace":"","requestQueueName":"","requestSubmitterIdentityResourceId":""}}'
     : wc027PublisherConfigurationJson
 )
+var wc027PublisherImagePullIdentityResourceId = !empty(wc027PublisherConfigurationJson)
+  ? wc027ParsedPublisherConfiguration.imagePull.identityResourceId
+  : ''
+var wc027PublisherImagePullIdentityResourceIdRawSegments = split(
+  wc027PublisherImagePullIdentityResourceId,
+  '/'
+)
+var wc027PublisherImagePullIdentityResourceIdSegments = concat(
+  wc027PublisherImagePullIdentityResourceIdRawSegments,
+  [
+    ''
+    ''
+    ''
+    ''
+    ''
+    ''
+    ''
+    ''
+    ''
+  ]
+)
+var wc027PublisherImagePullIdentityResourceIdValid = length(wc027PublisherImagePullIdentityResourceIdRawSegments) == 9 && empty(wc027PublisherImagePullIdentityResourceIdSegments[0]) && wc027PublisherImagePullIdentityResourceIdSegments[1] == 'subscriptions' && !empty(wc027PublisherImagePullIdentityResourceIdSegments[2]) && wc027PublisherImagePullIdentityResourceIdSegments[3] == 'resourceGroups' && !empty(wc027PublisherImagePullIdentityResourceIdSegments[4]) && wc027PublisherImagePullIdentityResourceIdSegments[5] == 'providers' && wc027PublisherImagePullIdentityResourceIdSegments[6] == 'Microsoft.ManagedIdentity' && wc027PublisherImagePullIdentityResourceIdSegments[7] == 'userAssignedIdentities' && !empty(wc027PublisherImagePullIdentityResourceIdSegments[8]) && !contains(wc027PublisherImagePullIdentityResourceId, '//') && !contains(wc027PublisherImagePullIdentityResourceId, '?') && !contains(wc027PublisherImagePullIdentityResourceId, '#') && !contains(wc027PublisherImagePullIdentityResourceId, '%')
+resource wc027PublisherImagePullIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2024-11-30' existing = if (wc027PublisherReady && wc027PublisherImagePullIdentityResourceIdValid) {
+  name: wc027PublisherImagePullIdentityResourceIdSegments[8]
+  scope: resourceGroup(
+    wc027PublisherImagePullIdentityResourceIdSegments[2],
+    wc027PublisherImagePullIdentityResourceIdSegments[4]
+  )
+}
+var wc027PublisherImagePullIdentityMatches = wc027PublisherReady && wc027PublisherImagePullIdentityResourceIdValid && !empty(wc027PublisherConfigurationJson)
+  ? !contains([
+      toLower(wc027PublisherImagePullIdentity!.id) == toLower(wc027ParsedPublisherConfiguration.imagePull.identityResourceId)
+      toLower(wc027PublisherImagePullIdentity!.properties.clientId) == toLower(wc027ParsedPublisherConfiguration.imagePull.identityClientId)
+      toLower(wc027PublisherImagePullIdentity!.properties.principalId) == toLower(wc027ParsedPublisherConfiguration.imagePull.identityPrincipalId)
+      toLower(wc027ParsedPublisherConfiguration.imagePull.identityResourceId) == toLower(wc027ParsedPublisherConfiguration.serviceBus.brokerIdentityResourceId)
+    ], false)
+  : false
+var wc027PublisherImagePullRegistryResourceIdRawSegments = split(
+  wc027ParsedPublisherConfiguration.imagePull.registryResourceId,
+  '/'
+)
+var wc027PublisherImagePullRegistryResourceIdSegments = concat(
+  wc027PublisherImagePullRegistryResourceIdRawSegments,
+  [
+    ''
+    ''
+    ''
+    ''
+    ''
+    ''
+    ''
+    ''
+    ''
+  ]
+)
+var wc027PublisherImagePullRegistryResourceIdValid = length(wc027PublisherImagePullRegistryResourceIdRawSegments) == 9 && empty(wc027PublisherImagePullRegistryResourceIdSegments[0]) && wc027PublisherImagePullRegistryResourceIdSegments[1] == 'subscriptions' && !empty(wc027PublisherImagePullRegistryResourceIdSegments[2]) && wc027PublisherImagePullRegistryResourceIdSegments[3] == 'resourceGroups' && !empty(wc027PublisherImagePullRegistryResourceIdSegments[4]) && wc027PublisherImagePullRegistryResourceIdSegments[5] == 'providers' && wc027PublisherImagePullRegistryResourceIdSegments[6] == 'Microsoft.ContainerRegistry' && wc027PublisherImagePullRegistryResourceIdSegments[7] == 'registries' && !empty(wc027PublisherImagePullRegistryResourceIdSegments[8]) && !contains(wc027ParsedPublisherConfiguration.imagePull.registryResourceId, '//') && !contains(wc027ParsedPublisherConfiguration.imagePull.registryResourceId, '?') && !contains(wc027ParsedPublisherConfiguration.imagePull.registryResourceId, '#') && !contains(wc027ParsedPublisherConfiguration.imagePull.registryResourceId, '%')
 var wc027ParsedPublisherImagePullEvidence = json(
   empty(wc027PublisherImagePullEvidenceJson)
-    ? '{"attempts":0,"condition":null,"conditionVersion":null,"image":"","managedIdentityClientId":"","maxAttempts":0,"registryResourceId":"","registryServer":"","repositoryName":"","roleAssignmentMode":"","roleDefinitionId":"","schemaVersion":"","success":false,"verifiedAt":""}'
+    ? '{"anonymousPullEnabled":true,"attempts":0,"condition":null,"conditionVersion":null,"effectiveAccess":{"acrEscalationPathsChecked":false,"anonymousPullEnabled":true,"convergedMembershipReadbacks":false,"directAssignmentsComplete":false,"directMembershipTraversalComplete":false,"evidenceDigest":"","exactAssignmentReadbacksComplete":false,"expectedAssignmentCount":0,"expectedAssignmentIds":[],"extraPullCapableAssignmentIds":[],"governedSubscriptionIds":[],"inheritedAssignmentsComplete":false,"principalIds":[],"pullCapableAssignmentCount":0,"registryResourceIds":[],"reviewedAssignments":[],"roleDefinitionsResolved":false,"schemaVersion":"","siblingRegistriesChecked":false,"tenantId":"","tenantSubscriptionHierarchyComplete":false,"transitiveGroupsComplete":false,"verified":false,"verifiedAt":"1970-01-01T00:00:00.000Z"},"image":"","managedIdentityClientId":"","managedIdentityPrincipalId":"","managedIdentityResourceId":"","maxAttempts":0,"registryResourceId":"","registryServer":"","repositoryName":"","roleAssignmentMode":"","roleAssignmentResourceId":"","roleDefinitionId":"","schemaVersion":"","success":false,"verifiedAt":"1970-01-01T00:00:00.000Z"}'
     : wc027PublisherImagePullEvidenceJson
 )
 var wc027ParsedProducerConfiguration = json(
   empty(wc027EnrichmentFeedProducerConfigurationJson)
     ? '{"deliveryBudget":{"feedColdStartSeconds":0,"feedConnectionSetupSeconds":0,"feedDeliveryJitterSeconds":0,"feedIrreversibleWriteMarginSeconds":0,"feedKedaPollingIntervalSeconds":0,"feedMinimumRemainingLifetimeSeconds":0,"feedProcessingSeconds":0,"feedTriggerRecoverySeconds":0,"minimumRemainingLifetimeSeconds":0,"publisherCasMarginSeconds":0,"publisherColdStartSeconds":0,"publisherConnectionSetupSeconds":0,"publisherKedaPollingIntervalSeconds":0,"publisherMinimumRemainingLifetimeSeconds":0,"publisherProcessingSeconds":0}}'
     : wc027EnrichmentFeedProducerConfigurationJson
+)
+var wc027ParsedFeedProducerImagePullBinding = json(
+  empty(wc027EnrichmentFeedProducerImagePullBindingJson)
+    ? '{"anonymousPullEnabled":true,"condition":null,"conditionVersion":null,"image":"","principalId":"","registryResourceId":"","repositoryName":"","roleAssignmentMode":"","roleAssignmentResourceId":"","roleDefinitionId":"","schemaVersion":""}'
+    : wc027EnrichmentFeedProducerImagePullBindingJson
+)
+var wc027FeedProducerImagePullIdentityResourceId = !empty(wc027EnrichmentFeedProducerConfigurationJson)
+  ? wc027ParsedProducerConfiguration.serviceBus.brokerIdentityResourceId
+  : ''
+var wc027FeedProducerImagePullIdentityResourceIdRawSegments = split(
+  wc027FeedProducerImagePullIdentityResourceId,
+  '/'
+)
+var wc027FeedProducerImagePullIdentityResourceIdSegments = concat(
+  wc027FeedProducerImagePullIdentityResourceIdRawSegments,
+  [
+    ''
+    ''
+    ''
+    ''
+    ''
+    ''
+    ''
+    ''
+    ''
+  ]
+)
+var wc027FeedProducerImagePullIdentityResourceIdValid = length(wc027FeedProducerImagePullIdentityResourceIdRawSegments) == 9 && empty(wc027FeedProducerImagePullIdentityResourceIdSegments[0]) && wc027FeedProducerImagePullIdentityResourceIdSegments[1] == 'subscriptions' && !empty(wc027FeedProducerImagePullIdentityResourceIdSegments[2]) && wc027FeedProducerImagePullIdentityResourceIdSegments[3] == 'resourceGroups' && !empty(wc027FeedProducerImagePullIdentityResourceIdSegments[4]) && wc027FeedProducerImagePullIdentityResourceIdSegments[5] == 'providers' && wc027FeedProducerImagePullIdentityResourceIdSegments[6] == 'Microsoft.ManagedIdentity' && wc027FeedProducerImagePullIdentityResourceIdSegments[7] == 'userAssignedIdentities' && !empty(wc027FeedProducerImagePullIdentityResourceIdSegments[8]) && !contains(wc027FeedProducerImagePullIdentityResourceId, '//') && !contains(wc027FeedProducerImagePullIdentityResourceId, '?') && !contains(wc027FeedProducerImagePullIdentityResourceId, '#') && !contains(wc027FeedProducerImagePullIdentityResourceId, '%')
+resource wc027FeedProducerImagePullIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2024-11-30' existing = if (wc027FeedV2ProducerReady && wc027FeedProducerImagePullIdentityResourceIdValid) {
+  name: wc027FeedProducerImagePullIdentityResourceIdSegments[8]
+  scope: resourceGroup(
+    wc027FeedProducerImagePullIdentityResourceIdSegments[2],
+    wc027FeedProducerImagePullIdentityResourceIdSegments[4]
+  )
+}
+var wc027FeedProducerImagePullPrincipalMatches = wc027FeedV2ProducerReady && wc027FeedProducerImagePullIdentityResourceIdValid && !empty(wc027EnrichmentFeedProducerImagePullBindingJson)
+  ? toLower(wc027FeedProducerImagePullIdentity!.properties.principalId) == toLower(wc027ParsedFeedProducerImagePullBinding.principalId)
+  : false
+var wc027FeedProducerImagePullRegistryResourceIdRawSegments = split(
+  wc027ParsedFeedProducerImagePullBinding.registryResourceId,
+  '/'
+)
+var wc027FeedProducerImagePullRegistryResourceIdSegments = concat(
+  wc027FeedProducerImagePullRegistryResourceIdRawSegments,
+  [
+    ''
+    ''
+    ''
+    ''
+    ''
+    ''
+    ''
+    ''
+    ''
+  ]
+)
+var wc027FeedProducerImagePullRegistryResourceIdValid = length(wc027FeedProducerImagePullRegistryResourceIdRawSegments) == 9 && empty(wc027FeedProducerImagePullRegistryResourceIdSegments[0]) && wc027FeedProducerImagePullRegistryResourceIdSegments[1] == 'subscriptions' && !empty(wc027FeedProducerImagePullRegistryResourceIdSegments[2]) && wc027FeedProducerImagePullRegistryResourceIdSegments[3] == 'resourceGroups' && !empty(wc027FeedProducerImagePullRegistryResourceIdSegments[4]) && wc027FeedProducerImagePullRegistryResourceIdSegments[5] == 'providers' && wc027FeedProducerImagePullRegistryResourceIdSegments[6] == 'Microsoft.ContainerRegistry' && wc027FeedProducerImagePullRegistryResourceIdSegments[7] == 'registries' && !empty(wc027FeedProducerImagePullRegistryResourceIdSegments[8]) && !contains(wc027ParsedFeedProducerImagePullBinding.registryResourceId, '//') && !contains(wc027ParsedFeedProducerImagePullBinding.registryResourceId, '?') && !contains(wc027ParsedFeedProducerImagePullBinding.registryResourceId, '#') && !contains(wc027ParsedFeedProducerImagePullBinding.registryResourceId, '%')
+var wc027FeedProducerImagePullRegistryMatchesImage = wc027FeedProducerImagePullRegistryResourceIdValid && first(split(wc027ParsedFeedProducerImagePullBinding.image, '/')) == '${toLower(wc027FeedProducerImagePullRegistryResourceIdSegments[8])}.azurecr.io'
+var wc027FeedProducerImagePullAssignmentScopedToRegistry = wc027FeedProducerImagePullRegistryResourceIdValid && startsWith(
+  toLower(wc027ParsedFeedProducerImagePullBinding.roleAssignmentResourceId),
+  '${toLower(wc027ParsedFeedProducerImagePullBinding.registryResourceId)}/providers/microsoft.authorization/roleassignments/'
+)
+var wc027FeedProducerImagePullAssignmentInDeploymentBinding = !empty(wc027EnrichmentFeedProducerConfigurationJson) && contains(
+  map(
+    wc027ParsedProducerConfiguration.deploymentBinding.rbacResourceIds,
+    resourceId => toLower(resourceId)
+  ),
+  toLower(wc027ParsedFeedProducerImagePullBinding.roleAssignmentResourceId)
 )
 var wc027PublisherImageRegistryServer = first(split(wc027PublisherImage, '/'))
 var wc027PublisherImageRepositoryReference = first(split(wc027PublisherImage, '@sha256:'))
@@ -678,7 +895,183 @@ var wc027PublisherExpectedRepositoryCondition = '((!(ActionMatches{\'Microsoft.C
 var wc027PublisherLegacyImagePullConditionValid = wc027ParsedPublisherConfiguration.imagePull.roleAssignmentMode == 'LegacyRegistryPermissions' && wc027ParsedPublisherConfiguration.imagePull.conditionVersion == null && wc027ParsedPublisherConfiguration.imagePull.condition == null
 var wc027PublisherAbacImagePullConditionValid = wc027ParsedPublisherConfiguration.imagePull.roleAssignmentMode == 'AbacRepositoryPermissions' && wc027ParsedPublisherConfiguration.imagePull.conditionVersion == '2.0' && wc027ParsedPublisherConfiguration.imagePull.condition == wc027PublisherExpectedRepositoryCondition
 var wc027PublisherImagePullModeConditionValid = wc027PublisherLegacyImagePullConditionValid || wc027PublisherAbacImagePullConditionValid
-var wc027PublisherImagePullConditionValid = wc027ParsedPublisherConfiguration.imagePull.repositoryName == wc027PublisherImageRepositoryName && wc027PublisherImagePullModeConditionValid
+var wc027PublisherImagePullConditionValid = wc027ParsedPublisherConfiguration.imagePull.anonymousPullEnabled == false && wc027ParsedPublisherConfiguration.imagePull.repositoryName == wc027PublisherImageRepositoryName && wc027PublisherImagePullModeConditionValid
+var wc027RequestProducerExpectedRepositoryName = 'athena/wc027-guidance-publication-request-producer'
+var wc027RequestProducerExpectedRepositoryCondition = '((!(ActionMatches{\'Microsoft.ContainerRegistry/registries/repositories/content/read\'}) AND !(ActionMatches{\'Microsoft.ContainerRegistry/registries/repositories/metadata/read\'})) OR (@Request[Microsoft.ContainerRegistry/registries/repositories:name] StringEqualsIgnoreCase \'${wc027RequestProducerExpectedRepositoryName}\'))'
+var wc027RequestProducerLegacyImagePullBindingValid = wc027ParsedRequestProducerImagePullBinding.roleAssignmentMode == 'LegacyRegistryPermissions' && wc027ParsedRequestProducerImagePullBinding.roleDefinitionId == '7f951dda-4ed3-4680-a7ca-43fe172d538d' && wc027ParsedRequestProducerImagePullBinding.conditionVersion == null && wc027ParsedRequestProducerImagePullBinding.condition == null
+var wc027RequestProducerAbacImagePullBindingValid = wc027ParsedRequestProducerImagePullBinding.roleAssignmentMode == 'AbacRepositoryPermissions' && wc027ParsedRequestProducerImagePullBinding.roleDefinitionId == 'b93aa761-3e63-49ed-ac28-beffa264f7ac' && wc027ParsedRequestProducerImagePullBinding.conditionVersion == '2.0' && wc027ParsedRequestProducerImagePullBinding.condition == wc027RequestProducerExpectedRepositoryCondition
+var wc027RequestProducerImagePullBindingValid = !empty(wc027RequestProducerImagePullBindingJson) && !contains([
+  wc027ParsedRequestProducerImagePullBinding.schemaVersion == 'athena.wc027AcrPullBinding.v1'
+  wc027ParsedRequestProducerImagePullBinding.image == wc027RequestProducerImage
+  wc027ParsedRequestProducerImagePullBinding.anonymousPullEnabled == false
+  wc027ParsedRequestProducerImagePullBinding.repositoryName == wc027RequestProducerExpectedRepositoryName
+  !empty(wc027ParsedRequestProducerImagePullBinding.principalId)
+  !empty(wc027ParsedRequestProducerImagePullBinding.registryResourceId)
+  !empty(wc027ParsedRequestProducerImagePullBinding.roleAssignmentResourceId)
+  wc027RequestProducerImagePullPrincipalMatches
+  wc027RequestProducerImagePullRegistryMatchesImage
+  wc027RequestProducerImagePullAssignmentScopedToRegistry
+  wc027RequestProducerImagePullAssignmentInDeploymentBinding
+  wc027RequestProducerLegacyImagePullBindingValid || wc027RequestProducerAbacImagePullBindingValid
+], false)
+var wc027FeedProducerExpectedRepositoryName = 'athena/wc027-enrichment-feed-producer'
+var wc027FeedProducerExpectedRepositoryCondition = '((!(ActionMatches{\'Microsoft.ContainerRegistry/registries/repositories/content/read\'}) AND !(ActionMatches{\'Microsoft.ContainerRegistry/registries/repositories/metadata/read\'})) OR (@Request[Microsoft.ContainerRegistry/registries/repositories:name] StringEqualsIgnoreCase \'${wc027FeedProducerExpectedRepositoryName}\'))'
+var wc027FeedProducerLegacyImagePullBindingValid = wc027ParsedFeedProducerImagePullBinding.roleAssignmentMode == 'LegacyRegistryPermissions' && wc027ParsedFeedProducerImagePullBinding.roleDefinitionId == '7f951dda-4ed3-4680-a7ca-43fe172d538d' && wc027ParsedFeedProducerImagePullBinding.conditionVersion == null && wc027ParsedFeedProducerImagePullBinding.condition == null
+var wc027FeedProducerAbacImagePullBindingValid = wc027ParsedFeedProducerImagePullBinding.roleAssignmentMode == 'AbacRepositoryPermissions' && wc027ParsedFeedProducerImagePullBinding.roleDefinitionId == 'b93aa761-3e63-49ed-ac28-beffa264f7ac' && wc027ParsedFeedProducerImagePullBinding.conditionVersion == '2.0' && wc027ParsedFeedProducerImagePullBinding.condition == wc027FeedProducerExpectedRepositoryCondition
+var wc027FeedProducerImagePullBindingValid = !empty(wc027EnrichmentFeedProducerImagePullBindingJson) && !contains([
+  wc027ParsedFeedProducerImagePullBinding.schemaVersion == 'athena.wc027AcrPullBinding.v1'
+  wc027ParsedFeedProducerImagePullBinding.image == wc027EnrichmentFeedProducerImage
+  wc027ParsedFeedProducerImagePullBinding.anonymousPullEnabled == false
+  wc027ParsedFeedProducerImagePullBinding.repositoryName == wc027FeedProducerExpectedRepositoryName
+  !empty(wc027ParsedFeedProducerImagePullBinding.principalId)
+  !empty(wc027ParsedFeedProducerImagePullBinding.registryResourceId)
+  !empty(wc027ParsedFeedProducerImagePullBinding.roleAssignmentResourceId)
+  wc027FeedProducerImagePullPrincipalMatches
+  wc027FeedProducerImagePullRegistryMatchesImage
+  wc027FeedProducerImagePullAssignmentScopedToRegistry
+  wc027FeedProducerImagePullAssignmentInDeploymentBinding
+  wc027FeedProducerLegacyImagePullBindingValid || wc027FeedProducerAbacImagePullBindingValid
+], false)
+var wc027ParsedEffectiveAcrAccess = wc027ParsedPublisherImagePullEvidence.effectiveAccess
+var wc027ReadinessEvaluationEpoch = dateTimeToEpoch(wc027ReadinessEvaluationTimeUtc)
+var wc027EffectiveAcrVerifiedEpoch = dateTimeToEpoch(wc027ParsedEffectiveAcrAccess.verifiedAt)
+var wc027PublisherPullVerifiedEpoch = dateTimeToEpoch(wc027ParsedPublisherImagePullEvidence.verifiedAt)
+var wc027EffectiveAcrEvidenceFresh = !empty(wc027PublisherImagePullEvidenceJson) && wc027EffectiveAcrVerifiedEpoch <= wc027PublisherPullVerifiedEpoch && wc027PublisherPullVerifiedEpoch - wc027EffectiveAcrVerifiedEpoch <= 120 && wc027PublisherPullVerifiedEpoch <= wc027ReadinessEvaluationEpoch && wc027ReadinessEvaluationEpoch - wc027PublisherPullVerifiedEpoch <= 300
+var wc027EffectiveAcrEvidenceDigestValid = length(wc027ParsedEffectiveAcrAccess.evidenceDigest) == 71 && startsWith(wc027ParsedEffectiveAcrAccess.evidenceDigest, 'sha256:') && wc027ParsedEffectiveAcrAccess.evidenceDigest == toLower(wc027ParsedEffectiveAcrAccess.evidenceDigest)
+var wc027GovernedSubscriptionIds = map(
+  wc027ParsedEffectiveAcrAccess.governedSubscriptionIds,
+  subscriptionId => toLower(subscriptionId)
+)
+var wc027ReviewedEffectiveAcrAssignments = wc027ParsedEffectiveAcrAccess.reviewedAssignments
+var wc027ReviewedEffectiveAcrAssignmentLabels = map(
+  wc027ReviewedEffectiveAcrAssignments,
+  assignment => assignment.label
+)
+var wc027ReviewedPublisherAcrAssignments = filter(
+  wc027ReviewedEffectiveAcrAssignments,
+  assignment => assignment.label == 'publisher'
+)
+var wc027ReviewedRequestProducerAcrAssignments = filter(
+  wc027ReviewedEffectiveAcrAssignments,
+  assignment => assignment.label == 'request-producer'
+)
+var wc027ReviewedFeedProducerAcrAssignments = filter(
+  wc027ReviewedEffectiveAcrAssignments,
+  assignment => assignment.label == 'feed-producer'
+)
+var wc027ReviewedRequestProducerAcrAssignment = first(concat(
+  wc027ReviewedRequestProducerAcrAssignments,
+  [
+    {
+      assignmentResourceId: ''
+      condition: null
+      conditionVersion: null
+      principalId: ''
+      registryResourceId: ''
+      repositoryName: ''
+      roleAssignmentMode: ''
+      roleDefinitionId: ''
+    }
+  ]
+))
+var wc027ReviewedFeedProducerAcrAssignment = first(concat(
+  wc027ReviewedFeedProducerAcrAssignments,
+  [
+    {
+      assignmentResourceId: ''
+      condition: null
+      conditionVersion: null
+      principalId: ''
+      registryResourceId: ''
+      repositoryName: ''
+      roleAssignmentMode: ''
+      roleDefinitionId: ''
+    }
+  ]
+))
+var wc027ReviewedPublisherAcrAssignment = first(concat(
+  wc027ReviewedPublisherAcrAssignments,
+  [
+    {
+      assignmentResourceId: ''
+      condition: null
+      conditionVersion: null
+      principalId: ''
+      registryResourceId: ''
+      repositoryName: ''
+      roleAssignmentMode: ''
+      roleDefinitionId: ''
+    }
+  ]
+))
+var wc027ReviewedRequestProducerAcrAssignmentValid = length(wc027ReviewedRequestProducerAcrAssignments) == 1 && wc027RequestProducerImagePullBindingValid && !contains([
+  toLower(wc027ReviewedRequestProducerAcrAssignment.principalId) == toLower(wc027ParsedRequestProducerImagePullBinding.principalId)
+  toLower(wc027ReviewedRequestProducerAcrAssignment.assignmentResourceId) == toLower(wc027ParsedRequestProducerImagePullBinding.roleAssignmentResourceId)
+  toLower(wc027ReviewedRequestProducerAcrAssignment.registryResourceId) == toLower(wc027ParsedRequestProducerImagePullBinding.registryResourceId)
+  wc027ReviewedRequestProducerAcrAssignment.repositoryName == wc027ParsedRequestProducerImagePullBinding.repositoryName
+  wc027ReviewedRequestProducerAcrAssignment.roleAssignmentMode == wc027ParsedRequestProducerImagePullBinding.roleAssignmentMode
+  wc027ReviewedRequestProducerAcrAssignment.roleDefinitionId == wc027ParsedRequestProducerImagePullBinding.roleDefinitionId
+  wc027ReviewedRequestProducerAcrAssignment.conditionVersion == wc027ParsedRequestProducerImagePullBinding.conditionVersion
+  wc027ReviewedRequestProducerAcrAssignment.condition == wc027ParsedRequestProducerImagePullBinding.condition
+], false)
+var wc027ReviewedFeedProducerAcrAssignmentValid = length(wc027ReviewedFeedProducerAcrAssignments) == 1 && wc027FeedProducerImagePullBindingValid && !contains([
+  toLower(wc027ReviewedFeedProducerAcrAssignment.principalId) == toLower(wc027ParsedFeedProducerImagePullBinding.principalId)
+  toLower(wc027ReviewedFeedProducerAcrAssignment.assignmentResourceId) == toLower(wc027ParsedFeedProducerImagePullBinding.roleAssignmentResourceId)
+  toLower(wc027ReviewedFeedProducerAcrAssignment.registryResourceId) == toLower(wc027ParsedFeedProducerImagePullBinding.registryResourceId)
+  wc027ReviewedFeedProducerAcrAssignment.repositoryName == wc027ParsedFeedProducerImagePullBinding.repositoryName
+  wc027ReviewedFeedProducerAcrAssignment.roleAssignmentMode == wc027ParsedFeedProducerImagePullBinding.roleAssignmentMode
+  wc027ReviewedFeedProducerAcrAssignment.roleDefinitionId == wc027ParsedFeedProducerImagePullBinding.roleDefinitionId
+  wc027ReviewedFeedProducerAcrAssignment.conditionVersion == wc027ParsedFeedProducerImagePullBinding.conditionVersion
+  wc027ReviewedFeedProducerAcrAssignment.condition == wc027ParsedFeedProducerImagePullBinding.condition
+], false)
+var wc027ReviewedPublisherAcrAssignmentValid = length(wc027ReviewedPublisherAcrAssignments) == 1 && !contains([
+  toLower(wc027ReviewedPublisherAcrAssignment.principalId) == toLower(wc027ParsedPublisherConfiguration.imagePull.identityPrincipalId)
+  toLower(wc027ReviewedPublisherAcrAssignment.assignmentResourceId) == toLower(wc027ParsedPublisherConfiguration.imagePull.roleAssignmentResourceId)
+  toLower(wc027ReviewedPublisherAcrAssignment.registryResourceId) == toLower(wc027ParsedPublisherConfiguration.imagePull.registryResourceId)
+  wc027ReviewedPublisherAcrAssignment.repositoryName == wc027ParsedPublisherConfiguration.imagePull.repositoryName
+  wc027ReviewedPublisherAcrAssignment.roleAssignmentMode == wc027ParsedPublisherConfiguration.imagePull.roleAssignmentMode
+  wc027ReviewedPublisherAcrAssignment.roleDefinitionId == wc027ParsedPublisherConfiguration.imagePull.roleDefinitionId
+  wc027ReviewedPublisherAcrAssignment.conditionVersion == wc027ParsedPublisherConfiguration.imagePull.conditionVersion
+  wc027ReviewedPublisherAcrAssignment.condition == wc027ParsedPublisherConfiguration.imagePull.condition
+], false)
+var wc027EffectiveAcrAssignmentsVerified = !contains([
+  wc027ParsedEffectiveAcrAccess.schemaVersion == 'athena.wc027AcrEffectiveAccessEvidence.v1'
+  wc027ParsedEffectiveAcrAccess.verified == true
+  toLower(wc027ParsedEffectiveAcrAccess.tenantId) == toLower(tenant().tenantId)
+  wc027ParsedEffectiveAcrAccess.tenantSubscriptionHierarchyComplete == true
+  length(wc027GovernedSubscriptionIds) >= 1
+  contains(wc027GovernedSubscriptionIds, toLower(wc027RequestProducerImagePullRegistryResourceIdSegments[2]))
+  contains(wc027GovernedSubscriptionIds, toLower(wc027FeedProducerImagePullRegistryResourceIdSegments[2]))
+  contains(wc027GovernedSubscriptionIds, toLower(wc027PublisherImagePullRegistryResourceIdSegments[2]))
+  wc027ParsedEffectiveAcrAccess.anonymousPullEnabled == false
+  wc027ParsedEffectiveAcrAccess.expectedAssignmentCount == 3
+  wc027ParsedEffectiveAcrAccess.pullCapableAssignmentCount == 3
+  wc027ParsedEffectiveAcrAccess.roleDefinitionsResolved == true
+  wc027ParsedEffectiveAcrAccess.exactAssignmentReadbacksComplete == true
+  wc027ParsedEffectiveAcrAccess.directAssignmentsComplete == true
+  wc027ParsedEffectiveAcrAccess.inheritedAssignmentsComplete == true
+  wc027ParsedEffectiveAcrAccess.transitiveGroupsComplete == true
+  wc027ParsedEffectiveAcrAccess.directMembershipTraversalComplete == true
+  wc027ParsedEffectiveAcrAccess.convergedMembershipReadbacks == true
+  wc027ParsedEffectiveAcrAccess.siblingRegistriesChecked == true
+  wc027ParsedEffectiveAcrAccess.acrEscalationPathsChecked == true
+  wc027EffectiveAcrEvidenceFresh
+  wc027EffectiveAcrEvidenceDigestValid
+  length(wc027ParsedEffectiveAcrAccess.expectedAssignmentIds) == 3
+  length(wc027ParsedEffectiveAcrAccess.principalIds) == 3
+  length(wc027ParsedEffectiveAcrAccess.registryResourceIds) >= 1
+  length(wc027ReviewedEffectiveAcrAssignments) == 3
+  length(filter(wc027ReviewedEffectiveAcrAssignmentLabels, label => label == 'request-producer')) == 1
+  length(filter(wc027ReviewedEffectiveAcrAssignmentLabels, label => label == 'feed-producer')) == 1
+  length(filter(wc027ReviewedEffectiveAcrAssignmentLabels, label => label == 'publisher')) == 1
+  wc027ParsedRequestProducerImagePullBinding.roleAssignmentMode == wc027ParsedFeedProducerImagePullBinding.roleAssignmentMode
+  wc027ParsedRequestProducerImagePullBinding.roleAssignmentMode == wc027ParsedPublisherConfiguration.imagePull.roleAssignmentMode
+  wc027ReviewedRequestProducerAcrAssignmentValid
+  wc027ReviewedFeedProducerAcrAssignmentValid
+  wc027ReviewedPublisherAcrAssignmentValid
+  empty(wc027ParsedEffectiveAcrAccess.extraPullCapableAssignmentIds)
+  !empty(wc027ParsedEffectiveAcrAccess.verifiedAt)
+], false)
 var wc027PublisherImagePullEvidenceValid = !empty(wc027PublisherImagePullEvidenceJson) && !contains([
   wc027ParsedPublisherImagePullEvidence.schemaVersion == 'athena.wc027AcrDigestPullReadiness.v1'
   wc027ParsedPublisherImagePullEvidence.success == true
@@ -686,10 +1079,16 @@ var wc027PublisherImagePullEvidenceValid = !empty(wc027PublisherImagePullEvidenc
   wc027ParsedPublisherImagePullEvidence.registryServer == wc027ParsedPublisherConfiguration.imagePull.registryServer
   wc027ParsedPublisherImagePullEvidence.image == wc027PublisherImage
   wc027ParsedPublisherConfiguration.imagePull.image == wc027PublisherImage
+  wc027ParsedPublisherImagePullEvidence.anonymousPullEnabled == false
+  wc027ParsedPublisherImagePullEvidence.anonymousPullEnabled == wc027ParsedPublisherConfiguration.imagePull.anonymousPullEnabled
   wc027ParsedPublisherImagePullEvidence.repositoryName == wc027ParsedPublisherConfiguration.imagePull.repositoryName
+  toLower(wc027ParsedPublisherImagePullEvidence.managedIdentityResourceId) == toLower(wc027ParsedPublisherConfiguration.imagePull.identityResourceId)
   toLower(wc027ParsedPublisherImagePullEvidence.managedIdentityClientId) == toLower(wc027ParsedPublisherConfiguration.imagePull.identityClientId)
+  toLower(wc027ParsedPublisherImagePullEvidence.managedIdentityPrincipalId) == toLower(wc027ParsedPublisherConfiguration.imagePull.identityPrincipalId)
+  wc027PublisherImagePullIdentityMatches
   wc027ParsedPublisherImagePullEvidence.roleAssignmentMode == wc027ParsedPublisherConfiguration.imagePull.roleAssignmentMode
   wc027ParsedPublisherImagePullEvidence.roleDefinitionId == wc027ParsedPublisherConfiguration.imagePull.roleDefinitionId
+  toLower(wc027ParsedPublisherImagePullEvidence.roleAssignmentResourceId) == toLower(wc027ParsedPublisherConfiguration.imagePull.roleAssignmentResourceId)
   wc027ParsedPublisherImagePullEvidence.conditionVersion == wc027ParsedPublisherConfiguration.imagePull.conditionVersion
   wc027ParsedPublisherImagePullEvidence.condition == wc027ParsedPublisherConfiguration.imagePull.condition
   wc027PublisherImagePullConditionValid
@@ -894,9 +1293,11 @@ var wc027PublisherTagsMatch = wc027PublisherReady && wc027PublisherJobResourceId
       wc027PublisherJob!.tags.runtimeConfigurationDigest == wc027PublisherConfigurationDigest
     ], false)
   : false
-var validatedWc027PublisherReady = wc027PublisherReady && !wc027PublisherJobResourceIdValid
-  ? fail('wc027PublisherJobResourceId must identify one Microsoft.App/jobs resource')
-  : wc027PublisherReady && !wc027PublisherConfigurationDigestValid
+var validatedWc027PublisherReady = wc027PublisherReady && !wc027EffectiveAcrAssignmentsVerified
+  ? fail('WC-027 publisher requires PR #102-equivalent full role-definition resolution proving no extra direct, inherited, group-derived, or sibling-registry pull-capable assignment')
+  : wc027PublisherReady && !wc027PublisherJobResourceIdValid
+    ? fail('wc027PublisherJobResourceId must identify one Microsoft.App/jobs resource')
+    : wc027PublisherReady && !wc027PublisherConfigurationDigestValid
     ? fail('WC-027 publisher requires the exact deployed configuration digest')
     : wc027PublisherReady && empty(wc027PublisherConfigurationJson)
       ? fail('WC-027 publisher requires the exact deployed configuration JSON')
@@ -1143,12 +1544,14 @@ var wc027ProducerTagsMatch = wc027FeedV2ProducerReady && wc027ProducerJobResourc
       wc027ProducerJob!.tags.bindingEvidenceDigest == wc027ParsedConfiguration.deploymentBinding.bindingEvidenceId
     ], false)
   : false
-var validatedWc027FeedV2ProducerReady = wc027FeedV2ProducerReady && !startsWith(
-  toLower(wc027EnrichmentFeedProducerJobResourceId),
-  '/subscriptions/'
-)
-  ? fail('WC-027 Notification v2 cannot be enabled without the exact deployed producer Job resource ID')
-  : wc027FeedV2ProducerReady && !wc027ProducerJobResourceIdValid
+var validatedWc027FeedV2ProducerReady = wc027FeedV2ProducerReady && !wc027EffectiveAcrAssignmentsVerified
+  ? fail('WC-027 feed producer requires PR #102-equivalent full role-definition resolution proving no extra direct, inherited, group-derived, or sibling-registry pull-capable assignment')
+  : wc027FeedV2ProducerReady && !startsWith(
+      toLower(wc027EnrichmentFeedProducerJobResourceId),
+      '/subscriptions/'
+    )
+    ? fail('WC-027 Notification v2 cannot be enabled without the exact deployed producer Job resource ID')
+    : wc027FeedV2ProducerReady && !wc027ProducerJobResourceIdValid
     ? fail('wc027EnrichmentFeedProducerJobResourceId must identify one Microsoft.App/jobs resource')
     : wc027FeedV2ProducerReady && !wc027ConfigurationDigestValid
       ? fail('WC-027 Notification v2 requires the exact deployed producer configuration digest')
@@ -1569,6 +1972,7 @@ module presentationWeb 'modules/presentation-web.bicep' = {
     presentationImage: validatedPresentationImage
     presentationImageRegistryServer: validatedPresentationDeliveryRegistryServer
     presentationImageRegistryResourceId: presentationImageRegistryResourceId
+    presentationImageRegistryRoleAssignmentMode: presentationImageRegistryRoleAssignmentMode
     deliveryImage: validatedAcceptanceImage
     presentationAssetBlobEndpoint: presentationAssetBlobEndpoint
     presentationAssetContainerName: presentationAssetContainerName
@@ -1644,9 +2048,10 @@ module acceptanceImagePull 'modules/acr-pull-rbac.bicep' = {
     azureMcp
   ]
   params: {
-    registryName: last(split(acceptanceImageRegistryResourceId, '/'))
-    identityName: '${namePrefix}-context-id'
+    registryResourceId: acceptanceImageRegistryResourceId
     identityPrincipalId: acceptanceJobIdentity.properties.principalId
+    image: validatedAcceptanceImage
+    registryRoleAssignmentMode: acceptanceImageRegistryRoleAssignmentMode
   }
 }
 
@@ -1660,9 +2065,10 @@ module evidenceCollectorImagePull 'modules/acr-pull-rbac.bicep' = {
     azureMcp
   ]
   params: {
-    registryName: last(split(acceptanceImageRegistryResourceId, '/'))
-    identityName: '${namePrefix}-mcp-evidence-id'
+    registryResourceId: acceptanceImageRegistryResourceId
     identityPrincipalId: evidenceIdentity.properties.principalId
+    image: validatedAcceptanceImage
+    registryRoleAssignmentMode: acceptanceImageRegistryRoleAssignmentMode
   }
 }
 
@@ -1673,9 +2079,10 @@ module collectorControllerImagePull 'modules/acr-pull-rbac.bicep' = {
     split(acceptanceImageRegistryResourceId, '/')[4]
   )
   params: {
-    registryName: last(split(acceptanceImageRegistryResourceId, '/'))
-    identityName: '${namePrefix}-collector-controller-id'
+    registryResourceId: acceptanceImageRegistryResourceId
     identityPrincipalId: collectorControllerIdentity.outputs.principalId
+    image: validatedControllerImage
+    registryRoleAssignmentMode: acceptanceImageRegistryRoleAssignmentMode
   }
 }
 
@@ -1686,9 +2093,10 @@ module wc016DetectorImagePull 'modules/acr-pull-rbac.bicep' = if (validatedWc016
     split(acceptanceImageRegistryResourceId, '/')[4]
   )
   params: {
-    registryName: last(split(acceptanceImageRegistryResourceId, '/'))
-    identityName: '${namePrefix}-wc016-detector-v2-id'
+    registryResourceId: acceptanceImageRegistryResourceId
     identityPrincipalId: wc016DetectorIdentity.outputs.principalId
+    image: validatedWc016DetectorImage
+    registryRoleAssignmentMode: acceptanceImageRegistryRoleAssignmentMode
   }
 }
 
@@ -1699,9 +2107,10 @@ module wc016OrchestratorImagePull 'modules/acr-pull-rbac.bicep' = if (validatedW
     split(acceptanceImageRegistryResourceId, '/')[4]
   )
   params: {
-    registryName: last(split(acceptanceImageRegistryResourceId, '/'))
-    identityName: '${namePrefix}-wc016-orchestrator-v2-id'
+    registryResourceId: acceptanceImageRegistryResourceId
     identityPrincipalId: wc016OrchestratorIdentity.outputs.principalId
+    image: validatedWc016OrchestratorImage
+    registryRoleAssignmentMode: acceptanceImageRegistryRoleAssignmentMode
   }
 }
 
@@ -1712,11 +2121,107 @@ module wc016NotificationImagePull 'modules/acr-pull-rbac.bicep' = if (validatedW
     split(acceptanceImageRegistryResourceId, '/')[4]
   )
   params: {
-    registryName: last(split(acceptanceImageRegistryResourceId, '/'))
-    identityName: '${namePrefix}-wc016-notification-v2-id'
+    registryResourceId: acceptanceImageRegistryResourceId
     identityPrincipalId: wc016NotificationIdentity.outputs.principalId
+    image: validatedWc016OrchestratorImage
+    registryRoleAssignmentMode: acceptanceImageRegistryRoleAssignmentMode
   }
 }
+
+var wc013CoreAcrPullAssignments = concat([
+  {
+    label: 'acceptance'
+    assignmentResourceId: acceptanceImagePull.outputs.roleAssignmentResourceId
+    principalId: acceptanceJobIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: acceptanceImagePull.outputs.roleDefinitionResourceId
+    roleAssignmentMode: acceptanceImagePull.outputs.roleAssignmentMode
+    anonymousPullEnabled: acceptanceImagePull.outputs.anonymousPullEnabled
+    scope: acceptanceImagePull.outputs.registryResourceId
+    image: validatedAcceptanceImage
+    repositoryName: acceptanceImagePull.outputs.repositoryName
+    conditionVersion: acceptanceImagePull.outputs.?conditionVersion
+    condition: acceptanceImagePull.outputs.?condition
+  }
+  {
+    label: 'evidence'
+    assignmentResourceId: evidenceCollectorImagePull.outputs.roleAssignmentResourceId
+    principalId: evidenceIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: evidenceCollectorImagePull.outputs.roleDefinitionResourceId
+    roleAssignmentMode: evidenceCollectorImagePull.outputs.roleAssignmentMode
+    anonymousPullEnabled: evidenceCollectorImagePull.outputs.anonymousPullEnabled
+    scope: evidenceCollectorImagePull.outputs.registryResourceId
+    image: validatedAcceptanceImage
+    repositoryName: evidenceCollectorImagePull.outputs.repositoryName
+    conditionVersion: evidenceCollectorImagePull.outputs.?conditionVersion
+    condition: evidenceCollectorImagePull.outputs.?condition
+  }
+  {
+    label: 'controller'
+    assignmentResourceId: collectorControllerImagePull.outputs.roleAssignmentResourceId
+    principalId: collectorControllerIdentity.outputs.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: collectorControllerImagePull.outputs.roleDefinitionResourceId
+    roleAssignmentMode: collectorControllerImagePull.outputs.roleAssignmentMode
+    anonymousPullEnabled: collectorControllerImagePull.outputs.anonymousPullEnabled
+    scope: collectorControllerImagePull.outputs.registryResourceId
+    image: validatedControllerImage
+    repositoryName: collectorControllerImagePull.outputs.repositoryName
+    conditionVersion: collectorControllerImagePull.outputs.?conditionVersion
+    condition: collectorControllerImagePull.outputs.?condition
+  }
+], presentationWeb.outputs.acrPullAssignments)
+var wc016AcrPullAssignments = validatedWc016RuntimeEnabled
+  ? [
+      {
+        label: 'wc016-detector'
+        assignmentResourceId: wc016DetectorImagePull!.outputs.roleAssignmentResourceId
+        principalId: wc016DetectorIdentity.outputs.principalId
+        principalType: 'ServicePrincipal'
+        roleDefinitionId: wc016DetectorImagePull!.outputs.roleDefinitionResourceId
+        roleAssignmentMode: wc016DetectorImagePull!.outputs.roleAssignmentMode
+        anonymousPullEnabled: wc016DetectorImagePull!.outputs.anonymousPullEnabled
+        scope: wc016DetectorImagePull!.outputs.registryResourceId
+        image: validatedWc016DetectorImage
+        repositoryName: wc016DetectorImagePull!.outputs.repositoryName
+        conditionVersion: wc016DetectorImagePull!.outputs.?conditionVersion
+        condition: wc016DetectorImagePull!.outputs.?condition
+      }
+      {
+        label: 'wc016-orchestrator'
+        assignmentResourceId: wc016OrchestratorImagePull!.outputs.roleAssignmentResourceId
+        principalId: wc016OrchestratorIdentity.outputs.principalId
+        principalType: 'ServicePrincipal'
+        roleDefinitionId: wc016OrchestratorImagePull!.outputs.roleDefinitionResourceId
+        roleAssignmentMode: wc016OrchestratorImagePull!.outputs.roleAssignmentMode
+        anonymousPullEnabled: wc016OrchestratorImagePull!.outputs.anonymousPullEnabled
+        scope: wc016OrchestratorImagePull!.outputs.registryResourceId
+        image: validatedWc016OrchestratorImage
+        repositoryName: wc016OrchestratorImagePull!.outputs.repositoryName
+        conditionVersion: wc016OrchestratorImagePull!.outputs.?conditionVersion
+        condition: wc016OrchestratorImagePull!.outputs.?condition
+      }
+      {
+        label: 'wc016-notification'
+        assignmentResourceId: wc016NotificationImagePull!.outputs.roleAssignmentResourceId
+        principalId: wc016NotificationIdentity.outputs.principalId
+        principalType: 'ServicePrincipal'
+        roleDefinitionId: wc016NotificationImagePull!.outputs.roleDefinitionResourceId
+        roleAssignmentMode: wc016NotificationImagePull!.outputs.roleAssignmentMode
+        anonymousPullEnabled: wc016NotificationImagePull!.outputs.anonymousPullEnabled
+        scope: wc016NotificationImagePull!.outputs.registryResourceId
+        image: validatedWc016OrchestratorImage
+        repositoryName: wc016NotificationImagePull!.outputs.repositoryName
+        conditionVersion: wc016NotificationImagePull!.outputs.?conditionVersion
+        condition: wc016NotificationImagePull!.outputs.?condition
+      }
+    ]
+  : []
+var wc013AcrPullAssignments = concat(
+  wc013CoreAcrPullAssignments,
+  wc016AcrPullAssignments
+)
 
 var notificationV2ConfigurationJson = string({
   lifecycle: {
@@ -2005,6 +2510,7 @@ output wc016ApprovedConfiguration object = {
   wc016ApprovedAlertRulesJson: validatedWc016RuntimeEnabled
     ? wc016Runtime!.outputs.approvedAlertRulesJson
     : ''
+  wc013AcrPullAssignments: wc013AcrPullAssignments
 }
 
 @description('WC-016 scheduled detector Job resource ID.')

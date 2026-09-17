@@ -1310,6 +1310,9 @@ output registryResourceId string = producerImagePull.outputs.registryResourceId
 @description('Live ACR role-assignment permissions mode used for producer image pull.')
 output registryRoleAssignmentMode string = producerImagePull.outputs.roleAssignmentMode
 
+@description('Server-returned anonymous-pull posture; always false for accepted deployments.')
+output registryAnonymousPullEnabled bool = producerImagePull.outputs.anonymousPullEnabled
+
 @description('Exact ACR repository parsed from the reviewed producer image.')
 output registryRepositoryName string = producerImagePull.outputs.repositoryName
 
@@ -1319,11 +1322,29 @@ output registryPullRoleDefinitionId string = producerImagePull.outputs.roleDefin
 @description('Deterministic producer ACR pull role assignment resource ID.')
 output registryPullRoleAssignmentResourceId string = producerImagePull.outputs.roleAssignmentResourceId
 
+@description('Server-returned managed-identity principal ID bound to the producer ACR pull assignment.')
+output registryPullPrincipalId string = validatedBrokerIdentityPrincipalId
+
 @description('Exact condition version on the producer ACR pull assignment, or null in legacy mode.')
 output registryPullConditionVersion string? = producerImagePull.outputs.?conditionVersion
 
 @description('Exact repository-scoped condition on the producer ACR pull assignment, or null in legacy mode.')
 output registryPullCondition string? = producerImagePull.outputs.?condition
+
+@description('Exact non-secret feed-producer ACR pull binding for root readiness verification.')
+output deployedRegistryPullBindingJson string = string({
+  schemaVersion: 'athena.wc027AcrPullBinding.v1'
+  registryResourceId: producerImagePull.outputs.registryResourceId
+  image: validatedProducerImage
+  principalId: validatedBrokerIdentityPrincipalId
+  roleAssignmentMode: producerImagePull.outputs.roleAssignmentMode
+  anonymousPullEnabled: producerImagePull.outputs.anonymousPullEnabled
+  repositoryName: producerImagePull.outputs.repositoryName
+  roleDefinitionId: registryPullRoleDefinitionGuid
+  roleAssignmentResourceId: producerImagePull.outputs.roleAssignmentResourceId
+  conditionVersion: producerImagePull.outputs.?conditionVersion
+  condition: producerImagePull.outputs.?condition
+})
 
 @description('Private Service Bus namespace host used by the runtime configuration.')
 output namespaceHostName string = serviceBusNamespaceHostName

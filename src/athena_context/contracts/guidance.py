@@ -1006,7 +1006,8 @@ class GuidanceAuthorityPublicationRequestAttestation(_StrictGuidanceModel):
 
 class GuidanceAuthorityPublicationRequest(_StrictGuidanceModel):
     schema_version: Literal[
-        "athena.wc027GuidanceAuthorityPublicationRequest.v1"
+        "athena.wc027GuidanceAuthorityPublicationRequest.v1",
+        "athena.wc027GuidanceAuthorityPublicationRequest.v2",
     ] = Field(alias="schemaVersion")
     request_id: str = Field(
         alias="requestId",
@@ -1025,7 +1026,10 @@ class GuidanceAuthorityPublicationRequest(_StrictGuidanceModel):
     )
     evaluated_at: UtcDateTime = Field(alias="evaluatedAt")
     expires_at: UtcDateTime = Field(alias="expiresAt")
-    finish_before: UtcDateTime = Field(alias="finishBefore")
+    finish_before: UtcDateTime | None = Field(
+        default=None,
+        alias="finishBefore",
+    )
     request_attestation: GuidanceAuthorityPublicationRequestAttestation = Field(
         alias="requestAttestation"
     )
@@ -1039,15 +1043,23 @@ class GuidanceAuthorityPublicationRequest(_StrictGuidanceModel):
     @property
     def effective_finish_before(self) -> UtcDateTime:
         return min(
-            self.finish_before,
+            self.delivery_finish_before,
             self.incident_bound_request.correlation_request.expires_at,
         )
+
+    @property
+    def delivery_finish_before(self) -> UtcDateTime:
+        return self.finish_before or self.expires_at
 
     @model_validator(mode="after")
     def validate_request(self) -> GuidanceAuthorityPublicationRequest:
         correlation_request = self.incident_bound_request.correlation_request
         subject = self.incident_bound_request.incident_subject
         occurrence = self.incident_occurrence
+        legacy = (
+            self.schema_version
+            == "athena.wc027GuidanceAuthorityPublicationRequest.v1"
+        )
         if (
             occurrence.incident_id != subject.incident_id
             or occurrence.transition_id != subject.incident_transition_id
@@ -1064,9 +1076,13 @@ class GuidanceAuthorityPublicationRequest(_StrictGuidanceModel):
             > timedelta(
                 seconds=WC027_GUIDANCE_PUBLICATION_REQUEST_MAX_LIFETIME_SECONDS
             )
-            or self.finish_before
-            != GuidancePublicationRequestDeliveryBudget.reviewed().finish_before(
-                self.expires_at
+            or (not legacy and self.finish_before is None)
+            or (
+                self.finish_before is not None
+                and self.finish_before
+                != GuidancePublicationRequestDeliveryBudget.reviewed().finish_before(
+                    self.expires_at
+                )
             )
         ):
             raise ValueError(
@@ -1137,7 +1153,8 @@ class PublishedGuidanceAuthorityActivationAttestation(_StrictGuidanceModel):
 
 class PublishedGuidanceAuthorityActivation(_StrictGuidanceModel):
     schema_version: Literal[
-        "athena.wc027PublishedGuidanceAuthorityActivation.v1"
+        "athena.wc027PublishedGuidanceAuthorityActivation.v1",
+        "athena.wc027PublishedGuidanceAuthorityActivation.v2",
     ] = Field(alias="schemaVersion")
     activation_id: str = Field(
         alias="activationId",
@@ -1159,21 +1176,25 @@ class PublishedGuidanceAuthorityActivation(_StrictGuidanceModel):
     )
     binding_digest: Sha256Digest = Field(alias="bindingDigest")
     binding_reference: VersionPinnedBlobReference = Field(alias="bindingReference")
-    trigger_message_id: str = Field(
+    trigger_message_id: str | None = Field(
+        default=None,
         alias="triggerMessageId",
         pattern=r"^guidance-binding-[a-f0-9]{32}$",
     )
-    trigger_delivery_pending: Literal[True] = Field(
-        alias="triggerDeliveryPending"
+    trigger_delivery_pending: Literal[True] | None = Field(
+        default=None, alias="triggerDeliveryPending"
     )
-    delivery_budget: GuidancePublicationRequestDeliveryBudget = Field(
-        alias="deliveryBudget"
+    delivery_budget: GuidancePublicationRequestDeliveryBudget | None = Field(
+        default=None, alias="deliveryBudget"
     )
     activated_at: UtcDateTime = Field(alias="activatedAt")
-    publication_request_expires_at: UtcDateTime = Field(
-        alias="publicationRequestExpiresAt"
+    publication_request_expires_at: UtcDateTime | None = Field(
+        default=None, alias="publicationRequestExpiresAt"
     )
-    finish_before: UtcDateTime = Field(alias="finishBefore")
+    finish_before: UtcDateTime | None = Field(
+        default=None,
+        alias="finishBefore",
+    )
     expires_at: UtcDateTime = Field(alias="expiresAt")
     activation_attestation: PublishedGuidanceAuthorityActivationAttestation = Field(
         alias="activationAttestation"
@@ -1182,16 +1203,43 @@ class PublishedGuidanceAuthorityActivation(_StrictGuidanceModel):
 
     @model_validator(mode="after")
     def validate_activation(self) -> PublishedGuidanceAuthorityActivation:
+        legacy = (
+            self.schema_version
+            == "athena.wc027PublishedGuidanceAuthorityActivation.v1"
+        )
+        extended_fields = (
+            self.trigger_message_id,
+            self.trigger_delivery_pending,
+            self.delivery_budget,
+            self.publication_request_expires_at,
+            self.finish_before,
+        )
+        has_extended_delivery_binding = all(value is not None for value in extended_fields)
+        has_no_extended_delivery_binding = all(value is None for value in extended_fields)
         if (
-            self.binding_reference.name
-            != f"guidance-bindings/{self.binding_id}/binding.json"
-            or self.trigger_message_id != self.binding_id
-            or self.activated_at >= self.publication_request_expires_at
-            or self.finish_before
-            != self.delivery_budget.finish_before(
-                self.publication_request_expires_at
+            self.binding_reference.name != f"guidance-bindings/{self.binding_id}/binding.json"
+            or (not has_extended_delivery_binding and not has_no_extended_delivery_binding)
+            or (not legacy and not has_extended_delivery_binding)
+            or (has_no_extended_delivery_binding and self.activated_at >= self.expires_at)
+            or (has_extended_delivery_binding and self.trigger_message_id != self.binding_id)
+            or (
+                has_extended_delivery_binding
+                and self.publication_request_expires_at is not None
+                and self.activated_at >= self.publication_request_expires_at
             )
-            or self.expires_at != self.finish_before
+            or (
+                has_extended_delivery_binding
+                and self.delivery_budget is not None
+                and self.publication_request_expires_at is not None
+                and self.finish_before
+                not in {
+                    self.publication_request_expires_at,
+                    self.delivery_budget.finish_before(
+                        self.publication_request_expires_at
+                    ),
+                }
+            )
+            or (has_extended_delivery_binding and self.expires_at != self.finish_before)
         ):
             raise ValueError("guidance activation does not bind an eligible binding")
         preimage = self.model_dump(
@@ -1221,6 +1269,27 @@ class PublishedGuidanceAuthorityActivation(_StrictGuidanceModel):
         ):
             raise ValueError("activationId is not digest-bound")
         return self
+
+    @property
+    def delivery_finish_before(self) -> UtcDateTime:
+        return self.finish_before or self.expires_at
+
+    @property
+    def request_expires_at(self) -> UtcDateTime:
+        return self.publication_request_expires_at or self.expires_at
+
+    @property
+    def has_extended_delivery_binding(self) -> bool:
+        return all(
+            value is not None
+            for value in (
+                self.trigger_message_id,
+                self.trigger_delivery_pending,
+                self.delivery_budget,
+                self.publication_request_expires_at,
+                self.finish_before,
+            )
+        )
 
 
 def guidance_authority_activation_signature_preimage(

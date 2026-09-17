@@ -358,13 +358,14 @@ def validate_wc027_enrichment_broker_metadata(
         "schemaVersion": WC027_ENRICHMENT_TRIGGER_SCHEMA_VERSION,
         "bindingDigest": binding.binding_digest,
     }
+    legacy_properties = dict(expected_properties)
     expected_properties.update(expected_delivery_budget.broker_properties())
     if (
         getattr(message, "content_type", None) != "application/json"
         or str(getattr(message, "message_id", "")) != binding.binding_id
         or str(getattr(message, "session_id", ""))
         != binding.incident_bound_request.incident_subject.incident_id
-        or normalized != expected_properties
+        or normalized not in (legacy_properties, expected_properties)
     ):
         raise ValueError("WC-027 enrichment trigger broker metadata is invalid")
 

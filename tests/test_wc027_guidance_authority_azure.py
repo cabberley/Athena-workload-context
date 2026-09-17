@@ -14,7 +14,11 @@ from athena_context.guidance.azure import (
     AzureTableGuidanceAuthorityActivationStore,
 )
 from test_wc026_correlation_contract import NOW
-from test_wc027_guidance_authority_publisher import _publisher, _request
+from test_wc027_guidance_authority_publisher import (
+    _legacy_activation,
+    _publisher,
+    _request,
+)
 
 _DELIVERY_BUDGET = GuidancePublicationRequestDeliveryBudget.reviewed()
 
@@ -135,19 +139,44 @@ def test_activation_materialization_recovers_an_uncertain_committed_update() -> 
     assert table.entity["triggerDeliveryStatus"] == "materialized"
 
 
-def test_published_submitted_activation_row_is_recovered_as_pending() -> None:
+@pytest.mark.parametrize(
+    ("extended", "stored_status"),
+    ((False, None), (False, "submitted"), (True, "submitted")),
+)
+def test_published_legacy_activation_row_is_recovered_as_pending(
+    extended: bool,
+    stored_status: str | None,
+) -> None:
     activation, binding = _activation_and_binding(legacy_deadline=True)
+    activation = _legacy_activation(activation, extended=extended)
     table = _Table()
     store = _table_store(table)
-    store.compare_and_swap(activation, expected_etag=None)
-    table.entity["triggerDeliveryStatus"] = "submitted"
+    entity = {
+        "PartitionKey": "wc027-guidance-authority",
+        "RowKey": activation.incident_id,
+        "activationDigest": activation.activation_digest,
+        "payload": activation.canonical_bytes().decode("utf-8"),
+    }
+    if stored_status is not None:
+        entity["triggerDeliveryStatus"] = stored_status
+    table.entity = _Entity(entity, etag='"etag-legacy"')
 
     recovered = store.read_current(incident_id=activation.incident_id)
 
     assert recovered is not None
     assert recovered.activation == activation
     assert recovered.trigger_delivery_status == "pending"
-    assert activation.finish_before > binding.incident_bound_request.correlation_request.expires_at
+    assert activation.has_extended_delivery_binding is extended
+    if extended:
+        assert (
+            activation.delivery_finish_before
+            > binding.incident_bound_request.correlation_request.expires_at
+        )
+    else:
+        assert (
+            activation.delivery_finish_before
+            <= binding.incident_bound_request.correlation_request.expires_at
+        )
 
 
 def test_activation_table_create_conflict_fails_closed() -> None:

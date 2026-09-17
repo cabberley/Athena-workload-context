@@ -53,12 +53,15 @@ competing hypothesis, and no explicit competing-cause contradiction. Every
 binding carries a domain-separated detached-signature preimage digest.
 
 Production publication accepts only canonical, bounded
-`GuidanceAuthorityPublicationRequest.v1` messages. The request signs the exact incident-bound
+`GuidanceAuthorityPublicationRequest.v2` messages. The request signs the exact incident-bound
 correlation request, current signed `IncidentOccurrenceReceipt`, requested actions, evaluation
-time, and expiry using a dedicated publication-request authority. The publisher verifies the
-request and every nested lifecycle/subject/correlation-binding signature before writing guidance
-assets, re-reads the signed current occurrence and active index, and recomputes correlation rather
-than trusting a caller-supplied report.
+time, expiry, and absolute `finishBefore` using a dedicated publication-request authority. The
+reader still verifies the original v1 shape without synthesizing signed fields, but legacy
+broker-only requests cannot bypass the mandatory immutable-outbox proof and must be reissued by
+the governed producer. The publisher verifies the request and every nested
+lifecycle/subject/correlation-binding signature before writing guidance assets, re-reads the
+signed current occurrence and active index, and recomputes correlation rather than trusting a
+caller-supplied report.
 
 The publication request is now produced by a separate production runtime rather than by the
 authority publisher or a caller-side submit command. That producer consumes only the exact
@@ -132,13 +135,15 @@ record, and feed index are durably materialized, a separately authorized runtime
 conditionally changes only the same activation row to `materialized`. That identity has entity
 read/update permission only—no add or delete. The update occurs only after the deterministic
 notification is durably enqueued, so notification or marker uncertainty keeps recovery live.
-Publisher replay treats `materialized` as complete and does not resend. Existing rows written by
-the published head as `submitted` normalize to recoverable `pending` during reads. Their immutable
-signed bytes remain valid, while operational checks cap the effective deadline at the earlier of
-stored `finishBefore` and nested correlation expiry, preventing upgrade-time permanent rejection
-without allowing work beyond trusted correlation authority. The immutable occurrence-keyed request
-slot is not renewable: a different activation for the same occurrence remains conflict-closed even
-after expiry, and a new signed occurrence is required before guidance/feed state can change.
+Publisher replay treats `materialized` as complete and does not resend. Original v1 rows omit the
+new delivery fields and may omit the transport status entirely; pre-v2 transitional v1 rows may
+carry those fields plus the previously published `submitted` value. Both forms normalize to
+recoverable `pending` during reads and retain their original signed bytes. Original v1 uses signed
+`expiresAt`; extended v1 and new v2 use signed `finishBefore`. All operational checks cap either
+form at nested correlation expiry, preventing upgrade-time permanent rejection without allowing
+work beyond trusted correlation authority. The immutable occurrence-keyed request slot is not
+renewable: a different activation for the same occurrence remains conflict-closed even after
+expiry, and a new signed occurrence is required before guidance/feed state can change.
 The publisher dead-letters that permanent occurrence conflict and irreversible effective-deadline
 exhaustion with one lock-aware terminal disposition, while transient source, ETag, and transport
 failures retain the existing abandon/recovery behavior.
@@ -149,7 +154,7 @@ immediately verifies the binding, then create-or-recovers the binding Blob. Exis
 accepted only when their exact canonical bytes, digest, content type, and version-pinned readback
 match.
 
-Activation is a separate signed `PublishedGuidanceAuthorityActivation.v1` CAS row keyed by
+New activation is a separate signed `PublishedGuidanceAuthorityActivation.v2` CAS row keyed by
 incident ID. It binds the exact occurrence, request, binding digest, version-pinned binding
 reference, deterministic trigger message ID, complete delivery budget, activation time, original
 request expiry, and independently bounded `finishBefore`. A retry
@@ -192,14 +197,38 @@ version `2.0` and the documented request repository-name attribute with
 `StringEqualsIgnoreCase` against the one exact repository derived from the digest-pinned image.
 ABAC assignment identity includes that repository; legacy `AcrPull` retains the
 registry/principal/role seed and null condition fields. The module outputs, publisher
-configuration, and readiness evidence carry the same canonical repository and condition bytes as
-PR #102, allowing the required later rebase and its governed legacy-assignment migration to
-reconcile without semantic divergence. Root readiness additionally requires bounded, actual
-managed-identity pull evidence for the exact digest.
+configuration, and readiness evidence carry the same explicit `anonymousPullEnabled=false`
+readback, canonical repository, and condition bytes as PR #102. A digest pull cannot prove the
+managed identity when anonymous access is enabled, so the readiness probe performs live
+management-plane registry and user-assigned-identity readbacks before and after the pull using the
+unchanged operator context and an isolated managed-identity CLI profile. The live identity
+resource must return the exact resource, client, and principal IDs used for the scan, Docker login,
+publisher configuration, and Job registry binding.
+
+Root readiness additionally requires the PR #102-equivalent effective-assignment proof across the
+tenant root management-group hierarchy. Every descendant subscription is enumerated, direct group
+membership is traversed recursively twice without the eventual transitive-membership index, and
+the two closures must converge. Full role definitions are then resolved for every direct,
+inherited, and group-derived assignment in every subscription. Any extra pull grant or escalation
+path—including `roleAssignments/write`, role-definition mutation, ACR credential administration,
+custom roles, or a sibling registry in another subscription—fails closed. The scanner verifies
+every referenced registry's live permission mode, and the proof exact-matches each reviewed
+assignment's principal, registry scope, role, condition version, and canonical repository
+condition; legacy `AcrPull` accepts null condition fields only. The bounded publisher probe repeats
+the complete scan after the pull and requires an identical evidence digest. Request and feed
+deployments also emit exact non-secret ACR binding JSON, and root readiness binds those two
+reviewed assignments plus the publisher assignment to their live Job identities, deployment RBAC
+sets, registries, and images instead of trusting labels or counts. Evidence older than five
+minutes, generated after the trusted deployment evaluation instant, or lacking a final post-pull
+scan is rejected. This allows the required later rebase and its governed legacy-assignment
+migration to reconcile without semantic divergence.
 
 ## Consequences
 
 - WC-026 request/report and WC-027 incident-subject contracts remain unchanged.
+- New publication requests and activations use v2 shapes for the signed deadline and delivery
+  fields. Original v1 signatures remain verifiable; v1 activation rows remain readable and
+  materializable without rewriting their immutable payloads.
 - No runbook is safer and valid when authority is absent, stale, unhealthy, inapplicable, or too
   weakly supported.
 - Renderers may open only validated HTTPS references. Opaque references remain display-only.

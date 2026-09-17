@@ -113,6 +113,7 @@ class _Activation:
         *,
         delivery_budget: GuidancePublicationRequestDeliveryBudget = _DELIVERY_BUDGET,
         legacy_deadline: bool = False,
+        legacy_schema: bool = False,
     ) -> None:
         correlation_expires_at = binding.incident_bound_request.correlation_request.expires_at
         publication_request_expires_at = (
@@ -123,9 +124,12 @@ class _Activation:
             if legacy_deadline
             else correlation_expires_at - delivery_budget.finish_before_extension
         )
-        finish_before = delivery_budget.finish_before(publication_request_expires_at)
         payload = {
-            "schemaVersion": ("athena.wc027PublishedGuidanceAuthorityActivation.v1"),
+            "schemaVersion": (
+                "athena.wc027PublishedGuidanceAuthorityActivation.v1"
+                if legacy_schema
+                else "athena.wc027PublishedGuidanceAuthorityActivation.v2"
+            ),
             "incidentId": (binding.incident_bound_request.incident_subject.incident_id),
             "incidentStateDigest": (
                 binding.incident_bound_request.incident_subject.incident_state_digest
@@ -140,17 +144,24 @@ class _Activation:
                 version="synthetic-binding-version",
                 contentDigest=sha256_hex(binding.canonical_bytes()),
             ),
-            "triggerMessageId": binding.binding_id,
-            "triggerDeliveryPending": True,
-            "deliveryBudget": delivery_budget.model_dump(
-                mode="json",
-                by_alias=True,
-            ),
             "activatedAt": binding.evaluated_at,
-            "publicationRequestExpiresAt": publication_request_expires_at,
-            "finishBefore": finish_before,
-            "expiresAt": finish_before,
+            "expiresAt": publication_request_expires_at,
         }
+        if not legacy_schema:
+            finish_before = delivery_budget.finish_before(publication_request_expires_at)
+            payload.update(
+                {
+                    "triggerMessageId": binding.binding_id,
+                    "triggerDeliveryPending": True,
+                    "deliveryBudget": delivery_budget.model_dump(
+                        mode="json",
+                        by_alias=True,
+                    ),
+                    "publicationRequestExpiresAt": publication_request_expires_at,
+                    "finishBefore": finish_before,
+                    "expiresAt": finish_before,
+                }
+            )
         digest_payload = {
             **payload,
             "bindingReference": payload["bindingReference"].model_dump(  # type: ignore[union-attr]
@@ -485,6 +496,7 @@ def _bicep_generated_publisher_configuration() -> dict[str, object]:
             ),
             "repositoryName": "athena/wc027-guidance-authority-publisher",
             "roleAssignmentMode": "LegacyRegistryPermissions",
+            "anonymousPullEnabled": False,
             "roleDefinitionId": "7f951dda-4ed3-4680-a7ca-43fe172d538d",
             "roleAssignmentResourceId": (
                 "/subscriptions/00000000-0000-0000-0000-000000000000/"
@@ -577,6 +589,7 @@ def test_publisher_configuration_preserves_logical_and_physical_binding_keys() -
     assert configuration.image_pull.role_assignment_mode == ("LegacyRegistryPermissions")
     assert configuration.image_pull.role_definition_id == "7f951dda-4ed3-4680-a7ca-43fe172d538d"
     assert configuration.image_pull.repository_name == "athena/wc027-guidance-authority-publisher"
+    assert configuration.image_pull.anonymous_pull_enabled is False
     assert configuration.image_pull.condition_version is None
     assert configuration.image_pull.condition is None
 
@@ -705,6 +718,17 @@ def test_publisher_configuration_rejects_legacy_repository_condition() -> None:
     payload["imagePull"]["condition"] = "registry-wide"  # type: ignore[index]
 
     with pytest.raises(ValueError, match="exact repository"):
+        Wc027GuidanceAuthorityPublisherConfiguration.model_validate_json(json.dumps(payload))
+
+
+@pytest.mark.parametrize("anonymous_pull_enabled", (True, None, "false"))
+def test_publisher_configuration_requires_anonymous_pull_disabled(
+    anonymous_pull_enabled: object,
+) -> None:
+    payload = _bicep_generated_publisher_configuration()
+    payload["imagePull"]["anonymousPullEnabled"] = anonymous_pull_enabled  # type: ignore[index]
+
+    with pytest.raises(ValueError, match="anonymousPullEnabled"):
         Wc027GuidanceAuthorityPublisherConfiguration.model_validate_json(json.dumps(payload))
 
 
@@ -942,6 +966,7 @@ def _runtime(
     fail_feed_pointer_once: bool = False,
     clock=None,
     legacy_activation: bool = False,
+    legacy_activation_schema: bool = False,
 ):
     fixture = _fixture()
     operations: list[str] = []
@@ -983,6 +1008,7 @@ def _runtime(
             fixture.guidance_binding,
             fixture.incident_publication.occurrence,
             legacy_deadline=legacy_activation,
+            legacy_schema=legacy_activation_schema,
         ),
         enrichment_publication=_Enrichment(enrichment, operations),
         feed_publication=_Feed(feed, operations),
@@ -1127,6 +1153,32 @@ def test_runtime_uses_nested_expiry_for_published_head_activation(
         assert runtime.guidance_activation.snapshot.trigger_delivery_status == "pending"
 
 
+def test_runtime_materializes_a_signed_legacy_v1_activation() -> None:
+    (
+        fixture,
+        runtime,
+        _store,
+        _writer,
+        _registry,
+        _index,
+        notification,
+        _operations,
+        _binding_verifier,
+        _incident_authority,
+    ) = _runtime(legacy_activation_schema=True)
+    activation = runtime.guidance_activation.snapshot.activation
+
+    runtime.publish(
+        fixture.guidance_binding,
+        published_at=activation.activated_at,
+    )
+
+    assert activation.schema_version == "athena.wc027PublishedGuidanceAuthorityActivation.v1"
+    assert activation.finish_before is None
+    assert runtime.guidance_activation.snapshot.trigger_delivery_status == "materialized"
+    assert notification.calls == 1
+
+
 @pytest.mark.parametrize(
     ("remaining_seconds", "should_publish"),
     ((15, True), (14, False)),
@@ -1267,6 +1319,25 @@ def test_feed_trigger_metadata_binds_the_complete_delivery_budget() -> None:
             binding,
             expected_delivery_budget=_DELIVERY_BUDGET,
         )
+
+
+def test_feed_trigger_metadata_accepts_the_exact_legacy_v1_transport_shape() -> None:
+    binding = _fixture().guidance_binding
+    message = SimpleNamespace(
+        content_type="application/json",
+        message_id=binding.binding_id,
+        session_id=binding.incident_bound_request.incident_subject.incident_id,
+        application_properties={
+            "schemaVersion": "athena.wc027PublishedGuidanceAuthorityBinding.v2",
+            "bindingDigest": binding.binding_digest,
+        },
+    )
+
+    validate_wc027_enrichment_broker_metadata(
+        message,
+        binding,
+        expected_delivery_budget=_DELIVERY_BUDGET,
+    )
 
 
 def test_runtime_rejects_invalid_outer_signature_before_any_authority_or_storage_call() -> None:

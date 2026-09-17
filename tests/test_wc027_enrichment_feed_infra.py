@@ -392,6 +392,10 @@ def test_wc027_runtime_is_private_keyless_and_session_ordered() -> None:
     assert "image: validatedProducerImage" in source
     assert "registryRoleAssignmentMode: registryRoleAssignmentMode" in source
     assert "producerImagePull.outputs.repositoryName" in source
+    assert "producerImagePull.outputs.anonymousPullEnabled" in source
+    assert "output registryPullPrincipalId string = validatedBrokerIdentityPrincipalId" in source
+    assert "output deployedRegistryPullBindingJson string = string({" in source
+    assert "athena.wc027AcrPullBinding.v1" in source
     assert "producerImagePull.outputs.?conditionVersion" in source
     assert "producerImagePull.outputs.?condition" in source
     assert "triggerSubmitterIdentityResourceIds" in source

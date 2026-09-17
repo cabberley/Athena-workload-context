@@ -301,18 +301,27 @@ class AzureTableGuidanceAuthorityActivationStore:
             payload
         )
         stored_status = entity.get("triggerDeliveryStatus")
+        legacy_status_missing = (
+            stored_status is None
+            and activation.schema_version == "athena.wc027PublishedGuidanceAuthorityActivation.v1"
+        )
         if (
             activation.incident_id != entity.get("RowKey")
             or activation.activation_digest != entity.get("activationDigest")
             or payload.encode("utf-8") != activation.canonical_bytes()
-            or stored_status not in {"pending", "submitted", "materialized"}
+            or (
+                not legacy_status_missing
+                and stored_status not in {"pending", "submitted", "materialized"}
+            )
         ):
             raise ValueError("guidance activation row is not canonical")
         return GuidanceAuthorityActivationSnapshot(
             activation=activation,
             etag=self._entity_etag(entity),
             trigger_delivery_status=(
-                "pending" if stored_status == "submitted" else stored_status
+                "pending"
+                if legacy_status_missing or stored_status == "submitted"
+                else stored_status
             ),
         )
 

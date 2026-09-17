@@ -11,6 +11,7 @@ from athena_context.contracts import (
     GuidanceAuthorityPublicationRequestAttestation,
     GuidancePublicationRequestDeliveryBudget,
     PublishedGuidanceAuthorityActivation,
+    PublishedGuidanceAuthorityActivationAttestation,
     VersionPinnedBlobReference,
     compute_artifact_digest,
 )
@@ -57,6 +58,7 @@ def _request(
     evaluated_at=None,
     lifetime: timedelta = timedelta(minutes=5),
     bound_effective_deadline: bool = True,
+    legacy_schema: bool = False,
     incident_occurrence=None,
 ) -> GuidanceAuthorityPublicationRequest:
     binding = fixture.guidance_binding
@@ -72,14 +74,108 @@ def _request(
         latest_request_expiry,
     )
     payload = {
-        "schemaVersion": "athena.wc027GuidanceAuthorityPublicationRequest.v1",
+        "schemaVersion": (
+            "athena.wc027GuidanceAuthorityPublicationRequest.v1"
+            if legacy_schema
+            else "athena.wc027GuidanceAuthorityPublicationRequest.v2"
+        ),
         "incidentBoundRequest": binding.incident_bound_request,
         "incidentOccurrence": incident_occurrence or fixture.incident_publication.occurrence,
         "requestedActions": ("investigationCheck",),
         "evaluatedAt": evaluated_at,
         "expiresAt": expires_at,
-        "finishBefore": _DELIVERY_BUDGET.finish_before(expires_at),
     }
+    if not legacy_schema:
+        payload["finishBefore"] = _DELIVERY_BUDGET.finish_before(expires_at)
+    attestation = GuidanceAuthorityPublicationRequestAttestation(
+        schemaVersion=(
+            "athena.wc027GuidanceAuthorityPublicationRequestAttestation.v1"
+        ),
+        signatureAlgorithm="RS256",
+        keyId=_REQUEST_KEY_ID,
+        signedPreimageDigest=compute_artifact_digest(_json_value(payload)),
+        detachedSignature=_SIGNATURE,
+    )
+    complete = {**payload, "requestAttestation": attestation}
+    digest = compute_artifact_digest(_json_value(complete))
+    return GuidanceAuthorityPublicationRequest.model_validate(
+        {
+            **complete,
+            "requestId": (
+                f"guidance-publication-request-{digest.removeprefix('sha256:')[:32]}"
+            ),
+            "requestDigest": digest,
+        }
+    )
+
+
+def _legacy_activation(
+    activation: PublishedGuidanceAuthorityActivation,
+    *,
+    extended: bool = False,
+) -> PublishedGuidanceAuthorityActivation:
+    if extended:
+        payload = activation.model_dump(
+            mode="python",
+            by_alias=True,
+            exclude={
+                "activation_id",
+                "activation_digest",
+                "activation_attestation",
+            },
+        )
+        payload["schemaVersion"] = (
+            "athena.wc027PublishedGuidanceAuthorityActivation.v1"
+        )
+    else:
+        payload = {
+            "schemaVersion": "athena.wc027PublishedGuidanceAuthorityActivation.v1",
+            "incidentId": activation.incident_id,
+            "incidentStateDigest": activation.incident_state_digest,
+            "occurrenceDigest": activation.occurrence_digest,
+            "publicationRequestId": activation.publication_request_id,
+            "publicationRequestDigest": activation.publication_request_digest,
+            "bindingId": activation.binding_id,
+            "bindingDigest": activation.binding_digest,
+            "bindingReference": activation.binding_reference,
+            "activatedAt": activation.activated_at,
+            "expiresAt": activation.request_expires_at,
+        }
+    attestation = PublishedGuidanceAuthorityActivationAttestation(
+        schemaVersion=(
+            "athena.wc027PublishedGuidanceAuthorityActivationAttestation.v1"
+        ),
+        signatureAlgorithm="RS256",
+        keyId=_BINDING_KEY_ID,
+        signedPreimageDigest=compute_artifact_digest(_json_value(payload)),
+        detachedSignature=_SIGNATURE,
+    )
+    complete = {**payload, "activationAttestation": attestation}
+    digest = compute_artifact_digest(_json_value(complete))
+    return PublishedGuidanceAuthorityActivation.model_validate(
+        {
+            **complete,
+            "activationId": (
+                f"guidance-activation-{digest.removeprefix('sha256:')[:32]}"
+            ),
+            "activationDigest": digest,
+        }
+    )
+
+
+def _transitional_v1_request(
+    request: GuidanceAuthorityPublicationRequest,
+) -> GuidanceAuthorityPublicationRequest:
+    payload = request.model_dump(
+        mode="python",
+        by_alias=True,
+        exclude={
+            "request_id",
+            "request_digest",
+            "request_attestation",
+        },
+    )
+    payload["schemaVersion"] = "athena.wc027GuidanceAuthorityPublicationRequest.v1"
     attestation = GuidanceAuthorityPublicationRequestAttestation(
         schemaVersion=(
             "athena.wc027GuidanceAuthorityPublicationRequestAttestation.v1"
@@ -410,6 +506,83 @@ def test_publisher_caps_published_head_deadline_at_nested_correlation_expiry() -
             at=request.evaluated_at,
         )
     )
+
+
+def test_publisher_accepts_signed_legacy_v1_request_without_extending_its_deadline() -> None:
+    fixture, publisher, _writer, _activation, trigger, _correlation, _incident = _publisher()
+    request = _request(
+        fixture,
+        bound_effective_deadline=False,
+        legacy_schema=True,
+    )
+
+    receipt = publisher.publish(request, now=request.evaluated_at)
+
+    assert request.schema_version == "athena.wc027GuidanceAuthorityPublicationRequest.v1"
+    assert request.finish_before is None
+    assert request.effective_finish_before == request.expires_at
+    assert (
+        receipt.activation.schema_version
+        == "athena.wc027PublishedGuidanceAuthorityActivation.v2"
+    )
+    assert receipt.activation.delivery_finish_before == request.expires_at
+    assert trigger.calls[0][1] == (
+        _DELIVERY_BUDGET.feed_trigger_time_to_live_seconds(
+            finish_before=request.expires_at,
+            at=request.evaluated_at,
+        )
+    )
+
+
+def test_publisher_accepts_the_pre_v2_extended_v1_request_shape() -> None:
+    fixture, publisher, _writer, _activation, trigger, _correlation, _incident = _publisher()
+    request = _transitional_v1_request(_request(fixture))
+
+    receipt = publisher.publish(request, now=request.evaluated_at)
+
+    assert request.schema_version == "athena.wc027GuidanceAuthorityPublicationRequest.v1"
+    assert request.finish_before is not None
+    assert receipt.activation.delivery_finish_before == request.finish_before
+    assert trigger.calls[0][1] == (
+        _DELIVERY_BUDGET.feed_trigger_time_to_live_seconds(
+            finish_before=request.finish_before,
+            at=request.evaluated_at,
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("remaining_seconds", "should_publish"),
+    ((185, True), (184, False)),
+)
+def test_legacy_request_requires_complete_trigger_window_before_any_write(
+    remaining_seconds: int,
+    should_publish: bool,
+) -> None:
+    fixture, publisher, writer, activation, trigger, _correlation, _incident = (
+        _publisher()
+    )
+    request = _request(
+        fixture,
+        bound_effective_deadline=False,
+        legacy_schema=True,
+    )
+    now = request.expires_at - timedelta(seconds=remaining_seconds)
+
+    if should_publish:
+        publisher.publish(request, now=now)
+        assert len(writer.calls) == 2
+        assert activation.cas_calls == 1
+        assert len(trigger.calls) == 1
+    else:
+        with pytest.raises(
+            GuidanceAuthorityDeliveryExpiredError,
+            match="authority artifact write trigger-delivery window",
+        ):
+            publisher.publish(request, now=now)
+        assert writer.calls == []
+        assert activation.cas_calls == 0
+        assert trigger.calls == []
 
 
 def test_publisher_requires_reviewed_margin_immediately_before_cas() -> None:

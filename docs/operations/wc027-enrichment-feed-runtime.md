@@ -176,12 +176,14 @@ record, and feed index and durably enqueued the deterministic notification. The 
 only the same activation digest and ETag to `materialized`; its custom Table role permits entity
 read/update but not add, delete, or table administration. Notification or marker uncertainty
 therefore leaves a recoverable row and replays the same idempotent identities. The signed activation
-remains immutable. Legacy rows carrying the previously published `submitted` transport value are
-normalized to recoverable `pending` on read and can converge on `materialized` without migration
-downtime. Legacy signed activations may retain their original later `finishBefore` bytes, but
-runtime processing, TTL, and write guards use `min(finishBefore, nestedCorrelation.expiresAt)`.
-No different binding may replace the same occurrence after that effective deadline; replacement
-requires a new signed occurrence, so an existing feed-registry row cannot be silently repurposed.
+remains immutable. Original v1 rows omit the v2 delivery fields and may omit the transport status;
+pre-v2 transitional v1 rows may carry those fields plus the previously published `submitted`
+value. Both forms normalize to recoverable `pending` on read and can converge on `materialized`
+without migration downtime. Original v1 uses signed `expiresAt`; extended v1 and v2 use signed
+`finishBefore`. Runtime processing, TTL, and write guards cap either form at
+`nestedCorrelation.expiresAt`. No different binding may replace the same occurrence after that
+effective deadline; replacement requires a new signed occurrence, so an existing feed-registry row
+cannot be silently repurposed.
 
 The publisher verifies the outer request and nested lifecycle, subject, and correlation-binding
 signatures; confirms the exact current signed occurrence and active index; recomputes correlation;
@@ -196,9 +198,30 @@ Registry Repository Reader` only with condition version `2.0` and an exact
 `StringEqualsIgnoreCase` request-repository condition derived from that Job's digest-pinned image.
 Sibling, prefix-alias, and cross-component repositories remain denied. ABAC assignment identity
 also binds the repository name; legacy registries retain the registry/principal/role seed and
-carry unconditioned `AcrPull` with null condition fields. Runtime and publisher outputs expose the
-same repository, condition version, and condition bytes expected by PR #102 deployment evidence,
-so the later rebase can reconcile the shared module without semantic divergence.
+carry unconditioned `AcrPull` with null condition fields. The shared module also requires the live
+registry to return `anonymousPullEnabled=false`; runtime and publisher outputs expose that
+readback with the same repository, condition version, and condition bytes expected by PR #102
+deployment evidence. A successful digest pull is not accepted as identity evidence when anonymous
+pull is enabled or unproven; the publisher probe re-reads the live registry before and after the
+pull while isolating the managed-identity Azure CLI session from the operator context. The probe
+also exact-reads the publisher user-assigned identity before and after the pull and requires its
+resource, client, and principal IDs to bind the scan, login, configuration, and Job.
+
+Readiness remains blocked until the PR #103 pull probe runs the PR #102-equivalent scanner over the
+exact principal, assignment, registry, repository, and mode outputs from all three WC-027
+deployments. The scanner enumerates every subscription below the tenant root management group,
+recursively traverses direct group membership twice and requires convergence, exact-reads every
+registry's live `roleAssignmentMode`, and resolves every effective role definition across direct,
+inherited, and group-derived assignments. It rejects every extra pull grant or escalation path,
+including custom roles, role-assignment administration, ACR credential administration, and sibling
+registries in another subscription. The complete scan repeats after the pull and must return the
+same evidence digest. Root readiness also consumes the request and feed deployments' exact
+`deployedRegistryPullBindingJson` outputs and matches every reviewed principal to the live Job
+identity, every assignment to the deployment RBAC set, and every registry to the digest-pinned
+image rather than trusting labels or counts alone. The final post-pull proof must be no more than
+five minutes old at the trusted deployment evaluation instant. The later rebase can therefore
+reconcile the shared module, full-role scan, and legacy-assignment migration without semantic
+divergence.
 The module grants each configured reader only its exact container with `Blob.List` denied, and
 grants the trust-reader identity only exact-key read/verify data actions on the configured
 verification keys. Publisher authority and activation destinations are derived from the embedded

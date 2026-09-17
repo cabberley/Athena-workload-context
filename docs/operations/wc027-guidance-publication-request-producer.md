@@ -11,7 +11,7 @@ canonical signed IncidentBoundCorrelationRequest.v1
   -> verify nested signatures and published-runtime context
   -> read current signed lifecycle occurrence and active index
   -> verify exact immutable PublishedContextAuthority bytes
-  -> deterministically build, sign, and self-verify GuidanceAuthorityPublicationRequest.v1
+  -> deterministically build, sign, and self-verify GuidanceAuthorityPublicationRequest.v2
   -> create-or-recover immutable occurrence-keyed outbox evidence
   -> revalidate current lifecycle and context authority
   -> enqueue canonical request to wc027-guidance-authority-requests
@@ -143,7 +143,8 @@ Regression tests assert both versions and the SDK inheritance contract:
 - ACR pull for the event-trigger identity, deployed at the exact validated subscription and
   resource group parsed from `registryResourceId`; ABAC-mode Repository Reader assignments use
   condition version `2.0` and the shared canonical exact repository-name expression derived from
-  the digest-pinned image, while legacy registries retain unconditioned `AcrPull`;
+  the digest-pinned image, while legacy registries retain unconditioned `AcrPull`; the live
+  registry must return `anonymousPullEnabled=false` before either role assignment is accepted;
 - generated non-secret strict configuration and deterministic RBAC evidence; and
 - a publisher handoff containing the existing output queue, sender identity, exact request key
   binding, producer Job resource ID, and configuration digest.
@@ -185,14 +186,17 @@ another trigger send. If notification or marker persistence is uncertain, the ro
 recoverable and the same feed and notification identities replay idempotently. The runtime
 identity has only Table entity read/update permission for this marker—no add, delete, or table
 administration.
-Rows written by the previously published implementation with `triggerDeliveryStatus=submitted`
-are read as recoverable `pending` rows, so the upgrade neither dead-letters nor strands existing
-activations before the feed proves materialization. Previously signed requests whose stored
-`finishBefore` exceeded their nested correlation expiry are accepted only through the same trusted
-signature path; all operational TTL, freshness, and write checks use the earlier nested expiry as
-their effective deadline. The occurrence-keyed outbox remains authoritative: after that effective
-deadline, a different request cannot renew the same occurrence. A new signed incident occurrence
-is required, preserving immutable request and feed-registry identity.
+Existing v1 activation rows have no delivery-budget or `finishBefore` fields and may have no
+transport-status property; rows written by the immediately preceding implementation may instead
+carry `triggerDeliveryStatus=submitted`. Both forms are read as recoverable `pending`, retain their
+original signed bytes, and use signed `expiresAt` as their delivery deadline. New v2 activations
+carry `finishBefore` and the complete budget. All operational TTL, freshness, and write checks use
+the earlier of that version-appropriate deadline and nested correlation expiry. Legacy v1
+publication requests remain signature-verifiable, but a broker-only request without the exact
+version-pinned immutable outbox is rejected and must be reissued by the governed v2 producer. The
+occurrence-keyed outbox remains authoritative: after the effective deadline, a different request
+cannot renew the same occurrence. A new signed incident occurrence is required, preserving
+immutable request and feed-registry identity.
 
 Publisher settlement distinguishes permanent from transient outcomes. A different immutable
 activation for the same occurrence, or an exhausted effective trigger-recovery deadline, is
@@ -251,10 +255,20 @@ cross-subscription or cross-resource-group registries. The module reads the regi
 role-assignment GUID is seeded with the registry ID, managed-identity principal object ID, and
 selected role-definition ID; ABAC mode additionally binds the derived repository name. The
 assignment declares `principalType: ServicePrincipal`. Module outputs, publisher configuration,
-and pull-readiness evidence carry the same repository, condition version, and condition bytes.
-Legacy mode carries null condition fields. The later PR #102 integration rebase owns migration of
-the prior unconditioned Repository Reader assignment and can reconcile this identical shared
-module without semantic divergence.
+and pull-readiness evidence carry the same anonymous-pull posture, repository, condition version,
+and condition bytes. Legacy mode carries null condition fields. A digest pull is rejected as
+identity evidence unless anonymous pull is explicitly disabled in management-plane readbacks both
+before and after the pull. The probe keeps the deployment-verifier Azure CLI context intact and
+uses an isolated CLI profile only for the managed identity. Root readiness additionally
+requires the PR #102-equivalent effective-assignment scan that resolves complete role definitions
+for direct, inherited, and group-derived grants across every subscription below the tenant root
+management group. Direct memberships are recursively traversed twice and must converge. The scan
+rejects every extra pull or escalation-capable assignment, including role-assignment
+administration, ACR credential administration, custom roles, and sibling registries in another
+subscription. PR #103 runs the complete scan before and after the digest pull, requires identical
+evidence digests, and embeds the final evidence in the pull-readiness document. The later PR #102
+integration rebase retains ownership of the governed migration from prior unconditioned Repository
+Reader assignments and must reconcile the identical scan semantics without divergence.
 
 Before setting publisher readiness, run
 `infra/wc027-guidance-authority-publisher/Test-AcrDigestPullReadiness.ps1` on an Azure host that can
@@ -262,9 +276,36 @@ use the publisher's user-assigned identity. The script logs in with that identit
 registry mode already server-validated by Bicep, performs an actual pull of the exact digest-pinned
 image, verifies the resulting
 `RepoDigest`, and retries only within the reviewed attempt/delay bounds for RBAC propagation.
-Pass its compact JSON output unchanged as `wc027PublisherImagePullEvidenceJson`; the root gate
-matches the registry, image, identity, mode, role, and bounded success evidence to the deployed
-publisher configuration.
+Pass `ExpectedPullAssignmentsJson` as an array containing exactly `request-producer`,
+`feed-producer`, and `publisher`. Each item contains only `label`, `principalId`,
+`assignmentResourceId`, `registryResourceId`, `repositoryName`, and `roleAssignmentMode`, copied
+from the corresponding deployment's `registryPullPrincipalId`,
+`registryPullRoleAssignmentResourceId`, `registryResourceId`, `registryRepositoryName`, and
+`registryRoleAssignmentMode` outputs. Also pass the publisher deployment's exact principal and
+assignment outputs as `ManagedIdentityPrincipalId` and
+`RegistryPullRoleAssignmentResourceId`. The scanner rejects anonymous pull; incomplete Graph or
+assignment results; missing reviewed assignments; condition, scope, or role drift; and every
+additional direct, inherited, transitive-group, custom-role, or sibling-registry pull grant.
+Pass the publisher deployment's exact image-pull identity resource output as
+`ManagedIdentityResourceId`; the probe live-reads that user-assigned identity before and after the
+pull and binds its resource, client, and principal IDs to both the effective scan and Docker login.
+The deployment-verifier identity must be able to read the tenant root management-group descendants
+and role assignments in every descendant subscription; incomplete hierarchy visibility fails
+closed.
+
+Pass the script's compact JSON output unchanged as `wc027PublisherImagePullEvidenceJson`; the root
+gate matches the registry, image, client and principal identity, role assignment, mode, canonical
+condition, complete effective-access proof, and bounded success evidence to the deployed publisher
+configuration. Also pass the request producer and feed producer
+`deployedRegistryPullBindingJson` outputs unchanged as
+`wc027RequestProducerImagePullBindingJson` and
+`wc027EnrichmentFeedProducerImagePullBindingJson`. Root readiness exact-matches each reviewed
+assignment to its corresponding deployed principal, assignment, registry, image-derived
+repository, mode, role, condition version, and condition; a clean proof for stale or unrelated
+producer identities cannot enable any WC-027 Job. The proof is generated again after the pull and
+must reach root deployment within five minutes. Root uses its default
+`wc027ReadinessEvaluationTimeUtc` deployment instant to reject stale or future evidence; do not
+override that value during normal validation.
 
 The publisher independently exact-reads every referenced outbox Blob version before invoking its
 existing publication/activation service. Broker metadata without matching durable request bytes is
