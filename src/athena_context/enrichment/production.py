@@ -93,6 +93,7 @@ from athena_context.eventing.runtime import AzureServiceBusNotificationOutbox
 from athena_context.guidance.azure import (
     AzureTableGuidanceAuthorityActivationStore,
 )
+from athena_context.monitoring_acquisition import MonitoringAcquisitionAuthority
 from athena_context.presentation_assets import (
     PresentationAssetReadResult,
     PresentationAssetUnavailableError,
@@ -177,6 +178,7 @@ class Wc027EnrichmentFeedProductionConfiguration:
     guidance_activation: _TableSource
     monitoring_collector_contract: MonitoringCollectorContract
     monitoring_collector_contract_digest: str
+    monitoring_acquisition_authority: MonitoringAcquisitionAuthority
     monitoring_acquisition_authority_digest: str
     monitoring_collector_key: _MonitoringCollectorKey
     incident_key: _KeyAuthority
@@ -215,6 +217,7 @@ class Wc027EnrichmentFeedProductionConfiguration:
                 "guidanceActivation",
                 "monitoringCollectorContract",
                 "monitoringCollectorContractDigest",
+                "monitoringAcquisitionAuthority",
                 "monitoringAcquisitionAuthorityDigest",
                 "monitoringCollectorKey",
                 "keys",
@@ -438,6 +441,9 @@ class Wc027EnrichmentFeedProductionConfiguration:
                 root["monitoringCollectorContractDigest"],
                 "monitoringCollectorContractDigest",
             ),
+            monitoring_acquisition_authority=MonitoringAcquisitionAuthority.model_validate_json(
+                json.dumps(root["monitoringAcquisitionAuthority"])
+            ),
             monitoring_acquisition_authority_digest=_sha256_digest(
                 root["monitoringAcquisitionAuthorityDigest"],
                 "monitoringAcquisitionAuthorityDigest",
@@ -484,15 +490,19 @@ class Wc027EnrichmentFeedProductionConfiguration:
         ):
             raise ValueError(
                 "legacy monitoring collector contract v3 is parse-only; "
-                "WC-027 production requires recollection and republication under v8"
+                "WC-027 production requires recollection and republication under v9"
             )
+        authority = self.monitoring_acquisition_authority
         if (
             self.monitoring_collector_contract.compute_artifact_digest_value()
             != self.monitoring_collector_contract_digest
+            or authority.schema_version != "athena.wc028MonitoringAcquisitionAuthority.v6"
+            or authority.authority_digest != self.monitoring_acquisition_authority_digest
+            or authority.collector_contract_digest != self.monitoring_collector_contract_digest
+            or authority.max_acquisition_calls is None
+            or authority.max_logical_exchanges is None
         ):
-            raise ValueError(
-                "monitoringCollectorContractDigest does not bind the exact v8 contract"
-            )
+            raise ValueError("monitoring acquisition authority does not bind the exact v9 contract")
         correlation_sources = (
             self.monitoring_source,
             self.change_source,
@@ -788,6 +798,14 @@ def build_wc027_enrichment_feed_runtime(
             expected_collector_contract_digest=(configuration.monitoring_collector_contract_digest),
             expected_acquisition_authority_digest=(
                 configuration.monitoring_acquisition_authority_digest
+            ),
+            expected_maximum_acquisition_calls=cast(
+                int,
+                configuration.monitoring_acquisition_authority.max_acquisition_calls,
+            ),
+            expected_maximum_logical_exchanges=cast(
+                int,
+                configuration.monitoring_acquisition_authority.max_logical_exchanges,
             ),
         ),
         change_verifier=TrustedChangeArtifactVerifier(

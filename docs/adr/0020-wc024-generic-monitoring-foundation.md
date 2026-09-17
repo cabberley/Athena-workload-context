@@ -2,6 +2,7 @@
 
 - **Status:** Proposed
 - **Date:** 2026-09-06
+- **Amended:** 2026-09-16
 
 ## Context
 
@@ -130,34 +131,93 @@ workspace/table boundary. It issues zero table and IP Flow calls for those contr
 Context MCP, presentation, and correlation identities remain absent from monitoring read
 assignments.
 
-A separate RBAC attestor UAMI receives only role-assignment, role-definition, deny-assignment, and
-active PIM schedule-instance reads at the subscription, plus Microsoft Graph
+A separate RBAC attestor UAMI receives only role-assignment, role-definition, deny-assignment,
+active PIM schedule-instance, managed-identity attachment/federated-credential, Storage account
+authorization-mode, and Key Vault authorization-mode reads at the subscription, plus Microsoft Graph
 `Application.Read.All`, the least-privileged application permission for reading a service
 principal's transitive `memberOf` relationship. It receives no workload or monitoring data-plane
 role. Contract publication is deliberately two-phase so this identity and the collector
 assignments exist before they are measured. The foundation deployment outputs an immutable
 `athena.wc024MonitoringRbacBootstrapHandoff.v1`, including the exact Graph app-role assignment and
-membership request paths, and keeps acquisition-contract readiness false. The attestor then
-performs stable repeated `atScope() and assignedTo(principalId)` reads at the exact subscription
-and descendant scopes in that handoff and separately captures the two service principals'
-transitive group IDs from Microsoft Graph using the exact casted requests with
-`$count=true`, `$select=id`, and `ConsistencyLevel: eventual`. It does not claim direct enumeration of
-management-group ancestors; any inherited management-group deny returned by the scoped Azure
-query is evaluated conservatively. The short-lived v3 inventory binds exact target queries, full
-roles, conditions, applicable denies, transitive groups, independently timed first/second raw page
-sets for role assignments, Graph memberships, role definitions, deny assignments, and PIM
-instances, and stable repeated reads. V2 remains parseable only for historical inspection.
+membership request paths, the unfiltered managed-identity attachment requests, a subscription-wide
+all-principal role-assignment request, and keeps acquisition-contract readiness false. The attestor role includes the exact `Microsoft.Management/getEntities/action` needed for the
+hierarchy request. The attestor
+then performs two stable subscription-scope assignment reads for the collector and Athena Context
+principals using the exact equivalent of `az role assignment list --all --include-inherited
+--include-groups --assignee-object-id`. Those flags bind assignments at parent management groups,
+the subscription, and arbitrary descendants, plus transitive group assignments, so an unexpected
+grant cannot hide behind a fixed set of `atScope()` queries. A separate unfiltered
+subscription-wide read uses `--all --include-inherited` to derive every principal authorized to
+write monitoring evidence or sign receipts. The inventory permits
+only the collector principal, requires Storage Shared Key to remain disabled, requires OAuth to
+remain the default, and requires the signing vault to retain RBAC authorization with no access
+policies.
+
+The same two reads enumerate each UAMI's complete `listAssociatedResources` result and every
+federated identity credential, then read each associated Container Apps Job's complete UAMI map.
+The collector and attestor must each be attached to exactly one separate, contract-bound Job and
+must have no federated credential. The collector Job may contain only the collector and explicit
+runtime-support UAMI. Its collector identity lifecycle must be `All`, while the support identity
+lifecycle must be `None`, making the support UAMI platform-only and unavailable to init or main
+containers. The attestor Job may contain only the attestor with lifecycle `All`, and Athena Context
+must be absent from both. The attestor
+separately captures both service principals' transitive group IDs from Microsoft Graph using the
+exact casted requests with `$count=true`, `$select=id`, and `ConsistencyLevel: eventual`. It also
+performs two complete `Microsoft.Management/getEntities` reads, binds the subscription entity's
+ordered parent edges through the tenant-root management group, and performs stable assignment
+reads at every ancestor and at the subscription. Any missing or non-adjacent ancestor, unstable
+hierarchy/assignment page, inherited management-group or tenant-root grant, or applicable deny
+fails closed.
+Published v8 contracts
+retain their short-lived v3 inventory for parse-only compatibility. Current v4 inventory binds the
+subscription-wide queries, complete protected-scope set, full roles,
+conditions, applicable denies, runtime attachments, exclusive writer/signer derivation, transitive
+groups, resource authorization modes, Blob versioning, the container immutability-policy
+readback, independently timed first/second raw page sets, and stable repeated reads. V2 and v3
+remain parseable only for historical inspection.
+
+The collector no longer receives `Storage Blob Data Contributor` or
+`Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write`. Phase one creates the
+same deterministic `Athena WC028 Monitoring Evidence Create-Only Writer` role consumed by the
+stacked runtime: exact known-name Blob read plus `blobs/add/action`, with a role-assignment
+condition that denies `Blob.List` and restricts read/add to the three reviewed immutable
+monitoring-persistence path shapes. Incremental deployment cannot remove the
+superseded built-in assignment, so phase one requires a non-zero
+`athena.wc028LegacyCollectorRbacCleanup.v3` evidence digest proving the old assignment and role
+definitions are absent before the handoff can be published.
 
 `publish-monitoring-contract.bicep` is the only phase-two publication entry point. It accepts the
 name of the successful phase-one subscription deployment and retrieves the authoritative handoff
-directly from that deployment's outputs; callers cannot substitute a handoff object. It also
-requires the independently reviewed canonical inventory digest. It recomputes the handoff
-identity, rejects duplicate, missing, extra, or out-of-subscription target scopes, verifies the
-Graph membership contract, physical identity separation, principal evidence, exact collector
-grants, role-definition set, stable snapshots, source reference, and the inventory lifetime
-against the phase-two deployment's own timestamp before it emits the generic and WC-028 v8
-collector contracts. Current publication deliberately rejects any active PIM instance, Athena
-context grant, conditioned deny, or deny that effectively applies to the collector. An
+directly from that deployment's outputs; callers cannot substitute a handoff object. Phase one
+also binds a nonzero reviewer principal, the exact versioned
+`athenarbacevidencekv/monitoring-rbac-inventory-review` key, and a separate verifier UAMI with only
+public-key read access to that key. Phase one creates the deterministic keys/get-only custom role
+and exact-key assignment; the signed inventory proves that the verifier has exactly that one
+grant, no transitive groups, no federated credential, and no persistent associated resource. The
+reviewer must be distinct from the verifier, collector, Athena Context, and attestor principals.
+Phase one gives the complete `collectorContractInputs` object a
+deterministic binding ID and includes that ID plus its exact subscription deployment ID in the
+handoff identity. Phase two requires a detached RS256 signature over the bootstrap handoff,
+deployment ID, server template hash, complete-input binding ID, cleanup evidence, canonical
+inventory, and immutable source-manifest digests. Its
+AzureCLI deployment script runs as the verifier UAMI, resolves the exact Key Vault JWK, rejects
+caller-supplied modulus or fingerprint substitutions, recomputes the inventory digest, verifies
+the RSA-2048-or-stronger SPKI fingerprint and signature, and emits a validation digest; a nonempty
+signature or caller-supplied digest/key alone cannot publish a contract.
+
+After cryptographic review succeeds, phase two recomputes the handoff identity, rejects duplicate,
+missing, extra, or out-of-subscription target scopes, verifies the Graph and attachment collection
+contracts, physical identity separation, principal evidence, exact collector grants,
+role-definition set, the exact Blob-list deny condition, exclusive writer/signer evidence, Blob
+versioning, public-access and immutability readback, the deterministic storage-readiness
+binding/digest, and the runtime-support identity's exact direct four-action management-plane
+storage reader grant, complete role definition, principal evidence, and deny/PIM posture,
+stable snapshots, source reference, and
+the inventory lifetime against the deployment's own timestamp before it emits the generic and
+WC-028 v9 collector contracts. Current publication deliberately rejects any active PIM instance,
+Athena context grant, additional writer or signer, federated credential, unauthorized runtime
+attachment, insecure Storage or Key Vault authorization mode, conditioned deny, or deny that
+effectively applies to the collector. An
 `All Principals` deny is allowed only when its direct or transitive-group exclusion is present in
 the attested principal set, matching the Python contract's fail-closed semantics.
 
@@ -165,7 +225,7 @@ The same phase-one deployment creates the Athena-owned identity-proof authority 
 any collector source I/O. It uses a secure tenant-scoped
 `api://<tenant-id>/athena-monitoring-identity-proof` identifier URI, v1 access tokens, one
 application-only `Athena.MonitoringAcquisition.ProveIdentity` role, and one direct assignment to
-the collector UAMI. No secret or credential is created. The phase-one handoff and v8 contract bind
+the collector UAMI. No secret or credential is created. The phase-one handoff and v9 contract bind
 the application, enterprise application, role, assignment, assigned principal, and audience IDs,
 and the application explicitly requests the `idtyp` access-token claim, so an unprovisioned or
 substituted proof authority cannot be published.
@@ -209,27 +269,49 @@ reviewed endpoint paths in a separate change.
    stated ingestion baseline, run `set-private-access.ps1` with all three explicit confirmations.
    The steady-state template has no public-access mutation path and cannot reopen an adopted
    PrivateOnly AMPLS.
-4. Deploy `main.bicep` without a pre-existing effective-RBAC inventory. Capture the exact
+4. Select a separately governed reviewer principal and versioned RSA key in the fixed review vault
+   and key name. Preprovision a separate otherwise-unassigned verifier UAMI; phase one grants it
+   only `keys/get` on that exact key. Predeploy the exact dormant collector and RBAC-attestor
+   Container Apps Jobs plus the separate runtime-support UAMI; configure collector=`All`,
+   support=`None`, and attestor=`All`, and do not run either Job yet. Run the
+   reviewed v3 legacy-collector cleanup against every deterministic superseded assignment and role
+   definition, retain its non-zero `cleanupEvidenceDigest`, and deploy `main.bicep` with those
+   three resource IDs, that digest, the reviewer public material, and no pre-existing
+   effective-RBAC inventory. Capture the exact
    `monitoringRbacBootstrapHandoff` output and confirm
    `monitoringAcquisitionContractPublicationReady=false`.
-5. Use only the handoff attestor identity to collect both principals at every exact
-   `effectiveRbacTargetScopeIds` entry. Preserve every page, role definition, deny assignment,
-   active PIM instance, Graph transitive-group response, and both independently timed raw reads in
-   one short-lived v3 inventory. Do not add management-group target scopes or claim direct ancestor
-   enumeration. The target deployment currently requires empty PIM, deny, and Athena context
-   grant sets.
-6. Independently validate and record the inventory's canonical `inventoryDigest`.
+5. Use only the handoff attestor identity. Twice, list collector and Athena Context assignments
+   with the exact `--all --include-inherited --include-groups --assignee-object-id` semantics,
+   list all subscription and inherited assignments without a principal filter for the exclusive
+   writer/signer derivation, enumerate the collector, attestor, and reviewer-key verifier UAMIs'
+   associated resources, federated credentials, transitive groups, and effective assignments
+   through the exact handoff paths, read Storage and Key Vault
+   authorization modes, Blob-service versioning, the evidence container, and its default
+   immutability policy; preserve every role definition, deny assignment, active PIM instance,
+   Graph transitive-group response, page, target digest, and completion time in one short-lived v4
+   inventory. The verifier must have exactly one direct keys/get-only grant and no persistent
+   attachment. Evaluate denies against every exact `effectiveRbacTargetScopeIds` entry. The target
+   deployment currently requires empty PIM, Athena Context grant, and effective collector or
+   verifier deny sets.
+6. Have the separate reviewer validate the phase-one deployment ID and server template hash,
+   complete contract-input binding ID, immutable source artifact, canonical `inventoryDigest`,
+   exact runtime attachments, absence of federated credentials, and exclusive data-plane
+   derivation, then sign the domain-separated attestation preimage with the pinned key.
 7. Deploy `publish-monitoring-contract.bicep` with the exact successful phase-one deployment name,
-   the fresh inventory, and that independently reviewed digest. Capture its v8 acquisition
-   contract and publication handoff. Any identity, Graph permission, scope, duplicate target,
-   grant, stable-read, source, freshness, or digest mismatch keeps publication fail-closed.
+   the same two runtime Job IDs and runtime-support UAMI ID, fresh inventory, canonical digest,
+   and detached reviewer attestation. Capture its v9 acquisition contract and publication
+   handoff. Any identity, Graph
+   permission, scope, duplicate target, grant, attachment, federated credential, writer/signer,
+   authorization mode, Blob-list condition, versioning, immutability, cleanup, stable-read, source,
+   freshness, canonical-digest, key-anchor, or signature mismatch keeps publication fail-closed.
 
 The exact target list includes the subscription, all three relevant resource groups, the workload
 VNet, the Network Watcher, the Log Analytics workspace and every reviewed table resource, every
 collector Reader/signal/resource-log/resource-health scope, the evidence storage account and Blob
 service/container, and the signing vault/key. This is intentionally broader than the collector's
-grants: it lets the attestor detect a direct or group-derived Athena Context grant on a protected
-child resource that an `atScope()` query at only the parent resource group would not return.
+grants. The subscription-wide principal queries detect direct or group-derived grants on arbitrary
+descendants, while the protected-scope list binds deny evaluation and prevents any acquisition or
+resource-read scope from being omitted.
 
 ## Consequences
 

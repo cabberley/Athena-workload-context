@@ -23,37 +23,38 @@ from athena_context.contracts.eventing import IncidentState, IncidentStateAttest
 from athena_context.contracts.models import AthenaBaseModel, Sha256Digest, UtcDateTime
 from athena_context.contracts.monitoring import (
     MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION,
+    MONITORING_PREVIOUS_INCIDENT_BOUND_ACQUISITION_RECEIPT_SCHEMA_VERSION,
     MonitoringAcquisitionExchange,
     MonitoringAcquisitionReceipt,
     MonitoringEvidenceHandoff,
     MonitoringIpFlowProvenance,
     MonitoringLogPermissionEvidence,
+    MonitoringRuntimeReplayBinding,
     MonitoringSelectedIncident,
 )
 from athena_context.contracts.operational_phase import VersionPinnedBlobReference
 
 LEGACY_MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION: Final[
     Literal["athena.wc026MonitoringEvidenceBundle.v1"]
-] = (
-    "athena.wc026MonitoringEvidenceBundle.v1"
-)
+] = "athena.wc026MonitoringEvidenceBundle.v1"
 MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION: Final[
     Literal["athena.wc028MonitoringEvidenceBundle.v2"]
-] = (
-    "athena.wc028MonitoringEvidenceBundle.v2"
-)
+] = "athena.wc028MonitoringEvidenceBundle.v2"
 MONITORING_ACQUISITION_EVIDENCE_BUNDLE_SCHEMA_VERSION: Final[
     Literal["athena.wc028MonitoringEvidenceBundle.v3"]
 ] = "athena.wc028MonitoringEvidenceBundle.v3"
-LEGACY_CORRELATION_REQUEST_SCHEMA_VERSION: Final[
-    Literal["athena.wc026CorrelationRequest.v2"]
-] = "athena.wc026CorrelationRequest.v2"
-PREVIOUS_CORRELATION_REQUEST_SCHEMA_VERSION: Final[
-    Literal["athena.wc028CorrelationRequest.v3"]
-] = "athena.wc028CorrelationRequest.v3"
-CORRELATION_REQUEST_SCHEMA_VERSION: Final[
+LEGACY_CORRELATION_REQUEST_SCHEMA_VERSION: Final[Literal["athena.wc026CorrelationRequest.v2"]] = (
+    "athena.wc026CorrelationRequest.v2"
+)
+PREVIOUS_CORRELATION_REQUEST_SCHEMA_VERSION: Final[Literal["athena.wc028CorrelationRequest.v3"]] = (
+    "athena.wc028CorrelationRequest.v3"
+)
+PREVIOUS_INCIDENT_BOUND_CORRELATION_REQUEST_SCHEMA_VERSION: Final[
     Literal["athena.wc028CorrelationRequest.v4"]
 ] = "athena.wc028CorrelationRequest.v4"
+CORRELATION_REQUEST_SCHEMA_VERSION: Final[Literal["athena.wc028CorrelationRequest.v5"]] = (
+    "athena.wc028CorrelationRequest.v5"
+)
 CORRELATION_REPORT_SCHEMA_VERSION = "athena.wc026CorrelationReport.v1"
 CORRELATION_ALGORITHM_ID = "athena.wc026.correlation.v1"
 CORRELATION_CONFIDENCE_THRESHOLDS: Mapping[str, int] = MappingProxyType(
@@ -126,16 +127,14 @@ type ConfidenceCapCode = Literal[
     "missingDirectAttribution",
     "ambiguousObservationWindow",
 ]
-CORRELATION_REQUIRED_CAPS: Mapping[ConfidenceCapCode, ConfidenceLevel] = (
-    MappingProxyType(
-        {
-            "recentChangeOnly": "Low",
-            "missingAffectedPath": "Low",
-            "missingIndependentSupport": "Medium",
-            "missingDirectAttribution": "High",
-            "ambiguousObservationWindow": "Medium",
-        }
-    )
+CORRELATION_REQUIRED_CAPS: Mapping[ConfidenceCapCode, ConfidenceLevel] = MappingProxyType(
+    {
+        "recentChangeOnly": "Low",
+        "missingAffectedPath": "Low",
+        "missingIndependentSupport": "Medium",
+        "missingDirectAttribution": "High",
+        "ambiguousObservationWindow": "Medium",
+    }
 )
 type ContradictionCode = Literal[
     "changeFailed",
@@ -371,9 +370,7 @@ class CorrelationEvidenceCitation(_StrictCorrelationModel):
     def validate_interval(self) -> CorrelationEvidenceCitation:
         _require_interval(self.observed_start, self.observed_end)
         if self.provenance_root_digest != sha256_hex(self.source_root_reference):
-            raise ValueError(
-                "citation provenance root must derive from sourceRootReference"
-            )
+            raise ValueError("citation provenance root must derive from sourceRootReference")
         return self
 
 
@@ -401,9 +398,7 @@ class MonitoringIntentEvidenceReference(_StrictCorrelationModel):
     )
     asset_reference_digest: Sha256Digest = Field(alias="assetReferenceDigest")
     intent_reference: VersionPinnedBlobReference = Field(alias="intentReference")
-    attestation_reference: VersionPinnedBlobReference = Field(
-        alias="attestationReference"
-    )
+    attestation_reference: VersionPinnedBlobReference = Field(alias="attestationReference")
 
     @model_validator(mode="after")
     def validate_reference(self) -> MonitoringIntentEvidenceReference:
@@ -415,9 +410,7 @@ class MonitoringIntentEvidenceReference(_StrictCorrelationModel):
             raise ValueError("monitoring intent evidence asset paths are invalid")
         expected = compute_artifact_digest(
             {
-                "schemaVersion": (
-                    "athena.wc028PublishedMonitoringIntentAssetReference.v1"
-                ),
+                "schemaVersion": ("athena.wc028PublishedMonitoringIntentAssetReference.v1"),
                 "intentId": self.intent_id,
                 "intentDigest": self.intent_digest,
                 "intentReference": self.intent_reference.model_dump(
@@ -433,9 +426,7 @@ class MonitoringIntentEvidenceReference(_StrictCorrelationModel):
             }
         )
         if self.asset_reference_digest != expected:
-            raise ValueError(
-                "assetReferenceDigest does not bind monitoring intent evidence"
-            )
+            raise ValueError("assetReferenceDigest does not bind monitoring intent evidence")
         if (
             self.asset_reference_id
             != f"monitoring-intent-asset-{expected.removeprefix('sha256:')[:32]}"
@@ -491,9 +482,7 @@ class _MonitoringObservation(_StrictCorrelationModel):
     def validate_common_observation(self) -> _MonitoringObservation:
         _require_interval(self.observed_start, self.observed_end)
         if self.provenance_root_digest != sha256_hex(self.source_root_reference):
-            raise ValueError(
-                "provenanceRootDigest must derive from sourceRootReference"
-            )
+            raise ValueError("provenanceRootDigest must derive from sourceRootReference")
         expected = _expected_digest(
             self,
             excluded_fields={"observation_id", "observation_digest"},
@@ -670,12 +659,12 @@ class NetworkFlowObservation(_MonitoringObservation):
             any(value is not None for value in legacy_ip_flow_values)
             or self.ip_flow_rule_resource_id is not None
         ):
-            raise ValueError(
-                "network flow must not mix current and historical IP Flow evidence"
-            )
-        if provenance is None and any(
-            value is not None for value in legacy_ip_flow_values
-        ) and not all(value is not None for value in legacy_ip_flow_values):
+            raise ValueError("network flow must not mix current and historical IP Flow evidence")
+        if (
+            provenance is None
+            and any(value is not None for value in legacy_ip_flow_values)
+            and not all(value is not None for value in legacy_ip_flow_values)
+        ):
             raise ValueError(
                 "network flow IP Flow evidence requires access, checkedAt, and result digest"
             )
@@ -684,17 +673,11 @@ class NetworkFlowObservation(_MonitoringObservation):
             and self.ip_flow_rule_resource_id is not None
             and self.ip_flow_access is None
         ):
-            raise ValueError(
-                "network flow IP Flow rule cannot exist without point-in-time access"
-            )
+            raise ValueError("network flow IP Flow rule cannot exist without point-in-time access")
         if provenance is not None and provenance.checked_at < self.observed_end:
-            raise ValueError(
-                "network flow IP Flow checkedAt must not predate historical evidence"
-            )
+            raise ValueError("network flow IP Flow checkedAt must not predate historical evidence")
         if self.ip_flow_checked_at is not None and self.ip_flow_checked_at < self.observed_end:
-            raise ValueError(
-                "network flow IP Flow checkedAt must not predate historical evidence"
-            )
+            raise ValueError("network flow IP Flow checkedAt must not predate historical evidence")
         if self.protocol in {"Tcp", "Udp"} and (
             self.source_port is None or self.destination_port is None
         ):
@@ -742,15 +725,10 @@ class NetworkFlowObservation(_MonitoringObservation):
                 or rule_segments[:9] != enforcement_segments
                 or rule_segments[9] != "securityrules"
             ):
-                raise ValueError(
-                    "ruleResourceId must belong to enforcementResourceId"
-                )
+                raise ValueError("ruleResourceId must belong to enforcementResourceId")
         if self.effective_rule_attribution and (
             self.rule_resource_id is None
-            or (
-                provenance is not None
-                and provenance.causal_change_correlation_id is None
-            )
+            or (provenance is not None and provenance.causal_change_correlation_id is None)
             or self.attribution_method is None
             or self.causal_effect != "introducedDenyForTuple"
             or self.attribution_proof_digest is None
@@ -759,9 +737,7 @@ class NetworkFlowObservation(_MonitoringObservation):
             or self.matched_change_artifact_digest is None
             or not self.matched_property_paths
         ):
-            raise ValueError(
-                "effective rule attribution requires direct proof and change binding"
-            )
+            raise ValueError("effective rule attribution requires direct proof and change binding")
         current_ip_flow_invalid = provenance is not None and (
             provenance.access != "Deny"
             or provenance.result_rule_resource_id is None
@@ -781,9 +757,7 @@ class NetworkFlowObservation(_MonitoringObservation):
         if self.attribution_method == "ipFlowVerify" and (
             current_ip_flow_invalid or historical_ip_flow_invalid
         ):
-            raise ValueError(
-                "IP Flow attribution requires the exact denied point-in-time rule"
-            )
+            raise ValueError("IP Flow attribution requires the exact denied point-in-time rule")
         if not self.effective_rule_attribution and any(
             value is not None
             for value in (
@@ -795,19 +769,13 @@ class NetworkFlowObservation(_MonitoringObservation):
                 self.matched_change_artifact_digest,
             )
         ):
-            raise ValueError(
-                "non-attributed flow must not carry causal attribution fields"
-            )
+            raise ValueError("non-attributed flow must not carry causal attribution fields")
         if not self.effective_rule_attribution and self.matched_property_paths:
-            raise ValueError(
-                "non-attributed flow must not carry matched property paths"
-            )
+            raise ValueError("non-attributed flow must not carry matched property paths")
         if self.matched_property_paths != tuple(sorted(self.matched_property_paths)) or len(
             self.matched_property_paths
         ) != len(set(self.matched_property_paths)):
-            raise ValueError(
-                "matchedPropertyPaths must be unique deterministic paths"
-            )
+            raise ValueError("matchedPropertyPaths must be unique deterministic paths")
         if any(not _is_nsg_causal_property(path) for path in self.matched_property_paths):
             raise ValueError("matchedPropertyPaths must use causal NSG rule fields")
         return self
@@ -857,9 +825,7 @@ class ConnectionMonitorObservation(_MonitoringObservation):
         max_length=128,
         pattern=r"^[a-z][a-z0-9.-]{0,127}$",
     )
-    test_configuration_digest: Sha256Digest = Field(
-        alias="testConfigurationDigest"
-    )
+    test_configuration_digest: Sha256Digest = Field(alias="testConfigurationDigest")
 
     @field_validator(
         "monitor_resource_id",
@@ -1037,19 +1003,19 @@ class EvidenceCoverage(_StrictCorrelationModel):
                 "queryExecutionDigests",
             )
         if self.query_execution_digests and self.control_provenance is None:
-            raise ValueError(
-                "query-derived coverage requires resolvable control provenance"
-            )
+            raise ValueError("query-derived coverage requires resolvable control provenance")
         if self.provenance_root_digest != sha256_hex(self.source_root_reference):
-            raise ValueError(
-                "provenanceRootDigest must derive from sourceRootReference"
-            )
+            raise ValueError("provenanceRootDigest must derive from sourceRootReference")
         if self.status != "complete" and self.detail is None:
             raise ValueError("incomplete coverage requires detail")
-        if self.family == "networkFlow" and self.status == "complete" and (
-            self.scope.path_id is None
-            or self.scope.direction is None
-            or self.scope.five_tuple_digest is None
+        if (
+            self.family == "networkFlow"
+            and self.status == "complete"
+            and (
+                self.scope.path_id is None
+                or self.scope.direction is None
+                or self.scope.five_tuple_digest is None
+            )
         ):
             raise ValueError(
                 "complete network-flow coverage requires path, direction, and five-tuple"
@@ -1065,9 +1031,7 @@ class EvidenceCoverage(_StrictCorrelationModel):
                 or self.scope.five_tuple_digest is None
             )
         ):
-            raise ValueError(
-                "complete Connection Monitor coverage requires path and endpoint test"
-            )
+            raise ValueError("complete Connection Monitor coverage requires path and endpoint test")
         excluded_fields = {"coverage_id", "coverage_digest"}
         if not self.query_execution_digests:
             excluded_fields.add("query_execution_digests")
@@ -1085,13 +1049,11 @@ class EvidenceCoverage(_StrictCorrelationModel):
 class MonitoringAcquisitionEvidenceManifest(_StrictCorrelationModel):
     """Immutable digest manifest independently binding persisted acquisition evidence."""
 
-    schema_version: Literal[
-        "athena.wc028MonitoringAcquisitionEvidenceManifest.v1"
-    ] = Field(alias="schemaVersion")
-    collection_batch_digest: Sha256Digest = Field(alias="collectionBatchDigest")
-    normalized_evidence_digest: Sha256Digest = Field(
-        alias="normalizedEvidenceDigest"
+    schema_version: Literal["athena.wc028MonitoringAcquisitionEvidenceManifest.v1"] = Field(
+        alias="schemaVersion"
     )
+    collection_batch_digest: Sha256Digest = Field(alias="collectionBatchDigest")
+    normalized_evidence_digest: Sha256Digest = Field(alias="normalizedEvidenceDigest")
     exchanges: tuple[MonitoringAcquisitionExchange, ...] = Field(
         min_length=0,
         max_length=32,
@@ -1118,9 +1080,7 @@ class MonitoringEvidenceBundle(_StrictCorrelationModel):
         max_length=128,
         pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
     )
-    monitoring_contract_digest: Sha256Digest = Field(
-        alias="monitoringContractDigest"
-    )
+    monitoring_contract_digest: Sha256Digest = Field(alias="monitoringContractDigest")
     monitoring_intent_reference: MonitoringIntentEvidenceReference | None = Field(
         default=None,
         alias="monitoringIntentReference",
@@ -1172,9 +1132,7 @@ class MonitoringEvidenceBundle(_StrictCorrelationModel):
                     item.model_dump(mode="json", by_alias=True, exclude_none=True)
                     for item in self.coverage
                 ],
-                "expectedCoverageScopeDigests": (
-                    list(self.expected_coverage_scope_digests)
-                ),
+                "expectedCoverageScopeDigests": (list(self.expected_coverage_scope_digests)),
             }
         )
 
@@ -1198,19 +1156,17 @@ class MonitoringEvidenceBundle(_StrictCorrelationModel):
             )
             for item in self.coverage
         )
-        if coverage_keys != tuple(sorted(coverage_keys)) or len(
-            coverage_keys
-        ) != len(set(coverage_keys)):
+        if coverage_keys != tuple(sorted(coverage_keys)) or len(coverage_keys) != len(
+            set(coverage_keys)
+        ):
             raise ValueError("coverage records must be deterministically ordered")
         if any(
-            item.observed_start < self.observed_start
-            or item.observed_end > self.observed_end
+            item.observed_start < self.observed_start or item.observed_end > self.observed_end
             for item in self.observations
         ):
             raise ValueError("observations must be contained by the bundle interval")
         if any(
-            item.coverage_start < self.observed_start
-            or item.coverage_end > self.observed_end
+            item.coverage_start < self.observed_start or item.coverage_end > self.observed_end
             for item in self.coverage
         ):
             raise ValueError("coverage must be contained by the bundle interval")
@@ -1218,13 +1174,9 @@ class MonitoringEvidenceBundle(_StrictCorrelationModel):
             self.expected_coverage_scope_digests,
             "expectedCoverageScopeDigests",
         )
-        actual_scope_digests = tuple(
-            sorted({item.scope.scope_digest for item in self.coverage})
-        )
+        actual_scope_digests = tuple(sorted({item.scope.scope_digest for item in self.coverage}))
         if actual_scope_digests != self.expected_coverage_scope_digests:
-            raise ValueError(
-                "coverage must account for every expected monitoring query scope"
-            )
+            raise ValueError("coverage must account for every expected monitoring query scope")
         if self.schema_version == LEGACY_MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION:
             if (
                 self.monitoring_intent_reference is not None
@@ -1232,34 +1184,27 @@ class MonitoringEvidenceBundle(_StrictCorrelationModel):
                 or self.acquisition_receipt is not None
                 or self.acquisition_manifest is not None
                 or any(
-                    item.control_provenance is not None
-                    or item.query_execution_digest is not None
+                    item.control_provenance is not None or item.query_execution_digest is not None
                     for item in self.observations
                 )
                 or any(
-                    item.control_provenance is not None
-                    or item.query_execution_digests is not None
+                    item.control_provenance is not None or item.query_execution_digests is not None
                     for item in self.coverage
                 )
             ):
-                raise ValueError(
-                    "legacy monitoring bundle cannot contain WC028 provenance fields"
-                )
+                raise ValueError("legacy monitoring bundle cannot contain WC028 provenance fields")
         else:
             if self.monitoring_intent_reference is None or self.collected_at is None:
                 raise ValueError(
                     "WC028 monitoring bundle requires signed intent references and collectedAt"
                 )
-            if any(
-                item.control_provenance is None for item in self.observations
-            ) or any(item.control_provenance is None for item in self.coverage):
+            if any(item.control_provenance is None for item in self.observations) or any(
+                item.control_provenance is None for item in self.coverage
+            ):
                 raise ValueError(
                     "signed monitoring evidence requires resolvable control provenance"
                 )
-            if (
-                self.schema_version
-                == MONITORING_ACQUISITION_EVIDENCE_BUNDLE_SCHEMA_VERSION
-            ):
+            if self.schema_version == MONITORING_ACQUISITION_EVIDENCE_BUNDLE_SCHEMA_VERSION:
                 if self.acquisition_receipt is None:
                     raise ValueError(
                         "acquisition evidence bundle requires signed acquisition provenance"
@@ -1282,24 +1227,17 @@ class MonitoringEvidenceBundle(_StrictCorrelationModel):
                         for item in self.observations
                         if isinstance(item, NetworkFlowObservation)
                     )
-                    provenances = tuple(
-                        item.ip_flow_provenance for item in flow_observations
-                    )
-                    if (
-                        any(item is None for item in provenances)
-                        or len(ip_flow_exchanges) != len(flow_observations)
+                    provenances = tuple(item.ip_flow_provenance for item in flow_observations)
+                    if any(item is None for item in provenances) or len(ip_flow_exchanges) != len(
+                        flow_observations
                     ):
                         raise ValueError(
                             "current acquisition bundle requires exactly one semantic "
                             "IP Flow provenance mapping per retained network observation"
                         )
-                    exchanges_by_sequence = {
-                        item.sequence: item for item in ip_flow_exchanges
-                    }
+                    exchanges_by_sequence = {item.sequence: item for item in ip_flow_exchanges}
                     provenances_by_sequence = {
-                        item.exchange_sequence: item
-                        for item in provenances
-                        if item is not None
+                        item.exchange_sequence: item for item in provenances if item is not None
                     }
                     if (
                         len(exchanges_by_sequence) != len(ip_flow_exchanges)
@@ -1313,10 +1251,8 @@ class MonitoringEvidenceBundle(_StrictCorrelationModel):
                     for sequence, provenance in provenances_by_sequence.items():
                         exchange = exchanges_by_sequence[sequence]
                         if (
-                            provenance.ip_flow_request_digest
-                            != exchange.request_digest
-                            or provenance.ip_flow_result_digest
-                            != exchange.result_digest
+                            provenance.ip_flow_request_digest != exchange.request_digest
+                            or provenance.ip_flow_result_digest != exchange.result_digest
                             or provenance.requested_at != exchange.requested_at
                             or provenance.checked_at != exchange.checked_at
                             or provenance.received_at != exchange.received_at
@@ -1350,37 +1286,25 @@ class MonitoringEvidenceBundle(_StrictCorrelationModel):
                     != self.acquisition_manifest.normalized_evidence_digest
                     or self.acquisition_receipt.normalized_evidence_digest
                     != self.compute_normalized_evidence_digest_value()
-                    or self.acquisition_receipt.exchanges
-                    != self.acquisition_manifest.exchanges
+                    or self.acquisition_receipt.exchanges != self.acquisition_manifest.exchanges
                 ):
-                    raise ValueError(
-                        "acquisition receipt does not bind the monitoring bundle"
-                    )
-            elif (
-                self.acquisition_receipt is not None
-                or self.acquisition_manifest is not None
-            ):
-                raise ValueError(
-                    "WC028 v2 monitoring bundle cannot contain acquisition provenance"
-                )
+                    raise ValueError("acquisition receipt does not bind the monitoring bundle")
+            elif self.acquisition_receipt is not None or self.acquisition_manifest is not None:
+                raise ValueError("WC028 v2 monitoring bundle cannot contain acquisition provenance")
             query_observations = tuple(
                 item
                 for item in self.observations
                 if not isinstance(item, PlatformHealthObservation)
             )
             if any(item.query_execution_digest is None for item in query_observations):
-                raise ValueError(
-                    "query-derived observations require exact execution digests"
-                )
+                raise ValueError("query-derived observations require exact execution digests")
             observations_by_execution = {
                 item.query_execution_digest: item
                 for item in query_observations
                 if item.query_execution_digest is not None
             }
             if len(observations_by_execution) != len(query_observations):
-                raise ValueError(
-                    "query-derived observation execution digests must be unique"
-                )
+                raise ValueError("query-derived observation execution digests must be unique")
             coverage_by_execution: dict[str, list[EvidenceCoverage]] = {}
             for coverage in self.coverage:
                 for digest in coverage.query_execution_digests or ():
@@ -1388,12 +1312,9 @@ class MonitoringEvidenceBundle(_StrictCorrelationModel):
             if set(coverage_by_execution) != set(observations_by_execution) or any(
                 len(items) != 1 for items in coverage_by_execution.values()
             ):
-                raise ValueError(
-                    "every query observation must be covered exactly once"
-                )
+                raise ValueError("every query observation must be covered exactly once")
             current_permission_evidence_required = (
-                self.schema_version
-                == MONITORING_ACQUISITION_EVIDENCE_BUNDLE_SCHEMA_VERSION
+                self.schema_version == MONITORING_ACQUISITION_EVIDENCE_BUNDLE_SCHEMA_VERSION
                 and self.acquisition_receipt is not None
                 and self.acquisition_receipt.schema_version
                 == MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION
@@ -1407,9 +1328,7 @@ class MonitoringEvidenceBundle(_StrictCorrelationModel):
                     or coverage_item.family != _observation_family(observation)
                     or observation.observed_start < coverage_item.coverage_start
                     or observation.observed_end > coverage_item.coverage_end
-                    or not set(
-                        _observation_coverage_resource_ids(observation)
-                    ).issubset(
+                    or not set(_observation_coverage_resource_ids(observation)).issubset(
                         coverage_item.scope.resource_ids
                     )
                 ):
@@ -1425,24 +1344,24 @@ class MonitoringEvidenceBundle(_StrictCorrelationModel):
                     raise ValueError(
                         "current query observation lacks exact persisted Logs permission evidence"
                     )
-                if isinstance(
-                    observation,
-                    (
-                        NetworkFlowObservation,
-                        ConnectionMonitorObservation,
-                        EndpointHealthObservation,
-                    ),
-                ) and coverage_item.scope.path_id != observation.path_id:
-                    raise ValueError(
-                        "query observation coverage is incompatible with its path"
+                if (
+                    isinstance(
+                        observation,
+                        (
+                            NetworkFlowObservation,
+                            ConnectionMonitorObservation,
+                            EndpointHealthObservation,
+                        ),
                     )
+                    and coverage_item.scope.path_id != observation.path_id
+                ):
+                    raise ValueError("query observation coverage is incompatible with its path")
                 if isinstance(
                     observation,
                     (NetworkFlowObservation, ConnectionMonitorObservation),
                 ) and (
                     coverage_item.scope.direction != observation.direction
-                    or coverage_item.scope.five_tuple_digest
-                    != observation.five_tuple_digest
+                    or coverage_item.scope.five_tuple_digest != observation.five_tuple_digest
                 ):
                     raise ValueError(
                         "query observation coverage is incompatible with its network tuple"
@@ -1614,9 +1533,7 @@ class PublishedContextAuthority(_StrictCorrelationModel):
     profile_id: str = Field(alias="profileId", min_length=1, max_length=128)
     resolved_profile_digest: Sha256Digest = Field(alias="resolvedProfileDigest")
     dependency_graph_digest: Sha256Digest = Field(alias="dependencyGraphDigest")
-    context_binding_payload_digest: Sha256Digest = Field(
-        alias="contextBindingPayloadDigest"
-    )
+    context_binding_payload_digest: Sha256Digest = Field(alias="contextBindingPayloadDigest")
     publication_record_digest: Sha256Digest = Field(alias="publicationRecordDigest")
     audit_head_digest: Sha256Digest = Field(alias="auditHeadDigest")
     published_at: UtcDateTime = Field(alias="publishedAt")
@@ -1630,10 +1547,7 @@ class PublishedContextAuthority(_StrictCorrelationModel):
         )
         if self.authority_digest != expected:
             raise ValueError("authorityDigest does not bind publication authority")
-        if (
-            self.authority_id
-            != f"publication-authority-{expected.removeprefix('sha256:')[:32]}"
-        ):
+        if self.authority_id != f"publication-authority-{expected.removeprefix('sha256:')[:32]}":
             raise ValueError("authorityId is not digest-bound")
         return self
 
@@ -1684,9 +1598,7 @@ class _CorrelationContextBindingBase(_StrictCorrelationModel):
 
 class PublishedRuntimeContextBinding(_CorrelationContextBindingBase):
     binding_mode: Literal["publishedRuntime"] = Field(alias="bindingMode")
-    publication_authority: PublishedContextAuthority = Field(
-        alias="publicationAuthority"
-    )
+    publication_authority: PublishedContextAuthority = Field(alias="publicationAuthority")
     publication_authority_reference: VersionPinnedBlobReference = Field(
         alias="publicationAuthorityReference"
     )
@@ -1708,14 +1620,10 @@ class PublishedRuntimeContextBinding(_CorrelationContextBindingBase):
                     item.model_dump(mode="json", by_alias=True, exclude_none=True)
                     for item in self.dependency_paths
                 ],
-                "requiredCoverageScopeDigests": list(
-                    self.required_coverage_scope_digests
-                ),
+                "requiredCoverageScopeDigests": list(self.required_coverage_scope_digests),
             }
         )
-        expected_authority_name = (
-            f"context-authority/{authority.authority_id}/authority.json"
-        )
+        expected_authority_name = f"context-authority/{authority.authority_id}/authority.json"
         if (
             authority.workload_id != self.workload_id
             or authority.manifest_id != self.manifest_id
@@ -1729,9 +1637,7 @@ class PublishedRuntimeContextBinding(_CorrelationContextBindingBase):
             or self.publication_authority_reference.content_digest
             != sha256_hex(authority.canonical_bytes())
         ):
-            raise ValueError(
-                "publication authority does not bind the exact runtime context"
-            )
+            raise ValueError("publication authority does not bind the exact runtime context")
         return self
 
 
@@ -1753,9 +1659,9 @@ type CorrelationContextBinding = Annotated[
 
 
 class IncidentCorrelationSubjectAttestation(_StrictCorrelationModel):
-    schema_version: Literal[
-        "athena.wc027IncidentCorrelationSubjectAttestation.v1"
-    ] = Field(alias="schemaVersion")
+    schema_version: Literal["athena.wc027IncidentCorrelationSubjectAttestation.v1"] = Field(
+        alias="schemaVersion"
+    )
     signature_algorithm: Literal["RS256"] = Field(alias="signatureAlgorithm")
     key_vault_key_id: str = Field(
         alias="keyVaultKeyId",
@@ -1772,9 +1678,9 @@ class IncidentCorrelationSubjectAttestation(_StrictCorrelationModel):
 
 
 class IncidentBoundCorrelationRequestAttestation(_StrictCorrelationModel):
-    schema_version: Literal[
-        "athena.wc027IncidentBoundCorrelationRequestAttestation.v1"
-    ] = Field(alias="schemaVersion")
+    schema_version: Literal["athena.wc027IncidentBoundCorrelationRequestAttestation.v1"] = Field(
+        alias="schemaVersion"
+    )
     signature_algorithm: Literal["RS256"] = Field(alias="signatureAlgorithm")
     key_vault_key_id: str = Field(
         alias="keyVaultKeyId",
@@ -1810,17 +1716,11 @@ class IncidentCorrelationSubject(_StrictCorrelationModel):
         max_length=2048,
     )
     incident_state: IncidentState = Field(alias="incidentState")
-    incident_state_attestation: IncidentStateAttestation = Field(
-        alias="incidentStateAttestation"
-    )
+    incident_state_attestation: IncidentStateAttestation = Field(alias="incidentStateAttestation")
     incident_state_digest: Sha256Digest = Field(alias="incidentStateDigest")
     state_reference: VersionPinnedBlobReference = Field(alias="stateReference")
-    attestation_reference: VersionPinnedBlobReference = Field(
-        alias="attestationReference"
-    )
-    subject_attestation: IncidentCorrelationSubjectAttestation = Field(
-        alias="subjectAttestation"
-    )
+    attestation_reference: VersionPinnedBlobReference = Field(alias="attestationReference")
+    subject_attestation: IncidentCorrelationSubjectAttestation = Field(alias="subjectAttestation")
     subject_digest: Sha256Digest = Field(alias="subjectDigest")
 
     @field_validator("affected_resource_id")
@@ -1834,8 +1734,7 @@ class IncidentCorrelationSubject(_StrictCorrelationModel):
         attestation = self.incident_state_attestation
         expected_incident_id = (
             "inc-"
-            + sha256_hex(self.affected_resource_id.encode("utf-8"))
-            .removeprefix("sha256:")[:12]
+            + sha256_hex(self.affected_resource_id.encode("utf-8")).removeprefix("sha256:")[:12]
         )
         digest_suffix = state.result_digest.removeprefix("sha256:")
         prefix = f"incidents/{state.incident_id}/versions/{digest_suffix}"
@@ -1858,28 +1757,21 @@ class IncidentCorrelationSubject(_StrictCorrelationModel):
             or state.lifecycle not in {"active", "resolved"}
             or self.state_reference.name != f"{prefix}/state.json"
             or self.attestation_reference.name != f"{prefix}/attestation.json"
-            or self.state_reference.content_digest
-            != sha256_hex(state.canonical_bytes())
+            or self.state_reference.content_digest != sha256_hex(state.canonical_bytes())
             or self.attestation_reference.content_digest
             != sha256_hex(attestation.canonical_bytes())
-            or self.subject_attestation.key_vault_key_id
-            != attestation.key_vault_key_id
+            or self.subject_attestation.key_vault_key_id != attestation.key_vault_key_id
             or self.subject_attestation.signed_preimage_digest
             != compute_artifact_digest(signed_preimage)
         ):
-            raise ValueError(
-                "incident subject does not bind the exact signed incident state"
-            )
+            raise ValueError("incident subject does not bind the exact signed incident state")
         expected = _expected_digest(
             self,
             excluded_fields={"subject_id", "subject_digest"},
         )
         if self.subject_digest != expected:
             raise ValueError("subjectDigest does not bind the incident subject")
-        if (
-            self.subject_id
-            != f"incident-subject-{expected.removeprefix('sha256:')[:32]}"
-        ):
+        if self.subject_id != f"incident-subject-{expected.removeprefix('sha256:')[:32]}":
             raise ValueError("subjectId is not digest-bound")
         return self
 
@@ -1917,9 +1809,7 @@ class IncidentHealthTransition(_StrictCorrelationModel):
         _require_interval(self.observed_start, self.observed_end)
         if self.previous_state == self.current_state:
             raise ValueError("health transition must change state")
-        previous_refs = tuple(
-            item.evidence_id for item in self.previous_state_evidence
-        )
+        previous_refs = tuple(item.evidence_id for item in self.previous_state_evidence)
         current_refs = tuple(item.evidence_id for item in self.current_state_evidence)
         if (
             previous_refs != tuple(sorted(previous_refs))
@@ -1928,32 +1818,18 @@ class IncidentHealthTransition(_StrictCorrelationModel):
             or len(current_refs) != len(set(current_refs))
             or set(previous_refs).intersection(current_refs)
         ):
-            raise ValueError(
-                "transition evidence must have unique deterministic evidence IDs"
-            )
-        if (
-            self.observed_start
-            != min(item.observed_start for item in self.current_state_evidence)
-            or self.observed_end
-            != max(item.observed_end for item in self.current_state_evidence)
-        ):
-            raise ValueError(
-                "transition interval must be derived from current-state evidence"
-            )
-        if any(
-            item.observed_end > self.observed_start
-            for item in self.previous_state_evidence
-        ):
-            raise ValueError(
-                "previous-state evidence must not overlap the current-state onset"
-            )
+            raise ValueError("transition evidence must have unique deterministic evidence IDs")
+        if self.observed_start != min(
+            item.observed_start for item in self.current_state_evidence
+        ) or self.observed_end != max(item.observed_end for item in self.current_state_evidence):
+            raise ValueError("transition interval must be derived from current-state evidence")
+        if any(item.observed_end > self.observed_start for item in self.previous_state_evidence):
+            raise ValueError("previous-state evidence must not overlap the current-state onset")
         if any(
             self.affected_resource_id not in item.resource_ids
             for item in (*self.previous_state_evidence, *self.current_state_evidence)
         ):
-            raise ValueError(
-                "transition evidence must reference the affected resource"
-            )
+            raise ValueError("transition evidence must reference the affected resource")
         expected = _expected_digest(
             self,
             excluded_fields={"transition_id", "transition_digest"},
@@ -1971,9 +1847,7 @@ class IncidentHealthTransition(_StrictCorrelationModel):
 class CorrelationEvidenceInventory(_StrictCorrelationModel):
     rule_catalog_digest: Sha256Digest = Field(alias="ruleCatalogDigest")
     context_binding_digest: Sha256Digest = Field(alias="contextBindingDigest")
-    incident_transition_digest: Sha256Digest = Field(
-        alias="incidentTransitionDigest"
-    )
+    incident_transition_digest: Sha256Digest = Field(alias="incidentTransitionDigest")
     monitoring_handoff_digest: Sha256Digest = Field(alias="monitoringHandoffDigest")
     monitoring_bundle_digest: Sha256Digest = Field(alias="monitoringBundleDigest")
     change_artifact_digests: tuple[Sha256Digest, ...] = Field(
@@ -2000,17 +1874,13 @@ class CorrelationEvidenceInventory(_StrictCorrelationModel):
     def validate_inventory(self) -> CorrelationEvidenceInventory:
         _require_sorted_unique(self.change_artifact_digests, "changeArtifactDigests")
         source_keys = tuple(
-            (item.name, item.version, item.content_digest)
-            for item in self.source_references
+            (item.name, item.version, item.content_digest) for item in self.source_references
         )
         source_identities = tuple((item.name, item.version) for item in self.source_references)
-        if (
-            source_keys != tuple(sorted(source_keys))
-            or len(source_identities) != len(set(source_identities))
+        if source_keys != tuple(sorted(source_keys)) or len(source_identities) != len(
+            set(source_identities)
         ):
-            raise ValueError(
-                "sourceReferences must be unique deterministic immutable references"
-            )
+            raise ValueError("sourceReferences must be unique deterministic immutable references")
         expected = _expected_digest(self, excluded_fields={"inventory_digest"})
         if self.inventory_digest != expected:
             raise ValueError("inventoryDigest does not bind the evidence inventory")
@@ -2024,6 +1894,7 @@ class CorrelationRequest(_StrictCorrelationModel):
         "athena.wc026CorrelationRequest.v2",
         "athena.wc028CorrelationRequest.v3",
         "athena.wc028CorrelationRequest.v4",
+        "athena.wc028CorrelationRequest.v5",
     ] = Field(alias="schemaVersion")
     request_id: str = Field(alias="requestId")
     algorithm_id: Literal["athena.wc026.correlation.v1"] = Field(alias="algorithmId")
@@ -2036,6 +1907,10 @@ class CorrelationRequest(_StrictCorrelationModel):
     selected_incident: MonitoringSelectedIncident | None = Field(
         default=None,
         alias="selectedIncident",
+    )
+    runtime_replay_binding: MonitoringRuntimeReplayBinding | None = Field(
+        default=None,
+        alias="runtimeReplayBinding",
     )
     incident_anchor: IncidentHealthTransition = Field(alias="incidentAnchor")
     monitoring_handoff: MonitoringEvidenceHandoff = Field(alias="monitoringHandoff")
@@ -2065,10 +1940,9 @@ class CorrelationRequest(_StrictCorrelationModel):
                 self.monitoring_bundle.schema_version
                 != LEGACY_MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION
                 or self.selected_incident is not None
-                or self.evidence_inventory.monitoring_intent_asset_reference_digest
-                is not None
-                or self.evidence_inventory.monitoring_control_provenance_digest
-                is not None
+                or self.runtime_replay_binding is not None
+                or self.evidence_inventory.monitoring_intent_asset_reference_digest is not None
+                or self.evidence_inventory.monitoring_control_provenance_digest is not None
             ):
                 raise ValueError(
                     "legacy correlation request cannot contain WC028 provenance fields"
@@ -2076,6 +1950,7 @@ class CorrelationRequest(_StrictCorrelationModel):
         elif self.schema_version == PREVIOUS_CORRELATION_REQUEST_SCHEMA_VERSION:
             if (
                 self.selected_incident is not None
+                or self.runtime_replay_binding is not None
                 or self.monitoring_bundle.schema_version
                 not in {
                     MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION,
@@ -2086,16 +1961,30 @@ class CorrelationRequest(_StrictCorrelationModel):
                     and self.monitoring_bundle.acquisition_receipt.schema_version
                     == MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION
                 )
-                or self.evidence_inventory.monitoring_intent_asset_reference_digest
-                is None
-                or self.evidence_inventory.monitoring_control_provenance_digest
-                is None
+                or self.evidence_inventory.monitoring_intent_asset_reference_digest is None
+                or self.evidence_inventory.monitoring_control_provenance_digest is None
             ):
                 raise ValueError(
                     "historical v3 request cannot contain current production selection"
                 )
+        elif self.schema_version == PREVIOUS_INCIDENT_BOUND_CORRELATION_REQUEST_SCHEMA_VERSION:
+            if (
+                self.selected_incident is None
+                or self.runtime_replay_binding is not None
+                or self.monitoring_bundle.schema_version
+                != MONITORING_ACQUISITION_EVIDENCE_BUNDLE_SCHEMA_VERSION
+                or self.monitoring_bundle.acquisition_receipt is None
+                or self.monitoring_bundle.acquisition_receipt.schema_version
+                != MONITORING_PREVIOUS_INCIDENT_BOUND_ACQUISITION_RECEIPT_SCHEMA_VERSION
+                or self.monitoring_bundle.acquisition_receipt.selected_incident
+                != self.selected_incident
+                or self.evidence_inventory.monitoring_intent_asset_reference_digest is None
+                or self.evidence_inventory.monitoring_control_provenance_digest is None
+            ):
+                raise ValueError("historical v4 request requires receipt v5 selectedIncident")
         elif (
             self.selected_incident is None
+            or self.runtime_replay_binding is None
             or self.monitoring_bundle.schema_version
             != MONITORING_ACQUISITION_EVIDENCE_BUNDLE_SCHEMA_VERSION
             or self.monitoring_bundle.acquisition_receipt is None
@@ -2103,12 +1992,23 @@ class CorrelationRequest(_StrictCorrelationModel):
             != MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION
             or self.monitoring_bundle.acquisition_receipt.selected_incident
             != self.selected_incident
-            or self.evidence_inventory.monitoring_intent_asset_reference_digest
-            is None
+            or self.monitoring_bundle.acquisition_receipt.runtime_replay_binding
+            != self.runtime_replay_binding
+            or self.runtime_replay_binding.incident_revision != self.incident_revision
+            or self.runtime_replay_binding.issued_at != self.issued_at
+            or self.runtime_replay_binding.trusted_as_of != self.trusted_as_of
+            or self.runtime_replay_binding.expires_at != self.expires_at
+            or self.runtime_replay_binding.trust_delay_seconds
+            != int((self.trusted_as_of - self.issued_at).total_seconds())
+            or self.runtime_replay_binding.request_lifetime_seconds
+            != int((self.expires_at - self.issued_at).total_seconds())
+            or self.evidence_inventory.monitoring_intent_asset_reference_digest is None
+            or self.runtime_replay_binding.monitoring_intent_reference_digest
+            != self.evidence_inventory.monitoring_intent_asset_reference_digest
             or self.evidence_inventory.monitoring_control_provenance_digest is None
         ):
             raise ValueError(
-                "production v4 request requires receipt v5 selectedIncident"
+                "production v5 request requires exact receipt v6 replay and incident bindings"
             )
         if not (
             self.issued_at <= self.trusted_as_of <= self.expires_at
@@ -2131,23 +2031,17 @@ class CorrelationRequest(_StrictCorrelationModel):
             self.context_binding.required_coverage_scope_digests
             != self.monitoring_bundle.expected_coverage_scope_digests
         ):
-            raise ValueError(
-                "monitoring coverage scopes must match the governed context"
-            )
-        if any(
-            item.observed_end > self.trusted_as_of for item in self.evidence_index
-        ):
+            raise ValueError("monitoring coverage scopes must match the governed context")
+        if any(item.observed_end > self.trusted_as_of for item in self.evidence_index):
             raise ValueError("evidenceIndex contains evidence newer than trustedAsOf")
         if isinstance(self.context_binding, PublishedRuntimeContextBinding) and (
-            self.context_binding.publication_authority.published_at
-            > self.trusted_as_of
+            self.context_binding.publication_authority.published_at > self.trusted_as_of
         ):
             raise ValueError("publication authority must not be newer than trustedAsOf")
         handoff_digest = self.monitoring_handoff.compute_artifact_digest_value()
         monitoring_bundle_digest = sha256_hex(self.monitoring_bundle.canonical_bytes())
         if (
-            self.monitoring_handoff.evidence.content_digest
-            != monitoring_bundle_digest
+            self.monitoring_handoff.evidence.content_digest != monitoring_bundle_digest
             or self.monitoring_bundle.monitoring_contract_digest
             != self.monitoring_handoff.collector_contract_digest
         ):
@@ -2157,41 +2051,32 @@ class CorrelationRequest(_StrictCorrelationModel):
             intent_reference = self.monitoring_bundle.monitoring_intent_reference
             acquisition_manifest = self.monitoring_bundle.acquisition_manifest
             if (
-                self.monitoring_handoff.acquisition_receipt_digest
-                != receipt.receipt_digest
+                self.monitoring_handoff.acquisition_receipt_digest != receipt.receipt_digest
                 or intent_reference is None
                 or acquisition_manifest is None
                 or receipt.intent_id != intent_reference.intent_id
                 or receipt.intent_digest != intent_reference.intent_digest
                 or receipt.context_binding_digest != self.context_binding.binding_digest
-                or receipt.collection_batch_digest
-                != acquisition_manifest.collection_batch_digest
+                or receipt.collection_batch_digest != acquisition_manifest.collection_batch_digest
                 or receipt.normalized_evidence_digest
                 != acquisition_manifest.normalized_evidence_digest
                 or receipt.normalized_evidence_digest
                 != self.monitoring_bundle.compute_normalized_evidence_digest_value()
                 or receipt.exchanges != acquisition_manifest.exchanges
             ):
-                raise ValueError(
-                    "monitoring evidence does not bind the acquisition receipt"
-                )
+                raise ValueError("monitoring evidence does not bind the acquisition receipt")
         elif (
             self.monitoring_handoff.acquisition_receipt_digest is not None
             or self.monitoring_bundle.acquisition_manifest is not None
         ):
-            raise ValueError(
-                "monitoring handoff cannot claim absent acquisition provenance"
-            )
+            raise ValueError("monitoring handoff cannot claim absent acquisition provenance")
         change_digests = tuple(
-            sha256_hex(artifact.canonical_bytes())
-            for artifact in self.change_artifacts
+            sha256_hex(artifact.canonical_bytes()) for artifact in self.change_artifacts
         )
-        if change_digests != tuple(sorted(change_digests)) or len(
-            set(change_digests)
-        ) != len(change_digests):
-            raise ValueError(
-                "changeArtifacts must have unique deterministic artifact digests"
-            )
+        if change_digests != tuple(sorted(change_digests)) or len(set(change_digests)) != len(
+            change_digests
+        ):
+            raise ValueError("changeArtifacts must have unique deterministic artifact digests")
         if any(
             artifact.evidence.occurred_at > self.trusted_as_of
             or artifact.evidence.received_at > self.trusted_as_of
@@ -2208,14 +2093,11 @@ class CorrelationRequest(_StrictCorrelationModel):
         ):
             if (
                 handoff.evidence_id != artifact.evidence.evidence_id
-                or handoff.deduplication_key
-                != artifact.evidence.deduplication_key
+                or handoff.deduplication_key != artifact.evidence.deduplication_key
                 or handoff.change_key != artifact.evidence.change_key
                 or handoff.artifact.content_digest != artifact_digest
             ):
-                raise ValueError(
-                    "change handoff does not bind the exact change artifact"
-                )
+                raise ValueError("change handoff does not bind the exact change artifact")
         change_by_evidence_id = {
             artifact.evidence.evidence_id: (
                 artifact,
@@ -2235,30 +2117,24 @@ class CorrelationRequest(_StrictCorrelationModel):
                 continue
             matched_change_evidence_id = observation.matched_change_evidence_id
             if matched_change_evidence_id is None:
-                raise ValueError(
-                    "effective flow attribution references unknown change evidence"
-                )
+                raise ValueError("effective flow attribution references unknown change evidence")
             matched = change_by_evidence_id.get(matched_change_evidence_id)
             if matched is None:
-                raise ValueError(
-                    "effective flow attribution references unknown change evidence"
-                )
+                raise ValueError("effective flow attribution references unknown change evidence")
             artifact, artifact_digest = matched
             change = artifact.evidence
             provenance = observation.ip_flow_provenance
-            current_provenance_invalid = (
-                self.schema_version == CORRELATION_REQUEST_SCHEMA_VERSION
-                and (
-                    provenance is None
-                    or provenance.historical_decision != "denied"
-                    or provenance.access != "Deny"
-                    or provenance.result_rule_resource_id
-                    != observation.rule_resource_id
-                    or provenance.causal_change_correlation_id
-                    != change.correlation_id
-                    or provenance.checked_at < observation.observed_end
-                    or provenance.received_at > self.trusted_as_of
-                )
+            current_provenance_invalid = self.schema_version in {
+                PREVIOUS_INCIDENT_BOUND_CORRELATION_REQUEST_SCHEMA_VERSION,
+                CORRELATION_REQUEST_SCHEMA_VERSION,
+            } and (
+                provenance is None
+                or provenance.historical_decision != "denied"
+                or provenance.access != "Deny"
+                or provenance.result_rule_resource_id != observation.rule_resource_id
+                or provenance.causal_change_correlation_id != change.correlation_id
+                or provenance.checked_at < observation.observed_end
+                or provenance.received_at > self.trusted_as_of
             )
             if (
                 observation.matched_change_artifact_digest != artifact_digest
@@ -2272,9 +2148,7 @@ class CorrelationRequest(_StrictCorrelationModel):
                     {item.path for item in change.changed_properties}
                 )
             ):
-                raise ValueError(
-                    "effective flow attribution does not bind the exact NSG change"
-                )
+                raise ValueError("effective flow attribution does not bind the exact NSG change")
         expected_source_references = tuple(
             sorted(
                 (
@@ -2304,18 +2178,14 @@ class CorrelationRequest(_StrictCorrelationModel):
             CorrelationEvidenceCitation(
                 evidenceId=artifact.evidence.evidence_id,
                 family="resourceChange",
-                provenanceRootDigest=sha256_hex(
-                    artifact.evidence.source_record_reference
-                ),
+                provenanceRootDigest=sha256_hex(artifact.evidence.source_record_reference),
                 evidenceDigest=artifact_digest,
                 sourceReference=handoff.artifact,
                 observedStart=artifact.evidence.occurred_at,
                 observedEnd=artifact.evidence.occurred_at,
                 sourceRootReference=artifact.evidence.source_record_reference,
                 resourceIds=(artifact.evidence.target_resource_id,),
-                summaryCode=(
-                    f"change.{artifact.evidence.operation}.{artifact.evidence.result}"
-                ),
+                summaryCode=(f"change.{artifact.evidence.operation}.{artifact.evidence.result}"),
             )
             for artifact, handoff, artifact_digest in zip(
                 self.change_artifacts,
@@ -2337,9 +2207,7 @@ class CorrelationRequest(_StrictCorrelationModel):
             )
         )
         if self.evidence_index != expected_evidence_index:
-            raise ValueError(
-                "evidenceIndex must be derived exactly from the supplied evidence"
-            )
+            raise ValueError("evidenceIndex must be derived exactly from the supplied evidence")
         evidence_ids = tuple(item.evidence_id for item in self.evidence_index)
         if evidence_ids != tuple(sorted(evidence_ids)) or len(evidence_ids) != len(
             set(evidence_ids)
@@ -2348,23 +2216,13 @@ class CorrelationRequest(_StrictCorrelationModel):
         source_root_bindings: dict[str, str] = {}
         for citation in self.evidence_index:
             existing = source_root_bindings.get(citation.source_root_reference)
-            if (
-                existing is not None
-                and existing != citation.provenance_root_digest
-            ):
-                raise ValueError(
-                    "sourceRootReference cannot bind multiple provenance roots"
-                )
-            source_root_bindings[citation.source_root_reference] = (
-                citation.provenance_root_digest
-            )
+            if existing is not None and existing != citation.provenance_root_digest:
+                raise ValueError("sourceRootReference cannot bind multiple provenance roots")
+            source_root_bindings[citation.source_root_reference] = citation.provenance_root_digest
         if any(
-            item.source_reference not in expected_source_references
-            for item in self.evidence_index
+            item.source_reference not in expected_source_references for item in self.evidence_index
         ):
-            raise ValueError(
-                "evidenceIndex contains a source outside the immutable inventory"
-            )
+            raise ValueError("evidenceIndex contains a source outside the immutable inventory")
         evidence_by_id = {item.evidence_id: item for item in self.evidence_index}
         if any(
             evidence_by_id.get(item.evidence_id) != item
@@ -2373,32 +2231,32 @@ class CorrelationRequest(_StrictCorrelationModel):
                 *self.incident_anchor.current_state_evidence,
             )
         ):
-            raise ValueError(
-                "incident evidence must resolve exactly in the evidence index"
-            )
+            raise ValueError("incident evidence must resolve exactly in the evidence index")
         observation_by_id = {
             item.observation_id: item for item in self.monitoring_bundle.observations
         }
+
         def matches_health_state(
             reference: CorrelationEvidenceCitation,
             state: HealthState,
         ) -> bool:
             observation = observation_by_id.get(reference.evidence_id)
-            return bool(
-                isinstance(observation, GuestSignalObservation)
-                and observation.subject_resource_id
-                == self.incident_anchor.affected_resource_id
-                and observation.state == state
-            ) or (
-                isinstance(observation, EndpointHealthObservation)
-                and observation.subject_resource_id
-                == self.incident_anchor.affected_resource_id
-                and observation.status == state
-            ) or (
-                isinstance(observation, PlatformHealthObservation)
-                and observation.subject_resource_id
-                == self.incident_anchor.affected_resource_id
-                and observation.status == state
+            return (
+                bool(
+                    isinstance(observation, GuestSignalObservation)
+                    and observation.subject_resource_id == self.incident_anchor.affected_resource_id
+                    and observation.state == state
+                )
+                or (
+                    isinstance(observation, EndpointHealthObservation)
+                    and observation.subject_resource_id == self.incident_anchor.affected_resource_id
+                    and observation.status == state
+                )
+                or (
+                    isinstance(observation, PlatformHealthObservation)
+                    and observation.subject_resource_id == self.incident_anchor.affected_resource_id
+                    and observation.status == state
+                )
             )
 
         if not all(
@@ -2411,9 +2269,7 @@ class CorrelationRequest(_StrictCorrelationModel):
             raise ValueError(
                 "incident transition requires matching previous and current health evidence"
             )
-        dependency_paths = {
-            path.path_id: path for path in self.context_binding.dependency_paths
-        }
+        dependency_paths = {path.path_id: path for path in self.context_binding.dependency_paths}
         for observation in self.monitoring_bundle.observations:
             path_id = (
                 observation.path_id
@@ -2428,9 +2284,7 @@ class CorrelationRequest(_StrictCorrelationModel):
                 else None
             )
             if path_id is not None and path_id not in dependency_paths:
-                raise ValueError(
-                    "monitoring observation references an undeclared dependency path"
-                )
+                raise ValueError("monitoring observation references an undeclared dependency path")
             if path_id is not None:
                 path_resources = set(dependency_paths[path_id].resource_ids)
                 if isinstance(observation, NetworkFlowObservation):
@@ -2463,13 +2317,10 @@ class CorrelationRequest(_StrictCorrelationModel):
                         "monitoring observation resources are outside the governed path"
                     )
         if any(
-            item.scope.path_id is not None
-            and item.scope.path_id not in dependency_paths
+            item.scope.path_id is not None and item.scope.path_id not in dependency_paths
             for item in self.monitoring_bundle.coverage
         ):
-            raise ValueError(
-                "monitoring coverage references an undeclared dependency path"
-            )
+            raise ValueError("monitoring coverage references an undeclared dependency path")
         if any(
             item.scope.path_id is not None
             and not set(item.scope.resource_ids).issubset(
@@ -2477,9 +2328,7 @@ class CorrelationRequest(_StrictCorrelationModel):
             )
             for item in self.monitoring_bundle.coverage
         ):
-            raise ValueError(
-                "monitoring coverage resources are outside the governed path"
-            )
+            raise ValueError("monitoring coverage resources are outside the governed path")
         evidence_index_digest = compute_artifact_digest(
             [
                 item.model_dump(mode="json", by_alias=True, exclude_none=True)
@@ -2506,9 +2355,7 @@ class CorrelationRequest(_StrictCorrelationModel):
                         "controlDigest": control_digest,
                         "sourceClausePath": source_clause_path,
                     }
-                    for control_id, control_digest, source_clause_path in sorted(
-                        control_provenance
-                    )
+                    for control_id, control_digest, source_clause_path in sorted(control_provenance)
                 ]
             )
             if control_provenance
@@ -2516,19 +2363,21 @@ class CorrelationRequest(_StrictCorrelationModel):
         )
         expected_incident_transition_digest = (
             self.selected_incident.transition_digest
-            if self.schema_version == CORRELATION_REQUEST_SCHEMA_VERSION
+            if self.schema_version
+            in {
+                PREVIOUS_INCIDENT_BOUND_CORRELATION_REQUEST_SCHEMA_VERSION,
+                CORRELATION_REQUEST_SCHEMA_VERSION,
+            }
             and self.selected_incident is not None
             else self.incident_anchor.transition_digest
         )
         if (
             self.evidence_inventory.rule_catalog_digest != self.rule_catalog_digest
-            or self.evidence_inventory.context_binding_digest
-            != self.context_binding.binding_digest
+            or self.evidence_inventory.context_binding_digest != self.context_binding.binding_digest
             or self.evidence_inventory.incident_transition_digest
             != expected_incident_transition_digest
             or self.evidence_inventory.monitoring_handoff_digest != handoff_digest
-            or self.evidence_inventory.monitoring_bundle_digest
-            != monitoring_bundle_digest
+            or self.evidence_inventory.monitoring_bundle_digest != monitoring_bundle_digest
             or self.evidence_inventory.change_artifact_digests != change_digests
             or self.evidence_inventory.evidence_index_digest != evidence_index_digest
             or self.evidence_inventory.monitoring_intent_asset_reference_digest
@@ -2539,8 +2388,7 @@ class CorrelationRequest(_StrictCorrelationModel):
             )
             or self.evidence_inventory.monitoring_control_provenance_digest
             != control_provenance_digest
-            or self.evidence_inventory.source_references
-            != expected_source_references
+            or self.evidence_inventory.source_references != expected_source_references
         ):
             raise ValueError("evidenceInventory does not match the exact request inputs")
         expected = _expected_digest(
@@ -2558,8 +2406,8 @@ class CorrelationRequest(_StrictCorrelationModel):
 
 
 class IncidentBoundCorrelationRequest(_StrictCorrelationModel):
-    schema_version: Literal["athena.wc027IncidentBoundCorrelationRequest.v1"] = (
-        Field(alias="schemaVersion")
+    schema_version: Literal["athena.wc027IncidentBoundCorrelationRequest.v1"] = Field(
+        alias="schemaVersion"
     )
     request_id: str = Field(
         alias="requestId",
@@ -2567,9 +2415,7 @@ class IncidentBoundCorrelationRequest(_StrictCorrelationModel):
     )
     incident_subject: IncidentCorrelationSubject = Field(alias="incidentSubject")
     correlation_request: CorrelationRequest = Field(alias="correlationRequest")
-    correlation_transition_digest: Sha256Digest = Field(
-        alias="correlationTransitionDigest"
-    )
+    correlation_transition_digest: Sha256Digest = Field(alias="correlationTransitionDigest")
     binding_attestation: IncidentBoundCorrelationRequestAttestation = Field(
         alias="bindingAttestation"
     )
@@ -2591,11 +2437,9 @@ class IncidentBoundCorrelationRequest(_StrictCorrelationModel):
             },
         )
         if (
-            subject.affected_resource_id
-            != request.incident_anchor.affected_resource_id
+            subject.affected_resource_id != request.incident_anchor.affected_resource_id
             or subject.incident_revision != request.incident_revision
-            or self.correlation_transition_digest
-            != request.incident_anchor.transition_digest
+            or self.correlation_transition_digest != request.incident_anchor.transition_digest
             or state.detected_at > request.trusted_as_of
             or state.updated_at > request.trusted_as_of
             or state.updated_at < request.incident_anchor.observed_start
@@ -2606,25 +2450,19 @@ class IncidentBoundCorrelationRequest(_StrictCorrelationModel):
             )
             or (
                 state.lifecycle == "resolved"
-                and request.incident_anchor.current_state
-                not in {"healthy", "recovered"}
+                and request.incident_anchor.current_state not in {"healthy", "recovered"}
             )
             or self.binding_attestation.signed_preimage_digest
             != compute_artifact_digest(signed_preimage)
         ):
-            raise ValueError(
-                "incident subject does not bind the exact correlation request"
-            )
+            raise ValueError("incident subject does not bind the exact correlation request")
         expected = _expected_digest(
             self,
             excluded_fields={"request_id", "binding_digest"},
         )
         if self.binding_digest != expected:
             raise ValueError("bindingDigest does not bind the incident request")
-        if (
-            self.request_id
-            != f"incident-bound-request-{expected.removeprefix('sha256:')[:32]}"
-        ):
+        if self.request_id != f"incident-bound-request-{expected.removeprefix('sha256:')[:32]}":
             raise ValueError("requestId is not digest-bound")
         return self
 
@@ -2632,9 +2470,7 @@ class IncidentBoundCorrelationRequest(_StrictCorrelationModel):
 def incident_correlation_subject_signature_preimage(
     subject: IncidentCorrelationSubject,
 ) -> bytes:
-    subject = IncidentCorrelationSubject.model_validate_json(
-        subject.model_dump_json(by_alias=True)
-    )
+    subject = IncidentCorrelationSubject.model_validate_json(subject.model_dump_json(by_alias=True))
     return canonicalize_json(
         subject.model_dump(
             mode="json",
@@ -2684,9 +2520,7 @@ def _flow_coverage_matches(
         and flow.path_id == coverage.scope.path_id
         and flow.direction == coverage.scope.direction
         and flow.five_tuple_digest == coverage.scope.five_tuple_digest
-        and set(_observation_resource_ids(flow)).issubset(
-            coverage.scope.resource_ids
-        )
+        and set(_observation_resource_ids(flow)).issubset(coverage.scope.resource_ids)
         and coverage.coverage_start <= incident_start
         and coverage.coverage_end >= incident_end
         and coverage.coverage_start <= flow.observed_start
@@ -2713,8 +2547,7 @@ def _monitor_coverage_matches(
         and coverage.status == "complete"
         and affected_path_id == coverage.scope.path_id
         and test.path_id == coverage.scope.path_id
-        and coverage.scope.endpoint_test_reference
-        == test.test_configuration_reference
+        and coverage.scope.endpoint_test_reference == test.test_configuration_reference
         and coverage.scope.endpoint_test_digest == test.test_configuration_digest
         and coverage.scope.direction == test.direction
         and coverage.scope.five_tuple_digest == test.five_tuple_digest
@@ -2789,8 +2622,7 @@ def validate_correlation_report_binding(
         or report.as_of != request.trusted_as_of
         or report.binding_mode != request.context_binding.binding_mode
         or report.preview_only != (request.context_binding.binding_mode == "draftPreview")
-        or report.incident_anchor_observed_start
-        != request.incident_anchor.observed_start
+        or report.incident_anchor_observed_start != request.incident_anchor.observed_start
         or report.incident_anchor_observed_end != request.incident_anchor.observed_end
     ):
         raise ValueError("correlation report does not bind the exact request")
@@ -2799,15 +2631,9 @@ def validate_correlation_report_binding(
     observation_index = {
         item.observation_id: item for item in request.monitoring_bundle.observations
     }
-    coverage_index = {
-        item.coverage_id: item for item in request.monitoring_bundle.coverage
-    }
-    change_index = {
-        item.evidence.evidence_id: item for item in request.change_artifacts
-    }
-    dependency_paths = {
-        item.path_id: item for item in request.context_binding.dependency_paths
-    }
+    coverage_index = {item.coverage_id: item for item in request.monitoring_bundle.coverage}
+    change_index = {item.evidence.evidence_id: item for item in request.change_artifacts}
+    dependency_paths = {item.path_id: item for item in request.context_binding.dependency_paths}
 
     def require_cap(
         hypothesis: RootCauseHypothesis,
@@ -2826,13 +2652,9 @@ def validate_correlation_report_binding(
             raise ValueError("correlation report references an unknown dependency path")
         for citation in hypothesis.supporting_evidence:
             if evidence_index.get(citation.evidence_id) != citation:
-                raise ValueError(
-                    "correlation report cites evidence outside the verified request"
-                )
+                raise ValueError("correlation report cites evidence outside the verified request")
         referenced_ids = {
-            evidence_id
-            for gate in hypothesis.gates
-            for evidence_id in gate.evidence_ids
+            evidence_id for gate in hypothesis.gates for evidence_id in gate.evidence_ids
         }
         referenced_ids.update(
             evidence_id
@@ -2840,9 +2662,7 @@ def validate_correlation_report_binding(
             for evidence_id in contradiction.evidence_ids
         )
         if not referenced_ids.issubset(evidence_index):
-            raise ValueError(
-                "correlation report references unknown gate or contradiction evidence"
-            )
+            raise ValueError("correlation report references unknown gate or contradiction evidence")
         gate_map = {item.code: item for item in hypothesis.gates}
         no_hard_conflict_gate = gate_map.get("noHardConflict")
         if (
@@ -2850,13 +2670,9 @@ def validate_correlation_report_binding(
             and no_hard_conflict_gate.satisfied
             and any(item.hard_conflict for item in hypothesis.contradictions)
         ):
-            raise ValueError(
-                "noHardConflict gate contradicts the reported hard conflicts"
-            )
+            raise ValueError("noHardConflict gate contradicts the reported hard conflicts")
         if any(
-            gate.satisfied
-            and gate.code != "noHardConflict"
-            and not gate.evidence_ids
+            gate.satisfied and gate.code != "noHardConflict" and not gate.evidence_ids
             for gate in hypothesis.gates
         ):
             raise ValueError("satisfied causal gates require cited evidence")
@@ -2868,8 +2684,7 @@ def validate_correlation_report_binding(
         )
         if (
             affected_path is not None
-            and request.incident_anchor.affected_resource_id
-            not in affected_path.resource_ids
+            and request.incident_anchor.affected_resource_id not in affected_path.resource_ids
         ):
             raise ValueError("affected path does not contain the incident resource")
         for gate in hypothesis.gates:
@@ -2877,19 +2692,13 @@ def validate_correlation_report_binding(
                 continue
             gate_citations = tuple(evidence_index[item] for item in gate.evidence_ids)
             positive_gate_citations = tuple(
-                item
-                for item in gate_citations
-                if item.evidence_id not in coverage_index
+                item for item in gate_citations if item.evidence_id not in coverage_index
             )
             gate_observations = tuple(
-                observation_index[item]
-                for item in gate.evidence_ids
-                if item in observation_index
+                observation_index[item] for item in gate.evidence_ids if item in observation_index
             )
             gate_changes = tuple(
-                change_index[item].evidence
-                for item in gate.evidence_ids
-                if item in change_index
+                change_index[item].evidence for item in gate.evidence_ids if item in change_index
             )
             path_observations = tuple(
                 item
@@ -2907,10 +2716,7 @@ def validate_correlation_report_binding(
                 affected_path is None
                 or not gate_citations
                 or not path_observations
-                or any(
-                    item.path_id != hypothesis.affected_path_id
-                    for item in path_observations
-                )
+                or any(item.path_id != hypothesis.affected_path_id for item in path_observations)
                 or not any(
                     set(citation.resource_ids).issubset(affected_path.resource_ids)
                     for citation in gate_citations
@@ -2958,9 +2764,7 @@ def validate_correlation_report_binding(
                 )
                 for item in gate_observations
             ):
-                raise ValueError(
-                    "effectiveRuleAttribution gate requires attributed flow evidence"
-                )
+                raise ValueError("effectiveRuleAttribution gate requires attributed flow evidence")
             if gate.code == "matchingDeniedFlow" and not any(
                 isinstance(item, NetworkFlowObservation)
                 and item.decision == "denied"
@@ -2986,9 +2790,7 @@ def validate_correlation_report_binding(
                 )
                 for item in gate_observations
             ):
-                raise ValueError(
-                    "connectionMonitorFailure gate requires failed test evidence"
-                )
+                raise ValueError("connectionMonitorFailure gate requires failed test evidence")
             if gate.code == "endpointDegradation" and not any(
                 isinstance(item, EndpointHealthObservation)
                 and item.status in {"degraded", "unhealthy", "unavailable"}
@@ -3001,14 +2803,10 @@ def validate_correlation_report_binding(
                 )
                 for item in gate_observations
             ):
-                raise ValueError(
-                    "endpointDegradation gate requires degraded endpoint evidence"
-                )
+                raise ValueError("endpointDegradation gate requires degraded endpoint evidence")
             if gate.code == "independentCorroboration":
                 if affected_path is None:
-                    raise ValueError(
-                        "independentCorroboration requires an affected path"
-                    )
+                    raise ValueError("independentCorroboration requires an affected path")
                 monitoring_corroboration = tuple(
                     citation
                     for citation in positive_gate_citations
@@ -3020,10 +2818,8 @@ def validate_correlation_report_binding(
                         change = change_index[citation.evidence_id].evidence
                         if (
                             hypothesis.cause_resource_id is None
-                            or change.target_resource_id
-                            != hypothesis.cause_resource_id
-                            or change.occurred_at
-                            > request.incident_anchor.observed_start
+                            or change.target_resource_id != hypothesis.cause_resource_id
+                            or change.occurred_at > request.incident_anchor.observed_start
                         ):
                             irrelevant_corroboration = True
                     elif citation.evidence_id in observation_index:
@@ -3038,8 +2834,7 @@ def validate_correlation_report_binding(
                                     observation,
                                     ConnectionMonitorObservation,
                                 )
-                                and observation.status
-                                not in {"failed", "degraded"}
+                                and observation.status not in {"failed", "degraded"}
                             )
                             or (
                                 isinstance(
@@ -3056,9 +2851,7 @@ def validate_correlation_report_binding(
                         ):
                             irrelevant_corroboration = True
                         if (
-                            not set(citation.resource_ids).intersection(
-                                affected_path.resource_ids
-                            )
+                            not set(citation.resource_ids).intersection(affected_path.resource_ids)
                             or not _intervals_overlap(
                                 citation.observed_start,
                                 citation.observed_end,
@@ -3074,25 +2867,16 @@ def validate_correlation_report_binding(
                                         EndpointHealthObservation,
                                     ),
                                 )
-                                and observation.path_id
-                                != hypothesis.affected_path_id
+                                and observation.path_id != hypothesis.affected_path_id
                             )
                         ):
                             irrelevant_corroboration = True
                 if (
                     len({item.family for item in monitoring_corroboration}) < 2
-                    or len(
-                        {
-                            item.provenance_root_digest
-                            for item in monitoring_corroboration
-                        }
-                    )
-                    < 2
+                    or len({item.provenance_root_digest for item in monitoring_corroboration}) < 2
                     or irrelevant_corroboration
                 ):
-                    raise ValueError(
-                        "independentCorroboration requires independent evidence roots"
-                    )
+                    raise ValueError("independentCorroboration requires independent evidence roots")
             if gate.code == "correctChronology" and (
                 len(gate.evidence_ids) != 1
                 or gate.evidence_ids[0] not in change_index
@@ -3103,24 +2887,15 @@ def validate_correlation_report_binding(
                     or item.occurred_at != hypothesis.candidate_causal_at
                     or (
                         hypothesis.cause_resource_id is not None
-                        and item.target_resource_id
-                        != hypothesis.cause_resource_id
+                        and item.target_resource_id != hypothesis.cause_resource_id
                     )
                     for item in gate_changes
                 )
             ):
-                raise ValueError(
-                    "correctChronology must bind the cited pre-incident change"
-                )
+                raise ValueError("correctChronology must bind the cited pre-incident change")
             if gate.code == "recoveryEvidence" and not any(
-                (
-                    isinstance(item, GuestSignalObservation)
-                    and item.state == "recovered"
-                )
-                or (
-                    isinstance(item, EndpointHealthObservation)
-                    and item.status == "recovered"
-                )
+                (isinstance(item, GuestSignalObservation) and item.state == "recovered")
+                or (isinstance(item, EndpointHealthObservation) and item.status == "recovered")
                 for item in gate_observations
             ):
                 raise ValueError("recoveryEvidence gate requires recovered evidence")
@@ -3143,8 +2918,7 @@ def validate_correlation_report_binding(
                         isinstance(candidate, NetworkFlowObservation)
                         and candidate.effective_rule_attribution
                         and candidate.decision == "denied"
-                        and candidate.rule_resource_id
-                        == hypothesis.cause_resource_id
+                        and candidate.rule_resource_id == hypothesis.cause_resource_id
                         and candidate.path_id == hypothesis.affected_path_id
                         and _intervals_overlap(
                             candidate.observed_start,
@@ -3170,9 +2944,7 @@ def validate_correlation_report_binding(
             for item in hypothesis.supporting_evidence
             if item.evidence_id not in coverage_index
         )
-        support_families = {
-            item.family for item in substantive_support
-        }
+        support_families = {item.family for item in substantive_support}
         if support_families == {"resourceChange"}:
             require_cap(
                 hypothesis,
@@ -3215,10 +2987,7 @@ def validate_correlation_report_binding(
                     "correctChronology",
                 ):
                     required_gate_value = gate_map.get(required_gate)
-                    if (
-                        required_gate_value is None
-                        or not required_gate_value.satisfied
-                    ):
+                    if required_gate_value is None or not required_gate_value.satisfied:
                         raise ValueError(
                             f"High network security confidence requires {required_gate}"
                         )
@@ -3234,13 +3003,10 @@ def validate_correlation_report_binding(
                     )
                 high_change_artifact = change_index[high_change_ids[0]]
                 high_change = high_change_artifact.evidence
-                high_change_digest = sha256_hex(
-                    high_change_artifact.canonical_bytes()
-                )
+                high_change_digest = sha256_hex(high_change_artifact.canonical_bytes())
                 if (
                     high_change.result != "succeeded"
-                    or high_change.target_resource_id
-                    != hypothesis.cause_resource_id
+                    or high_change.target_resource_id != hypothesis.cause_resource_id
                     or high_change.target_resource_type.casefold()
                     != "microsoft.network/networksecuritygroups/securityrules"
                     or not any(
@@ -3248,16 +3014,15 @@ def validate_correlation_report_binding(
                         for item in high_change.changed_properties
                     )
                     or hypothesis.candidate_causal_at != high_change.occurred_at
-                    or high_change.occurred_at
-                    > request.incident_anchor.observed_start
+                    or high_change.occurred_at > request.incident_anchor.observed_start
                 ):
                     raise ValueError(
                         "High network security confidence requires one causal pre-incident change"
                     )
                 if attribution_gate is not None and attribution_gate.satisfied:
-                    high_matching_flow_ids = set(
-                        attribution_gate.evidence_ids
-                    ).intersection(gate_map["matchingDeniedFlow"].evidence_ids)
+                    high_matching_flow_ids = set(attribution_gate.evidence_ids).intersection(
+                        gate_map["matchingDeniedFlow"].evidence_ids
+                    )
                     high_matching_flow = False
                     for evidence_id in high_matching_flow_ids:
                         candidate = observation_index.get(evidence_id)
@@ -3265,27 +3030,19 @@ def validate_correlation_report_binding(
                             isinstance(candidate, NetworkFlowObservation)
                             and candidate.effective_rule_attribution
                             and candidate.decision == "denied"
-                            and candidate.rule_resource_id
-                            == hypothesis.cause_resource_id
-                            and candidate.path_id
-                            == hypothesis.affected_path_id
+                            and candidate.rule_resource_id == hypothesis.cause_resource_id
+                            and candidate.path_id == hypothesis.affected_path_id
                             and _intervals_overlap(
                                 candidate.observed_start,
                                 candidate.observed_end,
                                 request.incident_anchor.observed_start,
                                 request.incident_anchor.observed_end,
                             )
-                            and candidate.matched_change_evidence_id
-                            == high_change.evidence_id
-                            and candidate.matched_change_key
-                            == high_change.change_key
-                            and candidate.matched_change_artifact_digest
-                            == high_change_digest
+                            and candidate.matched_change_evidence_id == high_change.evidence_id
+                            and candidate.matched_change_key == high_change.change_key
+                            and candidate.matched_change_artifact_digest == high_change_digest
                             and set(candidate.matched_property_paths).issubset(
-                                {
-                                    item.path
-                                    for item in high_change.changed_properties
-                                }
+                                {item.path for item in high_change.changed_properties}
                             )
                         ):
                             high_matching_flow = True
@@ -3294,10 +3051,7 @@ def validate_correlation_report_binding(
                             "High network security attribution must bind the selected change"
                         )
         chronology_gate = gate_map.get("correctChronology")
-        if (
-            chronology_gate is not None
-            and chronology_gate.satisfied
-        ):
+        if chronology_gate is not None and chronology_gate.satisfied:
             causal_change = change_index[chronology_gate.evidence_ids[0]].evidence
             causal_monitoring_ids = {
                 evidence_id
@@ -3307,8 +3061,7 @@ def validate_correlation_report_binding(
                 if evidence_id in observation_index
             }
             causal_monitoring_observations = [
-                observation_index[evidence_id]
-                for evidence_id in causal_monitoring_ids
+                observation_index[evidence_id] for evidence_id in causal_monitoring_ids
             ]
             if any(
                 item.observed_start < causal_change.occurred_at
@@ -3327,14 +3080,11 @@ def validate_correlation_report_binding(
         claimed_flows_list: list[NetworkFlowObservation] = []
         for evidence_id in claimed_flow_ids:
             candidate = observation_index.get(evidence_id)
-            if (
-                isinstance(candidate, NetworkFlowObservation)
-                and _intervals_overlap(
-                    candidate.observed_start,
-                    candidate.observed_end,
-                    request.incident_anchor.observed_start,
-                    request.incident_anchor.observed_end,
-                )
+            if isinstance(candidate, NetworkFlowObservation) and _intervals_overlap(
+                candidate.observed_start,
+                candidate.observed_end,
+                request.incident_anchor.observed_start,
+                request.incident_anchor.observed_end,
             ):
                 claimed_flows_list.append(candidate)
         claimed_flows = tuple(claimed_flows_list)
@@ -3343,8 +3093,7 @@ def validate_correlation_report_binding(
         connection_monitor_gate = gate_map.get("connectionMonitorFailure")
         for evidence_id in (
             ()
-            if connection_monitor_gate is None
-            or not connection_monitor_gate.satisfied
+            if connection_monitor_gate is None or not connection_monitor_gate.satisfied
             else connection_monitor_gate.evidence_ids
         ):
             candidate = observation_index.get(evidence_id)
@@ -3387,8 +3136,7 @@ def validate_correlation_report_binding(
         if any(item.result == "failed" for item in candidate_changes):
             mandatory_hard_conflicts.add("changeFailed")
         if any(
-            item.occurred_at > request.incident_anchor.observed_start
-            for item in candidate_changes
+            item.occurred_at > request.incident_anchor.observed_start for item in candidate_changes
         ):
             mandatory_hard_conflicts.add("changeAfterDegradation")
         for flow in request.monitoring_bundle.observations:
@@ -3413,10 +3161,7 @@ def validate_correlation_report_binding(
             if not (
                 isinstance(test, ConnectionMonitorObservation)
                 and test.status == "succeeded"
-                and any(
-                    _same_monitor(test, claimed)
-                    for claimed in claimed_failed_tests
-                )
+                and any(_same_monitor(test, claimed) for claimed in claimed_failed_tests)
             ):
                 continue
             if any(
@@ -3430,21 +3175,15 @@ def validate_correlation_report_binding(
                 for coverage in request.monitoring_bundle.coverage
             ):
                 mandatory_hard_conflicts.add("completeHealthyConnectionMonitor")
-        declared_contradiction_codes = {
-            item.code for item in hypothesis.contradictions
-        }
+        declared_contradiction_codes = {item.code for item in hypothesis.contradictions}
         if not mandatory_hard_conflicts.issubset(declared_contradiction_codes):
-            raise ValueError(
-                "correlation hypothesis omits mandatory hard-conflict evidence"
-            )
+            raise ValueError("correlation hypothesis omits mandatory hard-conflict evidence")
         if (
             no_hard_conflict_gate is not None
             and no_hard_conflict_gate.satisfied
             and mandatory_hard_conflicts
         ):
-            raise ValueError(
-                "noHardConflict gate contradicts derived hard-conflict evidence"
-            )
+            raise ValueError("noHardConflict gate contradicts derived hard-conflict evidence")
 
         for contradiction in hypothesis.contradictions:
             if contradiction.code == "changeFailed":
@@ -3457,14 +3196,11 @@ def validate_correlation_report_binding(
                     item.result == "failed"
                     and (
                         hypothesis.cause_resource_id is None
-                        or item.target_resource_id
-                        == hypothesis.cause_resource_id
+                        or item.target_resource_id == hypothesis.cause_resource_id
                     )
                     for item in cited_changes
                 ):
-                    raise ValueError(
-                        "changeFailed requires matching failed change evidence"
-                    )
+                    raise ValueError("changeFailed requires matching failed change evidence")
             if contradiction.code == "changeAfterDegradation":
                 cited_changes = [
                     change_index[evidence_id].evidence
@@ -3475,8 +3211,7 @@ def validate_correlation_report_binding(
                     item.occurred_at > request.incident_anchor.observed_start
                     and (
                         hypothesis.cause_resource_id is None
-                        or item.target_resource_id
-                        == hypothesis.cause_resource_id
+                        or item.target_resource_id == hypothesis.cause_resource_id
                     )
                     for item in cited_changes
                 ):
@@ -3528,10 +3263,7 @@ def validate_correlation_report_binding(
                     ):
                         cited_healthy_tests.append(candidate)
                 matching_pair = any(
-                    any(
-                        _same_monitor(test, claimed)
-                        for claimed in claimed_failed_tests
-                    )
+                    any(_same_monitor(test, claimed) for claimed in claimed_failed_tests)
                     and _monitor_coverage_matches(
                         coverage,
                         test,
@@ -3554,9 +3286,7 @@ def validate_correlation_report_binding(
                     if evidence_id in change_index
                     and change_index[evidence_id].evidence.result == "succeeded"
                 ]
-                cited_recoveries: list[
-                    GuestSignalObservation | EndpointHealthObservation
-                ] = []
+                cited_recoveries: list[GuestSignalObservation | EndpointHealthObservation] = []
                 for evidence_id in contradiction.evidence_ids:
                     candidate = observation_index.get(evidence_id)
                     if (
@@ -3567,19 +3297,20 @@ def validate_correlation_report_binding(
                         and candidate.status == "recovered"
                     ):
                         cited_recoveries.append(candidate)
-                if not cited_changes or not cited_recoveries or not any(
-                    recovery.observed_end < change.occurred_at
-                    for recovery in cited_recoveries
-                    for change in cited_changes
+                if (
+                    not cited_changes
+                    or not cited_recoveries
+                    or not any(
+                        recovery.observed_end < change.occurred_at
+                        for recovery in cited_recoveries
+                        for change in cited_changes
+                    )
                 ):
                     raise ValueError(
                         "recoveryBeforeCorrection requires recovery before the cited change"
                     )
 
-        if (
-            hypothesis.confidence == "Confirmed"
-            and hypothesis.category == "networkSecurityChange"
-        ):
+        if hypothesis.confidence == "Confirmed" and hypothesis.category == "networkSecurityChange":
             cause_resource_id = hypothesis.cause_resource_id
 
             successful_change_ids = gate_map["successfulChange"].evidence_ids
@@ -3596,9 +3327,7 @@ def validate_correlation_report_binding(
                 )
             matching_change_artifact = change_index[successful_change_ids[0]]
             matching_change = matching_change_artifact.evidence
-            matching_change_digest = sha256_hex(
-                matching_change_artifact.canonical_bytes()
-            )
+            matching_change_digest = sha256_hex(matching_change_artifact.canonical_bytes())
             if (
                 matching_change.result != "succeeded"
                 or matching_change.target_resource_id != cause_resource_id
@@ -3615,15 +3344,14 @@ def validate_correlation_report_binding(
                 )
             if (
                 hypothesis.candidate_causal_at != matching_change.occurred_at
-                or matching_change.occurred_at
-                > request.incident_anchor.observed_start
+                or matching_change.occurred_at > request.incident_anchor.observed_start
             ):
                 raise ValueError(
                     "Confirmed network security cause requires one exact pre-incident change"
                 )
-            matching_flow_ids = set(
-                gate_map["effectiveRuleAttribution"].evidence_ids
-            ).intersection(gate_map["matchingDeniedFlow"].evidence_ids)
+            matching_flow_ids = set(gate_map["effectiveRuleAttribution"].evidence_ids).intersection(
+                gate_map["matchingDeniedFlow"].evidence_ids
+            )
             matching_flows: list[NetworkFlowObservation] = []
             for evidence_id in matching_flow_ids:
                 candidate = observation_index.get(evidence_id)
@@ -3636,15 +3364,10 @@ def validate_correlation_report_binding(
                 and item.decision == "denied"
                 and item.rule_resource_id == cause_resource_id
                 and item.matched_change_key == matching_change.change_key
-                and item.matched_change_evidence_id
-                == matching_change.evidence_id
-                and item.matched_change_artifact_digest
-                == matching_change_digest
+                and item.matched_change_evidence_id == matching_change.evidence_id
+                and item.matched_change_artifact_digest == matching_change_digest
                 and set(item.matched_property_paths).issubset(
-                    {
-                        changed.path
-                        for changed in matching_change.changed_properties
-                    }
+                    {changed.path for changed in matching_change.changed_properties}
                 )
                 and item.path_id == hypothesis.affected_path_id
                 and affected_path is not None
@@ -3699,14 +3422,12 @@ def validate_correlation_report_binding(
                 )
                 and any(
                     flow.observation_id in valid_flow_ids
-                    and
-                    flow.path_id == item.path_id
+                    and flow.path_id == item.path_id
                     and flow.direction == item.direction
                     and flow.five_tuple_digest == item.five_tuple_digest
                     and flow.protocol == item.protocol
                     and flow.source_resource_id == item.source_resource_id
-                    and flow.destination_resource_id
-                    == item.destination_resource_id
+                    and flow.destination_resource_id == item.destination_resource_id
                     and flow.source_address == item.source_address
                     and flow.destination_address == item.destination_address
                     and flow.source_port == item.source_port
@@ -3752,40 +3473,26 @@ def validate_correlation_report_binding(
                     and coverage.status == "complete"
                     and coverage.scope.path_id == item.path_id
                     and item.subject_resource_id in coverage.scope.resource_ids
-                    and coverage.coverage_start
-                    <= request.incident_anchor.observed_start
-                    and coverage.coverage_end
-                    >= request.incident_anchor.observed_end
+                    and coverage.coverage_start <= request.incident_anchor.observed_start
+                    and coverage.coverage_end >= request.incident_anchor.observed_end
                     for coverage in request.monitoring_bundle.coverage
                 )
             }
             if not valid_endpoint_ids:
-                raise ValueError(
-                    "Confirmed network security cause requires endpoint degradation"
-                )
+                raise ValueError("Confirmed network security cause requires endpoint degradation")
             corroboration_ids = gate_map["independentCorroboration"].evidence_ids
             corroboration = [
                 evidence_index[evidence_id]
                 for evidence_id in corroboration_ids
                 if evidence_id not in coverage_index
             ]
-            causal_corroboration_ids = (
-                valid_flow_ids | valid_failed_test_ids | valid_endpoint_ids
-            )
+            causal_corroboration_ids = valid_flow_ids | valid_failed_test_ids | valid_endpoint_ids
             causal_corroboration = [
-                item
-                for item in corroboration
-                if item.evidence_id in causal_corroboration_ids
+                item for item in corroboration if item.evidence_id in causal_corroboration_ids
             ]
             if (
                 len({item.family for item in causal_corroboration}) < 3
-                or len(
-                    {
-                        item.provenance_root_digest
-                        for item in causal_corroboration
-                    }
-                )
-                < 3
+                or len({item.provenance_root_digest for item in causal_corroboration}) < 3
                 or not valid_flow_ids.intersection(corroboration_ids)
                 or not valid_failed_test_ids.intersection(corroboration_ids)
                 or not valid_endpoint_ids.intersection(corroboration_ids)
@@ -3794,9 +3501,7 @@ def validate_correlation_report_binding(
                     "Confirmed network security cause requires independent corroboration"
                 )
         elif hypothesis.confidence == "Confirmed":
-            raise ValueError(
-                "Confirmed confidence is not defined for this cause category"
-            )
+            raise ValueError("Confirmed confidence is not defined for this cause category")
 
 
 def validate_runtime_correlation_report(
@@ -3807,9 +3512,7 @@ def validate_runtime_correlation_report(
 ) -> None:
     validate_correlation_report_binding(report, request)
     if len(report.canonical_bytes()) > CORRELATION_MAX_CANONICAL_BYTES:
-        raise ValueError(
-            "correlation report exceeds its canonical byte budget"
-        )
+        raise ValueError("correlation report exceeds its canonical byte budget")
     if evaluated_at < request.issued_at or evaluated_at > request.expires_at:
         raise ValueError("runtime correlation request is outside its validity window")
     if (
@@ -3831,11 +3534,7 @@ class CorrelationScoreComponents(_StrictCorrelationModel):
     @model_validator(mode="after")
     def validate_sum(self) -> CorrelationScoreComponents:
         if self.raw_score != (
-            self.topology
-            + self.temporal
-            + self.semantic
-            + self.corroboration
-            + self.recovery
+            self.topology + self.temporal + self.semantic + self.corroboration + self.recovery
         ):
             raise ValueError("rawScore must equal the component score sum")
         return self
@@ -3947,13 +3646,9 @@ class RootCauseHypothesis(_StrictCorrelationModel):
     def validate_hypothesis(self) -> RootCauseHypothesis:
         has_omission = self.omitted_candidate_count is not None
         if has_omission != (self.omitted_candidate_digest is not None):
-            raise ValueError(
-                "omitted candidate count and digest must be supplied together"
-            )
+            raise ValueError("omitted candidate count and digest must be supplied together")
         omitted_codes = {
-            item.code
-            for item in self.missing_evidence
-            if item.code == "omittedCandidates"
+            item.code for item in self.missing_evidence if item.code == "omittedCandidates"
         }
         if has_omission and (
             self.category != "unknown"
@@ -3964,24 +3659,16 @@ class RootCauseHypothesis(_StrictCorrelationModel):
             or self.supporting_evidence
             or omitted_codes != {"omittedCandidates"}
         ):
-            raise ValueError(
-                "omitted candidates require one bounded unknown hypothesis"
-            )
+            raise ValueError("omitted candidates require one bounded unknown hypothesis")
         if not has_omission and omitted_codes:
-            raise ValueError(
-                "omittedCandidates requires structural count and digest"
-            )
+            raise ValueError("omittedCandidates requires structural count and digest")
         evidence_ids = tuple(item.evidence_id for item in self.supporting_evidence)
         if evidence_ids != tuple(sorted(evidence_ids)) or len(evidence_ids) != len(
             set(evidence_ids)
         ):
-            raise ValueError(
-                "supportingEvidence must have unique deterministic evidence IDs"
-            )
+            raise ValueError("supportingEvidence must have unique deterministic evidence IDs")
         gate_codes = tuple(item.code for item in self.gates)
-        if gate_codes != tuple(sorted(gate_codes)) or len(gate_codes) != len(
-            set(gate_codes)
-        ):
+        if gate_codes != tuple(sorted(gate_codes)) or len(gate_codes) != len(set(gate_codes)):
             raise ValueError("gates must have unique deterministic codes")
         cap_codes = tuple(item.code for item in self.caps)
         if cap_codes != tuple(sorted(cap_codes)) or len(cap_codes) != len(set(cap_codes)):
@@ -4037,9 +3724,7 @@ class RootCauseHypothesis(_StrictCorrelationModel):
             and self.category == "networkSecurityChange"
             and set(gate_codes) != _NETWORK_SECURITY_CONFIRMED_GATES
         ):
-            raise ValueError(
-                "Confirmed network security cause requires the complete gate set"
-            )
+            raise ValueError("Confirmed network security cause requires the complete gate set")
         expected = _expected_digest(
             self,
             excluded_fields={"rank", "hypothesis_id", "hypothesis_digest"},
@@ -4057,9 +3742,7 @@ class RootCauseHypothesis(_StrictCorrelationModel):
 class CorrelationReport(_StrictCorrelationModel):
     """Deterministic engine output that must be checked against its exact request."""
 
-    schema_version: Literal["athena.wc026CorrelationReport.v1"] = Field(
-        alias="schemaVersion"
-    )
+    schema_version: Literal["athena.wc026CorrelationReport.v1"] = Field(alias="schemaVersion")
     report_id: str = Field(alias="reportId")
     algorithm_id: Literal["athena.wc026.correlation.v1"] = Field(alias="algorithmId")
     rule_catalog_digest: Sha256Digest = Field(alias="ruleCatalogDigest")
@@ -4069,12 +3752,8 @@ class CorrelationReport(_StrictCorrelationModel):
     input_inventory_digest: Sha256Digest = Field(alias="inputInventoryDigest")
     request_digest: Sha256Digest = Field(alias="requestDigest")
     transition_digest: Sha256Digest = Field(alias="transitionDigest")
-    incident_anchor_observed_start: UtcDateTime = Field(
-        alias="incidentAnchorObservedStart"
-    )
-    incident_anchor_observed_end: UtcDateTime = Field(
-        alias="incidentAnchorObservedEnd"
-    )
+    incident_anchor_observed_start: UtcDateTime = Field(alias="incidentAnchorObservedStart")
+    incident_anchor_observed_end: UtcDateTime = Field(alias="incidentAnchorObservedEnd")
     hypotheses: tuple[RootCauseHypothesis, ...] = Field(
         min_length=1,
         max_length=CORRELATION_MAX_HYPOTHESES,
@@ -4098,26 +3777,20 @@ class CorrelationReport(_StrictCorrelationModel):
         if len(hypothesis_ids) != len(set(hypothesis_ids)):
             raise ValueError("duplicate hypothesis IDs are not permitted")
         omission_ranks = tuple(
-            item.rank
-            for item in self.hypotheses
-            if item.omitted_candidate_count is not None
+            item.rank for item in self.hypotheses if item.omitted_candidate_count is not None
         )
         if omission_ranks and (
             len(omission_ranks) != 1
             or len(self.hypotheses) < 2
             or omission_ranks[0] != len(self.hypotheses)
         ):
-            raise ValueError(
-                "one omission hypothesis is permitted only at the final rank"
-            )
+            raise ValueError("one omission hypothesis is permitted only at the final rank")
         if any(
             item.candidate_causal_at is not None
             and item.candidate_causal_at > self.incident_anchor_observed_start
             for item in self.hypotheses
         ):
-            raise ValueError(
-                "candidate causal time must not follow the incident degradation"
-            )
+            raise ValueError("candidate causal time must not follow the incident degradation")
         expected = _expected_digest(
             self,
             excluded_fields={"report_id", "report_digest"},
@@ -4130,9 +3803,7 @@ class CorrelationReport(_StrictCorrelationModel):
             digest=expected,
         )
         if len(self.canonical_bytes()) > CORRELATION_MAX_CANONICAL_BYTES:
-            raise ValueError(
-                "correlation report exceeds its canonical byte budget"
-            )
+            raise ValueError("correlation report exceeds its canonical byte budget")
         return self
 
 
@@ -4157,6 +3828,7 @@ __all__ = [
     "MONITORING_ACQUISITION_EVIDENCE_BUNDLE_SCHEMA_VERSION",
     "MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION",
     "PREVIOUS_CORRELATION_REQUEST_SCHEMA_VERSION",
+    "PREVIOUS_INCIDENT_BOUND_CORRELATION_REQUEST_SCHEMA_VERSION",
     "BindingMode",
     "ConfidenceCap",
     "ConfidenceCapCode",

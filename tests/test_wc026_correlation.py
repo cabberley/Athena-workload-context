@@ -118,8 +118,15 @@ class _MonitoringVerifier:
         self._calls.append(f"monitoring:{as_of.isoformat()}")
         return handoff.compute_artifact_digest_value()
 
-    def verify_acquisition_receipt(self, receipt, *, as_of):
+    def verify_acquisition_receipt(
+        self,
+        receipt,
+        *,
+        as_of,
+        expected_runtime_replay_binding,
+    ):
         self._calls.append(f"acquisition:{as_of.isoformat()}")
+        assert receipt.runtime_replay_binding == expected_runtime_replay_binding
         return receipt.receipt_digest
 
     def verify_persisted_scope(self, bundle, intent):

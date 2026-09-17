@@ -35,6 +35,7 @@ from athena_context.contracts import (
     LogQueryMonitoringSignal,
     MonitoringAcquisitionExchange,
     MonitoringAcquisitionReceipt,
+    MonitoringAcquisitionWireAttempt,
     MonitoringCollectorContract,
     MonitoringEvidenceAttestation,
     MonitoringIdentityProof,
@@ -58,6 +59,7 @@ from athena_context.contracts.monitoring import (
     MonitoringLogPermissionDataSource,
     MonitoringLogPermissionEvidence,
     MonitoringLogPermissionResource,
+    MonitoringRuntimeReplayBinding,
     MonitoringSelectedIncident,
 )
 from athena_context.monitoring_collection import (
@@ -269,6 +271,7 @@ class MonitoringAcquisitionAuthority(_StrictAcquisitionModel):
         "athena.wc028MonitoringAcquisitionAuthority.v3",
         "athena.wc028MonitoringAcquisitionAuthority.v4",
         "athena.wc028MonitoringAcquisitionAuthority.v5",
+        "athena.wc028MonitoringAcquisitionAuthority.v6",
     ] = Field(alias="schemaVersion")
     authority_id: str = Field(
         alias="authorityId",
@@ -359,6 +362,12 @@ class MonitoringAcquisitionAuthority(_StrictAcquisitionModel):
     max_acquisition_calls: int | None = Field(
         default=None,
         alias="maxAcquisitionCalls",
+        ge=1,
+        le=32,
+    )
+    max_logical_exchanges: int | None = Field(
+        default=None,
+        alias="maxLogicalExchanges",
         ge=1,
         le=32,
     )
@@ -470,6 +479,7 @@ class MonitoringAcquisitionAuthority(_StrictAcquisitionModel):
             self.athena_context_principal_id,
             self.required_control_ids,
         )
+        successor_budget_fields = (self.max_logical_exchanges,)
         legacy_assertion_fields = (
             self.monitoring_reader_has_read_only_workload_access,
             self.read_only,
@@ -498,6 +508,7 @@ class MonitoringAcquisitionAuthority(_StrictAcquisitionModel):
                 item is not None
                 for item in (
                     *common_receipt_fields,
+                    *successor_budget_fields,
                     *credential_and_scope_fields,
                     *identity_proof_fields,
                     *effective_rbac_fields,
@@ -513,6 +524,7 @@ class MonitoringAcquisitionAuthority(_StrictAcquisitionModel):
                     *credential_and_scope_fields,
                     *identity_proof_fields,
                     *effective_rbac_fields,
+                    *successor_budget_fields,
                 )
             ):
                 raise ValueError("v2 acquisition authority requires only legacy receipt policy")
@@ -539,20 +551,45 @@ class MonitoringAcquisitionAuthority(_StrictAcquisitionModel):
                 )
             ) or any(item is not None for item in effective_rbac_fields):
                 raise ValueError("v4 acquisition authority requires legacy identity assertions")
+        elif self.schema_version == "athena.wc028MonitoringAcquisitionAuthority.v5":
+            if any(
+                item is None
+                for item in (
+                    *common_receipt_fields,
+                    *credential_and_scope_fields,
+                    *identity_proof_fields,
+                    *effective_rbac_fields,
+                )
+            ) or any(
+                item is not None
+                for item in (
+                    *legacy_assertion_fields,
+                    *successor_budget_fields,
+                )
+            ):
+                raise ValueError(
+                    "v5 acquisition authority requires measured effective RBAC evidence"
+                )
         elif any(
             item is None
             for item in (
                 *common_receipt_fields,
+                *successor_budget_fields,
                 *credential_and_scope_fields,
                 *identity_proof_fields,
                 *effective_rbac_fields,
             )
         ) or any(item is not None for item in legacy_assertion_fields):
-            raise ValueError("v5 acquisition authority requires measured effective RBAC evidence")
+            raise ValueError("v6 acquisition authority requires physical and logical call budgets")
+        if self.schema_version == "athena.wc028MonitoringAcquisitionAuthority.v6" and cast(
+            int, self.max_logical_exchanges
+        ) > cast(int, self.max_acquisition_calls):
+            raise ValueError("logical exchange budget cannot exceed the physical call budget")
         if self.schema_version in {
             "athena.wc028MonitoringAcquisitionAuthority.v3",
             "athena.wc028MonitoringAcquisitionAuthority.v4",
             "athena.wc028MonitoringAcquisitionAuthority.v5",
+            "athena.wc028MonitoringAcquisitionAuthority.v6",
         }:
             required_control_ids = cast(tuple[str, ...], self.required_control_ids)
             required_coverage = cast(
@@ -595,6 +632,7 @@ class MonitoringAcquisitionAuthority(_StrictAcquisitionModel):
         if self.schema_version in {
             "athena.wc028MonitoringAcquisitionAuthority.v4",
             "athena.wc028MonitoringAcquisitionAuthority.v5",
+            "athena.wc028MonitoringAcquisitionAuthority.v6",
         }:
             expected_identity_proof_audience = (
                 f"api://{cast(str, self.monitoring_reader_tenant_id)}"
@@ -623,7 +661,10 @@ class MonitoringAcquisitionAuthority(_StrictAcquisitionModel):
                 "athenaContextIdentityId": self.athena_context_identity_id,
                 "athenaContextPrincipalId": self.athena_context_principal_id,
             }
-            if self.schema_version == "athena.wc028MonitoringAcquisitionAuthority.v5":
+            if self.schema_version in {
+                "athena.wc028MonitoringAcquisitionAuthority.v5",
+                "athena.wc028MonitoringAcquisitionAuthority.v6",
+            }:
                 deployment_payload.update(
                     {
                         "monitoringReaderClientId": self.monitoring_reader_client_id,
@@ -1495,6 +1536,81 @@ type _AzureHttpTransport = HttpTransport[HttpRequest, HttpResponse]
 
 
 @dataclass(frozen=True, slots=True)
+class _PendingWireAttempt:
+    requested_at: datetime
+    request_digest: Sha256Digest
+
+
+class _WireAttemptRecorder(Protocol):
+    def begin_wire_attempt(
+        self,
+        *,
+        method: str,
+        url: str,
+        headers: Mapping[str, str],
+        body: bytes | None,
+    ) -> _PendingWireAttempt: ...
+
+    def complete_wire_attempt(
+        self,
+        pending: _PendingWireAttempt,
+        *,
+        status_code: int,
+        headers: Mapping[str, str],
+    ) -> None: ...
+
+
+class _WireRecordingTransport(HttpTransport[HttpRequest, HttpResponse]):
+    """Record each physical transport send, including authentication resends."""
+
+    def __init__(self, inner: _AzureHttpTransport) -> None:
+        self._inner = inner
+        self._recorder: _WireAttemptRecorder | None = None
+
+    def set_wire_attempt_recorder(self, recorder: _WireAttemptRecorder) -> None:
+        self._recorder = recorder
+
+    def open(self) -> None:
+        self._inner.open()
+
+    def close(self) -> None:
+        self._inner.close()
+
+    def __enter__(self) -> _WireRecordingTransport:
+        self.open()
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        del args
+        self.close()
+
+    def sleep(self, duration: float) -> None:
+        self._inner.sleep(duration)
+
+    def send(self, request: HttpRequest, **kwargs: object) -> HttpResponse:
+        pending = (
+            None
+            if self._recorder is None
+            else self._recorder.begin_wire_attempt(
+                method=request.method,
+                url=request.url,
+                headers={str(name): str(value) for name, value in request.headers.items()},
+                body=(
+                    bytes(request.body) if isinstance(request.body, (bytes, bytearray)) else None
+                ),
+            )
+        )
+        response = self._inner.send(request, **kwargs)
+        if pending is not None:
+            cast(_WireAttemptRecorder, self._recorder).complete_wire_attempt(
+                pending,
+                status_code=response.status_code,
+                headers={str(name): str(value) for name, value in response.headers.items()},
+            )
+        return response
+
+
+@dataclass(frozen=True, slots=True)
 class _AzureJsonResponse:
     status_code: int
     headers: Mapping[str, str]
@@ -1514,7 +1630,7 @@ class _AzureJsonPipeline:
         transport: _AzureHttpTransport | None = None,
     ) -> None:
         self._endpoint = endpoint.rstrip("/")
-        self._transport = (
+        inner_transport = (
             cast(
                 _AzureHttpTransport,
                 RequestsTransport(connection_timeout=10, read_timeout=30),
@@ -1522,10 +1638,17 @@ class _AzureJsonPipeline:
             if transport is None
             else transport
         )
+        self._transport = _WireRecordingTransport(inner_transport)
         self._pipeline: Pipeline[HttpRequest, HttpResponse] = Pipeline(
             transport=self._transport,
             policies=[BearerTokenCredentialPolicy(credential, scope)],
         )
+
+    def set_wire_attempt_recorder(
+        self,
+        recorder: _WireAttemptRecorder,
+    ) -> None:
+        self._transport.set_wire_attempt_recorder(recorder)
 
     def request_json(
         self,
@@ -1864,6 +1987,12 @@ class _AzureAcquisitionClientBase:
             scope=scope,
             transport=transport,
         )
+
+    def set_wire_attempt_recorder(
+        self,
+        recorder: _WireAttemptRecorder,
+    ) -> None:
+        self._http.set_wire_attempt_recorder(recorder)
 
     def _require_request_contract(self, request: _AcquisitionRequest) -> None:
         if (
@@ -3154,6 +3283,21 @@ class _AzureMonitoringClients:
     resource_health: MonitoringResourceHealthClient
     ip_flow_verify: MonitoringIpFlowVerifyClient
 
+    def set_wire_attempt_recorder(
+        self,
+        recorder: _WireAttemptRecorder,
+    ) -> None:
+        for client in (
+            self.log_analytics,
+            self.activity_log,
+            self.resource_graph,
+            self.resource_health,
+            self.ip_flow_verify,
+        ):
+            setter = getattr(client, "set_wire_attempt_recorder", None)
+            if callable(setter):
+                setter(recorder)
+
 
 type _AzureMonitoringClientFactory = Callable[
     [ManagedIdentityCredential, MonitoringCollectorContract],
@@ -3215,6 +3359,10 @@ class AzureMonitoringAdapter:
         self._client_factory: _AzureMonitoringClientFactory = _production_azure_monitoring_clients
         self._identity_proof: MonitoringIdentityProof | None = None
         self._clients: _AzureMonitoringClients | None = None
+        self._active_wire_execution: _AcquisitionExecution | None = None
+        self._active_wire_source: AcquisitionSource | None = None
+        self._active_wire_request_digest: Sha256Digest | None = None
+        self._active_wire_exchange_sequence: int | None = None
 
     @property
     def reviewed_collector_contract(self) -> MonitoringCollectorContract:
@@ -3242,8 +3390,89 @@ class AzureMonitoringAdapter:
                 self._credential,
                 self._reviewed_contract,
             )
+            self._clients.set_wire_attempt_recorder(self)
         self._identity_proof = proof
         return proof
+
+    def begin_logical_exchange(
+        self,
+        *,
+        execution: _AcquisitionExecution,
+        source: AcquisitionSource,
+        request_digest: Sha256Digest,
+        exchange_sequence: int,
+    ) -> None:
+        if self._active_wire_execution is not None:
+            raise MonitoringAcquisitionError(
+                "Azure monitoring adapter already has an active logical exchange"
+            )
+        self._active_wire_execution = execution
+        self._active_wire_source = source
+        self._active_wire_request_digest = request_digest
+        self._active_wire_exchange_sequence = exchange_sequence
+
+    def end_logical_exchange(self) -> None:
+        self._active_wire_execution = None
+        self._active_wire_source = None
+        self._active_wire_request_digest = None
+        self._active_wire_exchange_sequence = None
+
+    def begin_wire_attempt(
+        self,
+        *,
+        method: str,
+        url: str,
+        headers: Mapping[str, str],
+        body: bytes | None,
+    ) -> _PendingWireAttempt:
+        execution = self._active_wire_execution
+        source = self._active_wire_source
+        logical_request_digest = self._active_wire_request_digest
+        exchange_sequence = self._active_wire_exchange_sequence
+        if (
+            execution is None
+            or source is None
+            or logical_request_digest is None
+            or exchange_sequence is None
+        ):
+            raise MonitoringAcquisitionError(
+                "physical Azure request escaped its logical acquisition exchange"
+            )
+        return execution.begin_wire_attempt(
+            method=method,
+            url=url,
+            headers=headers,
+            body=body,
+        )
+
+    def complete_wire_attempt(
+        self,
+        pending: _PendingWireAttempt,
+        *,
+        status_code: int,
+        headers: Mapping[str, str],
+    ) -> None:
+        execution = self._active_wire_execution
+        source = self._active_wire_source
+        logical_request_digest = self._active_wire_request_digest
+        exchange_sequence = self._active_wire_exchange_sequence
+        if (
+            execution is None
+            or source is None
+            or logical_request_digest is None
+            or exchange_sequence is None
+        ):
+            raise MonitoringAcquisitionError(
+                "physical Azure response escaped its logical acquisition exchange"
+            )
+        execution.complete_wire_attempt(
+            pending,
+            source=source,
+            logical_request_digest=logical_request_digest,
+            exchange_sequence=exchange_sequence,
+            status_code=status_code,
+            headers=headers,
+        )
 
     def _verified_clients(self) -> _AzureMonitoringClients:
         if self._identity_proof is None or self._clients is None:
@@ -3291,17 +3520,104 @@ class MonitoringAcquisitionReceiptSigner(Protocol):
 class _AcquisitionExecution:
     adapter: AzureMonitoringAdapter
     identity_proof: MonitoringIdentityProof
+    effective_rbac_inventory_digest: str
+    effective_rbac_source_manifest_digest: str
+    authorization_valid_from: datetime
     authorization_expires_at: datetime
     max_calls: int
+    max_logical_exchanges: int
     max_freshness_seconds: int
     started_at: datetime
     exchanges: list[MonitoringAcquisitionExchange]
+    wire_attempts: list[MonitoringAcquisitionWireAttempt]
+
+    def begin_wire_attempt(
+        self,
+        *,
+        method: str,
+        url: str,
+        headers: Mapping[str, str],
+        body: bytes | None,
+    ) -> _PendingWireAttempt:
+        if len(self.wire_attempts) >= self.max_calls:
+            raise MonitoringAcquisitionError(
+                "monitoring acquisition exceeded its physical request budget"
+            )
+        requested_at = self.adapter.utc_now()
+        if (
+            requested_at < self.started_at
+            or requested_at >= self.identity_proof.expires_at
+            or requested_at >= self.authorization_expires_at
+            or (requested_at - self.started_at).total_seconds() > self.max_freshness_seconds
+        ):
+            raise MonitoringAcquisitionError(
+                "verified monitoring credential is stale before physical Azure request"
+            )
+        request_digest = compute_artifact_digest(
+            {
+                "method": method,
+                "url": url,
+                "headers": {
+                    str(name).casefold(): str(value)
+                    for name, value in sorted(headers.items())
+                    if str(name).casefold() != "authorization"
+                },
+                "bodyDigest": sha256_hex(body or b""),
+            }
+        )
+        return _PendingWireAttempt(
+            requested_at=requested_at,
+            request_digest=request_digest,
+        )
+
+    def complete_wire_attempt(
+        self,
+        pending: _PendingWireAttempt,
+        *,
+        source: AcquisitionSource,
+        logical_request_digest: Sha256Digest,
+        exchange_sequence: int,
+        status_code: int,
+        headers: Mapping[str, str],
+    ) -> None:
+        received_at = self.adapter.utc_now()
+        if received_at < pending.requested_at or received_at >= self.authorization_expires_at:
+            raise MonitoringAcquisitionError(
+                "effective RBAC inventory expired during physical Azure request"
+            )
+        self.wire_attempts.append(
+            MonitoringAcquisitionWireAttempt(
+                sequence=len(self.wire_attempts) + 1,
+                exchangeSequence=exchange_sequence,
+                source=source,
+                requestDigest=pending.request_digest,
+                logicalRequestDigest=logical_request_digest,
+                resultDigest=compute_artifact_digest(
+                    {
+                        "statusCode": status_code,
+                        "headers": {
+                            str(name).casefold(): str(value)
+                            for name, value in sorted(headers.items())
+                        },
+                    }
+                ),
+                requestedAt=pending.requested_at,
+                receivedAt=received_at,
+                effectiveRbacInventoryDigest=self.effective_rbac_inventory_digest,
+                effectiveRbacSourceManifestDigest=(self.effective_rbac_source_manifest_digest),
+                effectiveRbacValidFrom=self.authorization_valid_from,
+                effectiveRbacValidUntil=self.authorization_expires_at,
+            )
+        )
 
     def _capture_call_start(
         self,
         requested_at_override: datetime | None,
     ) -> datetime:
-        if len(self.exchanges) >= self.max_calls:
+        if (
+            len(self.exchanges) >= self.max_logical_exchanges
+            or len(self.wire_attempts) >= self.max_calls
+        ):
             raise MonitoringAcquisitionError(
                 "monitoring acquisition exceeded its total call budget"
             )
@@ -3339,7 +3655,32 @@ class _AcquisitionExecution:
             raise MonitoringAcquisitionError(
                 "IP Flow checkedAt must equal the collector-owned call start"
             )
-        result = operation(request)
+        source = cast(AcquisitionSource, request.source)
+        exchange_sequence = len(self.exchanges) + 1
+        wire_attempt_start = len(self.wire_attempts)
+        begin_logical_exchange = getattr(
+            self.adapter,
+            "begin_logical_exchange",
+            None,
+        )
+        end_logical_exchange = getattr(
+            self.adapter,
+            "end_logical_exchange",
+            None,
+        )
+        if callable(begin_logical_exchange) and callable(end_logical_exchange):
+            begin_logical_exchange(
+                execution=self,
+                source=source,
+                request_digest=request.request_digest,
+                exchange_sequence=exchange_sequence,
+            )
+            try:
+                result = operation(request)
+            finally:
+                end_logical_exchange()
+        else:
+            result = operation(request)
         received_at = self.adapter.utc_now()
         if received_at < requested_at or received_at >= self.authorization_expires_at:
             if received_at >= self.authorization_expires_at:
@@ -3347,17 +3688,52 @@ class _AcquisitionExecution:
                     "effective RBAC inventory expired during Azure source I/O"
                 )
             raise MonitoringAcquisitionError("collector runtime returned non-monotonic time")
-        source = cast(AcquisitionSource, request.source)
+        result_digest = sha256_hex(result.canonical_bytes())
+        if len(self.wire_attempts) == wire_attempt_start:
+            if len(self.wire_attempts) >= self.max_calls:
+                raise MonitoringAcquisitionError(
+                    "monitoring acquisition exceeded its physical request budget"
+                )
+            self.wire_attempts.append(
+                MonitoringAcquisitionWireAttempt(
+                    sequence=len(self.wire_attempts) + 1,
+                    exchangeSequence=exchange_sequence,
+                    source=source,
+                    requestDigest=request.request_digest,
+                    logicalRequestDigest=request.request_digest,
+                    resultDigest=result_digest,
+                    exchangeResultDigest=result_digest,
+                    requestedAt=requested_at,
+                    receivedAt=received_at,
+                    effectiveRbacInventoryDigest=self.effective_rbac_inventory_digest,
+                    effectiveRbacSourceManifestDigest=(self.effective_rbac_source_manifest_digest),
+                    effectiveRbacValidFrom=self.authorization_valid_from,
+                    effectiveRbacValidUntil=self.authorization_expires_at,
+                )
+            )
+        else:
+            final_attempt = self.wire_attempts[-1]
+            if final_attempt.exchange_sequence != exchange_sequence:
+                raise MonitoringAcquisitionError(
+                    "physical Azure attempts escaped their logical exchange"
+                )
+            self.wire_attempts[-1] = final_attempt.model_copy(
+                update={"exchange_result_digest": result_digest}
+            )
         self.exchanges.append(
             MonitoringAcquisitionExchange(
-                sequence=len(self.exchanges) + 1,
+                sequence=exchange_sequence,
                 source=source,
                 requestDigest=request.request_digest,
-                resultDigest=sha256_hex(result.canonical_bytes()),
+                resultDigest=result_digest,
                 requestedAt=requested_at,
                 receivedAt=received_at,
                 checkedAt=checked_at,
                 identityProofDigest=self.identity_proof.proof_digest,
+                effectiveRbacInventoryDigest=self.effective_rbac_inventory_digest,
+                effectiveRbacSourceManifestDigest=(self.effective_rbac_source_manifest_digest),
+                effectiveRbacValidFrom=self.authorization_valid_from,
+                effectiveRbacValidUntil=self.authorization_expires_at,
             )
         )
         return result
@@ -3991,10 +4367,10 @@ class MonitoringAcquisitionCoordinator:
             )
         if (
             self._acquisition_authority.schema_version
-            != "athena.wc028MonitoringAcquisitionAuthority.v5"
+            != "athena.wc028MonitoringAcquisitionAuthority.v6"
         ):
             raise MonitoringAcquisitionError(
-                "Athena-proven acquisition requires authority schema v5"
+                "Athena-proven acquisition requires authority schema v6"
             )
         effective_rbac_inventory = self._collector_contract.effective_rbac_inventory
         if (
@@ -4053,6 +4429,7 @@ class MonitoringAcquisitionCoordinator:
         execution: _AcquisitionExecution,
         monitoring_intent: PublishedMonitoringIntent,
         context_binding: PublishedRuntimeContextBinding,
+        runtime_replay_binding: MonitoringRuntimeReplayBinding,
         batch: MonitoringCollectionBatch,
         selected_incident: SelectedIncident,
         collection_batch_digest: str,
@@ -4097,10 +4474,16 @@ class MonitoringAcquisitionCoordinator:
                 batch=batch,
                 selected_incident=selected_incident,
             ),
+            "effectiveRbacInventoryDigest": execution.effective_rbac_inventory_digest,
+            "effectiveRbacSourceManifestDigest": (execution.effective_rbac_source_manifest_digest),
+            "effectiveRbacValidFrom": execution.authorization_valid_from,
+            "effectiveRbacValidUntil": execution.authorization_expires_at,
+            "runtimeReplayBinding": runtime_replay_binding,
             "executionStartedAt": execution.started_at,
             "executionCompletedAt": execution_completed_at,
             "receiptIssuedAt": receipt_issued_at,
             "exchanges": tuple(execution.exchanges),
+            "wireAttempts": tuple(execution.wire_attempts),
             "identityProof": identity_proof,
         }
         receipt_digest = compute_artifact_digest(_json_value(payload))
@@ -4143,6 +4526,7 @@ class MonitoringAcquisitionCoordinator:
         *,
         monitoring_intent: PublishedMonitoringIntent,
         context_binding: PublishedRuntimeContextBinding,
+        runtime_replay_binding: MonitoringRuntimeReplayBinding,
         expected_active_context_authority_digest: str,
         collected_at: datetime,
         change_scope: ApprovedChangeScope,
@@ -4156,6 +4540,8 @@ class MonitoringAcquisitionCoordinator:
             raise TypeError("acquisition requires an exact PublishedMonitoringIntent")
         if type(context_binding) is not PublishedRuntimeContextBinding:
             raise TypeError("acquisition requires an exact PublishedRuntimeContextBinding")
+        if type(runtime_replay_binding) is not MonitoringRuntimeReplayBinding:
+            raise TypeError("acquisition requires an exact runtime replay-v3 binding")
         del collected_at
         controls_by_id = {item.control_id: item for item in monitoring_intent.controls}
         required_control_ids = set(
@@ -4214,6 +4600,37 @@ class MonitoringAcquisitionCoordinator:
                 context_binding,
                 expected_active_context_authority_digest=(expected_active_context_authority_digest),
             )
+            trust_delay_seconds = (trusted_as_of - issued_at).total_seconds()
+            request_lifetime_seconds = (expires_at - issued_at).total_seconds()
+            if (
+                not issued_at <= trusted_as_of < expires_at
+                or trust_delay_seconds > self._acquisition_authority.max_freshness_seconds
+            ):
+                raise MonitoringAcquisitionError(
+                    "collection time is outside the acquisition authority freshness bound"
+                )
+            if (
+                runtime_replay_binding.acquisition_authority_digest
+                != self._acquisition_authority.authority_digest
+                or runtime_replay_binding.monitoring_intent_digest
+                != monitoring_intent.intent_digest
+                or runtime_replay_binding.monitoring_intent_reference_digest
+                != intent_reference.reference_digest
+                or runtime_replay_binding.context_binding_digest != context_binding.binding_digest
+                or runtime_replay_binding.incident_revision != incident_revision
+                or runtime_replay_binding.legacy_collector_rbac_cleanup_digest
+                != self._collector_contract.legacy_collector_rbac_cleanup_digest
+                or runtime_replay_binding.monitoring_evidence_storage_readiness_digest
+                != self._collector_contract.evidence_storage_readiness_digest
+                or runtime_replay_binding.issued_at != issued_at
+                or runtime_replay_binding.trusted_as_of != trusted_as_of
+                or runtime_replay_binding.expires_at != expires_at
+                or trust_delay_seconds != runtime_replay_binding.trust_delay_seconds
+                or request_lifetime_seconds != runtime_replay_binding.request_lifetime_seconds
+            ):
+                raise MonitoringAcquisitionError(
+                    "runtime replay v3 does not bind the reviewed acquisition execution"
+                )
             required_sources, required_resources = _required_control_authority_scope(
                 selected_controls,
                 self._collector_contract,
@@ -4280,11 +4697,19 @@ class MonitoringAcquisitionCoordinator:
         execution = _AcquisitionExecution(
             adapter=self._acquisition_adapter,
             identity_proof=identity_proof,
+            effective_rbac_inventory_digest=effective_rbac_inventory.inventory_digest,
+            effective_rbac_source_manifest_digest=(effective_rbac_inventory.source_manifest_digest),
+            authorization_valid_from=effective_rbac_inventory.collected_at,
             authorization_expires_at=effective_rbac_inventory.expires_at,
             max_calls=cast(int, self._acquisition_authority.max_acquisition_calls),
+            max_logical_exchanges=cast(
+                int,
+                self._acquisition_authority.max_logical_exchanges,
+            ),
             max_freshness_seconds=self._acquisition_authority.max_freshness_seconds,
             started_at=collected_at,
             exchanges=[],
+            wire_attempts=[],
         )
 
         records: list[MonitoringCollectionRecord] = []
@@ -4445,6 +4870,7 @@ class MonitoringAcquisitionCoordinator:
             execution=execution,
             monitoring_intent=monitoring_intent,
             context_binding=context_binding,
+            runtime_replay_binding=runtime_replay_binding,
             batch=batch,
             selected_incident=selected_incident,
             collection_batch_digest=sha256_hex(batch.canonical_bytes()),

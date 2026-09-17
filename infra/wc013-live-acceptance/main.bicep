@@ -360,12 +360,12 @@ var wc027PublisherImageInvalidCharacters = replace(replace(replace(replace(repla
 var wc027PublisherImageValid = wc027PublisherImage == toLower(wc027PublisherImage) && length(wc027PublisherImageDigest) == 64 && empty(wc027PublisherImageInvalidCharacters) && wc027PublisherImageDigest != '0000000000000000000000000000000000000000000000000000000000000000'
 var wc027ParsedPublisherConfiguration = json(
   empty(wc027PublisherConfigurationJson)
-    ? '{"schemaVersion":"","deploymentBinding":{"attachedIdentityResourceIds":[],"bindingEvidenceId":"","rbacResourceIds":[]},"enrichmentRuntimeConfiguration":{"schemaVersion":"","monitoringCollectorContract":{"schemaVersion":"","acquisitionReceiptSchemaVersion":""},"monitoringCollectorContractDigest":"","monitoringAcquisitionAuthorityDigest":""},"monitoringAcquisitionTrust":{"collectorContractDigest":"","acquisitionAuthorityDigest":""},"serviceBus":{"brokerIdentityResourceId":"","namespace":"","requestQueueName":""}}'
+    ? '{"schemaVersion":"","deploymentBinding":{"attachedIdentityResourceIds":[],"bindingEvidenceId":"","rbacResourceIds":[]},"enrichmentRuntimeConfiguration":{"schemaVersion":"","monitoringCollectorContract":{"schemaVersion":"","acquisitionReceiptSchemaVersion":""},"monitoringCollectorContractDigest":"","monitoringAcquisitionAuthority":{"schemaVersion":"","authorityDigest":"","collectorContractDigest":"","maxAcquisitionCalls":0,"maxLogicalExchanges":0},"monitoringAcquisitionAuthorityDigest":""},"monitoringAcquisitionTrust":{"collectorContractDigest":"","acquisitionAuthorityDigest":""},"serviceBus":{"brokerIdentityResourceId":"","namespace":"","requestQueueName":""}}'
     : wc027PublisherConfigurationJson
 )
 var wc027ParsedProducerConfiguration = json(
   empty(wc027EnrichmentFeedProducerConfigurationJson)
-    ? '{"schemaVersion":"","monitoringCollectorContract":{"schemaVersion":"","acquisitionReceiptSchemaVersion":""},"monitoringCollectorContractDigest":"","monitoringAcquisitionAuthorityDigest":""}'
+    ? '{"schemaVersion":"","monitoringCollectorContract":{"schemaVersion":"","acquisitionReceiptSchemaVersion":""},"monitoringCollectorContractDigest":"","monitoringAcquisitionAuthority":{"schemaVersion":"","authorityDigest":"","collectorContractDigest":"","maxAcquisitionCalls":0,"maxLogicalExchanges":0},"monitoringAcquisitionAuthorityDigest":""}'
     : wc027EnrichmentFeedProducerConfigurationJson
 )
 var wc027MonitoringCollectorContractDigestHex = replace(wc027ParsedProducerConfiguration.monitoringCollectorContractDigest, 'sha256:', '')
@@ -392,7 +392,7 @@ var wc027MonitoringAcquisitionAuthorityDigestInvalidCharacters = replace(replace
   ''
 ), 'b', ''), 'c', ''), 'd', ''), 'e', ''), 'f', '')
 var wc027MonitoringAcquisitionAuthorityDigestValid = wc027ParsedProducerConfiguration.monitoringAcquisitionAuthorityDigest == toLower(wc027ParsedProducerConfiguration.monitoringAcquisitionAuthorityDigest) && startsWith(wc027ParsedProducerConfiguration.monitoringAcquisitionAuthorityDigest, 'sha256:') && length(wc027MonitoringAcquisitionAuthorityDigestHex) == 64 && empty(wc027MonitoringAcquisitionAuthorityDigestInvalidCharacters) && wc027MonitoringAcquisitionAuthorityDigestHex != '0000000000000000000000000000000000000000000000000000000000000000'
-var wc027ProducerMonitoringTrustIsCurrent = wc027ParsedProducerConfiguration.schemaVersion == 'athena.wc027EnrichmentFeedRuntimeConfiguration.v2' && wc027ParsedProducerConfiguration.monitoringCollectorContract.schemaVersion == 'athena.wc028MonitoringCollectorContract.v8' && wc027ParsedProducerConfiguration.monitoringCollectorContract.acquisitionReceiptSchemaVersion == 'athena.wc028MonitoringAcquisitionReceipt.v5' && wc027MonitoringCollectorContractDigestValid && wc027MonitoringAcquisitionAuthorityDigestValid
+var wc027ProducerMonitoringTrustIsCurrent = wc027ParsedProducerConfiguration.schemaVersion == 'athena.wc027EnrichmentFeedRuntimeConfiguration.v2' && wc027ParsedProducerConfiguration.monitoringCollectorContract.schemaVersion == 'athena.wc028MonitoringCollectorContract.v9' && wc027ParsedProducerConfiguration.monitoringCollectorContract.acquisitionReceiptSchemaVersion == 'athena.wc028MonitoringAcquisitionReceipt.v6' && wc027ParsedProducerConfiguration.monitoringAcquisitionAuthority.schemaVersion == 'athena.wc028MonitoringAcquisitionAuthority.v6' && wc027ParsedProducerConfiguration.monitoringAcquisitionAuthority.authorityDigest == wc027ParsedProducerConfiguration.monitoringAcquisitionAuthorityDigest && wc027ParsedProducerConfiguration.monitoringAcquisitionAuthority.collectorContractDigest == wc027ParsedProducerConfiguration.monitoringCollectorContractDigest && int(wc027ParsedProducerConfiguration.monitoringAcquisitionAuthority.maxLogicalExchanges) >= 1 && int(wc027ParsedProducerConfiguration.monitoringAcquisitionAuthority.maxAcquisitionCalls) >= int(wc027ParsedProducerConfiguration.monitoringAcquisitionAuthority.maxLogicalExchanges) && wc027MonitoringCollectorContractDigestValid && wc027MonitoringAcquisitionAuthorityDigestValid
 var wc027PublisherMonitoringTrustMatches = wc027ParsedPublisherConfiguration.schemaVersion == 'athena.wc027GuidanceAuthorityPublisherConfiguration.v2' && wc027ParsedPublisherConfiguration.monitoringAcquisitionTrust.collectorContractDigest == wc027ParsedProducerConfiguration.monitoringCollectorContractDigest && wc027ParsedPublisherConfiguration.monitoringAcquisitionTrust.acquisitionAuthorityDigest == wc027ParsedProducerConfiguration.monitoringAcquisitionAuthorityDigest
 var wc027PublisherImageRegistryServer = first(split(wc027PublisherImage, '/'))
 var wc027PublisherExpectedIdentityResourceIds = map(
@@ -455,7 +455,7 @@ var validatedWc027PublisherReady = wc027PublisherReady && !wc027PublisherJobReso
                       : wc027PublisherReady && string(wc027ParsedPublisherConfiguration.enrichmentRuntimeConfiguration) != string(wc027ParsedProducerConfiguration)
                         ? fail('WC-027 publisher embedded runtime configuration JSON does not match the producer')
                       : wc027PublisherReady && !wc027ProducerMonitoringTrustIsCurrent
-                        ? fail('WC-027 publisher requires the exact v8 monitoring collector contract and acquisition authority binding')
+                        ? fail('WC-027 publisher requires the exact v9 monitoring collector contract and acquisition authority binding')
                       : wc027PublisherReady && !wc027PublisherMonitoringTrustMatches
                         ? fail('WC-027 publisher monitoring acquisition trust does not match the producer')
                       : wc027PublisherReady && wc027PublisherJob!.tags.monitoringCollectorContractDigest != wc027ParsedProducerConfiguration.monitoringCollectorContractDigest
@@ -508,7 +508,7 @@ var wc027ConfigurationDigestValid = length(wc027EnrichmentFeedProducerConfigurat
 ) && empty(wc027ConfigurationDigestInvalidCharacters)
 var wc027ParsedConfiguration = json(
   empty(wc027EnrichmentFeedProducerConfigurationJson)
-    ? '{"schemaVersion":"","deploymentBinding":{"attachedIdentityResourceIds":[],"bindingEvidenceId":"","rbacResourceIds":[]},"monitoringCollectorContract":{"schemaVersion":"","acquisitionReceiptSchemaVersion":""},"monitoringCollectorContractDigest":"","monitoringAcquisitionAuthorityDigest":""}'
+    ? '{"schemaVersion":"","deploymentBinding":{"attachedIdentityResourceIds":[],"bindingEvidenceId":"","rbacResourceIds":[]},"monitoringCollectorContract":{"schemaVersion":"","acquisitionReceiptSchemaVersion":""},"monitoringCollectorContractDigest":"","monitoringAcquisitionAuthority":{"schemaVersion":"","authorityDigest":"","collectorContractDigest":"","maxAcquisitionCalls":0,"maxLogicalExchanges":0},"monitoringAcquisitionAuthorityDigest":""}'
     : wc027EnrichmentFeedProducerConfigurationJson
 )
 var wc027AttachedIdentityResourceIds = wc027FeedV2ProducerReady && wc027ProducerJobResourceIdValid
@@ -576,7 +576,7 @@ var validatedWc027FeedV2ProducerReady = wc027FeedV2ProducerReady && !startsWith(
             : wc027FeedV2ProducerReady && wc027ProducerJob!.properties.template.containers[0].env[1].value != wc027EnrichmentFeedProducerConfigurationJson
               ? fail('WC-027 producer Job configuration does not match the activation input')
             : wc027FeedV2ProducerReady && !wc027ProducerMonitoringTrustIsCurrent
-              ? fail('WC-027 Notification v2 requires the exact v8 monitoring collector contract and acquisition authority binding')
+              ? fail('WC-027 Notification v2 requires the exact v9 monitoring collector contract and acquisition authority binding')
             : wc027FeedV2ProducerReady && wc027ProducerJob!.tags.monitoringCollectorContractDigest != wc027ParsedConfiguration.monitoringCollectorContractDigest
               ? fail('WC-027 producer collector contract digest tag does not match its deployed configuration')
             : wc027FeedV2ProducerReady && wc027ProducerJob!.tags.monitoringAcquisitionAuthorityDigest != wc027ParsedConfiguration.monitoringAcquisitionAuthorityDigest

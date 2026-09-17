@@ -2162,7 +2162,7 @@ def test_production_verification_rejects_historical_v3_request() -> None:
 
     assert reissued_request.schema_version == PREVIOUS_CORRELATION_REQUEST_SCHEMA_VERSION
     assert reissued_request.trusted_as_of == trusted_as_of
-    with pytest.raises(ValueError, match="incident-bound request v4"):
+    with pytest.raises(ValueError, match="replay-bound request v5"):
         service.correlate(reissued_request)
 
 

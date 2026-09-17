@@ -5,6 +5,7 @@ import os
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import cast
 
 from azure.core.exceptions import (
     HttpResponseError,
@@ -421,6 +422,14 @@ def _build_correlation(
             expected_collector_contract_digest=(configuration.monitoring_collector_contract_digest),
             expected_acquisition_authority_digest=(
                 configuration.monitoring_acquisition_authority_digest
+            ),
+            expected_maximum_acquisition_calls=cast(
+                int,
+                configuration.monitoring_acquisition_authority.max_acquisition_calls,
+            ),
+            expected_maximum_logical_exchanges=cast(
+                int,
+                configuration.monitoring_acquisition_authority.max_logical_exchanges,
             ),
         ),
         change_verifier=TrustedChangeArtifactVerifier(

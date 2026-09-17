@@ -57,6 +57,7 @@ from test_wc027_incident_enrichment_publication import (
     _publication_service,
     _Store,
 )
+from test_wc028_monitoring_acquisition import _acquisition_authority
 
 
 class _Signer:
@@ -280,6 +281,9 @@ def _bicep_generated_runtime_configuration() -> dict[str, object]:
         "expiresAt": None,
     }
     monitoring_collector_contract = _acquisition_collector_contract()
+    monitoring_acquisition_authority = _acquisition_authority(
+        collector_contract=monitoring_collector_contract
+    )
     return {
         "schemaVersion": "athena.wc027EnrichmentFeedRuntimeConfiguration.v2",
         "serviceBus": {
@@ -336,7 +340,11 @@ def _bicep_generated_runtime_configuration() -> dict[str, object]:
         "monitoringCollectorContractDigest": (
             monitoring_collector_contract.compute_artifact_digest_value()
         ),
-        "monitoringAcquisitionAuthorityDigest": "sha256:" + "a" * 64,
+        "monitoringAcquisitionAuthority": monitoring_acquisition_authority.model_dump(
+            mode="json",
+            by_alias=True,
+        ),
+        "monitoringAcquisitionAuthorityDigest": (monitoring_acquisition_authority.authority_digest),
         "monitoringCollectorKey": monitoring_collector_key,
         "keys": {
             "incident": key(
@@ -578,11 +586,11 @@ def test_runtime_rejects_reused_public_key_material_across_trust_domains() -> No
         Wc027EnrichmentFeedProductionConfiguration.model_validate_json(json.dumps(payload))
 
 
-def test_runtime_requires_exact_v8_collector_contract_digest() -> None:
+def test_runtime_requires_exact_v9_collector_contract_digest() -> None:
     payload = _bicep_generated_runtime_configuration()
     payload["monitoringCollectorContractDigest"] = "sha256:" + "f" * 64
 
-    with pytest.raises(ValueError, match="does not bind the exact v8 contract"):
+    with pytest.raises(ValueError, match="does not bind the exact v9 contract"):
         Wc027EnrichmentFeedProductionConfiguration.model_validate_json(json.dumps(payload))
 
 
@@ -1120,6 +1128,9 @@ def test_production_configuration_rejects_identity_and_key_reuse() -> None:
         )
 
     monitoring_collector_contract = _acquisition_collector_contract()
+    monitoring_acquisition_authority = _acquisition_authority(
+        collector_contract=monitoring_collector_contract
+    )
     values = {
         "broker_identity_client_id": identity_ids[0],
         "broker_identity_resource_id": resource_id(0),
@@ -1150,7 +1161,10 @@ def test_production_configuration_rejects_identity_and_key_reuse() -> None:
         "monitoring_collector_contract_digest": (
             monitoring_collector_contract.compute_artifact_digest_value()
         ),
-        "monitoring_acquisition_authority_digest": "sha256:" + "a" * 64,
+        "monitoring_acquisition_authority": monitoring_acquisition_authority,
+        "monitoring_acquisition_authority_digest": (
+            monitoring_acquisition_authority.authority_digest
+        ),
         "monitoring_collector_key": _MonitoringCollectorKey(
             authority=key(1, 10),
             activated_at=NOW,

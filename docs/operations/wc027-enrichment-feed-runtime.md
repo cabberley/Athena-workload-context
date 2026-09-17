@@ -65,7 +65,7 @@ Service Bus namespace, and Key Vault keys. The strict configuration contains:
   `monitoring-intent/`;
 - exact guidance-authority Blob source;
 - signed current guidance-activation Table source;
-- the reviewed WC-028 v8 `MonitoringCollectorContract`, its exact canonical SHA-256 digest, and
+- the reviewed WC-028 v9 `MonitoringCollectorContract`, its exact canonical SHA-256 digest, and
   the exact deployed acquisition-authority digest accepted by production correlation;
 - a deployment binding containing the exact resource IDs of every identity attached to the Job
   and the deterministic RBAC evidence ID generated from the deployed assignments;
@@ -103,9 +103,22 @@ correlation reader identities/storage domains, and reused producer signing keys 
 Supply the referenced resource IDs/names (user-assigned identities, replay storage account,
 correlation source storage account, Service Bus namespace, and Key Vault keys); the module derives
 every runtime value from them. Supply the phase-two WC-024
-`monitoringAcquisitionCollectorContract` output, its independently computed canonical digest, and
-the exact deployed WC-028 acquisition-authority digest. Legacy v3 contracts are parse-only and
-must be recollected and republished as v8 before this runtime can start. Supply
+deployment name, the server-computed template hash of that reviewed deployment, the expected
+canonical collector-contract digest, and the full exact deployed WC-028 acquisition-authority v6
+object plus its digest.
+A subscription-scoped resolver module retrieves the contract and publication handoff directly
+from that exact successful deployment and requires
+`effectiveRbacCryptographicReviewVerified=true`; a caller-substituted contract is rejected. The v9
+contract parser independently revalidates the embedded
+inventory digest, external reviewer key separation and RS256 signature, exact collector/attestor
+runtime attachments, absence of federated credentials, exclusive writer/signer evidence, exact
+known-name Blob read plus add-only condition, non-zero cleanup evidence, and Blob
+versioning/immutability/public-access readback and the narrow runtime-support storage-reader
+authorization. Its authorized receipt v6 carries per-exchange effective-RBAC validity, every
+physical request attempt, authority-specific physical/logical budgets, and the collector-signed
+replay-v3 and storage-readiness binding consumed by the stacked acquisition runtime.
+Legacy v3-v8 contracts are parse-only and must be recollected and republished as v9 before this
+runtime can start. Supply
 `runtimeConfigurationDigest` as the externally computed `sha256:<lowercase-hex>` digest of the
 module's generated `deployedRuntimeConfigurationJson` output.
 Record the `deployedRuntimeConfigurationDigest`, `attachedIdentityResourceIds`, and
@@ -183,7 +196,7 @@ until all of the following are evidenced:
 5. a partial-write retry reaches the same immutable assets and registry row;
 6. feed-v2 CAS reconciliation commits the exact entry; and
 7. a stale or non-current binding is rejected by activation verification; and
-8. the producer and publisher carry the same non-placeholder v8 collector-contract and
+8. the producer and publisher carry the same non-placeholder v9 collector-contract and
    acquisition-authority digests in their generated configuration and deployed Job tags; and
 9. Notification v2 is observed only after the feed entry is verifiable.
 

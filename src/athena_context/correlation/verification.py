@@ -53,6 +53,7 @@ from athena_context.contracts.monitoring import (
     MonitoringAcquisitionReceipt,
     MonitoringCollectorContract,
     MonitoringEvidenceHandoff,
+    MonitoringRuntimeReplayBinding,
     verify_monitoring_acquisition_receipt_attestation,
     verify_monitoring_evidence_handoff_attestation,
 )
@@ -108,6 +109,7 @@ class MonitoringHandoffVerifier(Protocol):
         receipt: MonitoringAcquisitionReceipt,
         *,
         as_of: UtcDateTime,
+        expected_runtime_replay_binding: MonitoringRuntimeReplayBinding,
     ) -> str: ...
 
     def verify_persisted_scope(
@@ -178,6 +180,8 @@ class TrustedMonitoringHandoffVerifier:
     key_resolver: KeyVaultTrustedKeyResolver
     expected_collector_contract_digest: str
     expected_acquisition_authority_digest: str
+    expected_maximum_acquisition_calls: int
+    expected_maximum_logical_exchanges: int
     acquisition_receipt_maximum_age_seconds: int = 900
     receipt_trusted_key_anchor: TrustedKeyAnchor | None = None
     receipt_key_resolver: KeyVaultTrustedKeyResolver | None = None
@@ -202,7 +206,7 @@ class TrustedMonitoringHandoffVerifier:
         ):
             raise ValueError(
                 "legacy monitoring collector contracts, including v3, are parse-only; "
-                "production correlation requires recollection and republication under v8"
+                "production correlation requires recollection and republication under v9"
             )
         if (
             self.expected_collector_contract_digest
@@ -230,6 +234,15 @@ class TrustedMonitoringHandoffVerifier:
                 or any(character not in "0123456789abcdef" for character in value[7:])
             ):
                 raise ValueError(f"production monitoring {label} digest is invalid")
+        if (
+            type(self.expected_maximum_acquisition_calls) is not int
+            or type(self.expected_maximum_logical_exchanges) is not int
+            or not 1
+            <= self.expected_maximum_logical_exchanges
+            <= self.expected_maximum_acquisition_calls
+            <= 128
+        ):
+            raise ValueError("production monitoring authority call budgets are invalid")
 
     def verify(
         self,
@@ -252,6 +265,7 @@ class TrustedMonitoringHandoffVerifier:
         receipt: MonitoringAcquisitionReceipt,
         *,
         as_of: UtcDateTime,
+        expected_runtime_replay_binding: MonitoringRuntimeReplayBinding,
     ) -> str:
         receipt_anchor = self.receipt_trusted_key_anchor
         receipt_resolver = self.receipt_key_resolver
@@ -269,7 +283,10 @@ class TrustedMonitoringHandoffVerifier:
             key_resolver=receipt_resolver,
             reviewed_collector_contract=self.reviewed_contract,
             expected_acquisition_authority_digest=(self.expected_acquisition_authority_digest),
+            maximum_acquisition_calls=self.expected_maximum_acquisition_calls,
+            maximum_logical_exchanges=self.expected_maximum_logical_exchanges,
             maximum_receipt_age_seconds=(self.acquisition_receipt_maximum_age_seconds),
+            expected_runtime_replay_binding=expected_runtime_replay_binding,
         )
         return receipt.receipt_digest
 
@@ -631,7 +648,7 @@ class _CorrelationVerificationService:
             self.require_signed_monitoring_intent
             and request.schema_version != CORRELATION_REQUEST_SCHEMA_VERSION
         ):
-            raise ValueError("production correlation requires incident-bound request v4")
+            raise ValueError("production correlation requires replay-bound request v5")
         if evaluated_at < request.trusted_as_of:
             raise ValueError("verification time must not precede request trustedAsOf")
         if evaluated_at < request.issued_at or evaluated_at > request.expires_at:
@@ -704,6 +721,10 @@ class _CorrelationVerificationService:
                 self.monitoring_verifier.verify_acquisition_receipt(
                     acquisition_receipt,
                     as_of=evaluated_at,
+                    expected_runtime_replay_binding=cast(
+                        MonitoringRuntimeReplayBinding,
+                        request.runtime_replay_binding,
+                    ),
                 )
                 != acquisition_receipt.receipt_digest
             ):

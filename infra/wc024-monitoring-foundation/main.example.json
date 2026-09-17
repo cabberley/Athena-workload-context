@@ -59,6 +59,42 @@
     "athenaContextIdentityResourceId": {
       "value": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-athena-demo-context/providers/Microsoft.ManagedIdentity/userAssignedIdentities/athena-demo-context"
     },
+    "collectorRuntimeResourceId": {
+      "value": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-athena-wc013-live/providers/Microsoft.App/jobs/athena-wc028-monitoring-acquisition"
+    },
+    "rbacAttestorRuntimeResourceId": {
+      "value": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-athena-demo-monitoring/providers/Microsoft.App/jobs/athena-wc028-rbac-attestor"
+    },
+    "runtimeSupportIdentityResourceId": {
+      "value": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-athena-wc013-live/providers/Microsoft.ManagedIdentity/userAssignedIdentities/athena-wc028-monitoring-acquisition-support-id"
+    },
+    "rbacInventoryReviewerPrincipalId": {
+      "value": "77777777-7777-7777-7777-777777777777"
+    },
+    "rbacInventoryReviewerKeyId": {
+      "value": "https://athenarbacevidencekv.vault.azure.net/keys/monitoring-rbac-inventory-review/0123456789abcdef0123456789abcdef"
+    },
+    "rbacInventoryReviewerKeyArmResourceId": {
+      "value": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-athena-rbac-review/providers/Microsoft.KeyVault/vaults/athenarbacevidencekv/keys/monitoring-rbac-inventory-review"
+    },
+    "rbacInventoryVerifierIdentityResourceId": {
+      "value": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-athena-rbac-review/providers/Microsoft.ManagedIdentity/userAssignedIdentities/athena-wc028-rbac-review-verifier"
+    },
+    "rbacInventoryReviewerPublicKeyModulus": {
+      "value": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    },
+    "rbacInventoryReviewerPublicKeyExponent": {
+      "value": "AQAB"
+    },
+    "rbacInventoryReviewerPublicKeyFingerprint": {
+      "value": "sha256:abababababababababababababababababababababababababababababababab"
+    },
+    "legacyCollectorRbacCleanupDigest": {
+      "value": "sha256:9999999999999999999999999999999999999999999999999999999999999999"
+    },
+    "monitoringEvidenceStorageReadinessDigest": {
+      "value": "sha256:d6ffd8f9985cee9831ee4950bcf5234ae76de641afdb7133e6dceb9ca80cd103"
+    },
     "retentionDays": {
       "value": 30
     },

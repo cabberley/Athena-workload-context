@@ -94,22 +94,30 @@ required freshness bound. Version 1 assets are rejected rather than silently tre
 coverage or unbounded health events as activation eligible.
 
 Production acquisition uses `athena.wc028MonitoringEvidenceBundle.v3`,
-`athena.wc028MonitoringAcquisitionReceipt.v5`, and
-`athena.wc028CorrelationRequest.v4`. Receipt v5 signs a minimal `selectedIncident` containing the
+`athena.wc028MonitoringAcquisitionReceipt.v6`, and
+`athena.wc028CorrelationRequest.v5`. Receipt v6 preserves the v5 minimal `selectedIncident`
+containing the
 canonical incident resource, exact previous/current normalized source-record IDs, selected adverse
-state, and transition digest. Correlation request v4 carries the same value and reconstructs both
-the selection and canonical citation-bearing transition from persisted evidence.
+state, and transition digest. It additionally signs the exact effective-RBAC inventory digest,
+source-manifest digest, validity interval on every exchange, every ordered physical Azure request
+attempt, and the runtime's complete
+`athena.wc028MonitoringPersistenceReplay.v3`
+execution/cleanup/storage-readiness/request-window binding. Acquisition-authority v6 supplies
+separate physical-attempt and logical-exchange budgets; v5 remains byte-compatible and parse-only.
+Correlation
+request v5 carries the same selected incident and reconstructs both the selection and canonical
+citation-bearing transition from persisted evidence.
 
 Current production acquisition does not query Traffic Analytics, custom flow tables, Connection
 Monitor workspace tables, or IP Flow Verify. Without a dedicated or ABAC-isolated workspace/table
 boundary, those controls persist deterministic unavailable coverage with zero source calls and no
 network-flow observation. Historical v3 requests may retain their prior versioned flow evidence,
-but production request v4 accepts only permission-attested resource-context log evidence.
+but production request v5 accepts only permission-attested resource-context log evidence.
 
 `athena.wc028MonitoringEvidenceBundle.v2` with
-`athena.wc028CorrelationRequest.v3`, plus the legacy WC-026 v1/v2 pair, remain parseable for
-historical and explicitly non-production compatibility only. Production `CorrelationService`
-rejects those older request versions.
+`athena.wc028CorrelationRequest.v4` with receipt v5, `athena.wc028CorrelationRequest.v3`, and the
+legacy WC-026 v1/v2 pair remain parseable for historical and explicitly non-production
+compatibility only. Production `CorrelationService` rejects those older request versions.
 
 ## Consequences
 

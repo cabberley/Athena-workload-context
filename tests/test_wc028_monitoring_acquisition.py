@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 
 import jwt
@@ -12,6 +12,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from pydantic import ValidationError
 
 import athena_context.monitoring_acquisition as monitoring_acquisition_module
+import athena_context.monitoring_collection as monitoring_collection_module
 from athena_context.contracts import (
     MONITORING_IDENTITY_PROOF_AUDIENCE,
     MONITORING_IDENTITY_PROOF_MAXIMUM_LIFETIME_SECONDS,
@@ -21,13 +22,18 @@ from athena_context.contracts import (
     EvidenceCoverageScope,
     GuestSignalObservation,
     IncidentHealthTransition,
+    MonitoringAcquisitionReceipt,
     MonitoringCollectorContract,
     MonitoringLogPermissionDataSource,
     MonitoringLogPermissionEvidence,
     MonitoringLogPermissionResource,
+    MonitoringRuntimeReplayBinding,
     ResourceHealthMonitoringSignal,
     build_published_monitoring_intent,
     compute_artifact_digest,
+    monitoring_acquisition_receipt_preimage,
+    monitoring_handoff_preimage,
+    monitoring_runtime_replay_key_preimage,
     sha256_hex,
 )
 from athena_context.correlation.verification import (
@@ -78,6 +84,9 @@ from athena_context.monitoring_incident import (
 from test_wc024_monitoring_contract import (
     COLLECTOR_TENANT_ID,
     _acquisition_collector_contract,
+    _rebind_effective_rbac_inventory_attestation,
+    _recompute_effective_rbac_inventory,
+    _recompute_nested_evidence,
 )
 from test_wc026_correlation import _test_service
 from test_wc026_correlation_contract import (
@@ -339,6 +348,7 @@ def _acquisition_authority(
     context_principal_id: str = CONTEXT_PRINCIPAL_ID,
     max_freshness_seconds: int = 900,
     max_acquisition_calls: int = 32,
+    max_logical_exchanges: int | None = None,
     required_control_ids: tuple[str, ...] | None = None,
     required_control_bindings: tuple[MonitoringAcquisitionControlBinding, ...] | None = None,
     context_binding=None,
@@ -368,7 +378,7 @@ def _acquisition_authority(
     effective_rbac_inventory = contract.effective_rbac_inventory
     assert effective_rbac_inventory is not None
     payload: dict[str, object] = {
-        "schemaVersion": "athena.wc028MonitoringAcquisitionAuthority.v5",
+        "schemaVersion": "athena.wc028MonitoringAcquisitionAuthority.v6",
         "monitoringReaderIdentityId": reader_identity_id.casefold(),
         "monitoringReaderPrincipalId": reader_principal_id,
         "monitoringReaderClientId": reader_client_id,
@@ -402,6 +412,9 @@ def _acquisition_authority(
         "maxWindowSeconds": 86400,
         "maxFreshnessSeconds": max_freshness_seconds,
         "maxAcquisitionCalls": max_acquisition_calls,
+        "maxLogicalExchanges": (
+            max_acquisition_calls if max_logical_exchanges is None else max_logical_exchanges
+        ),
         "receiptSigningKeyId": contract.signing_key_resource_id,
         "effectiveRbacInventoryDigest": effective_rbac_inventory.inventory_digest,
         "effectiveRbacSourceManifestDigest": (effective_rbac_inventory.source_manifest_digest),
@@ -999,6 +1012,34 @@ class _SyntheticAzureClient:
         return self.port.query_ip_flow_verify(request)
 
 
+class _MultiAttemptSyntheticAzureClient(_SyntheticAzureClient):
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._wire_recorder = None
+
+    def set_wire_attempt_recorder(self, recorder) -> None:
+        self._wire_recorder = recorder
+
+    def query_log_analytics(
+        self,
+        request: LogAnalyticsQueryRequest,
+    ) -> LogAnalyticsQueryResult:
+        assert self._wire_recorder is not None
+        for index in range(2):
+            pending = self._wire_recorder.begin_wire_attempt(
+                method="POST",
+                url=f"https://api.loganalytics.io/v1/workspaces/synthetic/query?attempt={index}",
+                headers={"Content-Type": "application/json"},
+                body=b"{}",
+            )
+            self._wire_recorder.complete_wire_attempt(
+                pending,
+                status_code=200,
+                headers={"Content-Type": "application/json"},
+            )
+        return self.port.query_log_analytics(request)
+
+
 def _synthetic_client_factory(port: _AcquisitionPort):
     def create_clients(credential, reviewed_contract):
         clients = tuple(
@@ -1020,17 +1061,41 @@ def _synthetic_client_factory(port: _AcquisitionPort):
     return create_clients
 
 
+def _multi_attempt_client_factory(port: _AcquisitionPort):
+    def create_clients(credential, reviewed_contract):
+        clients = tuple(
+            _MultiAttemptSyntheticAzureClient(
+                port=port,
+                credential=credential,
+                reviewed_contract=reviewed_contract,
+            )
+            for _ in range(5)
+        )
+        return monitoring_acquisition_module._AzureMonitoringClients(
+            log_analytics=clients[0],
+            activity_log=clients[1],
+            resource_graph=clients[2],
+            resource_health=clients[3],
+            ip_flow_verify=clients[4],
+        )
+
+    return create_clients
+
+
 def _adapter(
     port: _AcquisitionPort,
     *,
     collector_contract=None,
+    client_factory=None,
 ):
     adapter = AzureMonitoringAdapter(
         reviewed_collector_contract=(
             _acquisition_collector_contract() if collector_contract is None else collector_contract
         ),
     )
-    adapter._client_factory = _synthetic_client_factory(port)
+    adapter._client_factory = (
+        _synthetic_client_factory(port) if client_factory is None else client_factory
+    )
     return adapter
 
 
@@ -1041,6 +1106,7 @@ def _coordinator(
     expected_authority_digest: str | None = None,
     signature_verifier=None,
     collector_contract=None,
+    client_factory=None,
 ) -> MonitoringAcquisitionCoordinator:
     reviewed_contract = (
         _acquisition_collector_contract() if collector_contract is None else collector_contract
@@ -1049,6 +1115,7 @@ def _coordinator(
         acquisition_adapter=_adapter(
             port,
             collector_contract=reviewed_contract,
+            client_factory=client_factory,
         ),
         acquisition_authority=authority,
         expected_acquisition_authority_digest=(
@@ -1069,6 +1136,46 @@ def _coordinator(
     )
 
 
+def _runtime_replay_binding(
+    *,
+    acquisition_authority: MonitoringAcquisitionAuthority,
+    monitoring_intent,
+    context_binding,
+    collector_contract: MonitoringCollectorContract,
+    incident_revision: int = 1,
+    issued_at: datetime = NOW,
+    trusted_as_of: datetime = NOW + timedelta(minutes=1),
+    expires_at: datetime = NOW + timedelta(minutes=10),
+) -> MonitoringRuntimeReplayBinding:
+    intent_reference, _ = _intent_assets(monitoring_intent)
+    payload = {
+        "schemaVersion": "athena.wc028MonitoringPersistenceReplay.v3",
+        "executionId": "wc028-execution-" + ("8" * 32),
+        "acquisitionAuthorityDigest": acquisition_authority.authority_digest,
+        "monitoringIntentDigest": monitoring_intent.intent_digest,
+        "monitoringIntentReferenceDigest": intent_reference.reference_digest,
+        "contextBindingDigest": context_binding.binding_digest,
+        "incidentRevision": incident_revision,
+        "legacyCollectorRbacCleanupDigest": (
+            collector_contract.legacy_collector_rbac_cleanup_digest
+        ),
+        "monitoringEvidenceStorageReadinessDigest": (
+            collector_contract.evidence_storage_readiness_digest
+        ),
+        "issuedAt": issued_at,
+        "trustedAsOf": trusted_as_of,
+        "expiresAt": expires_at,
+        "trustDelaySeconds": int((trusted_as_of - issued_at).total_seconds()),
+        "requestLifetimeSeconds": int((expires_at - issued_at).total_seconds()),
+    }
+    return MonitoringRuntimeReplayBinding(
+        **payload,
+        persistenceReplayKey=compute_artifact_digest(
+            monitoring_runtime_replay_key_preimage(payload)
+        ),
+    )
+
+
 def _execute(
     port: _AcquisitionPort,
     *,
@@ -1077,6 +1184,7 @@ def _execute(
     acquisition_authority: MonitoringAcquisitionAuthority | None = None,
     collector_contract=None,
     commit_port: _CommitPort | None = None,
+    client_factory=None,
 ):
     context, intent, controls = _authority() if authority is None else authority
     commit = _CommitPort() if commit_port is None else commit_port
@@ -1090,13 +1198,23 @@ def _execute(
         if acquisition_authority is None
         else acquisition_authority
     )
+    reviewed_contract = (
+        _acquisition_collector_contract() if collector_contract is None else collector_contract
+    )
     outcome = _coordinator(
         port,
         acquisition_authority,
-        collector_contract=collector_contract,
+        collector_contract=reviewed_contract,
+        client_factory=client_factory,
     ).execute(
         monitoring_intent=intent,
         context_binding=context,
+        runtime_replay_binding=_runtime_replay_binding(
+            acquisition_authority=acquisition_authority,
+            monitoring_intent=intent,
+            context_binding=context,
+            collector_contract=reviewed_contract,
+        ),
         expected_active_context_authority_digest=(context.publication_authority.authority_digest),
         collected_at=collected_at,
         change_scope=_scope_contract(),
@@ -1125,7 +1243,7 @@ def test_acquisition_derives_strict_requests_and_commits_one_batch() -> None:
     )
     effective_rbac_inventory = _acquisition_collector_contract().effective_rbac_inventory
     assert effective_rbac_inventory is not None
-    assert acquisition_authority.schema_version == ("athena.wc028MonitoringAcquisitionAuthority.v5")
+    assert acquisition_authority.schema_version == ("athena.wc028MonitoringAcquisitionAuthority.v6")
     assert acquisition_authority.read_only is None
     assert acquisition_authority.athena_context_has_workload_reader is None
     assert acquisition_authority.monitoring_reader_has_read_only_workload_access is None
@@ -1214,8 +1332,8 @@ def test_acquisition_derives_strict_requests_and_commits_one_batch() -> None:
         outcome.committed.monitoring_handoff.schema_version
         == "athena.wc028MonitoringEvidenceHandoff.v2"
     )
-    assert outcome.correlation_request.schema_version == "athena.wc028CorrelationRequest.v4"
-    assert receipt.schema_version == "athena.wc028MonitoringAcquisitionReceipt.v5"
+    assert outcome.correlation_request.schema_version == "athena.wc028CorrelationRequest.v5"
+    assert receipt.schema_version == "athena.wc028MonitoringAcquisitionReceipt.v6"
     assert receipt.selected_incident is not None
     assert receipt.selected_incident.incident_resource_id == (outcome.batch.incident_resource_id)
     assert receipt.selected_incident.previous_record_id == (
@@ -1238,6 +1356,23 @@ def test_acquisition_derives_strict_requests_and_commits_one_batch() -> None:
     assert receipt.identity_proof.token_version == MONITORING_IDENTITY_PROOF_TOKEN_VERSION
     assert receipt.identity_proof.identity_type == "app"
     assert receipt.identity_proof.roles == (MONITORING_IDENTITY_PROOF_REQUIRED_ROLE,)
+    assert receipt.runtime_replay_binding is not None
+    assert receipt.wire_attempts is not None
+    assert len(receipt.wire_attempts) == len(receipt.exchanges)
+    assert tuple(item.exchange_sequence for item in receipt.wire_attempts) == tuple(
+        item.sequence for item in receipt.exchanges
+    )
+    assert (
+        receipt.runtime_replay_binding.legacy_collector_rbac_cleanup_digest
+        == _acquisition_collector_contract().legacy_collector_rbac_cleanup_digest
+    )
+    assert receipt.effective_rbac_inventory_digest == effective_rbac_inventory.inventory_digest
+    assert (
+        receipt.effective_rbac_source_manifest_digest
+        == effective_rbac_inventory.source_manifest_digest
+    )
+    assert receipt.effective_rbac_valid_from == effective_rbac_inventory.collected_at
+    assert receipt.effective_rbac_valid_until == effective_rbac_inventory.expires_at
     assert receipt.acquisition_authority_digest == acquisition_authority.authority_digest
     assert receipt.collection_batch_digest == sha256_hex(outcome.batch.canonical_bytes())
     assert manifest.collection_batch_digest == receipt.collection_batch_digest
@@ -1250,6 +1385,14 @@ def test_acquisition_derives_strict_requests_and_commits_one_batch() -> None:
     assert len(receipt.exchanges) == len(port.requests)
     assert all(
         item.identity_proof_digest == receipt.identity_proof.proof_digest
+        for item in receipt.exchanges
+    )
+    assert all(
+        item.effective_rbac_inventory_digest == effective_rbac_inventory.inventory_digest
+        and item.effective_rbac_source_manifest_digest
+        == effective_rbac_inventory.source_manifest_digest
+        and item.effective_rbac_valid_from == effective_rbac_inventory.collected_at
+        and item.effective_rbac_valid_until == effective_rbac_inventory.expires_at
         for item in receipt.exchanges
     )
     assert tuple(item.request_digest for item in receipt.exchanges) == tuple(
@@ -1293,6 +1436,318 @@ def test_acquisition_derives_strict_requests_and_commits_one_batch() -> None:
     )
     with pytest.raises(ValidationError, match="does not bind the monitoring bundle"):
         type(outcome.prepared.monitoring_bundle).model_validate_json(json.dumps(tampered_evidence))
+
+
+@pytest.mark.parametrize(
+    ("field_name", "replacement"),
+    (
+        ("monitoringIntentReferenceDigest", "sha256:" + ("a" * 64)),
+        ("incidentRevision", 2),
+        ("legacyCollectorRbacCleanupDigest", "sha256:" + ("b" * 64)),
+    ),
+)
+def test_runtime_replay_v3_mismatch_fails_before_credential_or_source_io(
+    field_name: str,
+    replacement: object,
+) -> None:
+    context, intent, controls = _authority()
+    contract = _acquisition_collector_contract()
+    acquisition_authority = _acquisition_authority(
+        required_control_ids=_required_control_ids(context, controls),
+        context_binding=context,
+        controls=controls,
+        collector_contract=contract,
+    )
+    replay = _runtime_replay_binding(
+        acquisition_authority=acquisition_authority,
+        monitoring_intent=intent,
+        context_binding=context,
+        collector_contract=contract,
+    ).model_dump(mode="python", by_alias=True)
+    replay[field_name] = replacement
+    replay.pop("persistenceReplayKey")
+    replay["persistenceReplayKey"] = compute_artifact_digest(
+        monitoring_runtime_replay_key_preimage(replay)
+    )
+    mutated = MonitoringRuntimeReplayBinding(**replay)
+    port = _AcquisitionPort()
+
+    with pytest.raises(MonitoringAcquisitionError, match="runtime replay v3"):
+        _coordinator(
+            port,
+            acquisition_authority,
+            collector_contract=contract,
+        ).execute(
+            monitoring_intent=intent,
+            context_binding=context,
+            runtime_replay_binding=mutated,
+            expected_active_context_authority_digest=(
+                context.publication_authority.authority_digest
+            ),
+            collected_at=NOW,
+            change_scope=_scope_contract(),
+            commit_port=_CommitPort(),
+            incident_revision=1,
+            issued_at=NOW,
+            trusted_as_of=NOW + timedelta(minutes=1),
+            expires_at=NOW + timedelta(minutes=10),
+        )
+
+    assert len(_SyntheticManagedIdentityCredential.instances) == 1
+    assert _SyntheticManagedIdentityCredential.instances[0].calls == 0
+    assert port.requests == []
+
+
+def test_runtime_replay_v3_rejects_zero_cleanup_evidence() -> None:
+    context, intent, controls = _authority()
+    contract = _acquisition_collector_contract()
+    acquisition_authority = _acquisition_authority(
+        required_control_ids=_required_control_ids(context, controls),
+        context_binding=context,
+        controls=controls,
+        collector_contract=contract,
+    )
+    replay = _runtime_replay_binding(
+        acquisition_authority=acquisition_authority,
+        monitoring_intent=intent,
+        context_binding=context,
+        collector_contract=contract,
+    ).model_dump(mode="python", by_alias=True)
+    replay["legacyCollectorRbacCleanupDigest"] = "sha256:" + ("0" * 64)
+    replay.pop("persistenceReplayKey")
+    replay["persistenceReplayKey"] = compute_artifact_digest(
+        monitoring_runtime_replay_key_preimage(replay)
+    )
+
+    with pytest.raises(ValidationError, match="runtime replay digests must be non-zero"):
+        MonitoringRuntimeReplayBinding(**replay)
+
+
+def test_receipt_rejects_per_exchange_effective_rbac_validity_drift() -> None:
+    outcome, _, _ = _execute(_AcquisitionPort())
+    receipt = outcome.prepared.monitoring_bundle.acquisition_receipt
+    assert receipt is not None
+    assert receipt.effective_rbac_valid_from is not None
+    payload = receipt.model_dump(mode="python", by_alias=True)
+    exchanges = list(payload["exchanges"])
+    first_exchange = dict(exchanges[0])
+    first_exchange["effectiveRbacValidFrom"] = receipt.effective_rbac_valid_from - timedelta(
+        minutes=1
+    )
+    exchanges[0] = first_exchange
+    payload["exchanges"] = tuple(exchanges)
+
+    with pytest.raises(
+        ValidationError,
+        match="per-exchange effective RBAC bindings",
+    ):
+        MonitoringAcquisitionReceipt.model_validate(payload)
+
+
+def test_correlation_request_rejects_shifted_absolute_replay_window() -> None:
+    outcome, _, _ = _execute(_AcquisitionPort())
+    payload = outcome.correlation_request.model_dump(
+        mode="python",
+        by_alias=True,
+    )
+    for field in ("issuedAt", "trustedAsOf", "expiresAt"):
+        payload[field] = payload[field] + timedelta(seconds=30)
+    payload.pop("requestId")
+    payload.pop("requestDigest")
+    request_digest = compute_artifact_digest(monitoring_acquisition_module._json_value(payload))
+
+    with pytest.raises(
+        ValidationError,
+        match="exact receipt v6 replay and incident bindings",
+    ):
+        CorrelationRequest.model_validate(
+            {
+                **payload,
+                "requestId": f"request-{request_digest.removeprefix('sha256:')[:32]}",
+                "requestDigest": request_digest,
+            }
+        )
+
+
+def test_historical_v4_correlation_request_with_receipt_v5_remains_readable() -> None:
+    outcome, _, _ = _execute(_AcquisitionPort())
+    request = outcome.correlation_request
+    receipt = outcome.prepared.monitoring_bundle.acquisition_receipt
+    manifest = outcome.prepared.monitoring_bundle.acquisition_manifest
+    assert receipt is not None
+    assert manifest is not None
+
+    receipt_payload = receipt.model_dump(
+        mode="python",
+        by_alias=True,
+        exclude_none=True,
+        exclude={"collector_attestation"},
+    )
+    receipt_payload["schemaVersion"] = "athena.wc028MonitoringAcquisitionReceipt.v5"
+    for field in (
+        "receiptId",
+        "receiptDigest",
+        "effectiveRbacInventoryDigest",
+        "effectiveRbacSourceManifestDigest",
+        "effectiveRbacValidFrom",
+        "effectiveRbacValidUntil",
+        "runtimeReplayBinding",
+        "wireAttempts",
+    ):
+        receipt_payload.pop(field, None)
+    legacy_exchanges = []
+    for item in receipt_payload["exchanges"]:
+        exchange = dict(item)
+        for field in (
+            "effectiveRbacInventoryDigest",
+            "effectiveRbacSourceManifestDigest",
+            "effectiveRbacValidFrom",
+            "effectiveRbacValidUntil",
+        ):
+            exchange.pop(field, None)
+        legacy_exchanges.append(exchange)
+    receipt_payload["exchanges"] = tuple(legacy_exchanges)
+    receipt_digest = compute_artifact_digest(
+        monitoring_acquisition_module._json_value(receipt_payload)
+    )
+    signed_receipt_payload = {
+        **receipt_payload,
+        "receiptId": (
+            f"monitoring-acquisition-receipt-{receipt_digest.removeprefix('sha256:')[:32]}"
+        ),
+        "receiptDigest": receipt_digest,
+    }
+    receipt_preimage = monitoring_acquisition_receipt_preimage(signed_receipt_payload)
+    legacy_receipt = type(receipt).model_validate(
+        {
+            **signed_receipt_payload,
+            "collectorAttestation": receipt.collector_attestation.model_copy(
+                update={
+                    "signed_preimage_digest": compute_artifact_digest(
+                        monitoring_acquisition_module._json_value(receipt_preimage)
+                    ),
+                }
+            ),
+        }
+    )
+
+    manifest_payload = manifest.model_dump(mode="python", by_alias=True)
+    manifest_payload["exchanges"] = legacy_receipt.exchanges
+    manifest_payload.pop("manifestDigest")
+    manifest_payload["manifestDigest"] = compute_artifact_digest(
+        monitoring_acquisition_module._json_value(manifest_payload)
+    )
+    legacy_manifest = type(manifest).model_validate(manifest_payload)
+    bundle_payload = outcome.prepared.monitoring_bundle.model_dump(
+        mode="python",
+        by_alias=True,
+    )
+    bundle_payload["acquisitionReceipt"] = legacy_receipt
+    bundle_payload["acquisitionManifest"] = legacy_manifest
+    legacy_bundle = type(outcome.prepared.monitoring_bundle).model_validate(bundle_payload)
+
+    handoff = outcome.committed.monitoring_handoff
+    handoff_payload = handoff.model_dump(
+        mode="python",
+        by_alias=True,
+        exclude={"collector_attestation"},
+    )
+    handoff_payload["acquisitionReceiptDigest"] = legacy_receipt.receipt_digest
+    evidence_reference = dict(handoff_payload["evidence"])
+    evidence_reference["contentDigest"] = sha256_hex(legacy_bundle.canonical_bytes())
+    handoff_payload["evidence"] = evidence_reference
+    handoff_preimage = monitoring_handoff_preimage(
+        monitoring_acquisition_module._json_value(handoff_payload)
+    )
+    legacy_handoff = type(handoff).model_validate(
+        {
+            **handoff_payload,
+            "collectorAttestation": handoff.collector_attestation.model_copy(
+                update={
+                    "signed_preimage_digest": compute_artifact_digest(handoff_preimage),
+                }
+            ),
+        }
+    )
+    legacy_prepared = replace(outcome.prepared, monitoring_bundle=legacy_bundle)
+    legacy_committed = replace(
+        outcome.committed,
+        monitoring_handoff=legacy_handoff,
+    )
+    legacy_evidence_index = monitoring_collection_module._build_evidence_index(
+        legacy_prepared,
+        legacy_committed,
+    )
+    legacy_transition, _ = monitoring_collection_module._build_transition(
+        legacy_prepared,
+        legacy_evidence_index,
+    )
+
+    inventory_payload = request.evidence_inventory.model_dump(
+        mode="python",
+        by_alias=True,
+        exclude={"inventory_digest"},
+    )
+    inventory_payload["monitoringHandoffDigest"] = legacy_handoff.compute_artifact_digest_value()
+    inventory_payload["monitoringBundleDigest"] = sha256_hex(legacy_bundle.canonical_bytes())
+    inventory_payload["evidenceIndexDigest"] = compute_artifact_digest(
+        [
+            item.model_dump(mode="json", by_alias=True, exclude_none=True)
+            for item in legacy_evidence_index
+        ]
+    )
+    inventory_payload["sourceReferences"] = tuple(
+        item.model_dump(mode="json", by_alias=True)
+        for item in sorted(
+            (
+                legacy_handoff.evidence
+                if item.name == handoff.evidence.name and item.version == handoff.evidence.version
+                else item
+                for item in request.evidence_inventory.source_references
+            ),
+            key=lambda item: (item.name, item.version, item.content_digest),
+        )
+    )
+    legacy_inventory = type(request.evidence_inventory).model_validate(
+        {
+            **inventory_payload,
+            "inventoryDigest": compute_artifact_digest(
+                monitoring_acquisition_module._json_value(inventory_payload)
+            ),
+        }
+    )
+    request_payload = request.model_dump(
+        mode="python",
+        by_alias=True,
+        exclude_none=True,
+    )
+    request_payload.update(
+        {
+            "schemaVersion": "athena.wc028CorrelationRequest.v4",
+            "monitoringHandoff": legacy_handoff,
+            "monitoringBundle": legacy_bundle,
+            "incidentAnchor": legacy_transition,
+            "evidenceIndex": legacy_evidence_index,
+            "evidenceInventory": legacy_inventory,
+        }
+    )
+    request_payload.pop("runtimeReplayBinding", None)
+    request_payload.pop("requestId")
+    request_payload.pop("requestDigest")
+    request_digest = compute_artifact_digest(
+        monitoring_acquisition_module._json_value(request_payload)
+    )
+    historical = CorrelationRequest.model_validate(
+        {
+            **request_payload,
+            "requestId": f"request-{request_digest.removeprefix('sha256:')[:32]}",
+            "requestDigest": request_digest,
+        }
+    )
+
+    assert historical.schema_version == "athena.wc028CorrelationRequest.v4"
+    assert historical.monitoring_bundle.acquisition_receipt == legacy_receipt
+    assert historical.runtime_replay_binding is None
 
 
 def test_heartbeat_and_vmconnection_corroboration_reaches_correlation_service() -> None:
@@ -1673,6 +2128,12 @@ def test_synthetic_client_factories_are_isolated_per_adapter() -> None:
         return coordinator.execute(
             monitoring_intent=intent,
             context_binding=context,
+            runtime_replay_binding=_runtime_replay_binding(
+                acquisition_authority=acquisition_authority,
+                monitoring_intent=intent,
+                context_binding=context,
+                collector_contract=_acquisition_collector_contract(),
+            ),
             expected_active_context_authority_digest=(
                 context.publication_authority.authority_digest
             ),
@@ -1911,6 +2372,12 @@ def test_source_failure_never_enters_commit() -> None:
         coordinator.execute(
             monitoring_intent=intent,
             context_binding=context,
+            runtime_replay_binding=_runtime_replay_binding(
+                acquisition_authority=acquisition_authority,
+                monitoring_intent=intent,
+                context_binding=context,
+                collector_contract=_acquisition_collector_contract(),
+            ),
             expected_active_context_authority_digest=(
                 context.publication_authority.authority_digest
             ),
@@ -1940,6 +2407,12 @@ def test_recovered_historical_outage_is_not_selected_as_current() -> None:
         coordinator.execute(
             monitoring_intent=intent,
             context_binding=context,
+            runtime_replay_binding=_runtime_replay_binding(
+                acquisition_authority=acquisition_authority,
+                monitoring_intent=intent,
+                context_binding=context,
+                collector_contract=_acquisition_collector_contract(),
+            ),
             expected_active_context_authority_digest=(
                 context.publication_authority.authority_digest
             ),
@@ -2098,6 +2571,12 @@ def test_signed_intent_is_verified_before_any_source_query() -> None:
         coordinator.execute(
             monitoring_intent=intent,
             context_binding=context,
+            runtime_replay_binding=_runtime_replay_binding(
+                acquisition_authority=acquisition_authority,
+                monitoring_intent=intent,
+                context_binding=context,
+                collector_contract=_acquisition_collector_contract(),
+            ),
             expected_active_context_authority_digest=(
                 context.publication_authority.authority_digest
             ),
@@ -2142,6 +2621,12 @@ def test_acquisition_authority_and_freshness_are_checked_before_reads() -> None:
             coordinator.execute(
                 monitoring_intent=intent,
                 context_binding=context,
+                runtime_replay_binding=_runtime_replay_binding(
+                    acquisition_authority=acquisition_authority,
+                    monitoring_intent=intent,
+                    context_binding=context,
+                    collector_contract=_acquisition_collector_contract(),
+                ),
                 expected_active_context_authority_digest=(
                     context.publication_authority.authority_digest
                 ),
@@ -2177,6 +2662,12 @@ def test_stale_context_bound_authority_fails_before_credential_or_source_io() ->
         coordinator.execute(
             monitoring_intent=intent,
             context_binding=context,
+            runtime_replay_binding=_runtime_replay_binding(
+                acquisition_authority=stale_authority,
+                monitoring_intent=intent,
+                context_binding=context,
+                collector_contract=_acquisition_collector_contract(),
+            ),
             expected_active_context_authority_digest=(
                 context.publication_authority.authority_digest
             ),
@@ -2386,10 +2877,31 @@ def test_effective_rbac_inventory_expiry_blocks_credential_and_source_io() -> No
             "secondReadCompletedAt": NOW - timedelta(minutes=20),
         }
     )
-    inventory.pop("inventoryDigest")
-    inventory["inventoryDigest"] = compute_artifact_digest(
-        monitoring_acquisition_module._json_value(inventory)
-    )
+    for field in (
+        "collectorIdentityAttachmentEvidence",
+        "rbacAttestorIdentityAttachmentEvidence",
+        "exclusiveDataPlanePrincipalEvidence",
+    ):
+        evidence = inventory[field]
+        assert isinstance(evidence, dict)
+        evidence["firstReadCompletedAt"] = NOW - timedelta(minutes=22)
+        evidence["secondReadCompletedAt"] = NOW - timedelta(minutes=21)
+        _recompute_nested_evidence(evidence)
+    verifier_evidence = inventory["reviewerKeyVerifierEvidence"]
+    assert isinstance(verifier_evidence, dict)
+    verifier_attachment = verifier_evidence["attachmentEvidence"]
+    assert isinstance(verifier_attachment, dict)
+    verifier_attachment["firstReadCompletedAt"] = NOW - timedelta(minutes=22)
+    verifier_attachment["secondReadCompletedAt"] = NOW - timedelta(minutes=21)
+    _recompute_nested_evidence(verifier_attachment)
+    _recompute_nested_evidence(verifier_evidence)
+    hierarchy_evidence = inventory["managementGroupHierarchyEvidence"]
+    assert isinstance(hierarchy_evidence, dict)
+    hierarchy_evidence["firstReadCompletedAt"] = NOW - timedelta(minutes=22)
+    hierarchy_evidence["secondReadCompletedAt"] = NOW - timedelta(minutes=21)
+    _recompute_nested_evidence(hierarchy_evidence)
+    _recompute_effective_rbac_inventory(inventory)
+    _rebind_effective_rbac_inventory_attestation(payload)
     contract = MonitoringCollectorContract(**payload)
     port = _AcquisitionPort()
 
@@ -2486,6 +2998,7 @@ def test_legacy_acquisition_authority_remains_readable_but_not_executable() -> N
             "authority_id",
             "authority_digest",
             "max_acquisition_calls",
+            "max_logical_exchanges",
             "receipt_signing_key_id",
             "monitoring_reader_has_read_only_workload_access",
             "deployment_identity_contract_digest",
@@ -2519,7 +3032,7 @@ def test_legacy_acquisition_authority_remains_readable_but_not_executable() -> N
     )
 
     assert authority.schema_version == "athena.wc028MonitoringAcquisitionAuthority.v1"
-    with pytest.raises(MonitoringAcquisitionError, match="authority schema v5"):
+    with pytest.raises(MonitoringAcquisitionError, match="authority schema v6"):
         _coordinator(_AcquisitionPort(), authority)
 
 
@@ -2544,6 +3057,7 @@ def test_v2_acquisition_authority_remains_readable_but_not_executable() -> None:
             "identity_proof_maximum_lifetime_seconds",
             "effective_rbac_inventory_digest",
             "effective_rbac_source_manifest_digest",
+            "max_logical_exchanges",
         },
     )
     payload["schemaVersion"] = "athena.wc028MonitoringAcquisitionAuthority.v2"
@@ -2572,7 +3086,7 @@ def test_v2_acquisition_authority_remains_readable_but_not_executable() -> None:
     )
 
     assert authority.schema_version == "athena.wc028MonitoringAcquisitionAuthority.v2"
-    with pytest.raises(MonitoringAcquisitionError, match="authority schema v5"):
+    with pytest.raises(MonitoringAcquisitionError, match="authority schema v6"):
         _coordinator(_AcquisitionPort(), authority)
 
 
@@ -2591,6 +3105,7 @@ def test_v3_acquisition_authority_remains_readable_but_not_executable() -> None:
             "identity_proof_maximum_lifetime_seconds",
             "effective_rbac_inventory_digest",
             "effective_rbac_source_manifest_digest",
+            "max_logical_exchanges",
         },
     )
     payload["schemaVersion"] = "athena.wc028MonitoringAcquisitionAuthority.v3"
@@ -2623,7 +3138,7 @@ def test_v3_acquisition_authority_remains_readable_but_not_executable() -> None:
     )
 
     assert authority.schema_version == "athena.wc028MonitoringAcquisitionAuthority.v3"
-    with pytest.raises(MonitoringAcquisitionError, match="authority schema v5"):
+    with pytest.raises(MonitoringAcquisitionError, match="authority schema v6"):
         _coordinator(_AcquisitionPort(), authority)
 
 
@@ -2638,6 +3153,7 @@ def test_v4_acquisition_authority_remains_readable_but_not_executable() -> None:
             "authority_digest",
             "effective_rbac_inventory_digest",
             "effective_rbac_source_manifest_digest",
+            "max_logical_exchanges",
         },
     )
     payload.update(
@@ -2676,7 +3192,41 @@ def test_v4_acquisition_authority_remains_readable_but_not_executable() -> None:
     )
 
     assert authority.schema_version == "athena.wc028MonitoringAcquisitionAuthority.v4"
-    with pytest.raises(MonitoringAcquisitionError, match="authority schema v5"):
+    with pytest.raises(MonitoringAcquisitionError, match="authority schema v6"):
+        _coordinator(_AcquisitionPort(), authority)
+
+
+def test_v5_acquisition_authority_remains_readable_but_not_executable() -> None:
+    current = _acquisition_authority()
+    payload = current.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+        exclude={
+            "authority_id",
+            "authority_digest",
+            "max_logical_exchanges",
+        },
+    )
+    payload["schemaVersion"] = "athena.wc028MonitoringAcquisitionAuthority.v5"
+    digest = compute_artifact_digest(payload)
+    authority = MonitoringAcquisitionAuthority.model_validate(
+        {
+            **payload,
+            "allowedSources": current.allowed_sources,
+            "allowedResourceIds": current.allowed_resource_ids,
+            "requiredControlIds": current.required_control_ids,
+            "requiredControlBindings": current.required_control_bindings,
+            "requiredCoverageScopeDigests": current.required_coverage_scope_digests,
+            "authorityId": (
+                f"monitoring-acquisition-authority-{digest.removeprefix('sha256:')[:32]}"
+            ),
+            "authorityDigest": digest,
+        }
+    )
+
+    assert authority.schema_version == "athena.wc028MonitoringAcquisitionAuthority.v5"
+    with pytest.raises(MonitoringAcquisitionError, match="authority schema v6"):
         _coordinator(_AcquisitionPort(), authority)
 
 
@@ -2725,6 +3275,12 @@ def test_invalid_identity_proof_fails_before_first_source_io(
         coordinator.execute(
             monitoring_intent=intent,
             context_binding=context,
+            runtime_replay_binding=_runtime_replay_binding(
+                acquisition_authority=authority,
+                monitoring_intent=intent,
+                context_binding=context,
+                collector_contract=_acquisition_collector_contract(),
+            ),
             expected_active_context_authority_digest=(
                 context.publication_authority.authority_digest
             ),
@@ -2760,6 +3316,12 @@ def test_overlong_identity_proof_fails_before_first_source_io() -> None:
         coordinator.execute(
             monitoring_intent=intent,
             context_binding=context,
+            runtime_replay_binding=_runtime_replay_binding(
+                acquisition_authority=authority,
+                monitoring_intent=intent,
+                context_binding=context,
+                collector_contract=_acquisition_collector_contract(),
+            ),
             expected_active_context_authority_digest=(
                 context.publication_authority.authority_digest
             ),
@@ -3007,7 +3569,7 @@ def test_empty_traffic_analytics_emits_no_ip_flow_exchange_or_orphan_proof() -> 
     second_receipt = second.prepared.monitoring_bundle.acquisition_receipt
     assert receipt is not None
     assert second_receipt is not None
-    assert receipt.schema_version == "athena.wc028MonitoringAcquisitionReceipt.v5"
+    assert receipt.schema_version == "athena.wc028MonitoringAcquisitionReceipt.v6"
     assert receipt.selected_incident is not None
     assert receipt.collector_contract_digest == COLLECTOR_CONTRACT_DIGEST
     assert receipt.credential_proofs is None
@@ -3143,6 +3705,23 @@ def test_total_acquisition_call_budget_fails_before_extra_read() -> None:
     assert len(port.requests) == 1
 
 
+def test_physical_request_budget_fails_inside_one_logical_exchange() -> None:
+    port = _AcquisitionPort()
+    with pytest.raises(
+        MonitoringAcquisitionError,
+        match="physical request budget",
+    ):
+        _execute(
+            port,
+            acquisition_authority=_acquisition_authority(
+                max_acquisition_calls=1,
+                max_logical_exchanges=1,
+            ),
+            client_factory=_multi_attempt_client_factory(port),
+        )
+    assert port.requests == []
+
+
 @pytest.mark.parametrize(
     "port, message",
     (
@@ -3169,6 +3748,12 @@ def test_source_identity_and_resource_scope_are_fail_closed(
         coordinator.execute(
             monitoring_intent=intent,
             context_binding=context,
+            runtime_replay_binding=_runtime_replay_binding(
+                acquisition_authority=acquisition_authority,
+                monitoring_intent=intent,
+                context_binding=context,
+                collector_contract=_acquisition_collector_contract(),
+            ),
             expected_active_context_authority_digest=(
                 context.publication_authority.authority_digest
             ),

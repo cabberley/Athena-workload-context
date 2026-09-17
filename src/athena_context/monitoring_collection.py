@@ -2566,6 +2566,12 @@ def build_collected_correlation_request(
             if request_schema_version == CORRELATION_REQUEST_SCHEMA_VERSION
             else None
         ),
+        "runtimeReplayBinding": (
+            acquisition_receipt.runtime_replay_binding
+            if request_schema_version == CORRELATION_REQUEST_SCHEMA_VERSION
+            and acquisition_receipt is not None
+            else None
+        ),
         "incidentAnchor": transition,
         "monitoringHandoff": committed.monitoring_handoff,
         "monitoringBundle": prepared.monitoring_bundle,

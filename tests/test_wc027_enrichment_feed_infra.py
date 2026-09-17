@@ -11,6 +11,13 @@ BLOB_READER_RBAC = (
 KEY_VERIFIER_RBAC = (
     ROOT / "infra" / "wc027-enrichment-feed-runtime" / "modules" / "key-verifier-rbac.bicep"
 )
+MONITORING_CONTRACT_PUBLICATION_REFERENCE = (
+    ROOT
+    / "infra"
+    / "wc027-enrichment-feed-runtime"
+    / "modules"
+    / "monitoring-contract-publication-reference.bicep"
+)
 
 STORAGE_BLOB_DATA_CONTRIBUTOR_ROLE_ID = "ba92f5b4-2d11-453d-a403-e96b0029c9fe"
 
@@ -34,10 +41,25 @@ def test_wc027_runtime_is_private_keyless_and_session_ordered() -> None:
     assert "listKeys(" not in source
     assert "runtimeConfigurationJson" in source
     assert "param monitoringCollectorContractDigest string" in source
+    assert "param monitoringCollectorContract object" not in source
+    assert "param monitoringAcquisitionAuthority object" in source
     assert "param monitoringAcquisitionAuthorityDigest string" in source
     assert "athena.wc027EnrichmentFeedRuntimeConfiguration.v2" in source
-    assert "athena.wc028MonitoringCollectorContract.v8" in source
-    assert "athena.wc028MonitoringAcquisitionReceipt.v5" in source
+    assert "athena.wc028MonitoringCollectorContract.v9" in source
+    assert "athena.wc028MonitoringAcquisitionReceipt.v6" in source
+    assert "athena.wc028MonitoringAcquisitionAuthority.v6" in source
+    assert "monitoringAcquisitionAuthority: validatedMonitoringAcquisitionAuthority" in source
+    assert "param monitoringContractPublicationDeploymentName string" in source
+    assert "param monitoringContractPublicationTemplateHash string" in source
+    assert "scope: subscription()" in source
+    reference_source = MONITORING_CONTRACT_PUBLICATION_REFERENCE.read_text(encoding="utf-8")
+    assert "targetScope = 'subscription'" in reference_source
+    assert "Microsoft.Resources/deployments@2025-04-01" in reference_source
+    assert "properties.templateHash == expectedTemplateHash" in reference_source
+    assert "monitoringAcquisitionCollectorContract.value" in reference_source
+    assert "string(monitoringCollectorContract)" not in source
+    assert "effectiveRbacCryptographicReviewVerified == true" in source
+    assert "legacyCollectorRbacCleanupDigest" in source
     assert "triggerSubmitterIdentityResourceIds" in source
     assert "principalId: triggerSubmitterIdentities[index].properties.principalId" in source
     assert "scope: triggerQueue" in source

@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import re
 from datetime import UTC, datetime
 from fnmatch import fnmatchcase
 from ipaddress import ip_address
 from typing import Literal, cast
-from uuid import UUID
+from uuid import UUID, uuid5
 
 from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from pydantic import ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
@@ -40,15 +41,25 @@ MONITORING_PREVIOUS_PRODUCTION_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION = (
 MONITORING_PREVIOUS_MEASURED_RBAC_COLLECTOR_CONTRACT_SCHEMA_VERSION = (
     "athena.wc028MonitoringCollectorContract.v7"
 )
-MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION = (
+MONITORING_PREVIOUS_PERMISSION_ATTESTED_COLLECTOR_CONTRACT_SCHEMA_VERSION = (
     "athena.wc028MonitoringCollectorContract.v8"
+)
+MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION = (
+    "athena.wc028MonitoringCollectorContract.v9"
 )
 MONITORING_EVIDENCE_HANDOFF_SCHEMA_VERSION = "athena.wc024MonitoringEvidenceHandoff.v1"
 MONITORING_PREVIOUS_ACQUISITION_RECEIPT_SCHEMA_VERSION = (
     "athena.wc028MonitoringAcquisitionReceipt.v4"
 )
-MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION = "athena.wc028MonitoringAcquisitionReceipt.v5"
+MONITORING_PREVIOUS_INCIDENT_BOUND_ACQUISITION_RECEIPT_SCHEMA_VERSION = (
+    "athena.wc028MonitoringAcquisitionReceipt.v5"
+)
+MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION = "athena.wc028MonitoringAcquisitionReceipt.v6"
 MONITORING_ACQUISITION_HANDOFF_SCHEMA_VERSION = "athena.wc028MonitoringEvidenceHandoff.v2"
+MONITORING_EFFECTIVE_RBAC_INVENTORY_SCHEMA_VERSION = (
+    "athena.wc028MonitoringEffectiveRbacInventory.v4"
+)
+MONITORING_RUNTIME_REPLAY_BINDING_SCHEMA_VERSION = "athena.wc028MonitoringPersistenceReplay.v3"
 _LEGACY_MONITORING_IDENTITY_PROOF_AUDIENCE = "api://athena-monitoring-identity-proof"
 _MONITORING_IDENTITY_PROOF_AUDIENCE_SUFFIX = "/athena-monitoring-identity-proof"
 MONITORING_IDENTITY_PROOF_AUDIENCE = (
@@ -126,7 +137,28 @@ type MonitoringRbacAttestorOperation = Literal[
     "Microsoft.Authorization/roleDefinitions/read",
     "Microsoft.Authorization/denyAssignments/read",
     "Microsoft.Authorization/roleAssignmentScheduleInstances/read",
+    "Microsoft.App/jobs/read",
+    "Microsoft.KeyVault/vaults/read",
+    "Microsoft.Management/getEntities/action",
+    "Microsoft.ManagedIdentity/userAssignedIdentities/listAssociatedResources/action",
+    "Microsoft.ManagedIdentity/userAssignedIdentities/read",
+    "Microsoft.ManagedIdentity/userAssignedIdentities/federatedIdentityCredentials/read",
+    "Microsoft.Storage/storageAccounts/read",
+    "Microsoft.Storage/storageAccounts/blobServices/read",
+    "Microsoft.Storage/storageAccounts/blobServices/containers/read",
+    "Microsoft.Storage/storageAccounts/blobServices/containers/immutabilityPolicies/read",
 ]
+type MonitoringEvidenceWriterDataAction = Literal[
+    "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read",
+    "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action",
+]
+type MonitoringStorageReadbackOperation = Literal[
+    "Microsoft.Storage/storageAccounts/read",
+    "Microsoft.Storage/storageAccounts/blobServices/read",
+    "Microsoft.Storage/storageAccounts/blobServices/containers/read",
+    "Microsoft.Storage/storageAccounts/blobServices/containers/immutabilityPolicies/read",
+]
+type MonitoringReviewerKeyVerifierDataAction = Literal["Microsoft.KeyVault/vaults/keys/read",]
 type MonitoringLogTable = Literal[
     "Heartbeat",
     "Perf",
@@ -160,16 +192,58 @@ _LOG_ANALYTICS_DATA_READER_ROLE_DEFINITION_GUID = "3b03c2da-16b3-4a49-8834-0f813
 _IP_FLOW_VERIFY_ROLE_DEFINITION_GUID = "3728cdf6-4efd-5282-bdfc-63b7872fd801"
 _RESOURCE_HEALTH_ROLE_DEFINITION_GUID = "0790d6f2-9553-5b63-84ac-56596b7e4072"
 _RBAC_ATTESTOR_ROLE_DEFINITION_GUID = "2a8d9aea-2688-5841-a7e4-82f23d0f1bac"
-_STORAGE_BLOB_DATA_CONTRIBUTOR_ROLE_DEFINITION_GUID = "ba92f5b4-2d11-453d-a403-e96b0029c9fe"
+_PREVIOUS_STORAGE_BLOB_DATA_CONTRIBUTOR_ROLE_DEFINITION_GUID = (
+    "ba92f5b4-2d11-453d-a403-e96b0029c9fe"
+)
 _KEY_VAULT_CRYPTO_USER_ROLE_DEFINITION_GUID = "12338af0-0e69-4776-bea7-57ae8d297424"
 _SIGNAL_READER_ROLE_NAME_PREFIX = "Athena WC016 Approved Signal Reader "
 _RESOURCE_LOG_READER_ROLE_NAME = "Athena WC-028 VM Resource Log Reader"
 _IP_FLOW_VERIFY_ROLE_NAME = "Athena WC-028 Network Watcher IP Flow Verify"
 _RESOURCE_HEALTH_ROLE_NAME = "Athena WC-028 VM Resource Health Reader"
 _RBAC_ATTESTOR_ROLE_NAME = "Athena WC-028 Effective RBAC Attestor"
-_STORAGE_BLOB_DATA_CONTRIBUTOR_ROLE_NAME = "Storage Blob Data Contributor"
+_PREVIOUS_STORAGE_BLOB_DATA_CONTRIBUTOR_ROLE_NAME = "Storage Blob Data Contributor"
+_EVIDENCE_WRITER_ROLE_NAME = "Athena WC028 Monitoring Evidence Create-Only Writer"
+_STORAGE_READBACK_READER_ROLE_NAME = "Athena WC028 Monitoring Storage Protection Reader"
 _KEY_VAULT_CRYPTO_USER_ROLE_NAME = "Key Vault Crypto User"
 _ALL_PRINCIPALS_ID = "00000000-0000-0000-0000-000000000000"
+_ARM_TEMPLATE_GUID_NAMESPACE = UUID("11fb06fb-712d-4ddd-98c7-e71bbd588830")
+_EVIDENCE_WRITER_ROLE_GUID_SEED = "athena-wc028-monitoring-evidence-create-only"
+_STORAGE_READBACK_READER_ROLE_GUID_SEED = "athena-wc028-monitoring-storage-readback"
+_REVIEWER_KEY_VERIFIER_ROLE_GUID_SEED = "athena-wc028-rbac-reviewer-key-reader"
+_EVIDENCE_WRITER_ASSIGNMENT_CONDITION = (
+    "(((!(ActionMatches"
+    "{'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read'}"
+    " AND NOT SubOperationMatches{'Blob.List'}))"
+    " AND !(ActionMatches"
+    "{'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action'}))"
+    " OR (@Resource[Microsoft.Storage/storageAccounts/blobServices/containers:name]"
+    " StringEquals 'monitoring-evidence' AND ("
+    "@Resource[Microsoft.Storage/storageAccounts/blobServices/containers/blobs:path]"
+    " StringLike 'wc024-monitoring/commits/*/manifest.json' OR "
+    "@Resource[Microsoft.Storage/storageAccounts/blobServices/containers/blobs:path]"
+    " StringLike 'wc024-monitoring/commits/*/recovery.json' OR "
+    "@Resource[Microsoft.Storage/storageAccounts/blobServices/containers/blobs:path]"
+    " StringLike 'wc024-monitoring/wc024-*/evidence.json')))"
+    " AND (!(ActionMatches"
+    "{'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read'}"
+    " AND SubOperationMatches{'Blob.List'})))"
+)
+_REVIEWED_RBAC_INVENTORY_REVIEWER_VAULT_HOST = "athenarbacevidencekv.vault.azure.net"
+_REVIEWED_RBAC_INVENTORY_REVIEWER_KEY_NAME = "monitoring-rbac-inventory-review"
+_EXPECTED_EVIDENCE_WRITER_DATA_ACTIONS: tuple[MonitoringEvidenceWriterDataAction, ...] = (
+    "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read",
+    "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action",
+)
+_EXPECTED_STORAGE_READBACK_OPERATIONS: tuple[MonitoringStorageReadbackOperation, ...] = (
+    "Microsoft.Storage/storageAccounts/read",
+    "Microsoft.Storage/storageAccounts/blobServices/read",
+    "Microsoft.Storage/storageAccounts/blobServices/containers/read",
+    "Microsoft.Storage/storageAccounts/blobServices/containers/immutabilityPolicies/read",
+)
+_REVIEWER_KEY_VERIFIER_ROLE_NAME = "Athena WC028 RBAC Reviewer Public Key Reader"
+_EXPECTED_REVIEWER_KEY_VERIFIER_DATA_ACTIONS: tuple[
+    MonitoringReviewerKeyVerifierDataAction, ...
+] = ("Microsoft.KeyVault/vaults/keys/read",)
 _REVIEWED_WORKLOAD_RESOURCE_GROUP = "rg-athena-demo-workload"
 _REVIEWED_WORKLOAD_VNET_NAME = "athena-hackathon-vnet"
 _REVIEWED_MONITORING_RESOURCE_GROUP = "rg-athena-demo-monitoring"
@@ -278,12 +352,28 @@ _EXPECTED_RESOURCE_CONTEXT_LOG_TABLES: tuple[MonitoringResourceContextLogTable, 
     "Syslog",
     "VMConnection",
 )
-_EXPECTED_RBAC_ATTESTOR_OPERATIONS: tuple[MonitoringRbacAttestorOperation, ...] = (
+_EXPECTED_PREVIOUS_RBAC_ATTESTOR_OPERATIONS: tuple[MonitoringRbacAttestorOperation, ...] = (
     "Microsoft.Authorization/denyAssignments/read",
     "Microsoft.Authorization/roleAssignmentScheduleInstances/read",
     "Microsoft.Authorization/roleAssignments/read",
     "Microsoft.Authorization/roleDefinitions/read",
 )
+_EXPECTED_RBAC_ATTESTOR_OPERATIONS: tuple[MonitoringRbacAttestorOperation, ...] = (
+    *_EXPECTED_PREVIOUS_RBAC_ATTESTOR_OPERATIONS,
+    "Microsoft.App/jobs/read",
+    "Microsoft.KeyVault/vaults/read",
+    "Microsoft.Management/getEntities/action",
+    "Microsoft.ManagedIdentity/userAssignedIdentities/federatedIdentityCredentials/read",
+    "Microsoft.ManagedIdentity/userAssignedIdentities/listAssociatedResources/action",
+    "Microsoft.ManagedIdentity/userAssignedIdentities/read",
+    "Microsoft.Storage/storageAccounts/read",
+    "Microsoft.Storage/storageAccounts/blobServices/read",
+    "Microsoft.Storage/storageAccounts/blobServices/containers/read",
+    "Microsoft.Storage/storageAccounts/blobServices/containers/immutabilityPolicies/read",
+)
+_MANAGED_IDENTITY_ASSOCIATED_RESOURCES_API_VERSION = "2021-09-30-preview"
+_MANAGED_IDENTITY_FEDERATED_CREDENTIALS_API_VERSION = "2023-01-31"
+_CONTAINER_APPS_JOB_API_VERSION = "2025-01-01"
 _EXPECTED_PREVIOUS_PRODUCTION_ACQUISITION_READ_OPERATIONS: tuple[MonitoringReadOperation, ...] = (
     *_EXPECTED_PREVIOUS_ACQUISITION_READ_OPERATIONS,
     *_EXPECTED_PREVIOUS_RESOURCE_HEALTH_OPERATIONS,
@@ -348,6 +438,12 @@ def _parse_arm_resource_id(
     )
 
 
+def _arm_template_guid(*values: str) -> str:
+    if not values or any(not value for value in values):
+        raise ValueError("ARM guid inputs must be non-empty strings")
+    return str(uuid5(_ARM_TEMPLATE_GUID_NAMESPACE, "-".join(values)))
+
+
 def _canonical_rbac_scope(value: str) -> str:
     normalized = value.casefold().rstrip("/")
     if normalized == "":
@@ -363,6 +459,16 @@ def _canonical_rbac_scope(value: str) -> str:
         len(segments) == 2
         and segments[0] == "subscriptions"
         and _SUBSCRIPTION_ID_PATTERN.fullmatch(segments[1]) is not None
+    ):
+        return normalized
+    if (
+        len(segments) >= 6
+        and len(segments[4:]) % 2 == 0
+        and segments[0] == "subscriptions"
+        and _SUBSCRIPTION_ID_PATTERN.fullmatch(segments[1]) is not None
+        and segments[2] == "providers"
+        and segments[3]
+        and all(segments[index] and segments[index + 1] for index in range(4, len(segments), 2))
     ):
         return normalized
     if (
@@ -753,7 +859,22 @@ class MonitoringEffectiveRbacPrincipalEvidence(_StrictMonitoringContract):
         alias="principalId",
         pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
     )
-    query_filter: Literal["atScope() and assignedTo(principalId)"] = Field(alias="queryFilter")
+    query_filter: Literal[
+        "atScope() and assignedTo(principalId)",
+        "assignedTo(principalId)",
+    ] = Field(alias="queryFilter")
+    include_inherited: Literal[True] | None = Field(
+        default=None,
+        alias="includeInherited",
+    )
+    include_groups: Literal[True] | None = Field(
+        default=None,
+        alias="includeGroups",
+    )
+    include_all_descendant_scopes: Literal[True] | None = Field(
+        default=None,
+        alias="includeAllDescendantScopes",
+    )
     target_scope_ids: tuple[str, ...] = Field(
         alias="targetScopeIds",
         min_length=1,
@@ -906,6 +1027,558 @@ class MonitoringEffectiveRbacPrincipalEvidence(_StrictMonitoringContract):
         )
         if self.evidence_digest != expected:
             raise ValueError("evidenceDigest does not bind exact-target RBAC evidence")
+        return self
+
+
+class MonitoringRuntimeIdentityLifecycleBinding(_StrictMonitoringContract):
+    identity_resource_id: str = Field(
+        alias="identityResourceId",
+        min_length=1,
+        max_length=2048,
+    )
+    lifecycle: Literal["All", "Init", "Main", "None"]
+
+    @field_validator("identity_resource_id")
+    @classmethod
+    def normalize_identity_resource_id(cls, value: str) -> str:
+        normalized = value.casefold().rstrip("/")
+        _, _, provider, types = _parse_arm_resource_id(normalized)
+        if provider != "microsoft.managedidentity" or types != ("userassignedidentities",):
+            raise ValueError("runtime lifecycle must identify one user-assigned identity")
+        return normalized
+
+
+class MonitoringManagedIdentityAttachmentEvidence(_StrictMonitoringContract):
+    """Stable associated-resource and federated-credential inventory for one UAMI."""
+
+    identity_resource_id: str = Field(
+        alias="identityResourceId",
+        min_length=1,
+        max_length=2048,
+    )
+    associated_resources_request_path: str = Field(
+        alias="associatedResourcesRequestPath",
+        min_length=1,
+        max_length=4096,
+    )
+    federated_identity_credentials_request_path: str = Field(
+        alias="federatedIdentityCredentialsRequestPath",
+        min_length=1,
+        max_length=4096,
+    )
+    associated_resource_ids: tuple[str, ...] = Field(
+        alias="associatedResourceIds",
+        min_length=0,
+        max_length=16,
+    )
+    federated_identity_credential_ids: tuple[str, ...] = Field(
+        default=(),
+        alias="federatedIdentityCredentialIds",
+        max_length=16,
+    )
+    associated_resource_configuration_request_paths: tuple[str, ...] | None = Field(
+        default=None,
+        alias="associatedResourceConfigurationRequestPaths",
+        min_length=1,
+        max_length=16,
+    )
+    associated_resource_identity_resource_ids: tuple[str, ...] | None = Field(
+        default=None,
+        alias="associatedResourceIdentityResourceIds",
+        min_length=1,
+        max_length=16,
+    )
+    associated_resource_identity_lifecycles: (
+        tuple[MonitoringRuntimeIdentityLifecycleBinding, ...] | None
+    ) = Field(
+        default=None,
+        alias="associatedResourceIdentityLifecycles",
+        min_length=1,
+        max_length=16,
+    )
+    first_read_completed_at: UtcDateTime = Field(alias="firstReadCompletedAt")
+    second_read_completed_at: UtcDateTime = Field(alias="secondReadCompletedAt")
+    first_associated_resource_raw_page_digests: tuple[Sha256Digest, ...] = Field(
+        alias="firstAssociatedResourceRawPageDigests",
+        min_length=1,
+        max_length=256,
+    )
+    second_associated_resource_raw_page_digests: tuple[Sha256Digest, ...] = Field(
+        alias="secondAssociatedResourceRawPageDigests",
+        min_length=1,
+        max_length=256,
+    )
+    first_federated_credential_raw_page_digests: tuple[Sha256Digest, ...] = Field(
+        alias="firstFederatedCredentialRawPageDigests",
+        min_length=1,
+        max_length=256,
+    )
+    second_federated_credential_raw_page_digests: tuple[Sha256Digest, ...] = Field(
+        alias="secondFederatedCredentialRawPageDigests",
+        min_length=1,
+        max_length=256,
+    )
+    first_associated_resource_configuration_digests: tuple[Sha256Digest, ...] | None = Field(
+        default=None,
+        alias="firstAssociatedResourceConfigurationDigests",
+        min_length=1,
+        max_length=16,
+    )
+    second_associated_resource_configuration_digests: tuple[Sha256Digest, ...] | None = Field(
+        default=None,
+        alias="secondAssociatedResourceConfigurationDigests",
+        min_length=1,
+        max_length=16,
+    )
+    all_pages_retrieved: Literal[True] = Field(alias="allPagesRetrieved")
+    evidence_digest: Sha256Digest = Field(alias="evidenceDigest")
+
+    @field_validator("identity_resource_id")
+    @classmethod
+    def normalize_identity_resource_id(cls, value: str) -> str:
+        normalized = value.casefold().rstrip("/")
+        _, _, provider, types = _parse_arm_resource_id(normalized)
+        if provider != "microsoft.managedidentity" or types != ("userassignedidentities",):
+            raise ValueError("attachment evidence must identify one user-assigned identity")
+        return normalized
+
+    @field_validator(
+        "associated_resource_ids",
+        "federated_identity_credential_ids",
+        "associated_resource_identity_resource_ids",
+    )
+    @classmethod
+    def normalize_resource_ids(
+        cls,
+        values: tuple[str, ...] | None,
+    ) -> tuple[str, ...] | None:
+        if values is None:
+            return None
+        normalized = tuple(sorted(_canonical_rbac_scope(item) for item in values))
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("managed-identity attachment resource IDs must be unique")
+        return normalized
+
+    @field_validator(
+        "first_associated_resource_raw_page_digests",
+        "second_associated_resource_raw_page_digests",
+        "first_federated_credential_raw_page_digests",
+        "second_federated_credential_raw_page_digests",
+        "first_associated_resource_configuration_digests",
+        "second_associated_resource_configuration_digests",
+    )
+    @classmethod
+    def normalize_page_digests(
+        cls,
+        values: tuple[Sha256Digest, ...] | None,
+    ) -> tuple[Sha256Digest, ...] | None:
+        if values is None:
+            return None
+        if values != tuple(sorted(values)) or len(values) != len(set(values)):
+            raise ValueError("managed-identity raw page digests must be sorted and unique")
+        return values
+
+    @model_validator(mode="after")
+    def validate_attachment_evidence(
+        self,
+    ) -> MonitoringManagedIdentityAttachmentEvidence:
+        expected_associated_resources_request_path = (
+            f"{self.identity_resource_id}/listAssociatedResources"
+            f"?api-version={_MANAGED_IDENTITY_ASSOCIATED_RESOURCES_API_VERSION}"
+        )
+        expected_federated_credentials_request_path = (
+            f"{self.identity_resource_id}/federatedIdentityCredentials"
+            f"?api-version={_MANAGED_IDENTITY_FEDERATED_CREDENTIALS_API_VERSION}"
+        )
+        if (
+            self.associated_resources_request_path != expected_associated_resources_request_path
+            or self.federated_identity_credentials_request_path
+            != expected_federated_credentials_request_path
+        ):
+            raise ValueError(
+                "managed-identity attachment evidence must use exact unfiltered request paths"
+            )
+        if (
+            not self.first_read_completed_at < self.second_read_completed_at
+            or self.first_associated_resource_raw_page_digests
+            != self.second_associated_resource_raw_page_digests
+            or self.first_federated_credential_raw_page_digests
+            != self.second_federated_credential_raw_page_digests
+        ):
+            raise ValueError("managed-identity attachment evidence must contain two stable reads")
+        runtime_configuration_fields = (
+            self.associated_resource_configuration_request_paths,
+            self.associated_resource_identity_resource_ids,
+            self.associated_resource_identity_lifecycles,
+            self.first_associated_resource_configuration_digests,
+            self.second_associated_resource_configuration_digests,
+        )
+        if any(item is None for item in runtime_configuration_fields) and any(
+            item is not None for item in runtime_configuration_fields
+        ):
+            raise ValueError("managed-identity runtime configuration evidence must be complete")
+        if self.associated_resource_configuration_request_paths is not None:
+            expected_paths = tuple(
+                f"{resource_id}?api-version={_CONTAINER_APPS_JOB_API_VERSION}"
+                for resource_id in self.associated_resource_ids
+            )
+            lifecycle_bindings = cast(
+                tuple[MonitoringRuntimeIdentityLifecycleBinding, ...],
+                self.associated_resource_identity_lifecycles,
+            )
+            if (
+                self.associated_resource_configuration_request_paths != expected_paths
+                or len(cast(tuple[str, ...], self.associated_resource_ids)) != 1
+                or tuple(item.identity_resource_id for item in lifecycle_bindings)
+                != cast(tuple[str, ...], self.associated_resource_identity_resource_ids)
+                or lifecycle_bindings
+                != tuple(sorted(lifecycle_bindings, key=lambda item: item.identity_resource_id))
+                or len(
+                    cast(
+                        tuple[Sha256Digest, ...],
+                        self.first_associated_resource_configuration_digests,
+                    )
+                )
+                != 1
+                or self.first_associated_resource_configuration_digests
+                != self.second_associated_resource_configuration_digests
+            ):
+                raise ValueError(
+                    "managed-identity runtime configuration evidence is incomplete or unstable"
+                )
+        expected = compute_artifact_digest(
+            self.model_dump(
+                mode="json",
+                by_alias=True,
+                exclude={"evidence_digest"},
+                exclude_none=True,
+            )
+        )
+        if self.evidence_digest != expected:
+            raise ValueError("evidenceDigest does not bind managed-identity attachment evidence")
+        return self
+
+
+class MonitoringReviewerKeyVerifierEvidence(_StrictMonitoringContract):
+    """Exact read-only identity and RBAC evidence for the reviewer-key verifier."""
+
+    identity_resource_id: str = Field(
+        alias="identityResourceId",
+        min_length=1,
+        max_length=2048,
+    )
+    identity_client_id: str = Field(
+        alias="identityClientId",
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    )
+    identity_principal_id: str = Field(
+        alias="identityPrincipalId",
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    )
+    identity_tenant_id: str = Field(
+        alias="identityTenantId",
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    )
+    reviewer_key_arm_resource_id: str = Field(
+        alias="reviewerKeyArmResourceId",
+        min_length=1,
+        max_length=2048,
+    )
+    role_definition_id: str = Field(
+        alias="roleDefinitionId",
+        min_length=1,
+        max_length=2048,
+    )
+    role_definition_name: Literal["Athena WC028 RBAC Reviewer Public Key Reader"] = Field(
+        alias="roleDefinitionName"
+    )
+    role_assignment_id: str = Field(
+        alias="roleAssignmentId",
+        min_length=1,
+        max_length=2048,
+    )
+    allowed_data_actions: tuple[MonitoringReviewerKeyVerifierDataAction, ...] = Field(
+        alias="allowedDataActions",
+        min_length=1,
+        max_length=1,
+    )
+    assignment_count: Literal[1] = Field(alias="assignmentCount")
+    grant: MonitoringEffectiveRbacGrant
+    principal_evidence: MonitoringEffectiveRbacPrincipalEvidence = Field(alias="principalEvidence")
+    attachment_evidence: MonitoringManagedIdentityAttachmentEvidence = Field(
+        alias="attachmentEvidence"
+    )
+    evidence_digest: Sha256Digest = Field(alias="evidenceDigest")
+
+    @field_validator(
+        "identity_client_id",
+        "identity_principal_id",
+        "identity_tenant_id",
+    )
+    @classmethod
+    def normalize_identity_guid(cls, value: str) -> str:
+        return value.casefold()
+
+    @field_validator(
+        "identity_resource_id",
+        "reviewer_key_arm_resource_id",
+        "role_definition_id",
+        "role_assignment_id",
+    )
+    @classmethod
+    def normalize_resource_id(cls, value: str) -> str:
+        return _canonical_rbac_scope(value)
+
+    @model_validator(mode="after")
+    def validate_verifier_evidence(self) -> MonitoringReviewerKeyVerifierEvidence:
+        subscription_id, _, identity_provider, identity_types = _parse_arm_resource_id(
+            self.identity_resource_id
+        )
+        key_subscription, _, key_provider, key_types = _parse_arm_resource_id(
+            self.reviewer_key_arm_resource_id
+        )
+        expected_subscription_scope = f"/subscriptions/{subscription_id}"
+        expected_role_guid = _arm_template_guid(
+            expected_subscription_scope,
+            _REVIEWER_KEY_VERIFIER_ROLE_GUID_SEED,
+            self.reviewer_key_arm_resource_id,
+        )
+        expected_role_definition_id = (
+            f"{expected_subscription_scope}/providers/microsoft.authorization/"
+            f"roledefinitions/{expected_role_guid}"
+        )
+        expected_assignment_guid = _arm_template_guid(
+            self.reviewer_key_arm_resource_id,
+            self.identity_resource_id,
+            self.role_definition_id,
+        )
+        expected_role_assignment_id = (
+            f"{self.reviewer_key_arm_resource_id}/providers/microsoft.authorization/"
+            f"roleassignments/{expected_assignment_guid}"
+        )
+        if (
+            identity_provider != "microsoft.managedidentity"
+            or identity_types != ("userassignedidentities",)
+            or key_subscription != subscription_id
+            or key_provider != "microsoft.keyvault"
+            or key_types != ("vaults", "keys")
+            or self.role_definition_id != expected_role_definition_id
+            or self.role_assignment_id != expected_role_assignment_id
+            or self.allowed_data_actions != _EXPECTED_REVIEWER_KEY_VERIFIER_DATA_ACTIONS
+            or self.grant.assigned_principal_id != self.identity_principal_id
+            or self.grant.effective_principal_id != self.identity_principal_id
+            or self.grant.assigned_principal_type != "ServicePrincipal"
+            or self.grant.role_definition_id != self.role_definition_id
+            or self.grant.role_definition_name != self.role_definition_name
+            or self.grant.assignment_scope_ids != (self.reviewer_key_arm_resource_id,)
+            or self.grant.inheritance != "direct"
+            or self.grant.group_derived
+            or self.grant.condition is not None
+            or self.principal_evidence.principal_id != self.identity_principal_id
+            or self.principal_evidence.query_filter != "assignedTo(principalId)"
+            or self.principal_evidence.include_inherited is not True
+            or self.principal_evidence.include_groups is not True
+            or self.principal_evidence.include_all_descendant_scopes is not True
+            or self.principal_evidence.target_scope_ids != (expected_subscription_scope,)
+            or self.principal_evidence.transitive_group_ids
+            or self.attachment_evidence.identity_resource_id != self.identity_resource_id
+            or self.attachment_evidence.associated_resource_ids
+            or self.attachment_evidence.federated_identity_credential_ids
+            or self.attachment_evidence.associated_resource_configuration_request_paths is not None
+            or self.attachment_evidence.associated_resource_identity_resource_ids is not None
+            or self.attachment_evidence.associated_resource_identity_lifecycles is not None
+            or self.attachment_evidence.first_associated_resource_configuration_digests is not None
+            or self.attachment_evidence.second_associated_resource_configuration_digests is not None
+        ):
+            raise ValueError(
+                "reviewer-key verifier evidence must bind one unattached keys/get-only identity"
+            )
+        expected = compute_artifact_digest(
+            self.model_dump(
+                mode="json",
+                by_alias=True,
+                exclude={"evidence_digest"},
+                exclude_none=True,
+            )
+        )
+        if self.evidence_digest != expected:
+            raise ValueError("evidenceDigest does not bind reviewer-key verifier evidence")
+        return self
+
+
+class MonitoringExclusiveDataPlanePrincipalEvidence(_StrictMonitoringContract):
+    """Stable subscription-wide scan for all evidence writers and receipt signers."""
+
+    assignment_collection_scope_id: str = Field(
+        alias="assignmentCollectionScopeId",
+        min_length=1,
+        max_length=2048,
+    )
+    scope_ids: tuple[str, ...] = Field(
+        alias="scopeIds",
+        min_length=1,
+        max_length=16,
+    )
+    query_filter: Literal["none"] = Field(alias="queryFilter")
+    include_inherited: Literal[True] | None = Field(
+        default=None,
+        alias="includeInherited",
+    )
+    include_all_descendant_scopes: Literal[True] | None = Field(
+        default=None,
+        alias="includeAllDescendantScopes",
+    )
+    evidence_writer_authorized_principal_ids: tuple[str, ...] = Field(
+        alias="evidenceWriterAuthorizedPrincipalIds",
+        min_length=1,
+        max_length=32,
+    )
+    signing_key_authorized_principal_ids: tuple[str, ...] = Field(
+        alias="signingKeyAuthorizedPrincipalIds",
+        min_length=1,
+        max_length=32,
+    )
+    evidence_storage_shared_key_access_enabled: Literal[False] = Field(
+        alias="evidenceStorageSharedKeyAccessEnabled"
+    )
+    evidence_storage_default_to_oauth_authentication: Literal[True] = Field(
+        alias="evidenceStorageDefaultToOAuthAuthentication"
+    )
+    evidence_blob_versioning_enabled: Literal[True] | None = Field(
+        default=None, alias="evidenceBlobVersioningEnabled"
+    )
+    evidence_container_public_access: Literal["None"] | None = Field(
+        default=None,
+        alias="evidenceContainerPublicAccess",
+    )
+    evidence_container_has_immutability_policy: Literal[True] | None = Field(
+        default=None, alias="evidenceContainerHasImmutabilityPolicy"
+    )
+    evidence_container_immutability_policy_state: Literal["Locked", "Unlocked"] | None = Field(
+        default=None, alias="evidenceContainerImmutabilityPolicyState"
+    )
+    evidence_container_immutability_period_days: int | None = Field(
+        default=None,
+        alias="evidenceContainerImmutabilityPeriodDays",
+        ge=30,
+        le=365,
+    )
+    evidence_container_protected_append_writes_enabled: Literal[False] | None = Field(
+        default=None, alias="evidenceContainerProtectedAppendWritesEnabled"
+    )
+    evidence_container_protected_append_writes_all_enabled: Literal[False] | None = Field(
+        default=None, alias="evidenceContainerProtectedAppendWritesAllEnabled"
+    )
+    signing_key_vault_rbac_authorization_enabled: Literal[True] = Field(
+        alias="signingKeyVaultRbacAuthorizationEnabled"
+    )
+    signing_key_vault_access_policy_principal_ids: tuple[str, ...] = Field(
+        default=(),
+        alias="signingKeyVaultAccessPolicyPrincipalIds",
+        max_length=0,
+    )
+    first_read_completed_at: UtcDateTime = Field(alias="firstReadCompletedAt")
+    second_read_completed_at: UtcDateTime = Field(alias="secondReadCompletedAt")
+    first_read_target_digests: tuple[Sha256Digest, ...] = Field(
+        alias="firstReadTargetDigests",
+        min_length=1,
+        max_length=16,
+    )
+    second_read_target_digests: tuple[Sha256Digest, ...] = Field(
+        alias="secondReadTargetDigests",
+        min_length=1,
+        max_length=16,
+    )
+    first_raw_page_digests: tuple[Sha256Digest, ...] = Field(
+        alias="firstRawPageDigests",
+        min_length=1,
+        max_length=256,
+    )
+    second_raw_page_digests: tuple[Sha256Digest, ...] = Field(
+        alias="secondRawPageDigests",
+        min_length=1,
+        max_length=256,
+    )
+    first_resource_configuration_digests: tuple[Sha256Digest, ...] = Field(
+        alias="firstResourceConfigurationDigests",
+        min_length=2,
+        max_length=5,
+    )
+    second_resource_configuration_digests: tuple[Sha256Digest, ...] = Field(
+        alias="secondResourceConfigurationDigests",
+        min_length=2,
+        max_length=5,
+    )
+    all_pages_retrieved: Literal[True] = Field(alias="allPagesRetrieved")
+    evidence_digest: Sha256Digest = Field(alias="evidenceDigest")
+
+    @field_validator("assignment_collection_scope_id")
+    @classmethod
+    def normalize_assignment_collection_scope_id(cls, value: str) -> str:
+        return _canonical_rbac_scope(value)
+
+    @field_validator("scope_ids")
+    @classmethod
+    def normalize_scope_ids(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        normalized = tuple(sorted(_canonical_rbac_scope(item) for item in values))
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("privileged data-plane scope IDs must be unique")
+        return normalized
+
+    @field_validator(
+        "evidence_writer_authorized_principal_ids",
+        "signing_key_authorized_principal_ids",
+    )
+    @classmethod
+    def normalize_principal_ids(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        normalized = tuple(sorted(item.casefold() for item in values))
+        if len(normalized) != len(set(normalized)) or any(
+            _SUBSCRIPTION_ID_PATTERN.fullmatch(item) is None for item in normalized
+        ):
+            raise ValueError("privileged data-plane principal IDs must be sorted UUIDs")
+        return normalized
+
+    @field_validator(
+        "first_raw_page_digests",
+        "second_raw_page_digests",
+        "first_resource_configuration_digests",
+        "second_resource_configuration_digests",
+    )
+    @classmethod
+    def normalize_raw_page_digests(
+        cls,
+        values: tuple[Sha256Digest, ...],
+    ) -> tuple[Sha256Digest, ...]:
+        if values != tuple(sorted(values)) or len(values) != len(set(values)):
+            raise ValueError("privileged data-plane raw pages must be sorted and unique")
+        return values
+
+    @model_validator(mode="after")
+    def validate_principal_evidence(
+        self,
+    ) -> MonitoringExclusiveDataPlanePrincipalEvidence:
+        if (
+            len(self.first_read_target_digests) != 1
+            or self.first_read_target_digests != self.second_read_target_digests
+            or not self.first_read_completed_at < self.second_read_completed_at
+            or self.first_raw_page_digests != self.second_raw_page_digests
+            or self.first_resource_configuration_digests
+            != self.second_resource_configuration_digests
+        ):
+            raise ValueError(
+                "privileged data-plane principal evidence must contain two complete stable reads"
+            )
+        expected = compute_artifact_digest(
+            self.model_dump(
+                mode="json",
+                by_alias=True,
+                exclude={"evidence_digest"},
+            )
+        )
+        if self.evidence_digest != expected:
+            raise ValueError(
+                "evidenceDigest does not bind privileged data-plane principal evidence"
+            )
         return self
 
 
@@ -1074,6 +1747,121 @@ class MonitoringEffectiveRbacPimScheduleInstance(_StrictMonitoringContract):
         return self
 
 
+class MonitoringManagementGroupParentEdge(_StrictMonitoringContract):
+    """One signed parent edge from the subscription through the tenant root."""
+
+    child_scope_id: str = Field(alias="childScopeId", min_length=1, max_length=2048)
+    parent_scope_id: str = Field(alias="parentScopeId", min_length=1, max_length=2048)
+    edge_digest: Sha256Digest = Field(alias="edgeDigest")
+
+    @field_validator("child_scope_id", "parent_scope_id")
+    @classmethod
+    def normalize_hierarchy_scope(cls, value: str) -> str:
+        return _canonical_rbac_scope(value)
+
+    @model_validator(mode="after")
+    def validate_edge(self) -> MonitoringManagementGroupParentEdge:
+        if not self.parent_scope_id.startswith("/providers/microsoft.management/managementgroups/"):
+            raise ValueError("management-group hierarchy parent must be a management group")
+        expected = compute_artifact_digest(
+            self.model_dump(
+                mode="json",
+                by_alias=True,
+                exclude={"edge_digest"},
+            )
+        )
+        if self.edge_digest != expected:
+            raise ValueError("edgeDigest does not bind management-group hierarchy")
+        return self
+
+
+class MonitoringManagementGroupHierarchyEvidence(_StrictMonitoringContract):
+    """Stable getEntities proof of the complete subscription-to-root parent chain."""
+
+    request_path: Literal[
+        "/providers/Microsoft.Management/getEntities?api-version=2020-05-01"
+        "&$select=Name,Type,ParentNameChain"
+    ] = Field(alias="requestPath")
+    subscription_scope_id: str = Field(
+        alias="subscriptionScopeId",
+        min_length=1,
+        max_length=2048,
+    )
+    ordered_ancestry: tuple[str, ...] = Field(
+        alias="orderedAncestry",
+        min_length=1,
+        max_length=32,
+    )
+    parent_edges: tuple[MonitoringManagementGroupParentEdge, ...] = Field(
+        alias="parentEdges",
+        min_length=1,
+        max_length=32,
+    )
+    first_read_completed_at: UtcDateTime = Field(alias="firstReadCompletedAt")
+    second_read_completed_at: UtcDateTime = Field(alias="secondReadCompletedAt")
+    first_raw_page_digests: tuple[Sha256Digest, ...] = Field(
+        alias="firstRawPageDigests",
+        min_length=1,
+        max_length=256,
+    )
+    second_raw_page_digests: tuple[Sha256Digest, ...] = Field(
+        alias="secondRawPageDigests",
+        min_length=1,
+        max_length=256,
+    )
+    all_pages_retrieved: Literal[True] = Field(alias="allPagesRetrieved")
+    evidence_digest: Sha256Digest = Field(alias="evidenceDigest")
+
+    @field_validator("subscription_scope_id")
+    @classmethod
+    def normalize_subscription_scope(cls, value: str) -> str:
+        normalized = _canonical_rbac_scope(value)
+        if re.fullmatch(r"/subscriptions/[0-9a-f-]{36}", normalized) is None:
+            raise ValueError("hierarchy evidence must identify one subscription")
+        return normalized
+
+    @field_validator("ordered_ancestry")
+    @classmethod
+    def normalize_ordered_ancestry(
+        cls,
+        values: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        normalized = tuple(_canonical_rbac_scope(item) for item in values)
+        if len(normalized) != len(set(normalized)) or any(
+            not item.startswith("/providers/microsoft.management/managementgroups/")
+            for item in normalized
+        ):
+            raise ValueError("hierarchy ancestry must be canonical and unique")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_hierarchy(self) -> MonitoringManagementGroupHierarchyEvidence:
+        expected_edges = tuple(
+            (
+                self.subscription_scope_id if index == 0 else self.ordered_ancestry[index - 1],
+                parent_scope,
+            )
+            for index, parent_scope in enumerate(self.ordered_ancestry)
+        )
+        if (
+            tuple((item.child_scope_id, item.parent_scope_id) for item in self.parent_edges)
+            != expected_edges
+            or not self.first_read_completed_at < self.second_read_completed_at
+            or self.first_raw_page_digests != self.second_raw_page_digests
+        ):
+            raise ValueError("management-group hierarchy evidence is incomplete or unstable")
+        expected = compute_artifact_digest(
+            self.model_dump(
+                mode="json",
+                by_alias=True,
+                exclude={"evidence_digest"},
+            )
+        )
+        if self.evidence_digest != expected:
+            raise ValueError("evidenceDigest does not bind management-group hierarchy")
+        return self
+
+
 class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
     """Measured effective assignments from the explicitly collectable RBAC scopes."""
 
@@ -1081,6 +1869,7 @@ class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
         "athena.wc028MonitoringEffectiveRbacInventory.v1",
         "athena.wc028MonitoringEffectiveRbacInventory.v2",
         "athena.wc028MonitoringEffectiveRbacInventory.v3",
+        "athena.wc028MonitoringEffectiveRbacInventory.v4",
     ] = Field(alias="schemaVersion")
     collection_run_id: str = Field(
         alias="collectionRunId",
@@ -1100,6 +1889,11 @@ class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
     )
     athena_context_principal_id: str = Field(
         alias="athenaContextPrincipalId",
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    )
+    runtime_support_principal_id: str | None = Field(
+        default=None,
+        alias="runtimeSupportPrincipalId",
         pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
     )
     attestor_identity_resource_id: str | None = Field(
@@ -1133,13 +1927,27 @@ class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
         default=None,
         alias="secondReadCompletedAt",
     )
-    scope_collection_mode: Literal["subscriptionAndDescendantAtScope"] | None = Field(
+    scope_collection_mode: (
+        Literal[
+            "subscriptionAndDescendantAtScope",
+            "subscriptionAssignedToAndUnfilteredWithProtectedScopes",
+            "subscriptionAssignedToAllInheritedAndUnfilteredWithProtectedScopes",
+        ]
+        | None
+    ) = Field(default=None, alias="scopeCollectionMode")
+    protected_scope_ids: tuple[str, ...] | None = Field(
         default=None,
-        alias="scopeCollectionMode",
+        alias="protectedScopeIds",
+        min_length=1,
+        max_length=256,
     )
     management_group_ancestry: tuple[str, ...] = Field(
         alias="managementGroupAncestry",
         max_length=32,
+    )
+    management_group_hierarchy_evidence: MonitoringManagementGroupHierarchyEvidence | None = Field(
+        default=None,
+        alias="managementGroupHierarchyEvidence",
     )
     ancestor_scope_collection_complete: bool = Field(alias="ancestorScopeCollectionComplete")
     subscription_descendant_collection_complete: Literal[True] = Field(
@@ -1155,9 +1963,17 @@ class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
         default=None,
         alias="denyAssignmentCollectionComplete",
     )
+    deny_assignment_include_inherited: Literal[True] | None = Field(
+        default=None,
+        alias="denyAssignmentIncludeInherited",
+    )
     pim_schedule_instance_collection_complete: Literal[True] | None = Field(
         default=None,
         alias="pimScheduleInstanceCollectionComplete",
+    )
+    pim_schedule_instance_include_inherited: Literal[True] | None = Field(
+        default=None,
+        alias="pimScheduleInstanceIncludeInherited",
     )
     signal_reader_role_actions: tuple[str, ...] = Field(
         alias="signalReaderRoleActions",
@@ -1198,6 +2014,34 @@ class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
         alias="athenaContextGrants",
         max_length=64,
     )
+    runtime_support_grants: tuple[MonitoringEffectiveRbacGrant, ...] | None = Field(
+        default=None,
+        alias="runtimeSupportGrants",
+        min_length=1,
+        max_length=8,
+    )
+    collector_identity_attachment_evidence: MonitoringManagedIdentityAttachmentEvidence | None = (
+        Field(
+            default=None,
+            alias="collectorIdentityAttachmentEvidence",
+        )
+    )
+    rbac_attestor_identity_attachment_evidence: (
+        MonitoringManagedIdentityAttachmentEvidence | None
+    ) = Field(
+        default=None,
+        alias="rbacAttestorIdentityAttachmentEvidence",
+    )
+    reviewer_key_verifier_evidence: MonitoringReviewerKeyVerifierEvidence | None = Field(
+        default=None,
+        alias="reviewerKeyVerifierEvidence",
+    )
+    exclusive_data_plane_principal_evidence: (
+        MonitoringExclusiveDataPlanePrincipalEvidence | None
+    ) = Field(
+        default=None,
+        alias="exclusiveDataPlanePrincipalEvidence",
+    )
     collector_principal_evidence: MonitoringEffectiveRbacPrincipalEvidence | None = Field(
         default=None,
         alias="collectorPrincipalEvidence",
@@ -1205,6 +2049,10 @@ class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
     athena_context_principal_evidence: MonitoringEffectiveRbacPrincipalEvidence | None = Field(
         default=None,
         alias="athenaContextPrincipalEvidence",
+    )
+    runtime_support_principal_evidence: MonitoringEffectiveRbacPrincipalEvidence | None = Field(
+        default=None,
+        alias="runtimeSupportPrincipalEvidence",
     )
     role_definitions: tuple[MonitoringEffectiveRbacRoleDefinition, ...] | None = Field(
         default=None,
@@ -1300,6 +2148,7 @@ class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
         "subscription_id",
         "collector_principal_id",
         "athena_context_principal_id",
+        "runtime_support_principal_id",
         "attestor_client_id",
         "attestor_principal_id",
         "attestor_tenant_id",
@@ -1382,12 +2231,31 @@ class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
             )
         return normalized
 
-    @field_validator("collector_grants", "athena_context_grants")
+    @field_validator("protected_scope_ids")
+    @classmethod
+    def normalize_protected_scope_ids(
+        cls,
+        values: tuple[str, ...] | None,
+    ) -> tuple[str, ...] | None:
+        if values is None:
+            return None
+        normalized = tuple(sorted(_canonical_rbac_scope(item) for item in values))
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("effective RBAC protected scopes must be sorted and unique")
+        return normalized
+
+    @field_validator(
+        "collector_grants",
+        "athena_context_grants",
+        "runtime_support_grants",
+    )
     @classmethod
     def validate_grant_order(
         cls,
-        values: tuple[MonitoringEffectiveRbacGrant, ...],
-    ) -> tuple[MonitoringEffectiveRbacGrant, ...]:
+        values: tuple[MonitoringEffectiveRbacGrant, ...] | None,
+    ) -> tuple[MonitoringEffectiveRbacGrant, ...] | None:
+        if values is None:
+            return None
         digests = tuple(item.grant_digest for item in values)
         if digests != tuple(sorted(digests)) or len(digests) != len(set(digests)):
             raise ValueError("effective RBAC grants must be sorted and unique")
@@ -1463,7 +2331,16 @@ class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
             or self.assignment_count
             != sum(
                 len(item.assignment_scope_ids)
-                for item in (*self.collector_grants, *self.athena_context_grants)
+                for item in (
+                    *self.collector_grants,
+                    *self.athena_context_grants,
+                    *(self.runtime_support_grants or ()),
+                )
+            )
+            + (
+                len(self.reviewer_key_verifier_evidence.grant.assignment_scope_ids)
+                if self.reviewer_key_verifier_evidence is not None
+                else 0
             )
             or self.source_reference.name
             != (f"monitoring-rbac/{self.collection_run_id}/effective-rbac-inventory.json")
@@ -1496,6 +2373,15 @@ class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
             raise ValueError(
                 "Athena context effective RBAC grants do not resolve through complete membership"
             )
+        if self.runtime_support_grants is not None:
+            runtime_support_principal_id = cast(str, self.runtime_support_principal_id)
+            if any(
+                item.effective_principal_id != runtime_support_principal_id
+                or item.assigned_principal_id != runtime_support_principal_id
+                or item.group_derived
+                for item in self.runtime_support_grants
+            ):
+                raise ValueError("runtime-support effective RBAC grants must be direct and exact")
         common_attestor_fields = (
             self.attestor_identity_resource_id,
             self.attestor_client_id,
@@ -1527,6 +2413,19 @@ class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
             self.first_pim_schedule_instance_raw_page_digests,
             self.second_pim_schedule_instance_raw_page_digests,
         )
+        security_v4_fields = (
+            self.protected_scope_ids,
+            self.management_group_hierarchy_evidence,
+            self.deny_assignment_include_inherited,
+            self.pim_schedule_instance_include_inherited,
+            self.collector_identity_attachment_evidence,
+            self.rbac_attestor_identity_attachment_evidence,
+            self.reviewer_key_verifier_evidence,
+            self.exclusive_data_plane_principal_evidence,
+            self.runtime_support_principal_id,
+            self.runtime_support_grants,
+            self.runtime_support_principal_evidence,
+        )
         if self.schema_version == "athena.wc028MonitoringEffectiveRbacInventory.v1":
             if (
                 any(
@@ -1535,6 +2434,7 @@ class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
                         *common_attestor_fields,
                         *legacy_repeated_read_fields,
                         *repeated_read_v3_fields,
+                        *security_v4_fields,
                     )
                 )
                 or self.ip_flow_verify_role_actions is None
@@ -1566,6 +2466,7 @@ class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
                 MonitoringEffectiveRbacPrincipalEvidence,
                 self.athena_context_principal_evidence,
             )
+            runtime_support_evidence = self.runtime_support_principal_evidence
             role_definitions = cast(
                 tuple[MonitoringEffectiveRbacRoleDefinition, ...],
                 self.role_definitions,
@@ -1583,11 +2484,22 @@ class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
                 or context_evidence.principal_id != self.athena_context_principal_id
                 or collector_evidence.transitive_group_ids != self.collector_security_group_ids
                 or context_evidence.transitive_group_ids != self.athena_context_security_group_ids
-                or any(
-                    item.condition is not None
-                    for item in (
-                        *self.collector_grants,
-                        *self.athena_context_grants,
+                or (
+                    runtime_support_evidence is not None
+                    and (
+                        runtime_support_evidence.principal_id != self.runtime_support_principal_id
+                        or runtime_support_evidence.transitive_group_ids
+                    )
+                )
+                or (
+                    self.schema_version != MONITORING_EFFECTIVE_RBAC_INVENTORY_SCHEMA_VERSION
+                    and any(
+                        item.condition is not None
+                        for item in (
+                            *self.collector_grants,
+                            *self.athena_context_grants,
+                            *(self.runtime_support_grants or ()),
+                        )
                     )
                 )
                 or any(item.condition is not None for item in deny_assignments)
@@ -1607,12 +2519,16 @@ class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
                 )
             }
             referenced_role_ids.update(item.role_definition_id for item in pim_instances)
+            if self.reviewer_key_verifier_evidence is not None:
+                referenced_role_ids.add(
+                    self.reviewer_key_verifier_evidence.grant.role_definition_id
+                )
             available_role_ids = {item.role_definition_id for item in role_definitions}
             if not referenced_role_ids.issubset(available_role_ids):
                 raise ValueError(
                     "effective RBAC evidence omitted a referenced full role definition"
                 )
-            normalized_record_digests = {
+            normalized_record_digests: dict[str, object] = {
                 "roleDefinitionRawDigests": [
                     item.raw_definition_digest for item in role_definitions
                 ],
@@ -1635,10 +2551,17 @@ class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
                 if (
                     any(item is None for item in legacy_repeated_read_fields)
                     or any(item is not None for item in repeated_read_v3_fields)
+                    or any(item is not None for item in security_v4_fields)
                     or collector_evidence.role_assignment_raw_page_digests is None
                     or collector_evidence.transitive_group_raw_page_digests is None
                     or context_evidence.role_assignment_raw_page_digests is None
                     or context_evidence.transitive_group_raw_page_digests is None
+                    or collector_evidence.include_inherited is not None
+                    or collector_evidence.include_groups is not None
+                    or collector_evidence.include_all_descendant_scopes is not None
+                    or context_evidence.include_inherited is not None
+                    or context_evidence.include_groups is not None
+                    or context_evidence.include_all_descendant_scopes is not None
                 ):
                     raise ValueError(
                         "effective RBAC inventory v2 cannot contain independent read receipts"
@@ -1681,13 +2604,140 @@ class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
                         "effective RBAC repeated-read snapshot does not bind raw hashes"
                     )
             else:
-                if (
-                    self.scope_collection_mode != "subscriptionAndDescendantAtScope"
-                    or self.management_group_ancestry
-                    or self.ancestor_scope_collection_complete is not False
-                ):
-                    raise ValueError(
-                        "effective RBAC inventory v3 requires exact collectable scope evidence"
+                if self.schema_version == "athena.wc028MonitoringEffectiveRbacInventory.v3":
+                    if (
+                        self.scope_collection_mode != "subscriptionAndDescendantAtScope"
+                        or self.management_group_ancestry
+                        or self.ancestor_scope_collection_complete is not False
+                        or any(item is not None for item in security_v4_fields)
+                        or collector_evidence.include_inherited is not None
+                        or collector_evidence.include_groups is not None
+                        or collector_evidence.include_all_descendant_scopes is not None
+                        or context_evidence.include_inherited is not None
+                        or context_evidence.include_groups is not None
+                        or context_evidence.include_all_descendant_scopes is not None
+                    ):
+                        raise ValueError(
+                            "effective RBAC inventory v3 requires exact collectable scope evidence"
+                        )
+                else:
+                    tenant_root_scope = (
+                        f"/providers/microsoft.management/managementgroups/{self.tenant_id}"
+                    )
+                    principal_target_scopes = tuple(
+                        sorted(
+                            (
+                                f"/subscriptions/{self.subscription_id}",
+                                *self.management_group_ancestry,
+                            )
+                        )
+                    )
+                    hierarchy_evidence = cast(
+                        MonitoringManagementGroupHierarchyEvidence,
+                        self.management_group_hierarchy_evidence,
+                    )
+                    runtime_support_evidence = cast(
+                        MonitoringEffectiveRbacPrincipalEvidence,
+                        self.runtime_support_principal_evidence,
+                    )
+                    runtime_support_grants = cast(
+                        tuple[MonitoringEffectiveRbacGrant, ...],
+                        self.runtime_support_grants,
+                    )
+                    if (
+                        self.scope_collection_mode
+                        != ("subscriptionAssignedToAllInheritedAndUnfilteredWithProtectedScopes")
+                        or not self.management_group_ancestry
+                        or self.management_group_ancestry[-1] != tenant_root_scope
+                        or hierarchy_evidence.subscription_scope_id
+                        != f"/subscriptions/{self.subscription_id}"
+                        or hierarchy_evidence.ordered_ancestry != self.management_group_ancestry
+                        or hierarchy_evidence.second_read_completed_at > self.collected_at
+                        or self.ancestor_scope_collection_complete is not True
+                        or any(item is None for item in security_v4_fields)
+                    ):
+                        raise ValueError(
+                            "effective RBAC inventory v4 requires exact collectable scope evidence"
+                        )
+                    collector_attachment = cast(
+                        MonitoringManagedIdentityAttachmentEvidence,
+                        self.collector_identity_attachment_evidence,
+                    )
+                    attestor_attachment = cast(
+                        MonitoringManagedIdentityAttachmentEvidence,
+                        self.rbac_attestor_identity_attachment_evidence,
+                    )
+                    verifier_evidence = cast(
+                        MonitoringReviewerKeyVerifierEvidence,
+                        self.reviewer_key_verifier_evidence,
+                    )
+                    exclusive_principals = cast(
+                        MonitoringExclusiveDataPlanePrincipalEvidence,
+                        self.exclusive_data_plane_principal_evidence,
+                    )
+                    subscription_scope = f"/subscriptions/{self.subscription_id}"
+                    if (
+                        collector_evidence.query_filter != "assignedTo(principalId)"
+                        or context_evidence.query_filter != "assignedTo(principalId)"
+                        or collector_evidence.include_inherited is not True
+                        or collector_evidence.include_groups is not True
+                        or collector_evidence.include_all_descendant_scopes is not True
+                        or context_evidence.include_inherited is not True
+                        or context_evidence.include_groups is not True
+                        or context_evidence.include_all_descendant_scopes is not True
+                        or collector_evidence.target_scope_ids != principal_target_scopes
+                        or context_evidence.target_scope_ids != principal_target_scopes
+                        or runtime_support_evidence.query_filter != "assignedTo(principalId)"
+                        or runtime_support_evidence.include_inherited is not True
+                        or runtime_support_evidence.include_groups is not True
+                        or runtime_support_evidence.include_all_descendant_scopes is not True
+                        or runtime_support_evidence.target_scope_ids != principal_target_scopes
+                        or len(runtime_support_grants) != 1
+                        or exclusive_principals.assignment_collection_scope_id != subscription_scope
+                        or exclusive_principals.include_inherited is not True
+                        or exclusive_principals.include_all_descendant_scopes is not True
+                        or attestor_attachment.identity_resource_id
+                        != cast(str, self.attestor_identity_resource_id)
+                        or verifier_evidence.identity_tenant_id != self.tenant_id
+                        or verifier_evidence.identity_principal_id
+                        in {
+                            self.collector_principal_id,
+                            self.athena_context_principal_id,
+                            self.attestor_principal_id,
+                        }
+                        or collector_attachment.federated_identity_credential_ids
+                        or attestor_attachment.federated_identity_credential_ids
+                        or collector_attachment.second_read_completed_at > self.collected_at
+                        or attestor_attachment.second_read_completed_at > self.collected_at
+                        or verifier_evidence.attachment_evidence.second_read_completed_at
+                        > self.collected_at
+                        or exclusive_principals.second_read_completed_at > self.collected_at
+                    ):
+                        raise ValueError(
+                            "effective RBAC inventory v4 runtime and "
+                            "subscription-wide evidence is invalid"
+                        )
+                    normalized_record_digests.update(
+                        {
+                            "collectorIdentityAttachmentEvidenceDigest": (
+                                collector_attachment.evidence_digest
+                            ),
+                            "rbacAttestorIdentityAttachmentEvidenceDigest": (
+                                attestor_attachment.evidence_digest
+                            ),
+                            "reviewerKeyVerifierEvidenceDigest": (
+                                verifier_evidence.evidence_digest
+                            ),
+                            "exclusiveDataPlanePrincipalEvidenceDigest": (
+                                exclusive_principals.evidence_digest
+                            ),
+                            "managementGroupHierarchyEvidenceDigest": (
+                                hierarchy_evidence.evidence_digest
+                            ),
+                            "runtimeSupportPrincipalEvidenceDigest": (
+                                runtime_support_evidence.evidence_digest
+                            ),
+                        }
                     )
                 if (
                     any(item is not None for item in legacy_repeated_read_fields)
@@ -1709,9 +2759,27 @@ class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
                             context_evidence.second_transitive_group_raw_page_digests,
                         )
                     )
+                    or (
+                        self.schema_version == MONITORING_EFFECTIVE_RBAC_INVENTORY_SCHEMA_VERSION
+                        and (
+                            runtime_support_evidence is None
+                            or runtime_support_evidence.role_assignment_raw_page_digests is not None
+                            or runtime_support_evidence.transitive_group_raw_page_digests
+                            is not None
+                            or any(
+                                item is None
+                                for item in (
+                                    runtime_support_evidence.first_role_assignment_raw_page_digests,
+                                    runtime_support_evidence.second_role_assignment_raw_page_digests,
+                                    runtime_support_evidence.first_transitive_group_raw_page_digests,
+                                    runtime_support_evidence.second_transitive_group_raw_page_digests,
+                                )
+                            )
+                        )
+                    )
                 ):
                     raise ValueError(
-                        "effective RBAC inventory v3 requires independent read receipts"
+                        "effective RBAC inventory v3+ requires independent read receipts"
                     )
                 first_read_completed_at = cast(
                     UtcDateTime,
@@ -1722,7 +2790,46 @@ class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
                     self.second_read_completed_at,
                 )
                 if not first_read_completed_at < second_read_completed_at <= self.collected_at:
-                    raise ValueError("effective RBAC inventory v3 read receipts are not distinct")
+                    raise ValueError("effective RBAC inventory read receipts are not distinct")
+                runtime_first_snapshot: dict[str, object] = {}
+                runtime_second_snapshot: dict[str, object] = {}
+                if runtime_support_evidence is not None:
+                    runtime_first_snapshot = {
+                        "runtimeSupportPrincipalId": runtime_support_evidence.principal_id,
+                        "runtimeSupportTargetReadDigests": list(
+                            runtime_support_evidence.first_read_target_digests
+                        ),
+                        "runtimeSupportRoleAssignmentRawPageDigests": list(
+                            cast(
+                                tuple[Sha256Digest, ...],
+                                runtime_support_evidence.first_role_assignment_raw_page_digests,
+                            )
+                        ),
+                        "runtimeSupportTransitiveGroupRawPageDigests": list(
+                            cast(
+                                tuple[Sha256Digest, ...],
+                                runtime_support_evidence.first_transitive_group_raw_page_digests,
+                            )
+                        ),
+                    }
+                    runtime_second_snapshot = {
+                        "runtimeSupportPrincipalId": runtime_support_evidence.principal_id,
+                        "runtimeSupportTargetReadDigests": list(
+                            runtime_support_evidence.second_read_target_digests
+                        ),
+                        "runtimeSupportRoleAssignmentRawPageDigests": list(
+                            cast(
+                                tuple[Sha256Digest, ...],
+                                runtime_support_evidence.second_role_assignment_raw_page_digests,
+                            )
+                        ),
+                        "runtimeSupportTransitiveGroupRawPageDigests": list(
+                            cast(
+                                tuple[Sha256Digest, ...],
+                                runtime_support_evidence.second_transitive_group_raw_page_digests,
+                            )
+                        ),
+                    }
                 first_snapshot_payload = {
                     "collectorPrincipalId": collector_evidence.principal_id,
                     "collectorTargetReadDigests": list(
@@ -1774,6 +2881,7 @@ class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
                             self.first_pim_schedule_instance_raw_page_digests,
                         )
                     ),
+                    **runtime_first_snapshot,
                     **normalized_record_digests,
                 }
                 second_snapshot_payload = {
@@ -1827,6 +2935,7 @@ class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
                             self.second_pim_schedule_instance_raw_page_digests,
                         )
                     ),
+                    **runtime_second_snapshot,
                     **normalized_record_digests,
                 }
                 if (
@@ -1852,6 +2961,179 @@ class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
         return self
 
 
+def monitoring_effective_rbac_inventory_attestation_preimage(
+    *,
+    bootstrap_handoff_id: str,
+    bootstrap_deployment_id: str,
+    bootstrap_template_hash: str,
+    bootstrap_contract_inputs_binding_id: str,
+    reviewer_principal_id: str,
+    reviewer_key_id: str,
+    public_key_fingerprint: str,
+    inventory_digest: str,
+    source_manifest_digest: str,
+    legacy_collector_rbac_cleanup_schema_version: str,
+    legacy_collector_rbac_cleanup_digest: str,
+) -> dict[str, object]:
+    return {
+        "domain": "athena.wc028-effective-rbac-inventory-attestation-v1",
+        "bootstrapHandoffId": bootstrap_handoff_id,
+        "bootstrapDeploymentId": bootstrap_deployment_id,
+        "bootstrapTemplateHash": bootstrap_template_hash,
+        "bootstrapContractInputsBindingId": bootstrap_contract_inputs_binding_id,
+        "reviewerPrincipalId": reviewer_principal_id,
+        "reviewerKeyId": reviewer_key_id,
+        "publicKeyFingerprint": public_key_fingerprint,
+        "inventoryDigest": inventory_digest,
+        "sourceManifestDigest": source_manifest_digest,
+        "legacyCollectorRbacCleanupSchemaVersion": (legacy_collector_rbac_cleanup_schema_version),
+        "legacyCollectorRbacCleanupDigest": legacy_collector_rbac_cleanup_digest,
+    }
+
+
+class MonitoringEffectiveRbacInventoryAttestation(_StrictMonitoringContract):
+    """Detached reviewer signature over one complete effective-RBAC inventory."""
+
+    schema_version: Literal["athena.wc028MonitoringEffectiveRbacInventoryAttestation.v1"] = Field(
+        alias="schemaVersion"
+    )
+    signature_algorithm: Literal["RS256"] = Field(alias="signatureAlgorithm")
+    bootstrap_handoff_id: str = Field(
+        alias="bootstrapHandoffId",
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    )
+    bootstrap_deployment_id: str = Field(
+        alias="bootstrapDeploymentId",
+        pattern=(
+            r"^/subscriptions/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+            r"[0-9a-f]{4}-[0-9a-f]{12}/providers/microsoft\.resources/"
+            r"deployments/[A-Za-z0-9._()-]{1,64}$"
+        ),
+    )
+    bootstrap_template_hash: str = Field(
+        alias="bootstrapTemplateHash",
+        min_length=1,
+        max_length=128,
+    )
+    bootstrap_contract_inputs_binding_id: str = Field(
+        alias="bootstrapContractInputsBindingId",
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    )
+    reviewer_principal_id: str = Field(
+        alias="reviewerPrincipalId",
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    )
+    reviewer_key_id: str = Field(
+        alias="reviewerKeyId",
+        pattern=(
+            r"^https://[A-Za-z0-9-]+\.vault\.azure\.net/keys/"
+            r"[A-Za-z0-9-]{1,127}/[A-Fa-f0-9]{32}$"
+        ),
+    )
+    public_key_modulus: str = Field(
+        alias="publicKeyModulus",
+        pattern=r"^[A-Za-z0-9_-]{342,1024}$",
+    )
+    public_key_exponent: str = Field(
+        alias="publicKeyExponent",
+        pattern=r"^[A-Za-z0-9_-]{2,16}$",
+    )
+    public_key_fingerprint: Sha256Digest = Field(alias="publicKeyFingerprint")
+    inventory_digest: Sha256Digest = Field(alias="inventoryDigest")
+    source_manifest_digest: Sha256Digest = Field(alias="sourceManifestDigest")
+    legacy_collector_rbac_cleanup_schema_version: Literal[
+        "athena.wc028LegacyCollectorRbacCleanup.v3"
+    ] = Field(alias="legacyCollectorRbacCleanupSchemaVersion")
+    legacy_collector_rbac_cleanup_digest: Sha256Digest = Field(
+        alias="legacyCollectorRbacCleanupDigest"
+    )
+    signed_preimage_digest: Sha256Digest = Field(alias="signedPreimageDigest")
+    signature: str = Field(min_length=1, max_length=2048)
+
+    @field_validator("bootstrap_deployment_id", mode="before")
+    @classmethod
+    def normalize_bootstrap_deployment_id(cls, value: object) -> object:
+        return value.casefold().rstrip("/") if type(value) is str else value
+
+    @field_validator("reviewer_principal_id")
+    @classmethod
+    def normalize_reviewer_principal_id(cls, value: str) -> str:
+        return value.casefold()
+
+    @field_validator("reviewer_key_id")
+    @classmethod
+    def normalize_reviewer_key_id(cls, value: str) -> str:
+        return value.rstrip("/")
+
+    @model_validator(mode="after")
+    def validate_attestation(
+        self,
+    ) -> MonitoringEffectiveRbacInventoryAttestation:
+        reviewer_key_segments = self.reviewer_key_id.split("/")
+        if (
+            len(reviewer_key_segments) != 6
+            or reviewer_key_segments[2].casefold() != _REVIEWED_RBAC_INVENTORY_REVIEWER_VAULT_HOST
+            or reviewer_key_segments[4] != _REVIEWED_RBAC_INVENTORY_REVIEWER_KEY_NAME
+            or self.bootstrap_handoff_id == _ALL_PRINCIPALS_ID
+            or self.reviewer_principal_id == _ALL_PRINCIPALS_ID
+            or self.legacy_collector_rbac_cleanup_digest == "sha256:" + ("0" * 64)
+        ):
+            raise ValueError(
+                "effective RBAC inventory attestation authority or cleanup binding is invalid"
+            )
+        try:
+            modulus = base64.urlsafe_b64decode(
+                self.public_key_modulus + "=" * (-len(self.public_key_modulus) % 4)
+            )
+            exponent = base64.urlsafe_b64decode(
+                self.public_key_exponent + "=" * (-len(self.public_key_exponent) % 4)
+            )
+            public_key = rsa.RSAPublicNumbers(
+                e=int.from_bytes(exponent, "big"),
+                n=int.from_bytes(modulus, "big"),
+            ).public_key()
+            signature = base64.b64decode(self.signature, validate=True)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("effective RBAC inventory attestation key is invalid") from exc
+        if public_key.key_size < 2048 or int.from_bytes(exponent, "big") != 65537:
+            raise ValueError(
+                "effective RBAC inventory attestation requires RSA-2048 or stronger with e=65537"
+            )
+        encoded_key = public_key.public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        if self.public_key_fingerprint != ("sha256:" + hashlib.sha256(encoded_key).hexdigest()):
+            raise ValueError("effective RBAC inventory attestation key fingerprint is invalid")
+        preimage = monitoring_effective_rbac_inventory_attestation_preimage(
+            bootstrap_handoff_id=self.bootstrap_handoff_id,
+            bootstrap_deployment_id=self.bootstrap_deployment_id,
+            bootstrap_template_hash=self.bootstrap_template_hash,
+            bootstrap_contract_inputs_binding_id=(self.bootstrap_contract_inputs_binding_id),
+            reviewer_principal_id=self.reviewer_principal_id,
+            reviewer_key_id=self.reviewer_key_id,
+            public_key_fingerprint=self.public_key_fingerprint,
+            inventory_digest=self.inventory_digest,
+            source_manifest_digest=self.source_manifest_digest,
+            legacy_collector_rbac_cleanup_schema_version=(
+                self.legacy_collector_rbac_cleanup_schema_version
+            ),
+            legacy_collector_rbac_cleanup_digest=(self.legacy_collector_rbac_cleanup_digest),
+        )
+        if self.signed_preimage_digest != compute_artifact_digest(preimage):
+            raise ValueError("effective RBAC inventory signedPreimageDigest is invalid")
+        try:
+            public_key.verify(
+                signature,
+                canonicalize_json(preimage).encode("utf-8"),
+                padding.PKCS1v15(),
+                hashes.SHA256(),
+            )
+        except InvalidSignature as exc:
+            raise ValueError("effective RBAC inventory reviewer signature is invalid") from exc
+        return self
+
+
 class MonitoringCollectorContract(_StrictMonitoringContract):
     """Reviewed generic boundary for one identity-isolated monitoring collector."""
 
@@ -1863,6 +3145,7 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
         "athena.wc028MonitoringCollectorContract.v6",
         "athena.wc028MonitoringCollectorContract.v7",
         "athena.wc028MonitoringCollectorContract.v8",
+        "athena.wc028MonitoringCollectorContract.v9",
     ] = Field(alias="schemaVersion")
     collector_identity_resource_id: str = Field(
         alias="collectorIdentityResourceId",
@@ -1896,6 +3179,61 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
     physical_identity_separation_enforced: Literal[True] | None = Field(
         default=None,
         alias="physicalIdentitySeparationEnforced",
+    )
+    collector_runtime_resource_id: str | None = Field(
+        default=None,
+        alias="collectorRuntimeResourceId",
+        min_length=1,
+        max_length=2048,
+    )
+    rbac_attestor_runtime_resource_id: str | None = Field(
+        default=None,
+        alias="rbacAttestorRuntimeResourceId",
+        min_length=1,
+        max_length=2048,
+    )
+    runtime_support_identity_resource_id: str | None = Field(
+        default=None,
+        alias="runtimeSupportIdentityResourceId",
+        min_length=1,
+        max_length=2048,
+    )
+    runtime_support_identity_principal_id: str | None = Field(
+        default=None,
+        alias="runtimeSupportIdentityPrincipalId",
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    )
+    runtime_support_storage_reader_role_definition_id: str | None = Field(
+        default=None,
+        alias="runtimeSupportStorageReaderRoleDefinitionId",
+        min_length=1,
+        max_length=2048,
+    )
+    runtime_support_storage_reader_role_name: str | None = Field(
+        default=None,
+        alias="runtimeSupportStorageReaderRoleName",
+        min_length=1,
+        max_length=256,
+    )
+    runtime_support_storage_reader_allowed_operations: (
+        tuple[MonitoringStorageReadbackOperation, ...] | None
+    ) = Field(
+        default=None,
+        alias="runtimeSupportStorageReaderAllowedOperations",
+        min_length=len(_EXPECTED_STORAGE_READBACK_OPERATIONS),
+        max_length=len(_EXPECTED_STORAGE_READBACK_OPERATIONS),
+    )
+    runtime_support_storage_reader_role_assignment_id: str | None = Field(
+        default=None,
+        alias="runtimeSupportStorageReaderRoleAssignmentId",
+        min_length=1,
+        max_length=2048,
+    )
+    runtime_support_storage_reader_scope_id: str | None = Field(
+        default=None,
+        alias="runtimeSupportStorageReaderScopeId",
+        min_length=1,
+        max_length=2048,
     )
     monitoring_resource_group_id: str = Field(
         alias="monitoringResourceGroupId",
@@ -2076,12 +3414,132 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
     rbac_attestor_allowed_operations: tuple[MonitoringRbacAttestorOperation, ...] | None = Field(
         default=None,
         alias="rbacAttestorAllowedOperations",
-        min_length=len(_EXPECTED_RBAC_ATTESTOR_OPERATIONS),
+        min_length=len(_EXPECTED_PREVIOUS_RBAC_ATTESTOR_OPERATIONS),
         max_length=len(_EXPECTED_RBAC_ATTESTOR_OPERATIONS),
     )
     rbac_attestor_identity_separation_enforced: Literal[True] | None = Field(
         default=None,
         alias="rbacAttestorIdentitySeparationEnforced",
+    )
+    rbac_inventory_reviewer_principal_id: str | None = Field(
+        default=None,
+        alias="rbacInventoryReviewerPrincipalId",
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    )
+    rbac_inventory_bootstrap_handoff_id: str | None = Field(
+        default=None,
+        alias="rbacInventoryBootstrapHandoffId",
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    )
+    rbac_inventory_bootstrap_deployment_id: str | None = Field(
+        default=None,
+        alias="rbacInventoryBootstrapDeploymentId",
+        min_length=1,
+        max_length=2048,
+    )
+    rbac_inventory_bootstrap_template_hash: str | None = Field(
+        default=None,
+        alias="rbacInventoryBootstrapTemplateHash",
+        min_length=1,
+        max_length=128,
+    )
+    rbac_inventory_bootstrap_contract_inputs_binding_id: str | None = Field(
+        default=None,
+        alias="rbacInventoryBootstrapContractInputsBindingId",
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    )
+    rbac_inventory_verifier_identity_resource_id: str | None = Field(
+        default=None,
+        alias="rbacInventoryVerifierIdentityResourceId",
+        min_length=1,
+        max_length=2048,
+    )
+    rbac_inventory_verifier_identity_client_id: str | None = Field(
+        default=None,
+        alias="rbacInventoryVerifierIdentityClientId",
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    )
+    rbac_inventory_verifier_identity_principal_id: str | None = Field(
+        default=None,
+        alias="rbacInventoryVerifierIdentityPrincipalId",
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    )
+    rbac_inventory_verifier_identity_tenant_id: str | None = Field(
+        default=None,
+        alias="rbacInventoryVerifierIdentityTenantId",
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    )
+    rbac_inventory_reviewer_key_arm_resource_id: str | None = Field(
+        default=None,
+        alias="rbacInventoryReviewerKeyArmResourceId",
+        min_length=1,
+        max_length=2048,
+    )
+    rbac_inventory_reviewer_key_vault_resource_id: str | None = Field(
+        default=None,
+        alias="rbacInventoryReviewerKeyVaultResourceId",
+        min_length=1,
+        max_length=2048,
+    )
+    rbac_inventory_verifier_role_definition_id: str | None = Field(
+        default=None,
+        alias="rbacInventoryVerifierRoleDefinitionId",
+        min_length=1,
+        max_length=2048,
+    )
+    rbac_inventory_verifier_role_name: str | None = Field(
+        default=None,
+        alias="rbacInventoryVerifierRoleName",
+        min_length=1,
+        max_length=256,
+    )
+    rbac_inventory_verifier_role_scope_id: str | None = Field(
+        default=None,
+        alias="rbacInventoryVerifierRoleScopeId",
+        min_length=1,
+        max_length=2048,
+    )
+    rbac_inventory_verifier_allowed_data_actions: (
+        tuple[MonitoringReviewerKeyVerifierDataAction, ...] | None
+    ) = Field(
+        default=None,
+        alias="rbacInventoryVerifierAllowedDataActions",
+        min_length=1,
+        max_length=1,
+    )
+    rbac_inventory_verifier_role_assignment_id: str | None = Field(
+        default=None,
+        alias="rbacInventoryVerifierRoleAssignmentId",
+        min_length=1,
+        max_length=2048,
+    )
+    rbac_inventory_reviewer_key_id: str | None = Field(
+        default=None,
+        alias="rbacInventoryReviewerKeyId",
+        pattern=(
+            r"^https://[A-Za-z0-9-]+\.vault\.azure\.net/keys/"
+            r"[A-Za-z0-9-]{1,127}/[A-Fa-f0-9]{32}$"
+        ),
+    )
+    rbac_inventory_reviewer_public_key_modulus: str | None = Field(
+        default=None,
+        alias="rbacInventoryReviewerPublicKeyModulus",
+        pattern=r"^[A-Za-z0-9_-]{342,1024}$",
+    )
+    rbac_inventory_reviewer_public_key_exponent: str | None = Field(
+        default=None,
+        alias="rbacInventoryReviewerPublicKeyExponent",
+        pattern=r"^[A-Za-z0-9_-]{2,16}$",
+    )
+    rbac_inventory_reviewer_public_key_fingerprint: Sha256Digest | None = Field(
+        default=None,
+        alias="rbacInventoryReviewerPublicKeyFingerprint",
+    )
+    effective_rbac_inventory_attestation: MonitoringEffectiveRbacInventoryAttestation | None = (
+        Field(
+            default=None,
+            alias="effectiveRbacInventoryAttestation",
+        )
     )
     identity_proof_audience: str | None = Field(
         default=None,
@@ -2205,9 +3663,25 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
         min_length=1,
         max_length=2048,
     )
+    evidence_blob_service_resource_id: str | None = Field(
+        default=None,
+        alias="evidenceBlobServiceResourceId",
+        min_length=1,
+        max_length=2048,
+    )
     evidence_container_resource_id: str | None = Field(
         default=None,
         alias="evidenceContainerResourceId",
+        min_length=1,
+        max_length=2048,
+    )
+    evidence_container_public_access: Literal["None"] | None = Field(
+        default=None,
+        alias="evidenceContainerPublicAccess",
+    )
+    evidence_immutability_policy_resource_id: str | None = Field(
+        default=None,
+        alias="evidenceImmutabilityPolicyResourceId",
         min_length=1,
         max_length=2048,
     )
@@ -2216,6 +3690,75 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
         alias="evidenceWriterRoleDefinitionId",
         min_length=1,
         max_length=2048,
+    )
+    evidence_writer_role_name: str | None = Field(
+        default=None,
+        alias="evidenceWriterRoleName",
+        min_length=1,
+        max_length=256,
+    )
+    evidence_writer_allowed_data_actions: tuple[MonitoringEvidenceWriterDataAction, ...] | None = (
+        Field(
+            default=None,
+            alias="evidenceWriterAllowedDataActions",
+            min_length=len(_EXPECTED_EVIDENCE_WRITER_DATA_ACTIONS),
+            max_length=len(_EXPECTED_EVIDENCE_WRITER_DATA_ACTIONS),
+        )
+    )
+    evidence_writer_assignment_condition: str | None = Field(
+        default=None,
+        alias="evidenceWriterAssignmentCondition",
+        min_length=1,
+        max_length=4096,
+    )
+    evidence_writer_assignment_condition_version: Literal["2.0"] | None = Field(
+        default=None,
+        alias="evidenceWriterAssignmentConditionVersion",
+    )
+    evidence_blob_versioning_enabled: Literal[True] | None = Field(
+        default=None,
+        alias="evidenceBlobVersioningEnabled",
+    )
+    evidence_container_has_immutability_policy: Literal[True] | None = Field(
+        default=None,
+        alias="evidenceContainerHasImmutabilityPolicy",
+    )
+    evidence_container_immutability_policy_state: Literal["Locked", "Unlocked"] | None = Field(
+        default=None,
+        alias="evidenceContainerImmutabilityPolicyState",
+    )
+    evidence_container_immutability_period_days: int | None = Field(
+        default=None,
+        alias="evidenceContainerImmutabilityPeriodDays",
+        ge=30,
+        le=365,
+    )
+    evidence_container_protected_append_writes_enabled: Literal[False] | None = Field(
+        default=None,
+        alias="evidenceContainerProtectedAppendWritesEnabled",
+    )
+    evidence_container_protected_append_writes_all_enabled: Literal[False] | None = Field(
+        default=None,
+        alias="evidenceContainerProtectedAppendWritesAllEnabled",
+    )
+    evidence_storage_readback_binding_id: str | None = Field(
+        default=None,
+        alias="evidenceStorageReadbackBindingId",
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    )
+    evidence_storage_readiness_digest: Sha256Digest | None = Field(
+        default=None,
+        alias="evidenceStorageReadinessDigest",
+    )
+    legacy_collector_rbac_cleanup_schema_version: (
+        Literal["athena.wc028LegacyCollectorRbacCleanup.v3"] | None
+    ) = Field(
+        default=None,
+        alias="legacyCollectorRbacCleanupSchemaVersion",
+    )
+    legacy_collector_rbac_cleanup_digest: Sha256Digest | None = Field(
+        default=None,
+        alias="legacyCollectorRbacCleanupDigest",
     )
     evidence_container_name: Literal["monitoring-evidence"] = Field(alias="evidenceContainerName")
     signal_kinds: tuple[MonitoringSignalKind, ...] = Field(
@@ -2241,6 +3784,7 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
             "athena.wc028MonitoringAcquisitionReceipt.v3",
             "athena.wc028MonitoringAcquisitionReceipt.v4",
             "athena.wc028MonitoringAcquisitionReceipt.v5",
+            "athena.wc028MonitoringAcquisitionReceipt.v6",
         ]
         | None
     ) = Field(
@@ -2269,6 +3813,12 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
         "rbac_attestor_identity_client_id",
         "rbac_attestor_principal_id",
         "rbac_attestor_tenant_id",
+        "rbac_inventory_bootstrap_handoff_id",
+        "rbac_inventory_verifier_identity_client_id",
+        "rbac_inventory_verifier_identity_principal_id",
+        "rbac_inventory_verifier_identity_tenant_id",
+        "rbac_inventory_reviewer_principal_id",
+        "runtime_support_identity_principal_id",
         "identity_proof_application_id",
         "identity_proof_application_object_id",
         "identity_proof_service_principal_id",
@@ -2302,6 +3852,80 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
     ) -> str | None:
         return None if value is None else value.casefold().rstrip("/")
 
+    @field_validator("rbac_inventory_reviewer_key_id")
+    @classmethod
+    def normalize_rbac_inventory_reviewer_key_id(
+        cls,
+        value: str | None,
+    ) -> str | None:
+        return None if value is None else value.rstrip("/")
+
+    @field_validator("rbac_inventory_bootstrap_deployment_id", mode="before")
+    @classmethod
+    def normalize_rbac_inventory_bootstrap_deployment_id(
+        cls,
+        value: object,
+    ) -> object:
+        return value.casefold().rstrip("/") if type(value) is str else value
+
+    @field_validator("legacy_collector_rbac_cleanup_digest")
+    @classmethod
+    def reject_zero_cleanup_digest(cls, value: str | None) -> str | None:
+        if value == "sha256:" + ("0" * 64):
+            raise ValueError("legacy collector RBAC cleanup digest must be non-zero")
+        return value
+
+    @field_validator(
+        "collector_runtime_resource_id",
+        "rbac_attestor_runtime_resource_id",
+    )
+    @classmethod
+    def canonicalize_runtime_resource_id(
+        cls,
+        value: str | None,
+    ) -> str | None:
+        if value is None:
+            return None
+        normalized = value.casefold().rstrip("/")
+        _, _, provider, types = _parse_arm_resource_id(normalized)
+        if provider != "microsoft.app" or types != ("jobs",):
+            raise ValueError("monitoring runtime bindings must identify Container Apps jobs")
+        return normalized
+
+    @field_validator(
+        "runtime_support_identity_resource_id",
+        "rbac_inventory_verifier_identity_resource_id",
+    )
+    @classmethod
+    def canonicalize_runtime_support_identity_resource_id(
+        cls,
+        value: str | None,
+    ) -> str | None:
+        if value is None:
+            return None
+        normalized = value.casefold().rstrip("/")
+        _, _, provider, types = _parse_arm_resource_id(normalized)
+        if provider != "microsoft.managedidentity" or types != ("userassignedidentities",):
+            raise ValueError("support and verifier bindings must identify user-assigned identities")
+        return normalized
+
+    @field_validator(
+        "rbac_inventory_reviewer_key_arm_resource_id",
+        "rbac_inventory_reviewer_key_vault_resource_id",
+        "rbac_inventory_verifier_role_definition_id",
+        "rbac_inventory_verifier_role_scope_id",
+        "rbac_inventory_verifier_role_assignment_id",
+        "runtime_support_storage_reader_role_definition_id",
+        "runtime_support_storage_reader_role_assignment_id",
+        "runtime_support_storage_reader_scope_id",
+    )
+    @classmethod
+    def canonicalize_reviewer_verifier_resource_id(
+        cls,
+        value: str | None,
+    ) -> str | None:
+        return None if value is None else _canonical_rbac_scope(value)
+
     @field_validator("workload_virtual_network_resource_id")
     @classmethod
     def canonicalize_workload_vnet_id(cls, value: str) -> str:
@@ -2333,6 +3957,7 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
                 MONITORING_IDENTITY_PROOF_COLLECTOR_CONTRACT_SCHEMA_VERSION,
                 MONITORING_PREVIOUS_PRODUCTION_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
                 MONITORING_PREVIOUS_MEASURED_RBAC_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+                MONITORING_PREVIOUS_PERMISSION_ATTESTED_COLLECTOR_CONTRACT_SCHEMA_VERSION,
                 MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
             }
             and self.handoff_schema_version != MONITORING_ACQUISITION_HANDOFF_SCHEMA_VERSION
@@ -2340,7 +3965,10 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
             raise ValueError("collector contract version does not authorize its handoff schema")
         if self.signal_kinds != _EXPECTED_SIGNALS:
             raise ValueError("monitoring signals must use the complete reviewed generic allowlist")
-        if self.schema_version == MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION:
+        if self.schema_version in {
+            MONITORING_PREVIOUS_PERMISSION_ATTESTED_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+            MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+        }:
             expected_read_operations = _EXPECTED_ACQUISITION_READ_OPERATIONS
         elif (
             self.schema_version
@@ -2375,6 +4003,17 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
             self.athena_context_identity_id,
             self.athena_context_principal_id,
             self.physical_identity_separation_enforced,
+        )
+        runtime_binding_fields = (
+            self.collector_runtime_resource_id,
+            self.rbac_attestor_runtime_resource_id,
+            self.runtime_support_identity_resource_id,
+            self.runtime_support_identity_principal_id,
+            self.runtime_support_storage_reader_role_definition_id,
+            self.runtime_support_storage_reader_role_name,
+            self.runtime_support_storage_reader_allowed_operations,
+            self.runtime_support_storage_reader_role_assignment_id,
+            self.runtime_support_storage_reader_scope_id,
         )
         credential_fields = (self.collector_tenant_id,)
         ip_flow_policy_fields = (
@@ -2433,11 +4072,54 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
             self.rbac_attestor_allowed_operations,
             self.rbac_attestor_identity_separation_enforced,
         )
+        reviewer_attestation_fields = (
+            self.rbac_inventory_bootstrap_handoff_id,
+            self.rbac_inventory_bootstrap_deployment_id,
+            self.rbac_inventory_bootstrap_template_hash,
+            self.rbac_inventory_bootstrap_contract_inputs_binding_id,
+            self.rbac_inventory_verifier_identity_resource_id,
+            self.rbac_inventory_verifier_identity_client_id,
+            self.rbac_inventory_verifier_identity_principal_id,
+            self.rbac_inventory_verifier_identity_tenant_id,
+            self.rbac_inventory_reviewer_key_arm_resource_id,
+            self.rbac_inventory_reviewer_key_vault_resource_id,
+            self.rbac_inventory_verifier_role_definition_id,
+            self.rbac_inventory_verifier_role_name,
+            self.rbac_inventory_verifier_role_scope_id,
+            self.rbac_inventory_verifier_allowed_data_actions,
+            self.rbac_inventory_verifier_role_assignment_id,
+            self.rbac_inventory_reviewer_principal_id,
+            self.rbac_inventory_reviewer_key_id,
+            self.rbac_inventory_reviewer_public_key_modulus,
+            self.rbac_inventory_reviewer_public_key_exponent,
+            self.rbac_inventory_reviewer_public_key_fingerprint,
+            self.effective_rbac_inventory_attestation,
+        )
+        conditioned_persistence_fields = (
+            self.evidence_blob_service_resource_id,
+            self.evidence_immutability_policy_resource_id,
+            self.evidence_container_public_access,
+            self.evidence_writer_role_name,
+            self.evidence_writer_allowed_data_actions,
+            self.evidence_writer_assignment_condition,
+            self.evidence_writer_assignment_condition_version,
+            self.evidence_blob_versioning_enabled,
+            self.evidence_container_has_immutability_policy,
+            self.evidence_container_immutability_policy_state,
+            self.evidence_container_immutability_period_days,
+            self.evidence_container_protected_append_writes_enabled,
+            self.evidence_container_protected_append_writes_all_enabled,
+            self.evidence_storage_readback_binding_id,
+            self.evidence_storage_readiness_digest,
+            self.legacy_collector_rbac_cleanup_schema_version,
+            self.legacy_collector_rbac_cleanup_digest,
+        )
         if self.schema_version == MONITORING_COLLECTOR_CONTRACT_SCHEMA_VERSION:
             if any(
                 item is not None
                 for item in (
                     *acquisition_identity_fields,
+                    *runtime_binding_fields,
                     *credential_fields,
                     *ip_flow_policy_fields,
                     self.ip_flow_verify_role_name,
@@ -2447,6 +4129,8 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
                     *measured_rbac_common_fields,
                     *current_resource_context_fields,
                     *attestor_fields,
+                    *reviewer_attestation_fields,
+                    *conditioned_persistence_fields,
                     self.acquisition_receipt_schema_version,
                 )
             ):
@@ -2479,6 +4163,8 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
                     *measured_rbac_common_fields,
                     *current_resource_context_fields,
                     *attestor_fields,
+                    *reviewer_attestation_fields,
+                    *conditioned_persistence_fields,
                     self.acquisition_receipt_schema_version,
                 )
             )
@@ -2502,7 +4188,14 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
                 UUID(cast(str, self.collector_tenant_id))
             except ValueError as exc:
                 raise ValueError("collector tenant ID must be a UUID") from exc
-        if self.schema_version == MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION:
+            if any(item is not None for item in runtime_binding_fields):
+                raise ValueError(
+                    "legacy collector contracts cannot bind production runtime resources"
+                )
+        if self.schema_version in {
+            MONITORING_PREVIOUS_PERMISSION_ATTESTED_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+            MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+        }:
             if any(item is None for item in credential_fields) or any(
                 item is not None
                 for item in (
@@ -2514,6 +4207,29 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
                     "current collector contract requires credential-bound acquisition "
                     "without IP Flow authorization"
                 )
+            if self.schema_version == MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION:
+                if (
+                    any(item is None for item in runtime_binding_fields)
+                    or self.collector_runtime_resource_id == self.rbac_attestor_runtime_resource_id
+                    or self.rbac_attestor_identity_resource_id is None
+                    or self.runtime_support_identity_resource_id
+                    in {
+                        self.collector_identity_resource_id.casefold().rstrip("/"),
+                        cast(str, self.athena_context_identity_id).casefold().rstrip("/"),
+                        cast(str, self.rbac_attestor_identity_resource_id).casefold().rstrip("/"),
+                    }
+                    or self.runtime_support_identity_principal_id
+                    in {
+                        self.monitoring_reader_principal_id,
+                        self.athena_context_principal_id,
+                        self.rbac_attestor_principal_id,
+                    }
+                ):
+                    raise ValueError(
+                        "current collector contract requires separate production runtime bindings"
+                    )
+            elif any(item is not None for item in runtime_binding_fields):
+                raise ValueError("collector contract v8 cannot contain production runtime bindings")
             try:
                 UUID(cast(str, self.collector_tenant_id))
             except ValueError as exc:
@@ -2536,6 +4252,7 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
             MONITORING_IDENTITY_PROOF_COLLECTOR_CONTRACT_SCHEMA_VERSION,
             MONITORING_PREVIOUS_PRODUCTION_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
             MONITORING_PREVIOUS_MEASURED_RBAC_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+            MONITORING_PREVIOUS_PERMISSION_ATTESTED_COLLECTOR_CONTRACT_SCHEMA_VERSION,
             MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
         } and (
             any(item is None for item in identity_proof_policy_fields)
@@ -2563,7 +4280,10 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
                 raise ValueError(
                     "legacy identity-proof collector contract contains unsupported authority IDs"
                 )
-        if self.schema_version == MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION:
+        if self.schema_version in {
+            MONITORING_PREVIOUS_PERMISSION_ATTESTED_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+            MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+        }:
             expected_current_audience = (
                 f"api://{cast(str, self.collector_tenant_id)}"
                 f"{_MONITORING_IDENTITY_PROOF_AUDIENCE_SUFFIX}"
@@ -2597,12 +4317,18 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
             self.schema_version
             in {
                 MONITORING_PREVIOUS_MEASURED_RBAC_COLLECTOR_CONTRACT_SCHEMA_VERSION,
-                MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+                MONITORING_PREVIOUS_PERMISSION_ATTESTED_COLLECTOR_CONTRACT_SCHEMA_VERSION,
             }
+            and self.acquisition_receipt_schema_version
+            != MONITORING_PREVIOUS_INCIDENT_BOUND_ACQUISITION_RECEIPT_SCHEMA_VERSION
+        ):
+            raise ValueError("collector contracts v7-v8 must use acquisition receipt v5")
+        if (
+            self.schema_version == MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION
             and self.acquisition_receipt_schema_version
             != MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION
         ):
-            raise ValueError("current collector contract must use acquisition receipt v5")
+            raise ValueError("current collector contract must use acquisition receipt v6")
         if (
             self.schema_version == MONITORING_IDENTITY_PROOF_COLLECTOR_CONTRACT_SCHEMA_VERSION
             and any(item is not None for item in resource_health_fields)
@@ -2621,7 +4347,10 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
             raise ValueError(
                 "historical production collector contract requires its exact Resource Health policy"
             )
-        if self.schema_version == MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION and (
+        if self.schema_version in {
+            MONITORING_PREVIOUS_PERMISSION_ATTESTED_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+            MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+        } and (
             any(item is None for item in resource_health_fields)
             or self.resource_health_allowed_operations != _EXPECTED_RESOURCE_HEALTH_OPERATIONS
         ):
@@ -2634,6 +4363,7 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
         )
         if self.schema_version not in {
             MONITORING_PREVIOUS_MEASURED_RBAC_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+            MONITORING_PREVIOUS_PERMISSION_ATTESTED_COLLECTOR_CONTRACT_SCHEMA_VERSION,
             MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
         } and any(
             item is not None
@@ -2641,6 +4371,8 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
                 *legacy_measured_fields,
                 *current_resource_context_fields,
                 *attestor_fields,
+                *reviewer_attestation_fields,
+                *conditioned_persistence_fields,
             )
         ):
             raise ValueError("legacy collector contracts cannot contain measured RBAC policy")
@@ -2654,6 +4386,8 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
                     for item in (
                         *current_resource_context_fields,
                         *attestor_fields,
+                        *reviewer_attestation_fields,
+                        *conditioned_persistence_fields,
                     )
                 )
                 or self.resource_log_allowed_operations
@@ -2662,6 +4396,33 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
             )
         ):
             raise ValueError("collector contract v7 requires its historical measured RBAC policy")
+        if (
+            self.schema_version
+            == MONITORING_PREVIOUS_PERMISSION_ATTESTED_COLLECTOR_CONTRACT_SCHEMA_VERSION
+            and (
+                any(
+                    item is None
+                    for item in (
+                        *measured_rbac_common_fields,
+                        *current_resource_context_fields,
+                        *attestor_fields,
+                    )
+                )
+                or any(
+                    item is not None
+                    for item in (
+                        *runtime_binding_fields,
+                        *reviewer_attestation_fields,
+                        *conditioned_persistence_fields,
+                    )
+                )
+                or self.resource_log_allowed_operations != _EXPECTED_RESOURCE_LOG_OPERATIONS
+                or self.rbac_attestor_allowed_operations
+                != _EXPECTED_PREVIOUS_RBAC_ATTESTOR_OPERATIONS
+                or self.workspace_access_control_mode != "workspaceAndResourceContext"
+            )
+        ):
+            raise ValueError("collector contract v8 requires its published measured RBAC policy")
         if self.schema_version == MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION and (
             any(
                 item is None
@@ -2669,9 +4430,12 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
                     *measured_rbac_common_fields,
                     *current_resource_context_fields,
                     *attestor_fields,
+                    *reviewer_attestation_fields,
+                    *conditioned_persistence_fields,
                 )
             )
             or self.resource_log_allowed_operations != _EXPECTED_RESOURCE_LOG_OPERATIONS
+            or self.rbac_attestor_allowed_operations != _EXPECTED_RBAC_ATTESTOR_OPERATIONS
             or self.workspace_access_control_mode != "workspaceAndResourceContext"
         ):
             raise ValueError(
@@ -2731,7 +4495,10 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
             )
         ):
             raise ValueError("collector contract v7 role names do not match deployed roles")
-        if self.schema_version == MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION and (
+        if self.schema_version in {
+            MONITORING_PREVIOUS_PERMISSION_ATTESTED_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+            MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+        } and (
             cast(str, self.signal_reader_role_name).startswith(_SIGNAL_READER_ROLE_NAME_PREFIX)
             is not True
             or self.resource_log_reader_role_name != _RESOURCE_LOG_READER_ROLE_NAME
@@ -2739,6 +4506,11 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
             or self.rbac_attestor_role_name != _RBAC_ATTESTOR_ROLE_NAME
         ):
             raise ValueError("current collector contract role names do not match deployed roles")
+        if (
+            self.schema_version == MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION
+            and self.evidence_writer_role_name != _EVIDENCE_WRITER_ROLE_NAME
+        ):
+            raise ValueError("current collector contract evidence-writer role name is invalid")
 
         expected_role_definition_ids = (
             (
@@ -2918,7 +4690,13 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
                 != expected_attestor_role_id.casefold()
                 or cast(str, self.rbac_attestor_scope_id).casefold().rstrip("/")
                 != expected_attestor_scope.casefold()
-                or self.rbac_attestor_allowed_operations != _EXPECTED_RBAC_ATTESTOR_OPERATIONS
+                or self.rbac_attestor_allowed_operations
+                != (
+                    _EXPECTED_RBAC_ATTESTOR_OPERATIONS
+                    if self.schema_version
+                    == MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION
+                    else _EXPECTED_PREVIOUS_RBAC_ATTESTOR_OPERATIONS
+                )
             ):
                 raise ValueError("RBAC attestor identity and exact read-only role are invalid")
 
@@ -3013,12 +4791,23 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
                 )
         if self.schema_version in {
             MONITORING_PREVIOUS_MEASURED_RBAC_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+            MONITORING_PREVIOUS_PERMISSION_ATTESTED_COLLECTOR_CONTRACT_SCHEMA_VERSION,
             MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
         }:
+            evidence_container_id = cast(str, self.evidence_container_resource_id)
+            expected_evidence_writer_role_guid = (
+                _arm_template_guid(
+                    f"/subscriptions/{monitoring_subscription}",
+                    _EVIDENCE_WRITER_ROLE_GUID_SEED,
+                    evidence_container_id.casefold().rstrip("/"),
+                )
+                if self.schema_version == MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION
+                else _PREVIOUS_STORAGE_BLOB_DATA_CONTRIBUTOR_ROLE_DEFINITION_GUID
+            )
             expected_evidence_writer_role_id = (
                 f"/subscriptions/{monitoring_subscription}/providers/"
                 "Microsoft.Authorization/roleDefinitions/"
-                f"{_STORAGE_BLOB_DATA_CONTRIBUTOR_ROLE_DEFINITION_GUID}"
+                f"{expected_evidence_writer_role_guid}"
             )
             expected_signing_key_role_id = (
                 f"/subscriptions/{monitoring_subscription}/providers/"
@@ -3035,7 +4824,7 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
                 != expected_signing_key_role_id.casefold()
             ):
                 raise ValueError(
-                    "evidence persistence roles must match the exact reviewed built-ins"
+                    "evidence persistence roles must match the exact reviewed definitions"
                 )
             signing_key_arm_id = cast(str, self.signing_key_arm_resource_id)
             (
@@ -3044,7 +4833,6 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
                 signing_key_provider,
                 signing_key_types,
             ) = _parse_arm_resource_id(signing_key_arm_id)
-            evidence_container_id = cast(str, self.evidence_container_resource_id)
             (
                 evidence_subscription,
                 evidence_resource_group,
@@ -3078,6 +4866,126 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
                 raise ValueError(
                     "evidence container must match the exact monitoring storage boundary"
                 )
+            if self.schema_version == MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION:
+                evidence_blob_service_id = cast(
+                    str,
+                    self.evidence_blob_service_resource_id,
+                )
+                evidence_immutability_policy_id = cast(
+                    str,
+                    self.evidence_immutability_policy_resource_id,
+                )
+                (
+                    blob_service_subscription,
+                    blob_service_resource_group,
+                    blob_service_provider,
+                    blob_service_types,
+                ) = _parse_arm_resource_id(evidence_blob_service_id)
+                (
+                    immutability_subscription,
+                    immutability_resource_group,
+                    immutability_provider,
+                    immutability_types,
+                ) = _parse_arm_resource_id(evidence_immutability_policy_id)
+                expected_blob_service_id = (
+                    self.evidence_storage_account_resource_id.rstrip("/") + "/blobServices/default"
+                )
+                expected_immutability_policy_id = (
+                    evidence_container_id.rstrip("/") + "/immutabilityPolicies/default"
+                )
+                storage_readiness_preimage = "|".join(
+                    (
+                        "athena.wc028MonitoringEvidenceStorageReadiness.v1",
+                        self.evidence_storage_account_resource_id.casefold().rstrip("/"),
+                        expected_blob_service_id.casefold(),
+                        evidence_container_id.casefold().rstrip("/"),
+                        expected_immutability_policy_id.casefold(),
+                        "true",
+                        "None",
+                        cast(str, self.evidence_container_immutability_policy_state),
+                        str(self.evidence_container_immutability_period_days),
+                        "false",
+                        "false",
+                    )
+                )
+                normalized_storage_scope = (
+                    self.evidence_storage_account_resource_id.casefold().rstrip("/")
+                )
+                normalized_runtime_support_identity = cast(
+                    str,
+                    self.runtime_support_identity_resource_id,
+                )
+                expected_storage_readback_role_id = (
+                    f"/subscriptions/{monitoring_subscription}/providers/"
+                    "microsoft.authorization/roledefinitions/"
+                    f"{
+                        _arm_template_guid(
+                            f'/subscriptions/{monitoring_subscription}',
+                            _STORAGE_READBACK_READER_ROLE_GUID_SEED,
+                            normalized_storage_scope,
+                        )
+                    }"
+                )
+                expected_storage_readback_assignment_id = (
+                    f"{normalized_storage_scope}/providers/"
+                    "microsoft.authorization/roleassignments/"
+                    f"{
+                        _arm_template_guid(
+                            normalized_storage_scope,
+                            normalized_runtime_support_identity,
+                            expected_storage_readback_role_id,
+                        )
+                    }"
+                )
+                if (
+                    blob_service_subscription != monitoring_subscription
+                    or blob_service_resource_group != monitoring_resource_group
+                    or blob_service_provider != "microsoft.storage"
+                    or blob_service_types != ("storageaccounts", "blobservices")
+                    or evidence_blob_service_id.casefold().rstrip("/")
+                    != expected_blob_service_id.casefold()
+                    or immutability_subscription != monitoring_subscription
+                    or immutability_resource_group != monitoring_resource_group
+                    or immutability_provider != "microsoft.storage"
+                    or immutability_types
+                    != (
+                        "storageaccounts",
+                        "blobservices",
+                        "containers",
+                        "immutabilitypolicies",
+                    )
+                    or evidence_immutability_policy_id.casefold().rstrip("/")
+                    != expected_immutability_policy_id.casefold()
+                    or self.evidence_writer_allowed_data_actions
+                    != _EXPECTED_EVIDENCE_WRITER_DATA_ACTIONS
+                    or self.evidence_container_public_access != "None"
+                    or "".join(cast(str, self.evidence_writer_assignment_condition).split())
+                    != "".join(_EVIDENCE_WRITER_ASSIGNMENT_CONDITION.split())
+                    or self.evidence_writer_assignment_condition_version != "2.0"
+                    or self.runtime_support_storage_reader_role_definition_id
+                    != expected_storage_readback_role_id
+                    or self.runtime_support_storage_reader_role_name
+                    != _STORAGE_READBACK_READER_ROLE_NAME
+                    or self.runtime_support_storage_reader_allowed_operations
+                    != _EXPECTED_STORAGE_READBACK_OPERATIONS
+                    or self.runtime_support_storage_reader_scope_id
+                    != self.evidence_storage_account_resource_id.casefold().rstrip("/")
+                    or self.runtime_support_storage_reader_role_assignment_id
+                    != expected_storage_readback_assignment_id
+                    or self.evidence_storage_readback_binding_id
+                    != _arm_template_guid(storage_readiness_preimage)
+                    or self.evidence_storage_readiness_digest
+                    != "sha256:"
+                    + hashlib.sha256(storage_readiness_preimage.encode("utf-8")).hexdigest()
+                    or self.legacy_collector_rbac_cleanup_schema_version
+                    != "athena.wc028LegacyCollectorRbacCleanup.v3"
+                    or self.legacy_collector_rbac_cleanup_digest == "sha256:" + ("0" * 64)
+                ):
+                    raise ValueError(
+                        "current evidence persistence must use exact conditioned "
+                        "known-name Blob read, add-only creation, immutable storage "
+                        "readback, and non-zero cleanup evidence"
+                    )
             inventory = cast(
                 MonitoringEffectiveRbacInventory,
                 self.effective_rbac_inventory,
@@ -3131,9 +5039,34 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
                     raise ValueError(
                         "collector contract v7 requires its exact effective RBAC inventory"
                     )
+            elif (
+                self.schema_version
+                == MONITORING_PREVIOUS_PERMISSION_ATTESTED_COLLECTOR_CONTRACT_SCHEMA_VERSION
+            ):
+                if (
+                    inventory.schema_version != "athena.wc028MonitoringEffectiveRbacInventory.v3"
+                    or inventory.resource_log_reader_role_actions
+                    != tuple(sorted(item.casefold() for item in _EXPECTED_RESOURCE_LOG_OPERATIONS))
+                    or inventory.ip_flow_verify_role_actions is not None
+                    or inventory.resource_health_role_actions
+                    != tuple(item.casefold() for item in _EXPECTED_RESOURCE_HEALTH_OPERATIONS)
+                    or inventory.attestor_identity_resource_id
+                    != cast(str, self.rbac_attestor_identity_resource_id).casefold().rstrip("/")
+                    or inventory.attestor_client_id != self.rbac_attestor_identity_client_id
+                    or inventory.attestor_principal_id != self.rbac_attestor_principal_id
+                    or inventory.attestor_tenant_id != self.rbac_attestor_tenant_id
+                ):
+                    raise ValueError(
+                        "collector contract v8 does not bind its separate attestor inventory"
+                    )
+                _validate_previous_permission_attested_effective_rbac_evidence(
+                    self,
+                    inventory,
+                )
             else:
                 if (
-                    inventory.resource_log_reader_role_actions
+                    inventory.schema_version != MONITORING_EFFECTIVE_RBAC_INVENTORY_SCHEMA_VERSION
+                    or inventory.resource_log_reader_role_actions
                     != tuple(sorted(item.casefold() for item in _EXPECTED_RESOURCE_LOG_OPERATIONS))
                     or inventory.ip_flow_verify_role_actions is not None
                     or inventory.resource_health_role_actions
@@ -3148,6 +5081,76 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
                         "current effective RBAC inventory does not bind the separate attestor"
                     )
                 _validate_current_effective_rbac_evidence(self, inventory)
+                if any(item is None for item in reviewer_attestation_fields):
+                    raise ValueError(
+                        "current collector contract requires a reviewer-signed "
+                        "effective RBAC inventory"
+                    )
+                attestation = cast(
+                    MonitoringEffectiveRbacInventoryAttestation,
+                    self.effective_rbac_inventory_attestation,
+                )
+                reviewer_key_segments = cast(
+                    str,
+                    self.rbac_inventory_reviewer_key_id,
+                ).split("/")
+                reviewer_key_arm_segments = cast(
+                    str,
+                    self.rbac_inventory_reviewer_key_arm_resource_id,
+                ).split("/")
+                if (
+                    self.rbac_inventory_verifier_identity_resource_id
+                    in {
+                        self.collector_identity_resource_id.casefold().rstrip("/"),
+                        cast(str, self.athena_context_identity_id).casefold().rstrip("/"),
+                        cast(str, self.rbac_attestor_identity_resource_id).casefold().rstrip("/"),
+                        cast(str, self.runtime_support_identity_resource_id).casefold().rstrip("/"),
+                    }
+                    or self.rbac_inventory_verifier_identity_principal_id
+                    == self.rbac_inventory_reviewer_principal_id
+                    or self.rbac_inventory_verifier_identity_tenant_id != self.collector_tenant_id
+                    or self.rbac_inventory_reviewer_principal_id
+                    in {
+                        self.monitoring_reader_principal_id,
+                        self.athena_context_principal_id,
+                        self.rbac_attestor_principal_id,
+                    }
+                    or attestation.reviewer_principal_id
+                    != self.rbac_inventory_reviewer_principal_id
+                    or attestation.bootstrap_handoff_id != self.rbac_inventory_bootstrap_handoff_id
+                    or attestation.bootstrap_deployment_id
+                    != self.rbac_inventory_bootstrap_deployment_id
+                    or attestation.bootstrap_template_hash
+                    != self.rbac_inventory_bootstrap_template_hash
+                    or attestation.bootstrap_contract_inputs_binding_id
+                    != self.rbac_inventory_bootstrap_contract_inputs_binding_id
+                    or attestation.reviewer_key_id != self.rbac_inventory_reviewer_key_id
+                    or attestation.public_key_modulus
+                    != self.rbac_inventory_reviewer_public_key_modulus
+                    or attestation.public_key_exponent
+                    != self.rbac_inventory_reviewer_public_key_exponent
+                    or attestation.public_key_fingerprint
+                    != self.rbac_inventory_reviewer_public_key_fingerprint
+                    or attestation.inventory_digest != inventory.inventory_digest
+                    or attestation.source_manifest_digest != inventory.source_manifest_digest
+                    or attestation.legacy_collector_rbac_cleanup_schema_version
+                    != self.legacy_collector_rbac_cleanup_schema_version
+                    or attestation.legacy_collector_rbac_cleanup_digest
+                    != self.legacy_collector_rbac_cleanup_digest
+                    or len(reviewer_key_segments) != 6
+                    or reviewer_key_segments[2].casefold()
+                    != _REVIEWED_RBAC_INVENTORY_REVIEWER_VAULT_HOST
+                    or reviewer_key_segments[4] != _REVIEWED_RBAC_INVENTORY_REVIEWER_KEY_NAME
+                    or len(reviewer_key_arm_segments) != 11
+                    or reviewer_key_arm_segments[8]
+                    != reviewer_key_segments[2].split(".", maxsplit=1)[0]
+                    or reviewer_key_arm_segments[10] != reviewer_key_segments[4]
+                    or reviewer_key_segments[2].casefold()
+                    == self.signing_key_resource_id.split("/", maxsplit=3)[2].casefold()
+                ):
+                    raise ValueError(
+                        "effective RBAC inventory attestation does not match its reviewed authority"
+                    )
         return self
 
 
@@ -3238,8 +5241,25 @@ def _expected_monitoring_effective_rbac_grants(
                 str,
                 contract.evidence_writer_role_definition_id,
             ),
-            role_definition_name=_STORAGE_BLOB_DATA_CONTRIBUTOR_ROLE_NAME,
+            role_definition_name=(
+                _EVIDENCE_WRITER_ROLE_NAME
+                if contract.schema_version
+                == MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION
+                else _PREVIOUS_STORAGE_BLOB_DATA_CONTRIBUTOR_ROLE_NAME
+            ),
             assignment_scope_ids=(cast(str, contract.evidence_container_resource_id),),
+            condition=(
+                _EVIDENCE_WRITER_ASSIGNMENT_CONDITION
+                if contract.schema_version
+                == MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION
+                else None
+            ),
+            condition_version=(
+                "2.0"
+                if contract.schema_version
+                == MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION
+                else None
+            ),
         ),
         _effective_rbac_grant(
             principal_id=principal_id,
@@ -3261,6 +5281,23 @@ def _expected_monitoring_effective_rbac_grants(
             )
         )
     return tuple(sorted(grants, key=lambda item: item.grant_digest))
+
+
+def _expected_runtime_support_storage_grant(
+    contract: MonitoringCollectorContract,
+) -> MonitoringEffectiveRbacGrant:
+    return _effective_rbac_grant(
+        principal_id=cast(str, contract.runtime_support_identity_principal_id),
+        role_definition_id=cast(
+            str,
+            contract.runtime_support_storage_reader_role_definition_id,
+        ),
+        role_definition_name=cast(
+            str,
+            contract.runtime_support_storage_reader_role_name,
+        ),
+        assignment_scope_ids=(cast(str, contract.runtime_support_storage_reader_scope_id),),
+    )
 
 
 def _effective_grant_affects_acquisition_scope(
@@ -3378,6 +5415,78 @@ def _expected_effective_rbac_target_scopes(
         sorted(
             {
                 subscription_scope.casefold(),
+                *(
+                    (cast(str, contract.collector_runtime_resource_id).casefold().rstrip("/"),)
+                    if contract.collector_runtime_resource_id is not None
+                    else ()
+                ),
+                *(
+                    (cast(str, contract.rbac_attestor_runtime_resource_id).casefold().rstrip("/"),)
+                    if contract.rbac_attestor_runtime_resource_id is not None
+                    else ()
+                ),
+                *(
+                    (
+                        cast(str, contract.runtime_support_identity_resource_id)
+                        .casefold()
+                        .rstrip("/"),
+                    )
+                    if contract.runtime_support_identity_resource_id is not None
+                    else ()
+                ),
+                *(
+                    (
+                        cast(str, contract.rbac_inventory_verifier_identity_resource_id)
+                        .casefold()
+                        .rstrip("/"),
+                    )
+                    if contract.rbac_inventory_verifier_identity_resource_id is not None
+                    else ()
+                ),
+                *(
+                    (
+                        cast(str, contract.rbac_inventory_reviewer_key_arm_resource_id)
+                        .casefold()
+                        .rstrip("/"),
+                        cast(str, contract.rbac_inventory_reviewer_key_arm_resource_id)
+                        .casefold()
+                        .rsplit("/keys/", maxsplit=1)[0],
+                    )
+                    if contract.rbac_inventory_reviewer_key_arm_resource_id is not None
+                    else ()
+                ),
+                *(
+                    (
+                        cast(str, contract.rbac_inventory_verifier_role_definition_id)
+                        .casefold()
+                        .rstrip("/"),
+                        cast(str, contract.rbac_inventory_verifier_role_assignment_id)
+                        .casefold()
+                        .rstrip("/"),
+                    )
+                    if contract.rbac_inventory_verifier_role_definition_id is not None
+                    and contract.rbac_inventory_verifier_role_assignment_id is not None
+                    else ()
+                ),
+                *(
+                    (
+                        cast(
+                            str,
+                            contract.runtime_support_storage_reader_role_definition_id,
+                        )
+                        .casefold()
+                        .rstrip("/"),
+                        cast(
+                            str,
+                            contract.runtime_support_storage_reader_role_assignment_id,
+                        )
+                        .casefold()
+                        .rstrip("/"),
+                    )
+                    if contract.runtime_support_storage_reader_role_definition_id is not None
+                    and contract.runtime_support_storage_reader_role_assignment_id is not None
+                    else ()
+                ),
                 contract.workload_resource_group_id.casefold().rstrip("/"),
                 contract.monitoring_resource_group_id.casefold().rstrip("/"),
                 contract.workload_virtual_network_resource_id.casefold().rstrip("/"),
@@ -3389,12 +5498,26 @@ def _expected_effective_rbac_target_scopes(
                 ),
                 evidence_storage_account_scope,
                 f"{evidence_storage_account_scope}/blobservices/default",
+                *(
+                    (cast(str, contract.evidence_blob_service_resource_id).casefold().rstrip("/"),)
+                    if contract.evidence_blob_service_resource_id is not None
+                    else ()
+                ),
                 cast(
                     str,
                     contract.evidence_container_resource_id,
                 )
                 .casefold()
                 .rstrip("/"),
+                *(
+                    (
+                        cast(str, contract.evidence_immutability_policy_resource_id)
+                        .casefold()
+                        .rstrip("/"),
+                    )
+                    if contract.evidence_immutability_policy_resource_id is not None
+                    else ()
+                ),
                 signing_key_vault_scope,
                 signing_key_scope,
                 *network_watcher_parent_scopes,
@@ -3409,12 +5532,10 @@ def _expected_effective_rbac_target_scopes(
     )
 
 
-def _validate_current_effective_rbac_evidence(
+def _validate_previous_permission_attested_effective_rbac_evidence(
     contract: MonitoringCollectorContract,
     inventory: MonitoringEffectiveRbacInventory,
 ) -> None:
-    if inventory.schema_version != "athena.wc028MonitoringEffectiveRbacInventory.v3":
-        raise ValueError("current collector contract requires effective RBAC inventory v3")
     expected_targets = _expected_effective_rbac_target_scopes(contract, inventory)
     collector_evidence = cast(
         MonitoringEffectiveRbacPrincipalEvidence,
@@ -3462,7 +5583,7 @@ def _validate_current_effective_rbac_evidence(
             sorted(item.casefold() for item in _EXPECTED_RESOURCE_HEALTH_OPERATIONS)
         ),
         attestor_role_id: tuple(
-            sorted(item.casefold() for item in _EXPECTED_RBAC_ATTESTOR_OPERATIONS)
+            sorted(item.casefold() for item in _EXPECTED_PREVIOUS_RBAC_ATTESTOR_OPERATIONS)
         ),
     }
     for role_id, expected_actions in exact_control_plane_roles.items():
@@ -3576,6 +5697,419 @@ def _validate_current_effective_rbac_evidence(
             raise ValueError(
                 "applicable Azure deny assignment removes a required collector permission"
             )
+
+
+def _validate_current_effective_rbac_evidence(
+    contract: MonitoringCollectorContract,
+    inventory: MonitoringEffectiveRbacInventory,
+) -> None:
+    if inventory.schema_version != MONITORING_EFFECTIVE_RBAC_INVENTORY_SCHEMA_VERSION:
+        raise ValueError("current collector contract requires effective RBAC inventory v4")
+    expected_targets = _expected_effective_rbac_target_scopes(contract, inventory)
+    collector_evidence = cast(
+        MonitoringEffectiveRbacPrincipalEvidence,
+        inventory.collector_principal_evidence,
+    )
+    context_evidence = cast(
+        MonitoringEffectiveRbacPrincipalEvidence,
+        inventory.athena_context_principal_evidence,
+    )
+    runtime_support_evidence = cast(
+        MonitoringEffectiveRbacPrincipalEvidence,
+        inventory.runtime_support_principal_evidence,
+    )
+    runtime_support_grants = cast(
+        tuple[MonitoringEffectiveRbacGrant, ...],
+        inventory.runtime_support_grants,
+    )
+    collector_attachment = cast(
+        MonitoringManagedIdentityAttachmentEvidence,
+        inventory.collector_identity_attachment_evidence,
+    )
+    attestor_attachment = cast(
+        MonitoringManagedIdentityAttachmentEvidence,
+        inventory.rbac_attestor_identity_attachment_evidence,
+    )
+    verifier_evidence = cast(
+        MonitoringReviewerKeyVerifierEvidence,
+        inventory.reviewer_key_verifier_evidence,
+    )
+    exclusive_principals = cast(
+        MonitoringExclusiveDataPlanePrincipalEvidence,
+        inventory.exclusive_data_plane_principal_evidence,
+    )
+    subscription_scope = (
+        f"/subscriptions/{_parse_arm_resource_id(contract.workload_resource_group_id)[0]}"
+    )
+    evidence_storage_account_scope = (
+        contract.evidence_storage_account_resource_id.casefold().rstrip("/")
+    )
+    signing_key_scope = (
+        cast(
+            str,
+            contract.signing_key_arm_resource_id,
+        )
+        .casefold()
+        .rstrip("/")
+    )
+    expected_privileged_scopes = tuple(
+        sorted(
+            {
+                evidence_storage_account_scope,
+                f"{evidence_storage_account_scope}/blobservices/default",
+                cast(
+                    str,
+                    contract.evidence_blob_service_resource_id,
+                )
+                .casefold()
+                .rstrip("/"),
+                cast(
+                    str,
+                    contract.evidence_container_resource_id,
+                )
+                .casefold()
+                .rstrip("/"),
+                cast(
+                    str,
+                    contract.evidence_immutability_policy_resource_id,
+                )
+                .casefold()
+                .rstrip("/"),
+                signing_key_scope.rsplit("/keys/", maxsplit=1)[0],
+                signing_key_scope,
+            }
+        )
+    )
+    expected_principal_target_scopes = tuple(
+        sorted((subscription_scope, *inventory.management_group_ancestry))
+    )
+    if (
+        inventory.protected_scope_ids != expected_targets
+        or collector_evidence.target_scope_ids != expected_principal_target_scopes
+        or context_evidence.target_scope_ids != expected_principal_target_scopes
+        or runtime_support_evidence.target_scope_ids != expected_principal_target_scopes
+        or inventory.runtime_support_principal_id != contract.runtime_support_identity_principal_id
+        or runtime_support_evidence.principal_id != contract.runtime_support_identity_principal_id
+        or runtime_support_grants != (_expected_runtime_support_storage_grant(contract),)
+        or collector_attachment.identity_resource_id
+        != contract.collector_identity_resource_id.casefold().rstrip("/")
+        or collector_attachment.associated_resource_ids
+        != (cast(str, contract.collector_runtime_resource_id),)
+        or collector_attachment.associated_resource_identity_resource_ids
+        != tuple(
+            sorted(
+                (
+                    contract.collector_identity_resource_id.casefold().rstrip("/"),
+                    cast(str, contract.runtime_support_identity_resource_id),
+                )
+            )
+        )
+        or collector_attachment.associated_resource_identity_lifecycles is None
+        or tuple(
+            (item.identity_resource_id, item.lifecycle)
+            for item in cast(
+                tuple[MonitoringRuntimeIdentityLifecycleBinding, ...],
+                collector_attachment.associated_resource_identity_lifecycles,
+            )
+        )
+        != tuple(
+            sorted(
+                (
+                    (
+                        contract.collector_identity_resource_id.casefold().rstrip("/"),
+                        "All",
+                    ),
+                    (cast(str, contract.runtime_support_identity_resource_id), "None"),
+                )
+            )
+        )
+        or attestor_attachment.identity_resource_id
+        != cast(str, contract.rbac_attestor_identity_resource_id)
+        or attestor_attachment.associated_resource_ids
+        != (cast(str, contract.rbac_attestor_runtime_resource_id),)
+        or attestor_attachment.associated_resource_identity_resource_ids
+        != (cast(str, contract.rbac_attestor_identity_resource_id),)
+        or attestor_attachment.associated_resource_identity_lifecycles is None
+        or tuple(
+            (item.identity_resource_id, item.lifecycle)
+            for item in cast(
+                tuple[MonitoringRuntimeIdentityLifecycleBinding, ...],
+                attestor_attachment.associated_resource_identity_lifecycles,
+            )
+        )
+        != ((cast(str, contract.rbac_attestor_identity_resource_id), "All"),)
+        or verifier_evidence.identity_resource_id
+        != cast(str, contract.rbac_inventory_verifier_identity_resource_id)
+        or verifier_evidence.identity_client_id
+        != contract.rbac_inventory_verifier_identity_client_id
+        or verifier_evidence.identity_principal_id
+        != contract.rbac_inventory_verifier_identity_principal_id
+        or verifier_evidence.identity_tenant_id
+        != contract.rbac_inventory_verifier_identity_tenant_id
+        or verifier_evidence.reviewer_key_arm_resource_id
+        != contract.rbac_inventory_reviewer_key_arm_resource_id
+        or cast(str, contract.rbac_inventory_reviewer_key_arm_resource_id).rsplit(
+            "/keys/",
+            maxsplit=1,
+        )[0]
+        != contract.rbac_inventory_reviewer_key_vault_resource_id
+        or verifier_evidence.role_definition_id
+        != contract.rbac_inventory_verifier_role_definition_id
+        or verifier_evidence.role_definition_name != contract.rbac_inventory_verifier_role_name
+        or verifier_evidence.grant.assignment_scope_ids
+        != (cast(str, contract.rbac_inventory_verifier_role_scope_id),)
+        or verifier_evidence.allowed_data_actions
+        != contract.rbac_inventory_verifier_allowed_data_actions
+        or verifier_evidence.role_assignment_id
+        != contract.rbac_inventory_verifier_role_assignment_id
+        or exclusive_principals.assignment_collection_scope_id != subscription_scope
+        or exclusive_principals.scope_ids != expected_privileged_scopes
+        or exclusive_principals.evidence_writer_authorized_principal_ids
+        != (inventory.collector_principal_id,)
+        or exclusive_principals.signing_key_authorized_principal_ids
+        != (inventory.collector_principal_id,)
+        or exclusive_principals.evidence_blob_versioning_enabled
+        != contract.evidence_blob_versioning_enabled
+        or exclusive_principals.evidence_container_public_access
+        != contract.evidence_container_public_access
+        or exclusive_principals.evidence_container_has_immutability_policy
+        != contract.evidence_container_has_immutability_policy
+        or exclusive_principals.evidence_container_immutability_policy_state
+        != contract.evidence_container_immutability_policy_state
+        or exclusive_principals.evidence_container_immutability_period_days
+        != contract.evidence_container_immutability_period_days
+        or exclusive_principals.evidence_container_protected_append_writes_enabled
+        != contract.evidence_container_protected_append_writes_enabled
+        or exclusive_principals.evidence_container_protected_append_writes_all_enabled
+        != contract.evidence_container_protected_append_writes_all_enabled
+        or len(exclusive_principals.first_resource_configuration_digests) != 5
+        or len(exclusive_principals.second_resource_configuration_digests) != 5
+    ):
+        raise ValueError(
+            "effective RBAC attestation omitted an exact scope, runtime, or exclusive principal"
+        )
+
+    role_definitions = cast(
+        tuple[MonitoringEffectiveRbacRoleDefinition, ...],
+        inventory.role_definitions,
+    )
+    roles_by_id = {item.role_definition_id: item for item in role_definitions}
+    attestor_role_id = cast(str, contract.rbac_attestor_role_definition_id).casefold()
+    expected_role_ids = {
+        *(item.role_definition_id for item in inventory.collector_grants),
+        *(item.role_definition_id for item in inventory.athena_context_grants),
+        *(item.role_definition_id for item in runtime_support_grants),
+        verifier_evidence.role_definition_id,
+        attestor_role_id,
+    }
+    if set(roles_by_id) != expected_role_ids:
+        raise ValueError(
+            "effective RBAC role-definition evidence is missing or contains an unreferenced role"
+        )
+
+    exact_control_plane_roles = {
+        cast(str, contract.signal_reader_role_definition_id).casefold(): tuple(
+            sorted(
+                (
+                    "microsoft.compute/virtualmachines/instanceview/read",
+                    "microsoft.insights/metrics/read",
+                )
+            )
+        ),
+        cast(str, contract.resource_log_reader_role_definition_id).casefold(): tuple(
+            sorted(item.casefold() for item in _EXPECTED_RESOURCE_LOG_OPERATIONS)
+        ),
+        cast(str, contract.resource_health_role_definition_id).casefold(): tuple(
+            sorted(item.casefold() for item in _EXPECTED_RESOURCE_HEALTH_OPERATIONS)
+        ),
+        attestor_role_id: tuple(
+            sorted(item.casefold() for item in _EXPECTED_RBAC_ATTESTOR_OPERATIONS)
+        ),
+        cast(
+            str,
+            contract.runtime_support_storage_reader_role_definition_id,
+        ).casefold(): tuple(
+            sorted(item.casefold() for item in _EXPECTED_STORAGE_READBACK_OPERATIONS)
+        ),
+    }
+    for role_id, expected_actions in exact_control_plane_roles.items():
+        role = roles_by_id.get(role_id)
+        if (
+            role is None
+            or role.actions != expected_actions
+            or role.not_actions
+            or role.data_actions
+            or role.not_data_actions
+        ):
+            raise ValueError("effective RBAC custom role definition does not match exact actions")
+
+    reader_role = roles_by_id.get(contract.reader_role_definition_id.casefold())
+    if reader_role is None or any(
+        not _rbac_action_is_allowed(
+            action,
+            actions=reader_role.actions,
+            not_actions=reader_role.not_actions,
+        )
+        for action in _EXPECTED_READ_OPERATIONS[3:]
+    ):
+        raise ValueError("effective RBAC Reader definition does not permit required reviewed reads")
+
+    writer_role = roles_by_id.get(cast(str, contract.evidence_writer_role_definition_id).casefold())
+    verifier_role = roles_by_id.get(
+        cast(str, contract.rbac_inventory_verifier_role_definition_id).casefold()
+    )
+    signing_role = roles_by_id.get(
+        cast(str, contract.signing_key_crypto_user_role_definition_id).casefold()
+    )
+    if (
+        writer_role is None
+        or writer_role.role_definition_name != _EVIDENCE_WRITER_ROLE_NAME
+        or writer_role.actions
+        or writer_role.not_actions
+        or writer_role.data_actions
+        != tuple(sorted(item.casefold() for item in _EXPECTED_EVIDENCE_WRITER_DATA_ACTIONS))
+        or writer_role.not_data_actions
+        or verifier_role is None
+        or verifier_role.role_definition_name != _REVIEWER_KEY_VERIFIER_ROLE_NAME
+        or verifier_role.actions
+        or verifier_role.not_actions
+        or verifier_role.data_actions
+        != tuple(sorted(item.casefold() for item in _EXPECTED_REVIEWER_KEY_VERIFIER_DATA_ACTIONS))
+        or verifier_role.not_data_actions
+        or signing_role is None
+        or not _rbac_action_is_allowed(
+            "Microsoft.KeyVault/vaults/keys/sign/action",
+            actions=signing_role.data_actions,
+            not_actions=signing_role.not_data_actions,
+        )
+    ):
+        raise ValueError("effective RBAC persistence role definitions omit required data actions")
+
+    if cast(
+        tuple[MonitoringEffectiveRbacPimScheduleInstance, ...],
+        inventory.active_pim_schedule_instances,
+    ):
+        raise ValueError("current collector identities must not depend on active PIM assignments")
+
+    required_control_actions: list[tuple[str, str]] = []
+    for scope in contract.signal_read_scope_ids:
+        required_control_actions.extend(
+            (scope, action)
+            for action in (
+                "Microsoft.Compute/virtualMachines/instanceView/read",
+                "Microsoft.Insights/metrics/read",
+                *_EXPECTED_RESOURCE_LOG_OPERATIONS,
+                *_EXPECTED_RESOURCE_HEALTH_OPERATIONS,
+            )
+        )
+    for scope in contract.resource_read_scope_ids:
+        required_control_actions.extend((scope, action) for action in _EXPECTED_READ_OPERATIONS[3:])
+    required_data_actions = (
+        (
+            cast(str, contract.evidence_container_resource_id),
+            "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read",
+        ),
+        (
+            cast(str, contract.evidence_container_resource_id),
+            "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action",
+        ),
+        (
+            cast(str, contract.signing_key_arm_resource_id),
+            "Microsoft.KeyVault/vaults/keys/sign/action",
+        ),
+    )
+    for deny in cast(
+        tuple[MonitoringEffectiveRbacDenyAssignment, ...],
+        inventory.deny_assignments,
+    ):
+        if not _deny_assignment_applies_to_principal(
+            deny,
+            principal_id=inventory.collector_principal_id,
+            security_group_ids=inventory.collector_security_group_ids,
+        ):
+            continue
+        if any(
+            _rbac_scope_applies(
+                deny.scope_id,
+                scope,
+                management_group_ancestry=inventory.management_group_ancestry,
+                do_not_apply_to_child_scopes=deny.do_not_apply_to_child_scopes,
+            )
+            and _rbac_action_is_denied(
+                action,
+                actions=deny.actions,
+                not_actions=deny.not_actions,
+            )
+            for scope, action in required_control_actions
+        ) or any(
+            _rbac_scope_applies(
+                deny.scope_id,
+                scope,
+                management_group_ancestry=inventory.management_group_ancestry,
+                do_not_apply_to_child_scopes=deny.do_not_apply_to_child_scopes,
+            )
+            and _rbac_action_is_denied(
+                action,
+                actions=deny.data_actions,
+                not_actions=deny.not_data_actions,
+            )
+            for scope, action in required_data_actions
+        ):
+            raise ValueError(
+                "applicable Azure deny assignment removes a required collector permission"
+            )
+    for deny in cast(
+        tuple[MonitoringEffectiveRbacDenyAssignment, ...],
+        inventory.deny_assignments,
+    ):
+        runtime_support_principal_id = cast(
+            str,
+            contract.runtime_support_identity_principal_id,
+        )
+        if not _deny_assignment_applies_to_principal(
+            deny,
+            principal_id=runtime_support_principal_id,
+            security_group_ids=(),
+        ):
+            continue
+        if any(
+            _rbac_scope_applies(
+                deny.scope_id,
+                cast(str, contract.runtime_support_storage_reader_scope_id),
+                management_group_ancestry=inventory.management_group_ancestry,
+                do_not_apply_to_child_scopes=deny.do_not_apply_to_child_scopes,
+            )
+            and _rbac_action_is_denied(
+                action,
+                actions=deny.actions,
+                not_actions=deny.not_actions,
+            )
+            for action in _EXPECTED_STORAGE_READBACK_OPERATIONS
+        ):
+            raise ValueError(
+                "applicable Azure deny assignment removes runtime storage verification"
+            )
+    for deny in cast(
+        tuple[MonitoringEffectiveRbacDenyAssignment, ...],
+        inventory.deny_assignments,
+    ):
+        if not _deny_assignment_applies_to_principal(
+            deny,
+            principal_id=verifier_evidence.identity_principal_id,
+            security_group_ids=(),
+        ):
+            continue
+        if _rbac_scope_applies(
+            deny.scope_id,
+            verifier_evidence.reviewer_key_arm_resource_id,
+            management_group_ancestry=inventory.management_group_ancestry,
+            do_not_apply_to_child_scopes=deny.do_not_apply_to_child_scopes,
+        ) and _rbac_action_is_denied(
+            "Microsoft.KeyVault/vaults/keys/read",
+            actions=deny.data_actions,
+            not_actions=deny.not_data_actions,
+        ):
+            raise ValueError("applicable Azure deny assignment removes reviewer-key verification")
 
 
 class MonitoringEvidenceAttestation(_StrictMonitoringContract):
@@ -3729,6 +6263,127 @@ class MonitoringIdentityProof(_StrictMonitoringContract):
         return self
 
 
+def monitoring_runtime_replay_key_preimage(
+    binding: MonitoringRuntimeReplayBinding | dict[str, object],
+) -> dict[str, object]:
+    if isinstance(binding, MonitoringRuntimeReplayBinding):
+        payload = binding.model_dump(mode="json", by_alias=True)
+    else:
+        payload = dict(binding)
+    for field in (
+        "issuedAt",
+        "trustedAsOf",
+        "expiresAt",
+        "persistenceReplayKey",
+    ):
+        payload.pop(field, None)
+    return payload
+
+
+class MonitoringRuntimeReplayBinding(_StrictMonitoringContract):
+    """Collector-signed stable replay-v3 binding supplied by the governed runtime."""
+
+    schema_version: Literal["athena.wc028MonitoringPersistenceReplay.v3"] = Field(
+        alias="schemaVersion"
+    )
+    execution_id: str = Field(
+        alias="executionId",
+        pattern=r"^wc028-execution-[a-f0-9]{32}$",
+    )
+    acquisition_authority_digest: Sha256Digest = Field(alias="acquisitionAuthorityDigest")
+    monitoring_intent_digest: Sha256Digest = Field(alias="monitoringIntentDigest")
+    monitoring_intent_reference_digest: Sha256Digest = Field(
+        alias="monitoringIntentReferenceDigest"
+    )
+    context_binding_digest: Sha256Digest = Field(alias="contextBindingDigest")
+    incident_revision: int = Field(alias="incidentRevision", ge=1)
+    legacy_collector_rbac_cleanup_digest: Sha256Digest = Field(
+        alias="legacyCollectorRbacCleanupDigest"
+    )
+    monitoring_evidence_storage_readiness_digest: Sha256Digest = Field(
+        alias="monitoringEvidenceStorageReadinessDigest"
+    )
+    issued_at: UtcDateTime = Field(alias="issuedAt")
+    trusted_as_of: UtcDateTime = Field(alias="trustedAsOf")
+    expires_at: UtcDateTime = Field(alias="expiresAt")
+    trust_delay_seconds: int = Field(alias="trustDelaySeconds", ge=1, le=600)
+    request_lifetime_seconds: int = Field(alias="requestLifetimeSeconds", ge=2, le=900)
+    persistence_replay_key: Sha256Digest = Field(alias="persistenceReplayKey")
+
+    @field_validator(
+        "acquisition_authority_digest",
+        "monitoring_intent_digest",
+        "monitoring_intent_reference_digest",
+        "context_binding_digest",
+        "legacy_collector_rbac_cleanup_digest",
+        "monitoring_evidence_storage_readiness_digest",
+        "persistence_replay_key",
+    )
+    @classmethod
+    def reject_zero_replay_digest(cls, value: str) -> str:
+        if value == "sha256:" + ("0" * 64):
+            raise ValueError("runtime replay digests must be non-zero")
+        return value
+
+    @model_validator(mode="after")
+    def validate_replay_binding(self) -> MonitoringRuntimeReplayBinding:
+        if (
+            self.execution_id == "wc028-execution-" + ("0" * 32)
+            or not self.issued_at < self.trusted_as_of < self.expires_at
+            or int((self.trusted_as_of - self.issued_at).total_seconds())
+            != self.trust_delay_seconds
+            or int((self.expires_at - self.issued_at).total_seconds())
+            != self.request_lifetime_seconds
+        ):
+            raise ValueError(
+                "runtime replay binding requires a non-zero execution and exact request window"
+            )
+        expected = compute_artifact_digest(monitoring_runtime_replay_key_preimage(self))
+        if self.persistence_replay_key != expected:
+            raise ValueError("persistenceReplayKey does not bind runtime replay v3")
+        return self
+
+
+class MonitoringAcquisitionWireAttempt(_StrictMonitoringContract):
+    """One collector-timed physical Azure request bound to a logical exchange."""
+
+    sequence: int = Field(ge=1, le=32)
+    exchange_sequence: int = Field(alias="exchangeSequence", ge=1, le=32)
+    source: Literal[
+        "activityLog",
+        "ipFlowVerify",
+        "logAnalytics",
+        "resourceGraph",
+        "resourceHealth",
+    ]
+    request_digest: Sha256Digest = Field(alias="requestDigest")
+    logical_request_digest: Sha256Digest = Field(alias="logicalRequestDigest")
+    result_digest: Sha256Digest = Field(alias="resultDigest")
+    exchange_result_digest: Sha256Digest | None = Field(
+        default=None,
+        alias="exchangeResultDigest",
+    )
+    requested_at: UtcDateTime = Field(alias="requestedAt")
+    received_at: UtcDateTime = Field(alias="receivedAt")
+    effective_rbac_inventory_digest: Sha256Digest = Field(alias="effectiveRbacInventoryDigest")
+    effective_rbac_source_manifest_digest: Sha256Digest = Field(
+        alias="effectiveRbacSourceManifestDigest"
+    )
+    effective_rbac_valid_from: UtcDateTime = Field(alias="effectiveRbacValidFrom")
+    effective_rbac_valid_until: UtcDateTime = Field(alias="effectiveRbacValidUntil")
+
+    @model_validator(mode="after")
+    def validate_wire_attempt(self) -> MonitoringAcquisitionWireAttempt:
+        if not (
+            self.effective_rbac_valid_from
+            <= self.requested_at
+            <= self.received_at
+            < self.effective_rbac_valid_until
+        ):
+            raise ValueError("acquisition wire attempt escapes its effective RBAC validity")
+        return self
+
+
 class MonitoringAcquisitionExchange(_StrictMonitoringContract):
     """Collector-timed receipt entry for one exact Azure acquisition call."""
 
@@ -3753,6 +6408,22 @@ class MonitoringAcquisitionExchange(_StrictMonitoringContract):
         default=None,
         alias="identityProofDigest",
     )
+    effective_rbac_inventory_digest: Sha256Digest | None = Field(
+        default=None,
+        alias="effectiveRbacInventoryDigest",
+    )
+    effective_rbac_source_manifest_digest: Sha256Digest | None = Field(
+        default=None,
+        alias="effectiveRbacSourceManifestDigest",
+    )
+    effective_rbac_valid_from: UtcDateTime | None = Field(
+        default=None,
+        alias="effectiveRbacValidFrom",
+    )
+    effective_rbac_valid_until: UtcDateTime | None = Field(
+        default=None,
+        alias="effectiveRbacValidUntil",
+    )
 
     @model_validator(mode="after")
     def validate_exchange(self) -> MonitoringAcquisitionExchange:
@@ -3767,6 +6438,23 @@ class MonitoringAcquisitionExchange(_StrictMonitoringContract):
                 raise ValueError("IP Flow receipt requires a collector-bounded checkedAt")
         elif self.checked_at is not None:
             raise ValueError("only IP Flow receipt entries may contain checkedAt")
+        effective_rbac_fields = (
+            self.effective_rbac_inventory_digest,
+            self.effective_rbac_source_manifest_digest,
+            self.effective_rbac_valid_from,
+            self.effective_rbac_valid_until,
+        )
+        if any(item is None for item in effective_rbac_fields) and any(
+            item is not None for item in effective_rbac_fields
+        ):
+            raise ValueError("acquisition exchange effective RBAC validity must be complete")
+        if self.effective_rbac_valid_from is not None and not (
+            self.effective_rbac_valid_from
+            <= self.requested_at
+            <= self.received_at
+            < cast(UtcDateTime, self.effective_rbac_valid_until)
+        ):
+            raise ValueError("acquisition exchange escapes its effective RBAC validity")
         return self
 
 
@@ -3971,6 +6659,7 @@ class MonitoringAcquisitionReceipt(_StrictMonitoringContract):
         "athena.wc028MonitoringAcquisitionReceipt.v3",
         "athena.wc028MonitoringAcquisitionReceipt.v4",
         "athena.wc028MonitoringAcquisitionReceipt.v5",
+        "athena.wc028MonitoringAcquisitionReceipt.v6",
     ] = Field(alias="schemaVersion")
     receipt_id: str = Field(
         alias="receiptId",
@@ -4040,11 +6729,36 @@ class MonitoringAcquisitionReceipt(_StrictMonitoringContract):
         default=None,
         alias="selectedIncident",
     )
+    effective_rbac_inventory_digest: Sha256Digest | None = Field(
+        default=None,
+        alias="effectiveRbacInventoryDigest",
+    )
+    effective_rbac_source_manifest_digest: Sha256Digest | None = Field(
+        default=None,
+        alias="effectiveRbacSourceManifestDigest",
+    )
+    effective_rbac_valid_from: UtcDateTime | None = Field(
+        default=None,
+        alias="effectiveRbacValidFrom",
+    )
+    effective_rbac_valid_until: UtcDateTime | None = Field(
+        default=None,
+        alias="effectiveRbacValidUntil",
+    )
+    runtime_replay_binding: MonitoringRuntimeReplayBinding | None = Field(
+        default=None,
+        alias="runtimeReplayBinding",
+    )
     execution_started_at: UtcDateTime = Field(alias="executionStartedAt")
     execution_completed_at: UtcDateTime = Field(alias="executionCompletedAt")
     receipt_issued_at: UtcDateTime = Field(alias="receiptIssuedAt")
     exchanges: tuple[MonitoringAcquisitionExchange, ...] = Field(
         min_length=0,
+        max_length=32,
+    )
+    wire_attempts: tuple[MonitoringAcquisitionWireAttempt, ...] | None = Field(
+        default=None,
+        alias="wireAttempts",
         max_length=32,
     )
     receipt_digest: str = Field(alias="receiptDigest", pattern=_DIGEST_PATTERN)
@@ -4062,6 +6776,19 @@ class MonitoringAcquisitionReceipt(_StrictMonitoringContract):
 
     @model_validator(mode="after")
     def validate_receipt(self) -> MonitoringAcquisitionReceipt:
+        effective_rbac_fields = (
+            self.effective_rbac_inventory_digest,
+            self.effective_rbac_source_manifest_digest,
+            self.effective_rbac_valid_from,
+            self.effective_rbac_valid_until,
+        )
+        exchange_effective_rbac_fields_present = any(
+            item.effective_rbac_inventory_digest is not None
+            or item.effective_rbac_source_manifest_digest is not None
+            or item.effective_rbac_valid_from is not None
+            or item.effective_rbac_valid_until is not None
+            for item in self.exchanges
+        )
         if self.schema_version == "athena.wc028MonitoringAcquisitionReceipt.v1":
             if (
                 not self.exchanges
@@ -4072,6 +6799,10 @@ class MonitoringAcquisitionReceipt(_StrictMonitoringContract):
                 or self.credential_proofs is not None
                 or self.identity_proof is not None
                 or self.selected_incident is not None
+                or any(item is not None for item in effective_rbac_fields)
+                or self.runtime_replay_binding is not None
+                or self.wire_attempts is not None
+                or exchange_effective_rbac_fields_present
                 or any(item.credential_proof_digest is not None for item in self.exchanges)
                 or any(item.identity_proof_digest is not None for item in self.exchanges)
             ):
@@ -4091,6 +6822,10 @@ class MonitoringAcquisitionReceipt(_StrictMonitoringContract):
                 or self.credential_proofs is not None
                 or self.identity_proof is not None
                 or self.selected_incident is not None
+                or any(item is not None for item in effective_rbac_fields)
+                or self.runtime_replay_binding is not None
+                or self.wire_attempts is not None
+                or exchange_effective_rbac_fields_present
                 or any(item.credential_proof_digest is not None for item in self.exchanges)
                 or any(item.identity_proof_digest is not None for item in self.exchanges)
             ):
@@ -4107,6 +6842,10 @@ class MonitoringAcquisitionReceipt(_StrictMonitoringContract):
                 or self.credential_proofs is None
                 or self.identity_proof is not None
                 or self.selected_incident is not None
+                or any(item is not None for item in effective_rbac_fields)
+                or self.runtime_replay_binding is not None
+                or self.wire_attempts is not None
+                or exchange_effective_rbac_fields_present
                 or re.fullmatch(
                     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
                     self.authenticated_principal_id,
@@ -4135,18 +6874,54 @@ class MonitoringAcquisitionReceipt(_StrictMonitoringContract):
                     identity_proof_invalid
                     or not self.exchanges
                     or self.selected_incident is not None
+                    or any(item is not None for item in effective_rbac_fields)
+                    or self.runtime_replay_binding is not None
+                    or self.wire_attempts is not None
+                    or exchange_effective_rbac_fields_present
                 ):
                     raise ValueError(
                         "v4 acquisition receipt requires only one Athena identity proof"
                     )
-            elif identity_proof_invalid or self.selected_incident is None:
+            elif (
+                self.schema_version
+                == MONITORING_PREVIOUS_INCIDENT_BOUND_ACQUISITION_RECEIPT_SCHEMA_VERSION
+            ):
+                if (
+                    identity_proof_invalid
+                    or self.selected_incident is None
+                    or any(item is not None for item in effective_rbac_fields)
+                    or self.runtime_replay_binding is not None
+                    or self.wire_attempts is not None
+                    or exchange_effective_rbac_fields_present
+                ):
+                    raise ValueError(
+                        "v5 acquisition receipt requires identity proof and incident selection"
+                    )
+            elif (
+                identity_proof_invalid
+                or self.selected_incident is None
+                or any(item is None for item in effective_rbac_fields)
+                or self.runtime_replay_binding is None
+                or self.wire_attempts is None
+                or any(
+                    item.effective_rbac_inventory_digest != self.effective_rbac_inventory_digest
+                    or item.effective_rbac_source_manifest_digest
+                    != self.effective_rbac_source_manifest_digest
+                    or item.effective_rbac_valid_from != self.effective_rbac_valid_from
+                    or item.effective_rbac_valid_until != self.effective_rbac_valid_until
+                    for item in self.exchanges
+                )
+            ):
                 raise ValueError(
-                    "v5 acquisition receipt requires identity proof and incident selection"
+                    "v6 acquisition receipt requires incident, replay, and per-exchange "
+                    "effective RBAC bindings"
                 )
         if self.schema_version in {
             "athena.wc028MonitoringAcquisitionReceipt.v2",
             "athena.wc028MonitoringAcquisitionReceipt.v3",
             "athena.wc028MonitoringAcquisitionReceipt.v4",
+            "athena.wc028MonitoringAcquisitionReceipt.v5",
+            "athena.wc028MonitoringAcquisitionReceipt.v6",
         } and (
             cast(str, self.monitoring_reader_identity_id).casefold().rstrip("/")
             == self.athena_context_identity_id.casefold().rstrip("/")
@@ -4175,6 +6950,7 @@ class MonitoringAcquisitionReceipt(_StrictMonitoringContract):
                 )
         if self.schema_version in {
             MONITORING_PREVIOUS_ACQUISITION_RECEIPT_SCHEMA_VERSION,
+            MONITORING_PREVIOUS_INCIDENT_BOUND_ACQUISITION_RECEIPT_SCHEMA_VERSION,
             MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION,
         }:
             proof = cast(MonitoringIdentityProof, self.identity_proof)
@@ -4187,6 +6963,72 @@ class MonitoringAcquisitionReceipt(_StrictMonitoringContract):
             ):
                 raise ValueError(
                     "Athena identity proof does not bind every acquisition exchange and identity"
+                )
+        if self.schema_version == MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION:
+            replay_binding = cast(
+                MonitoringRuntimeReplayBinding,
+                self.runtime_replay_binding,
+            )
+            valid_from = cast(UtcDateTime, self.effective_rbac_valid_from)
+            valid_until = cast(UtcDateTime, self.effective_rbac_valid_until)
+            if (
+                replay_binding.acquisition_authority_digest != self.acquisition_authority_digest
+                or replay_binding.monitoring_intent_digest != self.intent_digest
+                or replay_binding.context_binding_digest != self.context_binding_digest
+                or not (
+                    valid_from
+                    <= self.execution_started_at
+                    <= self.execution_completed_at
+                    <= self.receipt_issued_at
+                    < valid_until
+                )
+            ):
+                raise ValueError(
+                    "runtime replay or effective RBAC validity does not bind "
+                    "the acquisition receipt"
+                )
+            wire_attempts = cast(
+                tuple[MonitoringAcquisitionWireAttempt, ...],
+                self.wire_attempts,
+            )
+            exchange_by_sequence = {item.sequence: item for item in self.exchanges}
+            attempts_by_exchange = {
+                sequence: tuple(
+                    item for item in wire_attempts if item.exchange_sequence == sequence
+                )
+                for sequence in exchange_by_sequence
+            }
+            if (
+                tuple(item.sequence for item in wire_attempts)
+                != tuple(range(1, len(wire_attempts) + 1))
+                or {item.exchange_sequence for item in wire_attempts} != set(exchange_by_sequence)
+                or any(
+                    attempt.source != exchange_by_sequence[attempt.exchange_sequence].source
+                    or attempt.logical_request_digest
+                    != exchange_by_sequence[attempt.exchange_sequence].request_digest
+                    or attempt.requested_at
+                    < exchange_by_sequence[attempt.exchange_sequence].requested_at
+                    or attempt.received_at
+                    > exchange_by_sequence[attempt.exchange_sequence].received_at
+                    or attempt.effective_rbac_inventory_digest
+                    != self.effective_rbac_inventory_digest
+                    or attempt.effective_rbac_source_manifest_digest
+                    != self.effective_rbac_source_manifest_digest
+                    or attempt.effective_rbac_valid_from != self.effective_rbac_valid_from
+                    or attempt.effective_rbac_valid_until != self.effective_rbac_valid_until
+                    for attempt in wire_attempts
+                )
+                or any(
+                    not attempts
+                    or sum(item.exchange_result_digest is not None for item in attempts) != 1
+                    or attempts[-1].exchange_result_digest
+                    != exchange_by_sequence[sequence].result_digest
+                    or any(item.exchange_result_digest is not None for item in attempts[:-1])
+                    for sequence, attempts in attempts_by_exchange.items()
+                )
+            ):
+                raise ValueError(
+                    "v6 acquisition receipt wire attempts do not bind every logical exchange"
                 )
         if not (self.execution_started_at <= self.execution_completed_at <= self.receipt_issued_at):
             raise ValueError("acquisition receipt times are reversed")
@@ -4476,7 +7318,10 @@ def verify_monitoring_acquisition_receipt_attestation(
     key_resolver: TrustedKeyResolver,
     reviewed_collector_contract: MonitoringCollectorContract,
     expected_acquisition_authority_digest: str,
+    maximum_acquisition_calls: int = 32,
+    maximum_logical_exchanges: int = 32,
     maximum_receipt_age_seconds: int,
+    expected_runtime_replay_binding: MonitoringRuntimeReplayBinding,
 ) -> None:
     """Reverify signed acquisition provenance against one full reviewed contract."""
 
@@ -4485,6 +7330,12 @@ def verify_monitoring_acquisition_receipt_attestation(
         60 <= maximum_receipt_age_seconds <= 3600
     ):
         raise ValueError("acquisition receipt maximum age is invalid")
+    if (
+        not isinstance(maximum_acquisition_calls, int)
+        or not isinstance(maximum_logical_exchanges, int)
+        or not 1 <= maximum_logical_exchanges <= maximum_acquisition_calls <= 128
+    ):
+        raise ValueError("acquisition authority call budgets are invalid")
     if (
         type(reviewed_collector_contract) is not MonitoringCollectorContract
         or reviewed_collector_contract.schema_version
@@ -4544,8 +7395,19 @@ def verify_monitoring_acquisition_receipt_attestation(
         or receipt.authenticated_tenant_id is None
         or receipt.identity_proof is None
         or receipt.selected_incident is None
+        or receipt.effective_rbac_inventory_digest is None
+        or receipt.effective_rbac_source_manifest_digest is None
+        or receipt.effective_rbac_valid_from is None
+        or receipt.effective_rbac_valid_until is None
+        or receipt.runtime_replay_binding is None
+        or receipt.wire_attempts is None
     ):
-        raise ValueError("production verification requires incident-bound acquisition receipt v5")
+        raise ValueError("production verification requires replay-bound acquisition receipt v6")
+    if (
+        len(receipt.exchanges) > maximum_logical_exchanges
+        or len(receipt.wire_attempts) > maximum_acquisition_calls
+    ):
+        raise ValueError("acquisition receipt exceeds the reviewed authority call budget")
     effective_rbac_inventory = cast(
         MonitoringEffectiveRbacInventory,
         reviewed_collector_contract.effective_rbac_inventory,
@@ -4582,6 +7444,12 @@ def verify_monitoring_acquisition_receipt_attestation(
             <= exchange.requested_at
             <= exchange.received_at
             < effective_rbac_inventory.expires_at
+            and exchange.effective_rbac_inventory_digest
+            == effective_rbac_inventory.inventory_digest
+            and exchange.effective_rbac_source_manifest_digest
+            == effective_rbac_inventory.source_manifest_digest
+            and exchange.effective_rbac_valid_from == effective_rbac_inventory.collected_at
+            and exchange.effective_rbac_valid_until == effective_rbac_inventory.expires_at
             for exchange in receipt.exchanges
         )
     ):
@@ -4592,6 +7460,17 @@ def verify_monitoring_acquisition_receipt_attestation(
         receipt.acquisition_authority_digest != expected_acquisition_authority_digest
         or receipt.collector_contract_digest != expected_collector_contract_digest
         or receipt.deployment_identity_contract_digest != deployment_digest
+        or receipt.effective_rbac_inventory_digest != effective_rbac_inventory.inventory_digest
+        or receipt.effective_rbac_source_manifest_digest
+        != effective_rbac_inventory.source_manifest_digest
+        or receipt.effective_rbac_valid_from != effective_rbac_inventory.collected_at
+        or receipt.effective_rbac_valid_until != effective_rbac_inventory.expires_at
+        or receipt.runtime_replay_binding.acquisition_authority_digest
+        != expected_acquisition_authority_digest
+        or receipt.runtime_replay_binding.legacy_collector_rbac_cleanup_digest
+        != reviewed_collector_contract.legacy_collector_rbac_cleanup_digest
+        or receipt.runtime_replay_binding.monitoring_evidence_storage_readiness_digest
+        != reviewed_collector_contract.evidence_storage_readiness_digest
         or receipt.authenticated_principal_id.casefold().rstrip("/")
         != expected_authenticated_principal_id.casefold().rstrip("/")
         or receipt.authenticated_client_id.casefold() != expected_authenticated_client_id.casefold()
@@ -4616,6 +7495,11 @@ def verify_monitoring_acquisition_receipt_attestation(
         != (reviewed_collector_contract.identity_proof_required_role,)
     ):
         raise ValueError("acquisition receipt does not match deployed acquisition authority")
+    if (
+        type(expected_runtime_replay_binding) is not MonitoringRuntimeReplayBinding
+        or receipt.runtime_replay_binding != expected_runtime_replay_binding
+    ):
+        raise ValueError("acquisition receipt does not bind the expected runtime replay v3")
     if (
         expected_receipt_signing_key_id != trusted_key_anchor.key_vault_key_id
         or receipt.collector_attestation.trust_anchor_ref != expected_receipt_signing_key_id
@@ -4656,6 +7540,7 @@ __all__ = [
     "MONITORING_ACQUISITION_HANDOFF_SCHEMA_VERSION",
     "MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION",
     "MONITORING_COLLECTOR_CONTRACT_SCHEMA_VERSION",
+    "MONITORING_EFFECTIVE_RBAC_INVENTORY_SCHEMA_VERSION",
     "MONITORING_EVIDENCE_HANDOFF_SCHEMA_VERSION",
     "MONITORING_IDENTITY_PROOF_AUDIENCE",
     "MONITORING_IDENTITY_PROOF_COLLECTOR_CONTRACT_SCHEMA_VERSION",
@@ -4665,18 +7550,25 @@ __all__ = [
     "MONITORING_LEGACY_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION",
     "MONITORING_PREVIOUS_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION",
     "MONITORING_PREVIOUS_ACQUISITION_RECEIPT_SCHEMA_VERSION",
+    "MONITORING_PREVIOUS_INCIDENT_BOUND_ACQUISITION_RECEIPT_SCHEMA_VERSION",
     "MONITORING_PREVIOUS_MEASURED_RBAC_COLLECTOR_CONTRACT_SCHEMA_VERSION",
+    "MONITORING_PREVIOUS_PERMISSION_ATTESTED_COLLECTOR_CONTRACT_SCHEMA_VERSION",
     "MONITORING_PREVIOUS_PRODUCTION_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION",
+    "MONITORING_RUNTIME_REPLAY_BINDING_SCHEMA_VERSION",
     "MonitoringAcquisitionExchange",
     "MonitoringAcquisitionReceipt",
+    "MonitoringAcquisitionWireAttempt",
     "MonitoringCollectorContract",
     "MonitoringCredentialProof",
     "MonitoringEffectiveRbacGrant",
     "MonitoringEffectiveRbacDenyAssignment",
     "MonitoringEffectiveRbacInventory",
+    "MonitoringEffectiveRbacInventoryAttestation",
     "MonitoringEffectiveRbacPimScheduleInstance",
     "MonitoringEffectiveRbacPrincipalEvidence",
     "MonitoringEffectiveRbacRoleDefinition",
+    "MonitoringExclusiveDataPlanePrincipalEvidence",
+    "MonitoringManagedIdentityAttachmentEvidence",
     "MonitoringEvidenceAttestation",
     "MonitoringEvidenceHandoff",
     "MonitoringIdentityProof",
@@ -4684,15 +7576,22 @@ __all__ = [
     "MonitoringLogPermissionDataSource",
     "MonitoringLogPermissionEvidence",
     "MonitoringLogPermissionResource",
+    "MonitoringManagementGroupHierarchyEvidence",
+    "MonitoringManagementGroupParentEdge",
     "MonitoringResourceContextTablePlan",
     "MonitoringSelectedIncident",
     "MonitoringIpFlowVerifyOperation",
     "MonitoringReadOperation",
     "MonitoringResourceLogOperation",
     "MonitoringResourceHealthOperation",
+    "MonitoringReviewerKeyVerifierEvidence",
+    "MonitoringRuntimeIdentityLifecycleBinding",
+    "MonitoringRuntimeReplayBinding",
     "MonitoringSignalKind",
     "monitoring_acquisition_receipt_preimage",
+    "monitoring_effective_rbac_inventory_attestation_preimage",
     "monitoring_handoff_preimage",
+    "monitoring_runtime_replay_key_preimage",
     "verify_monitoring_acquisition_receipt_attestation",
     "verify_monitoring_evidence_handoff_attestation",
 ]

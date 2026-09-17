@@ -200,13 +200,19 @@ var validatedTrustDomainMetadata = length(union(runtimeTrustDomainFingerprints, 
   ? trustDomainMetadata
   : fail('WC-027 trust-domain public key fingerprints must be distinct')
 
-@description('Reviewed non-secret monitoring collector contract object.')
-param monitoringCollectorContract object
+@description('Exact successful WC-024 phase-two deployment that published monitoringCollectorContract.')
+param monitoringContractPublicationDeploymentName string
 
-@description('Exact canonical SHA-256 digest of monitoringCollectorContract. The contract must be WC-028 v8.')
+@description('Server-computed template hash of the reviewed phase-two publication deployment.')
+param monitoringContractPublicationTemplateHash string
+
+@description('Exact canonical SHA-256 digest of monitoringCollectorContract. The contract must be WC-028 v9.')
 @minLength(71)
 @maxLength(71)
 param monitoringCollectorContractDigest string
+
+@description('Exact canonical WC-028 acquisition authority accepted by production correlation.')
+param monitoringAcquisitionAuthority object
 
 @description('Exact deployed WC-028 monitoring acquisition authority digest accepted by correlation.')
 @minLength(71)
@@ -265,9 +271,26 @@ var monitoringAcquisitionAuthorityDigestInvalidCharacters = replace(replace(repl
 var validatedMonitoringAcquisitionAuthorityDigest = monitoringAcquisitionAuthorityDigest == toLower(monitoringAcquisitionAuthorityDigest) && startsWith(monitoringAcquisitionAuthorityDigest, 'sha256:') && length(monitoringAcquisitionAuthorityDigestHex) == 64 && empty(monitoringAcquisitionAuthorityDigestInvalidCharacters) && monitoringAcquisitionAuthorityDigestHex != '0000000000000000000000000000000000000000000000000000000000000000'
   ? monitoringAcquisitionAuthorityDigest
   : fail('monitoringAcquisitionAuthorityDigest must be one real lowercase SHA-256 digest')
-var validatedMonitoringCollectorContract = monitoringCollectorContract.schemaVersion == 'athena.wc028MonitoringCollectorContract.v8' && monitoringCollectorContract.acquisitionReceiptSchemaVersion == 'athena.wc028MonitoringAcquisitionReceipt.v5'
-  ? monitoringCollectorContract
-  : fail('WC-027 production requires the exact WC-028 v8 collector contract; legacy v3 must be recollected and republished')
+var validatedMonitoringAcquisitionAuthority = monitoringAcquisitionAuthority.schemaVersion == 'athena.wc028MonitoringAcquisitionAuthority.v6' && monitoringAcquisitionAuthority.authorityDigest == validatedMonitoringAcquisitionAuthorityDigest && monitoringAcquisitionAuthority.collectorContractDigest == validatedMonitoringCollectorContractDigest && int(monitoringAcquisitionAuthority.maxLogicalExchanges) >= 1 && int(monitoringAcquisitionAuthority.maxAcquisitionCalls) >= int(monitoringAcquisitionAuthority.maxLogicalExchanges)
+  ? monitoringAcquisitionAuthority
+  : fail('WC-027 production requires the exact v6 acquisition authority bound to the reviewed collector contract and call budgets')
+module monitoringContractPublication 'modules/monitoring-contract-publication-reference.bicep' = {
+  name: 'resolve-wc024-monitoring-contract-publication'
+  scope: subscription()
+  params: {
+    deploymentName: monitoringContractPublicationDeploymentName
+    expectedTemplateHash: monitoringContractPublicationTemplateHash
+  }
+}
+var publishedMonitoringCollectorContract = monitoringContractPublication.outputs.monitoringAcquisitionCollectorContract
+var monitoringContractPublicationHandoff = monitoringContractPublication.outputs.monitoringContractPublicationHandoff
+var expectedMonitoringContractPublicationDeploymentId = subscriptionResourceId(
+  'Microsoft.Resources/deployments',
+  monitoringContractPublicationDeploymentName
+)
+var validatedMonitoringCollectorContract = monitoringContractPublication.outputs.sourceDeploymentId == expectedMonitoringContractPublicationDeploymentId && monitoringContractPublication.outputs.sourceTemplateHash == monitoringContractPublicationTemplateHash && monitoringContractPublicationHandoff.publicationState == 'published' && monitoringContractPublicationHandoff.effectiveRbacCryptographicReviewVerified == true && monitoringContractPublicationHandoff.bootstrapHandoffId == publishedMonitoringCollectorContract.rbacInventoryBootstrapHandoffId && toLower(monitoringContractPublicationHandoff.bootstrapDeploymentId) == toLower(publishedMonitoringCollectorContract.rbacInventoryBootstrapDeploymentId) && monitoringContractPublicationHandoff.bootstrapTemplateHash == publishedMonitoringCollectorContract.rbacInventoryBootstrapTemplateHash && monitoringContractPublicationHandoff.bootstrapContractInputsBindingId == publishedMonitoringCollectorContract.rbacInventoryBootstrapContractInputsBindingId && monitoringContractPublicationHandoff.effectiveRbacInventoryDigest == publishedMonitoringCollectorContract.effectiveRbacInventory.inventoryDigest && monitoringContractPublicationHandoff.effectiveRbacSourceManifestDigest == publishedMonitoringCollectorContract.effectiveRbacInventory.sourceManifestDigest && monitoringContractPublicationHandoff.legacyCollectorRbacCleanupDigest == publishedMonitoringCollectorContract.legacyCollectorRbacCleanupDigest && publishedMonitoringCollectorContract.schemaVersion == 'athena.wc028MonitoringCollectorContract.v9' && publishedMonitoringCollectorContract.acquisitionReceiptSchemaVersion == 'athena.wc028MonitoringAcquisitionReceipt.v6'
+  ? publishedMonitoringCollectorContract
+  : fail('WC-027 production requires the exact cryptographically reviewed WC-024 phase-two v9 collector contract; legacy or caller-substituted contracts must be recollected and republished')
 
 var expectedRegistryServer = '${toLower(registry.name)}.azurecr.io'
 var imagePrefix = '${expectedRegistryServer}/athena/wc027-enrichment-feed-producer@sha256:'
@@ -1013,6 +1036,7 @@ var runtimeConfiguration = {
   }
   monitoringCollectorContract: validatedMonitoringCollectorContract
   monitoringCollectorContractDigest: validatedMonitoringCollectorContractDigest
+  monitoringAcquisitionAuthority: validatedMonitoringAcquisitionAuthority
   monitoringAcquisitionAuthorityDigest: validatedMonitoringAcquisitionAuthorityDigest
   monitoringCollectorKey: {
     keyId: monitoringCollectorKey.properties.keyUriWithVersion

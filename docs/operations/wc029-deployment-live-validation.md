@@ -188,6 +188,51 @@ Required separation:
 - notification dispatcher: exact v2 queue/table/Logic App rights only; and
 - no generic Contributor assignment for a runtime identity.
 
+For the WC-028 monitoring collector, do not substitute the generic CLI listing above for the
+phase-two contract-publication evidence. Use the phase-one handoff's exact requests and perform
+two complete reads:
+
+- subscription-scope role-assignment reads for both the collector and Athena Context principals
+  with exact `--all --include-inherited --include-groups --assignee-object-id` semantics,
+  plus two complete `Microsoft.Management/getEntities` reads proving the subscription entity's
+  exact ordered parent edges through the tenant-root management group, and stable principal reads
+  at every proven ancestor, including every ancestor, subscription, descendant, and transitive-
+  group page;
+- an unfiltered `--all --include-inherited` role-assignment read from which every principal
+  capable of Blob evidence writes or Key Vault signing is derived;
+- exact unfiltered `listAssociatedResources` and federated-credential reads for the collector and
+  RBAC-attestor UAMIs;
+- Storage account, default Blob service, evidence container, immutability policy, and signing-vault
+  reads proving Shared Key is disabled, OAuth is the default, Blob versioning is enabled, the
+  container has the reviewed unlocked-or-human-locked retention policy with protected append
+  writes disabled, vault RBAC is enabled, and no access policy exists; and
+- protected-scope deny, full role-definition, active PIM, and Microsoft Graph transitive-membership
+  evidence.
+
+The collector and attestor must each be attached only to their contract-bound Container Apps Job
+and must have no federated credential. Read both Jobs and sign their complete UAMI maps: the
+collector Job may contain only the collector plus the explicitly contract-bound runtime-support
+UAMI, while the attestor Job may contain only the attestor. The Athena Context UAMI must be absent.
+The collector must be the sole evidence writer and signer.
+Before phase one, run the reviewed v3 exact cleanup and retain a non-zero
+`cleanupEvidenceDigest`; neither an all-zero placeholder nor an incremental template that leaves
+the old `Storage Blob Data Contributor` assignment is acceptable. The new grant must contain only known-name Blob read and `blobs/add/action`, with the exact
+condition that denies `Blob.List` and limits access to the reviewed manifest, recovery, and
+evidence path shapes, and no `blobs/write`, unrestricted read, overwrite, or delete capability.
+The runtime-support identity must separately have only the four management-plane reads needed to
+revalidate the exact storage account, Blob service, evidence container, and immutability policy.
+A separately governed reviewer principal must sign the canonical inventory and source-manifest
+digests, bootstrap handoff, and cleanup evidence with the exact versioned key in the fixed review
+vault. The signature must also cover the phase-one subscription deployment ID, server template
+hash, and complete contract-input binding ID. A separate verifier UAMI must have exactly one
+direct keys/get-only assignment at that key, no groups, PIM, federated credential, or persistent
+attachment, and a principal distinct from the reviewer and every runtime identity. It lets the
+phase-two AzureCLI script resolve that Key Vault JWK; caller-supplied modulus/fingerprint values
+are not a trust root.
+`publish-monitoring-contract.bicep` must report
+`effectiveRbacCryptographicReviewVerified=true`; a caller-supplied digest without a valid detached
+signature is not acceptance evidence.
+
 ## Phase 4: deploy
 
 Deployment is an explicit operator action. The approved command, commit SHA, image digests,
@@ -198,7 +243,9 @@ After deployment:
 1. record deployment outputs and provisioning state;
 2. repeat RBAC checks;
 3. verify all Container Apps revisions use the reviewed image digests;
-4. verify Storage shared-key and public access remain disabled where required;
+4. verify Storage shared-key and public access remain disabled where required, Blob versioning and
+   the evidence immutability policy still match the published v9 contract, and the cleanup digest
+   is non-zero;
 5. verify monitoring/runtime workspace isolation;
 6. verify exact key versions and trusted fingerprints; and
 7. run signed feed/report/guidance/enrichment readback before any fault injection.
@@ -313,7 +360,8 @@ manifest, missing recovery evidence, or a renderer-generated instruction.
 WC-029 is complete only when:
 
 1. all reviewed deployments succeeded with no unintended delete or public exposure;
-2. effective RBAC matches the separation policy;
+2. effective RBAC matches the separation policy and the WC-028 publication handoff records a
+   successful canonical-digest and reviewer-signature verification;
 3. every enabled scenario met its declared incident-producing or correlation-only acceptance
    criteria;
 4. each incident-producing scenario rendered verified guidance from closed templates;
