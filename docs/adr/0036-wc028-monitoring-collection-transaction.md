@@ -77,24 +77,47 @@ The transaction exposes the existing `CorrelationRequest`; `CorrelationService` 
 owner of confidence and manual-investigation evidence.
 
 Incident construction preserves the selected adverse health state (`degraded`, `unhealthy`, or
-`unavailable`) and expands the anchor to the complete overlapping evidence interval required by
-the WC-026 verifier. A Resource Health incident anchor must be an active event that explicitly
-transitions from `Available`; a resolved event cannot open an incident. Resource Health event
-intervals must also remain within the control's reviewed `maximumEventAgeSeconds` at both
-collection time and the request's trusted evaluation time.
+`unavailable`). One shared canonical selector chooses the primary healthy-to-adverse transition
+and then expands it to every connected, overlapping, same-state corroborating health component
+across controls. The complete expanded source-record set is signed in `selectedIncident`, used by
+the collection transaction, and reconstructed by production correlation; a caller cannot narrow
+the signed selection while leaving corroborating observations in the anchor. Disconnected
+episodes within one control and overlapping healthy evidence fail closed. A Resource Health
+incident anchor must be an active event that explicitly transitions from `Available`; a resolved
+event cannot open an incident. Resource Health event intervals must also remain within the
+control's reviewed `maximumEventAgeSeconds` at both collection time and the request's trusted
+evaluation time.
 
 The strengthened input contract is `athena.wc028MonitoringCollectionBatch.v2`, and monitoring
 intent is `athena.wc028PublishedMonitoringIntent.v2` because Resource Health controls now carry a
 required freshness bound. Version 1 assets are rejected rather than silently treating unbound
 coverage or unbounded health events as activation eligible.
 
-The new wire contracts are `athena.wc028MonitoringEvidenceBundle.v2` and
-`athena.wc028CorrelationRequest.v3`. The legacy
-`athena.wc026MonitoringEvidenceBundle.v1` and `athena.wc026CorrelationRequest.v2` variants remain
-parseable, but they reject the new WC-028 fields rather than changing an existing strict schema in
-place. WC-028 always emits the new pair. The production `CorrelationService` fails closed for the
-legacy unsigned variant, while the explicitly non-production compatibility harness can continue
-to evaluate previously persisted WC-026 fixtures.
+Production acquisition uses `athena.wc028MonitoringEvidenceBundle.v3`,
+`athena.wc028MonitoringAcquisitionReceipt.v6`, and
+`athena.wc028CorrelationRequest.v5`. Receipt v6 preserves the v5 minimal `selectedIncident`
+containing the
+canonical incident resource, exact previous/current normalized source-record IDs, selected adverse
+state, and transition digest. It additionally signs the exact effective-RBAC inventory digest,
+source-manifest digest, validity interval on every exchange, every ordered physical Azure request
+attempt, and the runtime's complete
+`athena.wc028MonitoringPersistenceReplay.v3`
+execution/cleanup/storage-readiness/request-window binding. Acquisition-authority v6 supplies
+separate physical-attempt and logical-exchange budgets; v5 remains byte-compatible and parse-only.
+Correlation
+request v5 carries the same selected incident and reconstructs both the selection and canonical
+citation-bearing transition from persisted evidence.
+
+Current production acquisition does not query Traffic Analytics, custom flow tables, Connection
+Monitor workspace tables, or IP Flow Verify. Without a dedicated or ABAC-isolated workspace/table
+boundary, those controls persist deterministic unavailable coverage with zero source calls and no
+network-flow observation. Historical v3 requests may retain their prior versioned flow evidence,
+but production request v5 accepts only permission-attested resource-context log evidence.
+
+`athena.wc028MonitoringEvidenceBundle.v2` with
+`athena.wc028CorrelationRequest.v4` with receipt v5, `athena.wc028CorrelationRequest.v3`, and the
+legacy WC-026 v1/v2 pair remain parseable for historical and explicitly non-production
+compatibility only. Production `CorrelationService` rejects those older request versions.
 
 ## Consequences
 

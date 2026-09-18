@@ -11,15 +11,16 @@ from pydantic import ValidationError
 
 import athena_context.correlation.engine as correlation_engine
 from athena_context.contracts import (
-    CORRELATION_REQUEST_SCHEMA_VERSION,
     LEGACY_CORRELATION_REQUEST_SCHEMA_VERSION,
     LEGACY_MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION,
     MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION,
+    PREVIOUS_CORRELATION_REQUEST_SCHEMA_VERSION,
     ActivityLogMonitoringSignal,
     ApprovedChangeScope,
     ChangeEvidencePersistenceHandoff,
     EndpointHealthObservation,
     LogQueryMonitoringSignal,
+    MonitoringAcquisitionReceipt,
     MonitoringControlProvenance,
     MonitoringEvidenceAttestation,
     MonitoringEvidenceBundle,
@@ -51,6 +52,7 @@ from athena_context.monitoring_collection import (
     ResourceChangeRecord,
     ResourceHealthRecord,
     VmConnectionHealthRecord,
+    _MonitoringCollectionTransactionCore,
     compute_monitoring_query_execution_digest,
 )
 from test_wc026_correlation import _test_service
@@ -68,7 +70,7 @@ from test_wc026_correlation_contract import (
 )
 
 MONITOR_ID = (
-    f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg-synthetic-monitoring/"
+    f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg-athena-demo-monitoring/"
     "providers/Microsoft.Network/networkWatchers/synthetic-watcher/"
     "connectionMonitors/synthetic-web-db"
 )
@@ -97,6 +99,42 @@ def _json_value(value: Any) -> Any:
     if isinstance(value, dict):
         return {key: _json_value(item) for key, item in value.items() if item is not None}
     return value
+
+
+def _ip_flow_provenance(*, direct_attribution: bool) -> dict[str, object]:
+    tuple_payload = {
+        "direction": "inbound",
+        "protocol": "Tcp",
+        "sourceResourceId": WEB_ID.casefold(),
+        "destinationResourceId": DB_ID.casefold(),
+        "sourceAddress": "192.0.2.10",
+        "destinationAddress": "192.0.2.20",
+        "sourcePort": 443,
+        "destinationPort": 1433,
+    }
+    payload: dict[str, object] = {
+        "schemaVersion": "athena.wc028MonitoringIpFlowProvenance.v1",
+        "exchangeSequence": 1,
+        "ipFlowRequestDigest": "sha256:" + "a" * 64,
+        "ipFlowResultDigest": "sha256:" + "b" * 64,
+        "trafficAnalyticsRequestDigest": "sha256:" + "c" * 64,
+        "correlationRequestId": "93e948cc-df1e-4caf-8a91-c31aa3803793",
+        "targetResourceId": DB_ID.casefold(),
+        **tuple_payload,
+        "fiveTupleDigest": compute_artifact_digest(tuple_payload),
+        "historicalDecision": "denied",
+        "historicalRuleResourceId": NSG_RULE_ID.casefold(),
+        "access": "Deny",
+        "resultRuleResourceId": NSG_RULE_ID.casefold(),
+        "causalChangeCorrelationId": (CHANGE_CORRELATION_ID if direct_attribution else None),
+        "requestedAt": NOW,
+        "checkedAt": NOW,
+        "receivedAt": NOW,
+    }
+    return {
+        **payload,
+        "provenanceDigest": compute_artifact_digest(_json_value(payload)),
+    }
 
 
 def _scope(
@@ -178,7 +216,11 @@ def _controls(
             resources=(WEB_ID,),
             dry_run_only=dry_run_only,
             signal=_query_signal(
-                "Heartbeat | summarize heartbeatCount=count()",
+                (
+                    "Heartbeat "
+                    f"| where _ResourceId =~ '{WEB_ID.lower()}' "
+                    "| summarize heartbeatCount=count() by _ResourceId"
+                ),
                 operator="lessThan",
                 threshold=1,
             ),
@@ -188,7 +230,11 @@ def _controls(
             resources=(WEB_ID, DB_ID),
             dry_run_only=dry_run_only,
             signal=_query_signal(
-                "VMConnection | summarize failedConnectionCount=count()",
+                (
+                    "VMConnection "
+                    f"| where _ResourceId =~ '{WEB_ID.lower()}' "
+                    "| summarize failedConnectionCount=count() by _ResourceId"
+                ),
                 operator="greaterThan",
                 threshold=0,
             ),
@@ -341,7 +387,9 @@ def _authority(
     return context, intent, controls
 
 
-def _intent_assets(intent) -> tuple[
+def _intent_assets(
+    intent,
+) -> tuple[
     PublishedMonitoringIntentAssetReference,
     PublishedMonitoringIntentAttestation,
 ]:
@@ -426,9 +474,7 @@ def _coverage_query_fields(
         "queryTargetResourceId": signal.query_target_resource_id,
         "evaluationWindowSeconds": signal.evaluation_window_seconds,
         "frequencySeconds": signal.frequency_seconds,
-        "queryExecutionDigests": tuple(
-            sorted(item.query_execution_digest for item in records)
-        ),
+        "queryExecutionDigests": tuple(sorted(item.query_execution_digest for item in records)),
     }
 
 
@@ -574,6 +620,7 @@ def _batch(
             destinationPort=1433,
             enforcementResourceId=NSG_ID,
             ruleResourceId=NSG_RULE_ID,
+            ipFlowProvenance=_ip_flow_provenance(direct_attribution=direct_attribution),
             changeCorrelationId=(CHANGE_CORRELATION_ID if direct_attribution else None),
             attributionMethod=("ipFlowVerify" if direct_attribution else None),
             attributionEvidence=(
@@ -752,8 +799,8 @@ def _batch(
         schemaVersion="athena.wc028MonitoringCollectionBatch.v2",
         collectedAt=NOW,
         incidentResourceId=WEB_ID,
-        previousHealthSourceRecordId="endpoint-healthy",
-        currentHealthSourceRecordIds=("endpoint-unhealthy",),
+        previousHealthSourceRecordId="resource-health-resolved",
+        currentHealthSourceRecordIds=("resource-health-active",),
         records=records,
         coverage=coverage,
     )
@@ -791,9 +838,9 @@ class _CommitPort:
                 if bundle.acquisition_receipt is not None
                 else "athena.wc024MonitoringEvidenceHandoff.v1"
             ),
-            "collectorContractDigest": DIGEST_C,
+            "collectorContractDigest": bundle.monitoring_contract_digest,
             "collectionId": collection_id,
-            "observedAt": NOW,
+            "observedAt": bundle.observed_end,
             "evidence": reference.model_dump(
                 mode="json",
                 by_alias=True,
@@ -801,9 +848,7 @@ class _CommitPort:
             ),
         }
         if bundle.acquisition_receipt is not None:
-            payload["acquisitionReceiptDigest"] = (
-                bundle.acquisition_receipt.receipt_digest
-            )
+            payload["acquisitionReceiptDigest"] = bundle.acquisition_receipt.receipt_digest
         handoff = MonitoringEvidenceHandoff(
             **payload,
             collectorAttestation=MonitoringEvidenceAttestation(
@@ -843,6 +888,10 @@ class _CommitPort:
             self.calls += 1
 
 
+class _LegacyTestMonitoringCollectionTransaction(_MonitoringCollectionTransactionCore):
+    """Test-only compatibility path for pre-receipt collection fixtures."""
+
+
 def _transaction(
     *,
     asset_loader: Callable[
@@ -852,8 +901,38 @@ def _transaction(
             PublishedMonitoringIntentAttestation,
         ],
     ] = _intent_assets,
+) -> _LegacyTestMonitoringCollectionTransaction:
+    return _LegacyTestMonitoringCollectionTransaction(
+        change_signer=_Signer(),
+        change_signing_key_id=CHANGE_KEY_ID,
+        monitoring_intent_trusted_key_id=INTENT_KEY_ID,
+        monitoring_intent_signature_verifier=(
+            lambda _payload, signature: signature == INTENT_SIGNATURE
+        ),
+        monitoring_intent_asset_loader=asset_loader,
+    )
+
+
+def _production_transaction(
+    *,
+    asset_loader: Callable[
+        [object],
+        tuple[
+            PublishedMonitoringIntentAssetReference,
+            PublishedMonitoringIntentAttestation,
+        ],
+    ] = _intent_assets,
 ) -> MonitoringCollectionTransaction:
+    def verify_receipt(
+        receipt: MonitoringAcquisitionReceipt,
+        _trusted_as_of: datetime,
+    ) -> None:
+        expected = base64.b64encode(b"synthetic-acquisition-receipt").decode("ascii")
+        if receipt.collector_attestation.signature != expected:
+            raise ValueError("synthetic receipt signature is invalid")
+
     return MonitoringCollectionTransaction(
+        acquisition_receipt_verifier=verify_receipt,
         change_signer=_Signer(),
         change_signing_key_id=CHANGE_KEY_ID,
         monitoring_intent_trusted_key_id=INTENT_KEY_ID,
@@ -900,11 +979,8 @@ def test_collection_transaction_drives_confirmed_nsg_connectivity_correlation() 
 
     assert commit.calls == 1
     assert prepared.intent_digest
-    assert (
-        prepared.monitoring_bundle.schema_version
-        == MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION
-    )
-    assert request.schema_version == CORRELATION_REQUEST_SCHEMA_VERSION
+    assert prepared.monitoring_bundle.schema_version == MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION
+    assert request.schema_version == PREVIOUS_CORRELATION_REQUEST_SCHEMA_VERSION
     assert prepared.monitoring_bundle.monitoring_intent_reference is not None
     assert prepared.monitoring_bundle.collected_at == NOW
     query_observation_digests = {
@@ -929,10 +1005,7 @@ def test_collection_transaction_drives_confirmed_nsg_connectivity_correlation() 
     )
     intent_reference = prepared.monitoring_bundle.monitoring_intent_reference
     assert intent_reference.intent_reference in request.evidence_inventory.source_references
-    assert (
-        intent_reference.attestation_reference
-        in request.evidence_inventory.source_references
-    )
+    assert intent_reference.attestation_reference in request.evidence_inventory.source_references
     assert (
         request.evidence_inventory.monitoring_intent_asset_reference_digest
         == intent_reference.asset_reference_digest
@@ -975,9 +1048,7 @@ def test_unattested_monitoring_intent_fails_before_transaction_commit() -> None:
         PublishedMonitoringIntentAttestation,
     ]:
         reference, attestation = _intent_assets(selected_intent)
-        return reference, attestation.model_copy(
-            update={"detached_signature": "aW52YWxpZA"}
-        )
+        return reference, attestation.model_copy(update={"detached_signature": "aW52YWxpZA"})
 
     with pytest.raises(ValueError, match="assets"):
         _transaction(asset_loader=invalid_assets).execute(
@@ -1551,9 +1622,7 @@ def test_every_query_observation_requires_exactly_one_compatible_coverage() -> N
             trusted_as_of=NOW + timedelta(minutes=1),
         )
 
-    flow = next(
-        item for item in batch.coverage if item.source_record_id == "coverage-flow"
-    )
+    flow = next(item for item in batch.coverage if item.source_record_id == "coverage-flow")
     duplicated = (*batch.coverage, flow.model_copy(update={"source_record_id": "coverage-flow-2"}))
     with pytest.raises(MonitoringCollectionError, match="exactly one compatible coverage"):
         _transaction().prepare(
@@ -1593,21 +1662,15 @@ def test_confidence_matcher_rejects_unrelated_complete_query_coverage() -> None:
         update={
             "coverage_id": "coverage-" + "f" * 32,
             "coverage_digest": "sha256:" + "f" * 64,
-            "query_execution_digests": (
-                healthy_endpoint.query_execution_digest,
-            ),
+            "query_execution_digests": (healthy_endpoint.query_execution_digest,),
         }
     )
     coverage = tuple(
-        item
-        for item in request.monitoring_bundle.coverage
-        if item.coverage_id != exact.coverage_id
+        item for item in request.monitoring_bundle.coverage if item.coverage_id != exact.coverage_id
     ) + (partial_exact, unrelated_complete)
     forged_request = request.model_copy(
         update={
-            "monitoring_bundle": request.monitoring_bundle.model_copy(
-                update={"coverage": coverage}
-            )
+            "monitoring_bundle": request.monitoring_bundle.model_copy(update={"coverage": coverage})
         }
     )
 
@@ -1896,8 +1959,7 @@ def test_collection_to_trusted_as_of_delay_is_bounded() -> None:
             ),
             collector_contract_digest=DIGEST_C,
             change_scope=_scope_contract(),
-            trusted_as_of=NOW
-            + timedelta(seconds=MAX_COLLECTION_TRUST_DELAY_SECONDS + 1),
+            trusted_as_of=NOW + timedelta(seconds=MAX_COLLECTION_TRUST_DELAY_SECONDS + 1),
         )
 
 
@@ -1905,9 +1967,7 @@ def test_query_freshness_is_reapplied_at_trusted_as_of() -> None:
     context, intent, controls = _authority()
     batch = _batch(controls, direct_attribution=False)
     current_heartbeat = next(
-        item
-        for item in batch.records
-        if item.source_record_id == "heartbeat-unhealthy"
+        item for item in batch.records if item.source_record_id == "heartbeat-unhealthy"
     )
     without_change = batch.model_copy(
         update={
@@ -1916,8 +1976,7 @@ def test_query_freshness_is_reapplied_at_trusted_as_of() -> None:
                 *(
                     item
                     for item in batch.records
-                    if not isinstance(item, ResourceChangeRecord)
-                    and item is not current_heartbeat
+                    if not isinstance(item, ResourceChangeRecord) and item is not current_heartbeat
                 ),
             )
         }
@@ -1961,9 +2020,7 @@ def test_legacy_schema_versions_reject_wc028_wire_fields() -> None:
         by_alias=True,
         exclude_none=True,
     )
-    legacy_bundle_payload["schemaVersion"] = (
-        LEGACY_MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION
-    )
+    legacy_bundle_payload["schemaVersion"] = LEGACY_MONITORING_EVIDENCE_BUNDLE_SCHEMA_VERSION
     with pytest.raises(ValidationError, match="legacy monitoring bundle"):
         MonitoringEvidenceBundle.model_validate(legacy_bundle_payload)
 
@@ -2006,9 +2063,7 @@ class _IntentAssetVerifier:
             intent,
             attestation,
             trusted_key_id=INTENT_KEY_ID,
-            signature_verifier=(
-                lambda _payload, signature: signature == INTENT_SIGNATURE
-            ),
+            signature_verifier=(lambda _payload, signature: signature == INTENT_SIGNATURE),
         )
         return reference.reference_digest
 
@@ -2048,9 +2103,7 @@ def test_downstream_verification_rereads_signed_intent_and_resolves_controls() -
         controlDigest="sha256:" + "f" * 64,
         sourceClausePath="/controls/forged",
     )
-    forged_observation = observation.model_copy(
-        update={"control_provenance": forged_provenance}
-    )
+    forged_observation = observation.model_copy(update={"control_provenance": forged_provenance})
     forged_bundle = request.monitoring_bundle.model_copy(
         update={
             "observations": (
@@ -2068,7 +2121,7 @@ def test_downstream_verification_rereads_signed_intent_and_resolves_controls() -
         )
 
 
-def test_downstream_verification_rejects_reissued_stale_source_evidence() -> None:
+def test_production_verification_rejects_historical_v3_request() -> None:
     _, intent, _ = _authority()
     reference, attestation = _intent_assets(intent)
     _, _, request, _ = _execute(direct_attribution=True)
@@ -2107,8 +2160,9 @@ def test_downstream_verification_rejects_reissued_stale_source_evidence() -> Non
     )
     object.__setattr__(service, "_require_signed_monitoring_intent", True)
 
+    assert reissued_request.schema_version == PREVIOUS_CORRELATION_REQUEST_SCHEMA_VERSION
     assert reissued_request.trusted_as_of == trusted_as_of
-    with pytest.raises(ValueError, match="query-derived evidence exceeds"):
+    with pytest.raises(ValueError, match="replay-bound request v5"):
         service.correlate(reissued_request)
 
 

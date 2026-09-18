@@ -28,6 +28,21 @@ resource workspace 'Microsoft.OperationalInsights/workspaces@2025-02-01' existin
   name: workspaceName
 }
 
+var resourceContextTableNames = [
+  'Heartbeat'
+  'Perf'
+  'InsightsMetrics'
+  'Syslog'
+  'VMConnection'
+]
+
+resource resourceContextTables 'Microsoft.OperationalInsights/workspaces/tables@2025-02-01' existing = [
+  for tableName in resourceContextTableNames: {
+    parent: workspace
+    name: tableName
+  }
+]
+
 resource dataCollectionEndpoint 'Microsoft.Insights/dataCollectionEndpoints@2024-03-11' existing = {
   name: dataCollectionEndpointName
 }
@@ -44,6 +59,9 @@ var validatedWorkspaceLocation = toLower(adoptedWorkspaceLocation) == toLower(ad
 var validatedDataCollectionEndpointLocation = toLower(adoptedWorkspaceLocation) == toLower(adoptedDataCollectionEndpointLocation)
   ? adoptedDataCollectionEndpointLocation
   : fail('WC-024 requires the adopted Log Analytics workspace and data collection endpoint to use the same Azure region. Reconcile the regional topology before deployment.')
+var validatedWorkspaceResourceContextAccessEnabled = workspace.properties.features.enableLogAccessUsingOnlyResourcePermissions
+  ? true
+  : fail('WC-028 resource-context acquisition requires enableLogAccessUsingOnlyResourcePermissions=true.')
 
 resource workloadPrivateLinkScope 'Microsoft.Insights/privateLinkScopes@2021-09-01' existing = {
   name: '${namePrefix}-workload-ampls'
@@ -101,7 +119,16 @@ output workspaceTags object = workspace.tags
 output workspaceSkuName string = workspace.properties.sku.name
 output workspaceRetentionDays int = workspace.properties.retentionInDays
 output workspaceFeatures object = workspace.properties.features
-output workspaceResourceContextAccessEnabled bool = workspace.properties.features.enableLogAccessUsingOnlyResourcePermissions
+output workspaceResourceContextAccessEnabled bool = validatedWorkspaceResourceContextAccessEnabled
+output resourceContextTablePlans array = [
+  for (tableName, index) in resourceContextTableNames: {
+    table: tableName
+    plan: resourceContextTables[index].properties.plan == 'Analytics'
+      ? 'Analytics'
+      : fail('WC-028 resource-context acquisition requires Analytics plan on every exact VM log table.')
+    tableResourceId: resourceContextTables[index].id
+  }
+]
 output dataCollectionRuleResourceId string = dataCollectionRule.id
 output dataCollectionEndpointResourceId string = dataCollectionEndpoint.id
 output dataCollectionEndpointLocation string = validatedDataCollectionEndpointLocation

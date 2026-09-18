@@ -83,6 +83,72 @@ param monitoringStorageAccountName string
 @maxLength(24)
 param monitoringCollectorKeyVaultName string
 
+@description('Exact existing Athena context UAMI resource ID. Its resource and principal identities must differ from the monitoring collector UAMI.')
+param athenaContextIdentityResourceId string
+
+@description('Exact dormant or active Container Apps Job that will run the monitoring collector.')
+param collectorRuntimeResourceId string
+
+@description('Exact Container Apps Job that will run the separate RBAC inventory attestor.')
+param rbacAttestorRuntimeResourceId string
+
+@description('Separate runtime-support UAMI that is the only additional identity approved on the collector Job.')
+param runtimeSupportIdentityResourceId string
+
+@description('Exact separately governed reviewer principal that signs accepted effective-RBAC inventories.')
+param rbacInventoryReviewerPrincipalId string
+
+@description('Exact versioned reviewer Key Vault key URI used outside this deployment to sign accepted inventories.')
+@minLength(1)
+@maxLength(2048)
+param rbacInventoryReviewerKeyId string
+
+@description('Exact ARM resource ID of the separately governed reviewer key.')
+param rbacInventoryReviewerKeyArmResourceId string
+
+@description('Pre-provisioned otherwise-unassigned UAMI that phase one grants keys/get on the exact reviewer key.')
+param rbacInventoryVerifierIdentityResourceId string
+
+@description('Base64url RSA modulus of the reviewed inventory-signing public key.')
+@minLength(342)
+@maxLength(1024)
+param rbacInventoryReviewerPublicKeyModulus string
+
+@description('Base64url RSA exponent of the reviewed inventory-signing public key.')
+@allowed([
+  'AQAB'
+])
+param rbacInventoryReviewerPublicKeyExponent string
+
+@description('SHA-256 SPKI fingerprint of the reviewed inventory-signing public key.')
+@minLength(71)
+@maxLength(71)
+param rbacInventoryReviewerPublicKeyFingerprint string
+
+@description('Non-zero digest of the exact v3 cleanup evidence proving every superseded broad collector assignment and role definition is absent before narrow RBAC publication.')
+@minLength(71)
+@maxLength(71)
+param legacyCollectorRbacCleanupDigest string
+
+@description('Reviewed SHA-256 digest of the exact WC-024 storage-readiness preimage.')
+@minLength(71)
+@maxLength(71)
+param monitoringEvidenceStorageReadinessDigest string
+
+var athenaContextIdentitySegments = split(toLower(athenaContextIdentityResourceId), '/')
+resource athenaContextIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2024-11-30' existing = {
+  scope: resourceGroup(athenaContextIdentitySegments[2], athenaContextIdentitySegments[4])
+  name: athenaContextIdentitySegments[8]
+}
+var runtimeSupportIdentitySegments = split(toLower(runtimeSupportIdentityResourceId), '/')
+var runtimeSupportIdentityIsValid = length(runtimeSupportIdentitySegments) == 9
+  ? runtimeSupportIdentitySegments[1] == 'subscriptions' && runtimeSupportIdentitySegments[2] == toLower(subscription().subscriptionId) && runtimeSupportIdentitySegments[3] == 'resourcegroups' && runtimeSupportIdentitySegments[5] == 'providers' && runtimeSupportIdentitySegments[6] == 'microsoft.managedidentity' && runtimeSupportIdentitySegments[7] == 'userassignedidentities' && !empty(runtimeSupportIdentitySegments[8])
+  : false
+resource runtimeSupportIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2024-11-30' existing = {
+  scope: resourceGroup(runtimeSupportIdentitySegments[2], runtimeSupportIdentitySegments[4])
+  name: runtimeSupportIdentitySegments[8]
+}
+
 @description('Retention period for replacement flow-log and signed-evidence data.')
 @minValue(30)
 @maxValue(365)
@@ -154,6 +220,65 @@ var resourceTags = union(tags, {
   managedBy: 'bicep'
   autoRemediation: 'disabled'
 })
+var normalizedReviewerPrincipalId = toLower(rbacInventoryReviewerPrincipalId)
+var reviewerPrincipalIdSegments = split(normalizedReviewerPrincipalId, '-')
+var reviewerPrincipalIdIsValid = length(reviewerPrincipalIdSegments) == 5
+  ? length(reviewerPrincipalIdSegments[0]) == 8 && length(reviewerPrincipalIdSegments[1]) == 4 && length(reviewerPrincipalIdSegments[2]) == 4 && length(reviewerPrincipalIdSegments[3]) == 4 && length(reviewerPrincipalIdSegments[4]) == 12 && normalizedReviewerPrincipalId != '00000000-0000-0000-0000-000000000000'
+  : false
+var normalizedReviewerKeyId = toLower(rbacInventoryReviewerKeyId)
+var normalizedRbacInventoryVerifierIdentityResourceId = toLower(
+  rbacInventoryVerifierIdentityResourceId
+)
+var rbacInventoryVerifierIdentitySegments = split(
+  normalizedRbacInventoryVerifierIdentityResourceId,
+  '/'
+)
+var rbacInventoryVerifierIdentityIsValid = length(rbacInventoryVerifierIdentitySegments) == 9
+  ? rbacInventoryVerifierIdentitySegments[1] == 'subscriptions' && rbacInventoryVerifierIdentitySegments[2] == toLower(subscription().subscriptionId) && rbacInventoryVerifierIdentitySegments[5] == 'providers' && rbacInventoryVerifierIdentitySegments[6] == 'microsoft.managedidentity' && rbacInventoryVerifierIdentitySegments[7] == 'userassignedidentities' && !empty(rbacInventoryVerifierIdentitySegments[8])
+  : false
+resource rbacInventoryVerifierIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2024-11-30' existing = {
+  scope: resourceGroup(
+    rbacInventoryVerifierIdentitySegments[2],
+    rbacInventoryVerifierIdentitySegments[4]
+  )
+  name: rbacInventoryVerifierIdentitySegments[8]
+}
+var reviewerKeyIdSegments = split(normalizedReviewerKeyId, '/')
+var normalizedReviewerKeyArmResourceId = toLower(rbacInventoryReviewerKeyArmResourceId)
+var reviewerKeyArmSegments = split(normalizedReviewerKeyArmResourceId, '/')
+var reviewedRbacInventoryReviewerVaultHost = 'athenarbacevidencekv.${environment().suffixes.keyvaultDns}'
+var reviewerKeyIdIsExternalAndVersioned = length(reviewerKeyIdSegments) == 6
+  ? reviewerKeyIdSegments[0] == 'https:' && empty(reviewerKeyIdSegments[1]) && reviewerKeyIdSegments[2] == reviewedRbacInventoryReviewerVaultHost && reviewerKeyIdSegments[2] != '${toLower(monitoringCollectorKeyVaultName)}.${environment().suffixes.keyvaultDns}' && reviewerKeyIdSegments[3] == 'keys' && reviewerKeyIdSegments[4] == 'monitoring-rbac-inventory-review' && length(reviewerKeyIdSegments[5]) == 32 && length(reviewerKeyArmSegments) == 11 && reviewerKeyArmSegments[1] == 'subscriptions' && reviewerKeyArmSegments[2] == toLower(subscription().subscriptionId) && reviewerKeyArmSegments[5] == 'providers' && reviewerKeyArmSegments[6] == 'microsoft.keyvault' && reviewerKeyArmSegments[7] == 'vaults' && reviewerKeyArmSegments[8] == 'athenarbacevidencekv' && reviewerKeyArmSegments[9] == 'keys' && reviewerKeyArmSegments[10] == reviewerKeyIdSegments[4]
+  : false
+var reviewerFingerprintIsValid = rbacInventoryReviewerPublicKeyFingerprint == toLower(rbacInventoryReviewerPublicKeyFingerprint) && startsWith(
+  rbacInventoryReviewerPublicKeyFingerprint,
+  'sha256:'
+) && rbacInventoryReviewerPublicKeyFingerprint != 'sha256:0000000000000000000000000000000000000000000000000000000000000000'
+var cleanupDigestIsValid = legacyCollectorRbacCleanupDigest == toLower(legacyCollectorRbacCleanupDigest) && startsWith(
+  legacyCollectorRbacCleanupDigest,
+  'sha256:'
+) && legacyCollectorRbacCleanupDigest != 'sha256:0000000000000000000000000000000000000000000000000000000000000000'
+var validatedLegacyCollectorRbacCleanupDigest = cleanupDigestIsValid
+  ? legacyCollectorRbacCleanupDigest
+  : fail('WC-024 requires one non-zero lowercase SHA-256 digest for the exact legacy collector RBAC cleanup evidence.')
+var storageReadinessDigestIsValid = monitoringEvidenceStorageReadinessDigest == toLower(monitoringEvidenceStorageReadinessDigest) && startsWith(monitoringEvidenceStorageReadinessDigest, 'sha256:') && monitoringEvidenceStorageReadinessDigest != 'sha256:0000000000000000000000000000000000000000000000000000000000000000'
+var validatedMonitoringEvidenceStorageReadinessDigest = storageReadinessDigestIsValid
+  ? monitoringEvidenceStorageReadinessDigest
+  : fail('WC-024 requires one non-zero lowercase SHA-256 digest for the exact storage-readiness preimage.')
+var validatedRbacInventoryReviewAuthority = reviewerPrincipalIdIsValid && reviewerKeyIdIsExternalAndVersioned && reviewerFingerprintIsValid && rbacInventoryVerifierIdentityIsValid
+  ? {
+      reviewerPrincipalId: normalizedReviewerPrincipalId
+      reviewerKeyId: rbacInventoryReviewerKeyId
+      reviewerKeyArmResourceId: normalizedReviewerKeyArmResourceId
+      verifierIdentityResourceId: normalizedRbacInventoryVerifierIdentityResourceId
+      verifierIdentityClientId: rbacInventoryVerifierIdentity.properties.clientId
+      verifierIdentityPrincipalId: rbacInventoryVerifierIdentity.properties.principalId
+      verifierIdentityTenantId: rbacInventoryVerifierIdentity.properties.tenantId
+      publicKeyModulus: rbacInventoryReviewerPublicKeyModulus
+      publicKeyExponent: rbacInventoryReviewerPublicKeyExponent
+      publicKeyFingerprint: rbacInventoryReviewerPublicKeyFingerprint
+    }
+  : fail('WC-024 requires a nonzero reviewer UUID, a versioned key in a vault separate from the collector signing vault, and a real lowercase SHA-256 public-key fingerprint.')
 var legacyFlowLogStorageAccountName = 'athenahackathonflowwhtco'
 var workloadResourceGroupId = '${subscription().id}/resourceGroups/${workloadResourceGroupName}'
 var legacyFlowLogStorageAccountResourceId = '${workloadResourceGroupId}/providers/Microsoft.Storage/storageAccounts/${legacyFlowLogStorageAccountName}'
@@ -294,6 +419,63 @@ module monitoringStorage 'modules/monitoring-flow-log-storage.bicep' = {
   }
 }
 
+module monitoringEvidenceWriterRole 'modules/monitoring-evidence-writer-role.bicep' = {
+  name: 'monitoring-evidence-writer-role'
+  params: {
+    monitoringEvidenceContainerResourceId: monitoringStorage.outputs.monitoringEvidenceContainerResourceId
+    assignableScopeResourceId: monitoringResourceGroup.id
+  }
+}
+
+module monitoringStorageReadbackReader 'modules/monitoring-storage-readback-reader.bicep' = {
+  name: 'monitoring-storage-readback-reader'
+  params: {
+    storageAccountResourceId: monitoringStorage.outputs.storageAccountResourceId
+    assignableScopeResourceId: monitoringResourceGroup.id
+  }
+}
+
+module monitoringStorageReadbackReaderAssignment 'modules/monitoring-storage-readback-reader-assignment.bicep' = {
+  name: 'monitoring-storage-readback-reader-assignment'
+  scope: monitoringResourceGroup
+  params: {
+    storageAccountName: monitoringStorageAccountName
+    expectedStorageAccountResourceId: monitoringStorage.outputs.storageAccountResourceId
+    runtimeSupportIdentityResourceId: runtimeSupportIdentityIsValid
+      ? runtimeSupportIdentity.id
+      : fail('runtimeSupportIdentityResourceId must identify one UAMI in this subscription')
+    runtimeSupportPrincipalId: runtimeSupportIdentity.properties.principalId
+    roleDefinitionId: monitoringStorageReadbackReader.outputs.roleDefinitionId
+  }
+}
+
+var reviewerKeyResourceGroupId = subscriptionResourceId(
+  'Microsoft.Resources/resourceGroups',
+  reviewerKeyArmSegments[4]
+)
+var reviewerKeyVaultResourceId = '${reviewerKeyResourceGroupId}/providers/Microsoft.KeyVault/vaults/${reviewerKeyArmSegments[8]}'
+
+module monitoringReviewerKeyReaderRole 'modules/monitoring-reviewer-key-reader-role.bicep' = {
+  name: 'monitoring-reviewer-key-reader-role'
+  params: {
+    reviewerKeyArmResourceId: normalizedReviewerKeyArmResourceId
+    assignableScopeResourceId: reviewerKeyResourceGroupId
+  }
+}
+
+module monitoringReviewerKeyReaderAssignment 'modules/monitoring-reviewer-key-reader-assignment.bicep' = {
+  name: 'monitoring-reviewer-key-reader-assignment'
+  scope: resourceGroup(reviewerKeyArmSegments[2], reviewerKeyArmSegments[4])
+  params: {
+    verifierIdentityResourceId: validatedRbacInventoryReviewAuthority.verifierIdentityResourceId
+    verifierPrincipalId: validatedRbacInventoryReviewAuthority.verifierIdentityPrincipalId
+    roleDefinitionId: monitoringReviewerKeyReaderRole.outputs.roleDefinitionId
+    vaultName: reviewerKeyArmSegments[8]
+    keyName: reviewerKeyArmSegments[10]
+    expectedKeyResourceId: normalizedReviewerKeyArmResourceId
+  }
+}
+
 module monitoringEvidenceSeams 'modules/monitoring-evidence-seams.bicep' = {
   name: 'monitoring-evidence-seams'
   scope: monitoringResourceGroup
@@ -306,6 +488,7 @@ module monitoringEvidenceSeams 'modules/monitoring-evidence-seams.bicep' = {
     namePrefix: namePrefix
     storageAccountName: monitoringStorageAccountName
     monitoringEvidenceContainerResourceId: monitoringStorage.outputs.monitoringEvidenceContainerResourceId
+    evidenceWriterRoleDefinitionId: monitoringEvidenceWriterRole.outputs.roleDefinitionId
     keyVaultName: monitoringCollectorKeyVaultName
     tags: resourceTags
   }
@@ -376,13 +559,20 @@ module monitoringEvidenceReaderAssignments 'modules/monitoring-evidence-reader-r
   scope: monitoringResourceGroup
   params: {
     collectorPrincipalId: monitoringEvidenceSeams.outputs.collectorIdentityPrincipalId
-    workspaceName: workspaceName
     dataCollectionEndpointName: dataCollectionEndpointName
     dataCollectionRuleName: dataCollectionRuleName
     privateLinkScopeNames: [
       '${namePrefix}-workload-ampls'
       '${namePrefix}-collector-ampls'
     ]
+  }
+}
+
+module resourceGraphQueryReaderAssignment 'modules/resource-graph-query-reader-rbac.bicep' = {
+  name: 'resource-graph-query-reader-assignment'
+  scope: subscription()
+  params: {
+    collectorPrincipalId: monitoringEvidenceSeams.outputs.collectorIdentityPrincipalId
   }
 }
 
@@ -439,6 +629,22 @@ module networkWatcherEvidenceReaderAssignment 'modules/network-watcher-monitorin
   }
 }
 
+module monitoringRbacAttestor 'modules/monitoring-rbac-attestor.bicep' = {
+  name: 'monitoring-effective-rbac-attestor'
+  scope: subscription()
+  params: {
+    attestorPrincipalId: monitoringEvidenceSeams.outputs.rbacAttestorIdentityPrincipalId
+  }
+}
+
+module monitoringIdentityProofAuthority 'modules/monitoring-identity-proof-authority.bicep' = {
+  name: 'monitoring-identity-proof-authority'
+  params: {
+    tenantId: monitoringEvidenceSeams.outputs.collectorIdentityTenantId
+    collectorPrincipalId: monitoringEvidenceSeams.outputs.collectorIdentityPrincipalId
+  }
+}
+
 module legacyFlowLogMigration 'modules/legacy-flow-log-migration.bicep' = {
   name: 'disable-redundant-legacy-flow-logs'
   scope: resourceGroup(networkWatcherResourceGroupName)
@@ -465,44 +671,273 @@ module connectionMonitorCapability 'modules/connection-monitor-capability.bicep'
   }
 }
 
-module collectorContract 'modules/monitoring-collector-contract.bicep' = {
-  name: 'monitoring-collector-contract'
-  scope: monitoringResourceGroup
+var acquisitionIdentitySeparation = toLower(monitoringEvidenceSeams.outputs.collectorIdentityResourceId) != toLower(athenaContextIdentity.id) && toLower(monitoringEvidenceSeams.outputs.collectorIdentityResourceId) != toLower(monitoringEvidenceSeams.outputs.rbacAttestorIdentityResourceId) && toLower(athenaContextIdentity.id) != toLower(monitoringEvidenceSeams.outputs.rbacAttestorIdentityResourceId) && toLower(monitoringEvidenceSeams.outputs.collectorIdentityPrincipalId) != toLower(athenaContextIdentity.properties.principalId) && toLower(monitoringEvidenceSeams.outputs.collectorIdentityPrincipalId) != toLower(monitoringEvidenceSeams.outputs.rbacAttestorIdentityPrincipalId) && toLower(athenaContextIdentity.properties.principalId) != toLower(monitoringEvidenceSeams.outputs.rbacAttestorIdentityPrincipalId)
+  ? true
+  : fail('monitoring collector, Athena context, and RBAC attestor must be physically separate UAMIs with distinct principal IDs')
+var reviewAuthoritySeparation = !contains(
+    [
+      toLower(monitoringEvidenceSeams.outputs.collectorIdentityPrincipalId)
+      toLower(athenaContextIdentity.properties.principalId)
+      toLower(monitoringEvidenceSeams.outputs.rbacAttestorIdentityPrincipalId)
+    ],
+    validatedRbacInventoryReviewAuthority.reviewerPrincipalId
+  ) && validatedRbacInventoryReviewAuthority.reviewerPrincipalId != toLower(
+    validatedRbacInventoryReviewAuthority.verifierIdentityPrincipalId
+  ) && !contains(
+    [
+      toLower(monitoringEvidenceSeams.outputs.collectorIdentityResourceId)
+      toLower(athenaContextIdentity.id)
+      toLower(monitoringEvidenceSeams.outputs.rbacAttestorIdentityResourceId)
+      toLower(runtimeSupportIdentityResourceId)
+    ],
+    validatedRbacInventoryReviewAuthority.verifierIdentityResourceId
+  )
+  ? true
+  : fail('the effective-RBAC inventory reviewer principal must be separate from the collector, Athena context, and RBAC attestor principals')
+var resourceReadScopeIds = concat(
+  monitoringEvidenceReaderAssignments.outputs.resourceReadScopeIds,
+  workloadEvidenceReaderAssignments.outputs.resourceReadScopeIds,
+  networkWatcherEvidenceReaderAssignment.outputs.resourceReadScopeIds
+)
+var workspaceTableResourceIds = map(
+  monitoringEvidenceReaderAssignments.outputs.allowedLogTableNames,
+  tableName => '${monitoringDataPlatform.outputs.workspaceResourceId}/tables/${tableName}'
+)
+var evidenceBlobServiceResourceId = toLower(monitoringStorage.outputs.blobServiceResourceId) == toLower('${monitoringStorage.outputs.storageAccountResourceId}/blobServices/default')
+  ? monitoringStorage.outputs.blobServiceResourceId
+  : fail('WC-024 Blob-service readback escaped the replacement monitoring storage account.')
+var evidenceImmutabilityPolicyResourceId = toLower(
+  monitoringStorage.outputs.monitoringEvidenceImmutabilityPolicyResourceId
+) == toLower('${monitoringEvidenceSeams.outputs.evidenceContainerResourceId}/immutabilityPolicies/default')
+  ? monitoringStorage.outputs.monitoringEvidenceImmutabilityPolicyResourceId
+  : fail('WC-024 immutability-policy readback escaped the monitoring-evidence container.')
+var evidenceStorageReadinessPreimage = 'athena.wc028MonitoringEvidenceStorageReadiness.v1|${toLower(monitoringStorage.outputs.storageAccountResourceId)}|${toLower(evidenceBlobServiceResourceId)}|${toLower(monitoringEvidenceSeams.outputs.evidenceContainerResourceId)}|${toLower(evidenceImmutabilityPolicyResourceId)}|true|${monitoringStorage.outputs.monitoringEvidenceContainerPublicAccess}|${monitoringStorage.outputs.monitoringEvidenceImmutabilityPolicyState}|${monitoringStorage.outputs.monitoringEvidenceImmutabilityPeriodDays}|false|false'
+var networkWatcherResourceGroupId = subscriptionResourceId(
+  'Microsoft.Resources/resourceGroups',
+  networkWatcherResourceGroupName
+)
+var networkWatcherResourceId = resourceId(
+  networkWatcherResourceGroupName,
+  'Microsoft.Network/networkWatchers',
+  networkWatcherName
+)
+var effectiveRbacTargetScopeIds = union(
+  concat(
+    [
+      subscription().id
+      collectorRuntimeResourceId
+      rbacAttestorRuntimeResourceId
+      runtimeSupportIdentityResourceId
+      validatedRbacInventoryReviewAuthority.verifierIdentityResourceId
+      reviewerKeyVaultResourceId
+      normalizedReviewerKeyArmResourceId
+      monitoringReviewerKeyReaderRole.outputs.roleDefinitionId
+      monitoringReviewerKeyReaderAssignment.outputs.roleAssignmentId
+      monitoringStorageReadbackReader.outputs.roleDefinitionId
+      monitoringStorageReadbackReaderAssignment.outputs.assignmentId
+      workloadResourceGroupId
+      monitoringResourceGroup.id
+      networkWatcherResourceGroupId
+      validatedWorkloadVirtualNetworkResourceId
+      monitoringDataPlatform.outputs.workspaceResourceId
+      monitoringStorage.outputs.storageAccountResourceId
+      evidenceBlobServiceResourceId
+      monitoringEvidenceSeams.outputs.evidenceContainerResourceId
+      evidenceImmutabilityPolicyResourceId
+      monitoringEvidenceSeams.outputs.keyVaultResourceId
+      monitoringEvidenceSeams.outputs.signingKeyArmResourceId
+      networkWatcherResourceId
+    ],
+    workspaceTableResourceIds,
+    resourceReadScopeIds,
+    workloadEvidenceReaderAssignments.outputs.signalReadScopeIds,
+    workloadEvidenceReaderAssignments.outputs.resourceLogReadScopeIds,
+    workloadEvidenceReaderAssignments.outputs.resourceHealthScopeIds
+  ),
+  []
+)
+var collectorContractInputs = {
+  collectorIdentityResourceId: monitoringEvidenceSeams.outputs.collectorIdentityResourceId
+  collectorIdentityClientId: monitoringEvidenceSeams.outputs.collectorIdentityClientId
+  collectorTenantId: monitoringEvidenceSeams.outputs.collectorIdentityTenantId
+  collectorRuntimeResourceId: collectorRuntimeResourceId
+  rbacAttestorRuntimeResourceId: rbacAttestorRuntimeResourceId
+  runtimeSupportIdentityResourceId: runtimeSupportIdentityResourceId
+  runtimeSupportIdentityPrincipalId: runtimeSupportIdentity.properties.principalId
+  runtimeSupportStorageReaderRoleDefinitionId: monitoringStorageReadbackReader.outputs.roleDefinitionId
+  runtimeSupportStorageReaderRoleName: monitoringStorageReadbackReader.outputs.roleName
+  runtimeSupportStorageReaderAllowedOperations: monitoringStorageReadbackReader.outputs.allowedOperations
+  runtimeSupportStorageReaderRoleAssignmentId: monitoringStorageReadbackReaderAssignment.outputs.assignmentId
+  runtimeSupportStorageReaderScopeId: monitoringStorageReadbackReader.outputs.assignmentScopeId
+  rbacInventoryVerifierIdentityResourceId: validatedRbacInventoryReviewAuthority.verifierIdentityResourceId
+  rbacInventoryVerifierIdentityClientId: validatedRbacInventoryReviewAuthority.verifierIdentityClientId
+  rbacInventoryVerifierIdentityPrincipalId: validatedRbacInventoryReviewAuthority.verifierIdentityPrincipalId
+  rbacInventoryVerifierIdentityTenantId: validatedRbacInventoryReviewAuthority.verifierIdentityTenantId
+  rbacInventoryReviewerKeyVaultResourceId: reviewerKeyVaultResourceId
+  rbacInventoryReviewerKeyArmResourceId: normalizedReviewerKeyArmResourceId
+  rbacInventoryVerifierRoleDefinitionId: monitoringReviewerKeyReaderRole.outputs.roleDefinitionId
+  rbacInventoryVerifierRoleName: monitoringReviewerKeyReaderRole.outputs.roleName
+  rbacInventoryVerifierRoleScopeId: normalizedReviewerKeyArmResourceId
+  rbacInventoryVerifierAllowedDataActions: monitoringReviewerKeyReaderRole.outputs.allowedDataActions
+  rbacInventoryVerifierRoleAssignmentId: monitoringReviewerKeyReaderAssignment.outputs.roleAssignmentId
+  monitoringResourceGroupId: monitoringResourceGroup.id
+  workloadResourceGroupId: workloadResourceGroupId
+  workloadVirtualNetworkResourceId: validatedWorkloadVirtualNetworkResourceId
+  approvedVmNames: validatedApprovedVmNames
+  workspaceResourceId: monitoringDataPlatform.outputs.workspaceResourceId
+  dataCollectionRuleResourceId: monitoringDataPlatform.outputs.dataCollectionRuleResourceId
+  dataCollectionEndpointResourceId: monitoringDataPlatform.outputs.dataCollectionEndpointResourceId
+  authorizationMode: 'conditionedWorkspacePlusExactResourceContext'
+  workspaceAccessControlMode: monitoringDataPlatform.outputs.workspaceResourceContextAccessEnabled
+    ? 'workspaceAndResourceContext'
+    : 'workspaceOnly'
+  workspaceResourceContextAccessEnabled: monitoringDataPlatform.outputs.workspaceResourceContextAccessEnabled
+  workspaceSkuName: monitoringDataPlatform.outputs.workspaceSkuName == 'PerGB2018'
+    ? 'PerGB2018'
+    : fail('WC-028 resource-context acquisition requires the Analytics workspace SKU.')
+  resourceContextTablePlans: monitoringDataPlatform.outputs.resourceContextTablePlans
+  readerRoleDefinitionId: monitoringEvidenceReaderAssignments.outputs.readerRoleDefinitionId
+  signalReaderRoleDefinitionId: workloadEvidenceReaderAssignments.outputs.signalReaderRoleDefinitionId
+  signalReaderRoleName: workloadEvidenceReaderAssignments.outputs.signalReaderRoleName
+  resourceLogReaderRoleDefinitionId: workloadEvidenceReaderAssignments.outputs.resourceLogReaderRoleDefinitionId
+  resourceLogReaderRoleName: workloadEvidenceReaderAssignments.outputs.resourceLogReaderRoleName
+  resourceLogAllowedOperations: workloadEvidenceReaderAssignments.outputs.resourceLogAllowedOperations
+  resourceLogReadScopeIds: workloadEvidenceReaderAssignments.outputs.resourceLogReadScopeIds
+  logAnalyticsDataReaderRoleDefinitionId: monitoringEvidenceReaderAssignments.outputs.logAnalyticsDataReaderRoleDefinitionId
+  rbacAttestorIdentityResourceId: monitoringEvidenceSeams.outputs.rbacAttestorIdentityResourceId
+  rbacAttestorIdentityClientId: monitoringEvidenceSeams.outputs.rbacAttestorIdentityClientId
+  rbacAttestorPrincipalId: monitoringEvidenceSeams.outputs.rbacAttestorIdentityPrincipalId
+  rbacAttestorTenantId: monitoringEvidenceSeams.outputs.rbacAttestorIdentityTenantId
+  rbacAttestorRoleDefinitionId: monitoringRbacAttestor.outputs.attestorRoleDefinitionId
+  rbacAttestorRoleName: monitoringRbacAttestor.outputs.attestorRoleName
+  rbacAttestorScopeId: monitoringRbacAttestor.outputs.attestorScopeId
+  rbacAttestorAllowedOperations: monitoringRbacAttestor.outputs.attestorAllowedOperations
+  rbacAttestorGraphApplicationId: monitoringRbacAttestor.outputs.microsoftGraphApplicationId
+  rbacAttestorGraphApplicationReadAllAppRoleId: monitoringRbacAttestor.outputs.applicationReadAllAppRoleId
+  rbacAttestorGraphApplicationReadAllAssignmentId: monitoringRbacAttestor.outputs.applicationReadAllAssignmentId
+  rbacAttestorGraphServicePrincipalId: monitoringRbacAttestor.outputs.microsoftGraphServicePrincipalId
+  identityProofAudience: monitoringIdentityProofAuthority.outputs.identityProofAudience
+  identityProofApplicationId: monitoringIdentityProofAuthority.outputs.identityProofApplicationId
+  identityProofApplicationObjectId: monitoringIdentityProofAuthority.outputs.identityProofApplicationObjectId
+  identityProofServicePrincipalId: monitoringIdentityProofAuthority.outputs.identityProofServicePrincipalId
+  identityProofAppRoleId: monitoringIdentityProofAuthority.outputs.identityProofAppRoleId
+  identityProofAppRoleValue: monitoringIdentityProofAuthority.outputs.identityProofAppRoleValue
+  identityProofAppRoleAssignmentId: monitoringIdentityProofAuthority.outputs.identityProofAppRoleAssignmentId
+  identityProofAssignedPrincipalId: monitoringIdentityProofAuthority.outputs.identityProofAssignedPrincipalId
+  resourceGraphQueryRoleDefinitionId: resourceGraphQueryReaderAssignment.outputs.resourceGraphQueryRoleDefinitionId
+  resourceGraphQueryRoleName: resourceGraphQueryReaderAssignment.outputs.resourceGraphQueryRoleName
+  resourceGraphQueryScopeId: resourceGraphQueryReaderAssignment.outputs.resourceGraphQueryScopeId
+  resourceGraphQueryAllowedOperations: resourceGraphQueryReaderAssignment.outputs.resourceGraphQueryAllowedOperations
+  resourceHealthRoleDefinitionId: workloadEvidenceReaderAssignments.outputs.resourceHealthRoleDefinitionId
+  resourceHealthRoleName: workloadEvidenceReaderAssignments.outputs.resourceHealthRoleName
+  resourceHealthScopeIds: workloadEvidenceReaderAssignments.outputs.resourceHealthScopeIds
+  resourceHealthAllowedOperations: workloadEvidenceReaderAssignments.outputs.resourceHealthAllowedOperations
+  logAnalyticsAllowedTables: monitoringEvidenceReaderAssignments.outputs.allowedLogTableNames
+  logAnalyticsAccessCondition: monitoringEvidenceReaderAssignments.outputs.logAnalyticsAccessCondition
+  resourceReadScopeIds: resourceReadScopeIds
+  signalReadScopeIds: workloadEvidenceReaderAssignments.outputs.signalReadScopeIds
+  signingKeyResourceId: monitoringEvidenceSeams.outputs.signingKeyResourceId
+  signingKeyArmResourceId: monitoringEvidenceSeams.outputs.signingKeyArmResourceId
+  signingKeyCryptoUserRoleDefinitionId: monitoringEvidenceSeams.outputs.signingKeyCryptoUserRoleDefinitionId
+  evidenceStorageAccountResourceId: monitoringStorage.outputs.storageAccountResourceId
+  evidenceBlobServiceResourceId: evidenceBlobServiceResourceId
+  evidenceContainerResourceId: monitoringEvidenceSeams.outputs.evidenceContainerResourceId
+  evidenceContainerPublicAccess: monitoringStorage.outputs.monitoringEvidenceContainerPublicAccess
+  evidenceImmutabilityPolicyResourceId: evidenceImmutabilityPolicyResourceId
+  evidenceWriterRoleDefinitionId: monitoringEvidenceSeams.outputs.evidenceWriterRoleDefinitionId
+  evidenceWriterRoleName: monitoringEvidenceSeams.outputs.evidenceWriterRoleName
+  evidenceWriterAllowedDataActions: monitoringEvidenceSeams.outputs.evidenceWriterAllowedDataActions
+  evidenceWriterAssignmentCondition: monitoringEvidenceSeams.outputs.evidenceWriterAssignmentCondition
+  evidenceWriterAssignmentConditionVersion: monitoringEvidenceSeams.outputs.evidenceWriterAssignmentConditionVersion
+  evidenceBlobVersioningEnabled: monitoringStorage.outputs.blobVersioningEnabled
+  evidenceContainerHasImmutabilityPolicy: monitoringStorage.outputs.monitoringEvidenceContainerHasImmutabilityPolicy
+  evidenceContainerImmutabilityPolicyState: monitoringStorage.outputs.monitoringEvidenceImmutabilityPolicyState
+  evidenceContainerImmutabilityPeriodDays: monitoringStorage.outputs.monitoringEvidenceImmutabilityPeriodDays
+  evidenceContainerProtectedAppendWritesEnabled: monitoringStorage.outputs.monitoringEvidenceProtectedAppendWritesEnabled
+  evidenceContainerProtectedAppendWritesAllEnabled: monitoringStorage.outputs.monitoringEvidenceProtectedAppendWritesAllEnabled
+  evidenceStorageReadbackBindingId: guid(evidenceStorageReadinessPreimage)
+  evidenceStorageReadinessDigest: validatedMonitoringEvidenceStorageReadinessDigest
+  legacyCollectorRbacCleanupSchemaVersion: 'athena.wc028LegacyCollectorRbacCleanup.v3'
+  legacyCollectorRbacCleanupDigest: validatedLegacyCollectorRbacCleanupDigest
+  signingKeyVaultResourceId: monitoringEvidenceSeams.outputs.keyVaultResourceId
+  networkWatcherResourceGroupId: networkWatcherResourceGroupId
+  networkWatcherResourceId: networkWatcherResourceId
+  workspaceTableResourceIds: workspaceTableResourceIds
+  maximumEvidenceAgeSeconds: maximumEvidenceAgeSeconds
+  connectionMonitorDeploymentMode: connectionMonitorCapability.outputs.deploymentMode
+}
+module monitoringRbacBootstrapHandoffModule 'modules/monitoring-rbac-bootstrap-handoff.bicep' = {
+  name: 'monitoring-rbac-bootstrap-handoff'
   params: {
-    collectorIdentityResourceId: monitoringEvidenceSeams.outputs.collectorIdentityResourceId
-    collectorIdentityClientId: monitoringEvidenceSeams.outputs.collectorIdentityClientId
-    monitoringResourceGroupId: monitoringResourceGroup.id
-    workloadResourceGroupId: workloadResourceGroupId
-    workloadVirtualNetworkResourceId: validatedWorkloadVirtualNetworkResourceId
-    approvedVmNames: validatedApprovedVmNames
-    workspaceResourceId: monitoringDataPlatform.outputs.workspaceResourceId
-    dataCollectionRuleResourceId: monitoringDataPlatform.outputs.dataCollectionRuleResourceId
-    dataCollectionEndpointResourceId: monitoringDataPlatform.outputs.dataCollectionEndpointResourceId
-    authorizationMode: 'conditionedWorkspacePlusExactResourceContext'
-    workspaceAccessControlMode: monitoringDataPlatform.outputs.workspaceResourceContextAccessEnabled
-      ? 'workspaceAndResourceContext'
-      : 'workspaceOnly'
-    readerRoleDefinitionId: monitoringEvidenceReaderAssignments.outputs.readerRoleDefinitionId
-    signalReaderRoleDefinitionId: workloadEvidenceReaderAssignments.outputs.signalReaderRoleDefinitionId
-    logAnalyticsDataReaderRoleDefinitionId: monitoringEvidenceReaderAssignments.outputs.logAnalyticsDataReaderRoleDefinitionId
-    logAnalyticsAllowedTables: monitoringEvidenceReaderAssignments.outputs.allowedLogTableNames
-    logAnalyticsAccessCondition: monitoringEvidenceReaderAssignments.outputs.logAnalyticsAccessCondition
-    resourceReadScopeIds: concat(
-      monitoringEvidenceReaderAssignments.outputs.resourceReadScopeIds,
-      workloadEvidenceReaderAssignments.outputs.resourceReadScopeIds,
-      networkWatcherEvidenceReaderAssignment.outputs.resourceReadScopeIds
-    )
-    signalReadScopeIds: workloadEvidenceReaderAssignments.outputs.signalReadScopeIds
-    signingKeyResourceId: monitoringEvidenceSeams.outputs.signingKeyResourceId
-    evidenceStorageAccountResourceId: monitoringStorage.outputs.storageAccountResourceId
-    maximumEvidenceAgeSeconds: maximumEvidenceAgeSeconds
-    connectionMonitorDeploymentMode: connectionMonitorCapability.outputs.deploymentMode
+    sourceDeploymentName: deployment().name
+    sourceDeploymentId: subscriptionResourceId('Microsoft.Resources/deployments', deployment().name)
+    collectorContractInputs: collectorContractInputs
+    effectiveRbacTargetScopeIds: effectiveRbacTargetScopeIds
+    reviewAuthority: validatedRbacInventoryReviewAuthority
+    subscriptionId: subscription().subscriptionId
+    tenantId: tenant().tenantId
+    monitoringReaderPrincipalId: monitoringEvidenceSeams.outputs.collectorIdentityPrincipalId
+    athenaContextIdentityId: athenaContextIdentity.id
+    athenaContextPrincipalId: athenaContextIdentity.properties.principalId
+    physicalIdentitySeparationEnforced: acquisitionIdentitySeparation
+    reviewAuthoritySeparationEnforced: reviewAuthoritySeparation
+    managedIdentityAttachmentCollection: {
+      collectorAssociatedResourcesRequestPath: '${toLower(monitoringEvidenceSeams.outputs.collectorIdentityResourceId)}/listAssociatedResources?api-version=2021-09-30-preview'
+      collectorFederatedIdentityCredentialsRequestPath: '${toLower(monitoringEvidenceSeams.outputs.collectorIdentityResourceId)}/federatedIdentityCredentials?api-version=2023-01-31'
+      rbacAttestorAssociatedResourcesRequestPath: '${toLower(monitoringEvidenceSeams.outputs.rbacAttestorIdentityResourceId)}/listAssociatedResources?api-version=2021-09-30-preview'
+      rbacAttestorFederatedIdentityCredentialsRequestPath: '${toLower(monitoringEvidenceSeams.outputs.rbacAttestorIdentityResourceId)}/federatedIdentityCredentials?api-version=2023-01-31'
+      reviewerKeyVerifierAssociatedResourcesRequestPath: '${validatedRbacInventoryReviewAuthority.verifierIdentityResourceId}/listAssociatedResources?api-version=2021-09-30-preview'
+      reviewerKeyVerifierFederatedIdentityCredentialsRequestPath: '${validatedRbacInventoryReviewAuthority.verifierIdentityResourceId}/federatedIdentityCredentials?api-version=2023-01-31'
+    }
+    exclusiveDataPlanePrincipalCollection: {
+      assignmentCollectionScopeId: subscription().id
+      queryFilter: 'none'
+      evidenceStorageConfigurationRequestPath: '${toLower(monitoringStorage.outputs.storageAccountResourceId)}?api-version=2025-06-01'
+      evidenceBlobServiceConfigurationRequestPath: '${toLower(evidenceBlobServiceResourceId)}?api-version=2025-06-01'
+      evidenceContainerConfigurationRequestPath: '${toLower(monitoringEvidenceSeams.outputs.evidenceContainerResourceId)}?api-version=2025-06-01'
+      evidenceImmutabilityPolicyConfigurationRequestPath: '${toLower(evidenceImmutabilityPolicyResourceId)}?api-version=2025-06-01'
+      signingKeyVaultConfigurationRequestPath: '${toLower(monitoringEvidenceSeams.outputs.keyVaultResourceId)}?api-version=2024-11-01'
+    }
+    directoryMembershipCollection: {
+      graphApplicationId: monitoringRbacAttestor.outputs.microsoftGraphApplicationId
+      graphApplicationReadAllAppRoleId: monitoringRbacAttestor.outputs.applicationReadAllAppRoleId
+      graphApplicationReadAllAssignmentId: monitoringRbacAttestor.outputs.applicationReadAllAssignmentId
+      graphServicePrincipalId: monitoringRbacAttestor.outputs.microsoftGraphServicePrincipalId
+      requestHeaders: {
+        ConsistencyLevel: 'eventual'
+      }
+      collectorRequestPath: '/v1.0/servicePrincipals/${monitoringEvidenceSeams.outputs.collectorIdentityPrincipalId}/transitiveMemberOf/microsoft.graph.group?$count=true&$select=id'
+      athenaContextRequestPath: '/v1.0/servicePrincipals/${athenaContextIdentity.properties.principalId}/transitiveMemberOf/microsoft.graph.group?$count=true&$select=id'
+      reviewerKeyVerifierRequestPath: '/v1.0/servicePrincipals/${validatedRbacInventoryReviewAuthority.verifierIdentityPrincipalId}/transitiveMemberOf/microsoft.graph.group?$count=true&$select=id'
+    }
+    identityProofAuthority: {
+      audience: monitoringIdentityProofAuthority.outputs.identityProofAudience
+      applicationId: monitoringIdentityProofAuthority.outputs.identityProofApplicationId
+      applicationObjectId: monitoringIdentityProofAuthority.outputs.identityProofApplicationObjectId
+      servicePrincipalId: monitoringIdentityProofAuthority.outputs.identityProofServicePrincipalId
+      appRoleId: monitoringIdentityProofAuthority.outputs.identityProofAppRoleId
+      appRoleValue: monitoringIdentityProofAuthority.outputs.identityProofAppRoleValue
+      appRoleAssignmentId: monitoringIdentityProofAuthority.outputs.identityProofAppRoleAssignmentId
+      assignedPrincipalId: monitoringIdentityProofAuthority.outputs.identityProofAssignedPrincipalId
+      requestedAccessTokenVersion: '1.0'
+    }
+    managementGroupHierarchyCollection: {
+      requestMethod: 'POST'
+      requestPath: '/providers/Microsoft.Management/getEntities?api-version=2020-05-01&$select=Name,Type,ParentNameChain'
+      subscriptionScopeId: subscription().id
+      requiresAllPages: true
+      requiresTwoStableReads: true
+      tenantRootScopeId: '/providers/Microsoft.Management/managementGroups/${tenant().tenantId}'
+    }
+    legacyCollectorRbacCleanupDigest: validatedLegacyCollectorRbacCleanupDigest
   }
 }
 
-@description('Exact generic monitoring collector contract that must be captured, reviewed, and signed before a collector runs.')
-output monitoringCollectorContract object = collectorContract.outputs.collectorContract
-output monitoringAcquisitionCollectorContract object = collectorContract.outputs.acquisitionCollectorContract
+@description('Phase-one handoff. Collect effective RBAC only after these identities, roles, and exact target scopes exist, then pass the immutable reviewed handoff to publish-monitoring-contract.bicep.')
+output monitoringRbacBootstrapHandoff object = monitoringRbacBootstrapHandoffModule.outputs.handoff
+
+@description('Contract publication remains fail-closed until the phase-two template validates a fresh effective RBAC inventory against monitoringRbacBootstrapHandoff.')
+output monitoringAcquisitionContractPublicationReady bool = false
 
 @description('Monitoring-owned replacement storage. It is separate from the retained legacy flow-log destination.')
 output replacementMonitoringStorageAccountResourceId string = monitoringStorage.outputs.storageAccountResourceId

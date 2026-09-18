@@ -6,7 +6,7 @@
     "retrievedAt": "2026-08-17T00:01:53Z"
   },
   "requiredPermissions": {
-    "resourceHealthAvailability": "Microsoft.ResourceHealth/availabilityStatuses/read"
+    "resourceHealthAvailability": "Microsoft.ResourceHealth/availabilityStatuses/current/read"
   },
   "roles": [
     {

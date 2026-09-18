@@ -3,9 +3,6 @@ targetScope = 'resourceGroup'
 @description('Principal ID of the only identity permitted to read generic monitoring evidence.')
 param collectorPrincipalId string
 
-@description('Exact adopted Log Analytics workspace name.')
-param workspaceName string
-
 @description('Exact adopted data collection endpoint name.')
 param dataCollectionEndpointName string
 
@@ -46,10 +43,6 @@ var allowedLogTableExpressions = map(
 )
 var allowedLogTableCondition = '((!(ActionMatches{\'Microsoft.OperationalInsights/workspaces/tables/data/read\'})) OR (${join(allowedLogTableExpressions, ' OR ')}))'
 
-resource workspace 'Microsoft.OperationalInsights/workspaces@2025-02-01' existing = {
-  name: workspaceName
-}
-
 resource dataCollectionEndpoint 'Microsoft.Insights/dataCollectionEndpoints@2024-03-11' existing = {
   name: dataCollectionEndpointName
 }
@@ -63,18 +56,6 @@ resource privateLinkScopes 'Microsoft.Insights/privateLinkScopes@2021-09-01' exi
     name: privateLinkScopeName
   }
 ]
-
-resource collectorWorkspaceDataReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(workspace.id, collectorPrincipalId, logAnalyticsDataReaderRoleDefinitionId)
-  scope: workspace
-  properties: {
-    principalId: collectorPrincipalId
-    principalType: 'ServicePrincipal'
-    roleDefinitionId: logAnalyticsDataReaderRoleDefinitionId
-    condition: allowedLogTableCondition
-    conditionVersion: '2.0'
-  }
-}
 
 resource collectorDataCollectionEndpointReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(dataCollectionEndpoint.id, collectorPrincipalId, readerRoleDefinitionId)
