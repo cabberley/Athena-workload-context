@@ -209,8 +209,14 @@ Root readiness additionally requires the PR #102-equivalent effective-assignment
 tenant root management-group hierarchy. Every descendant subscription is enumerated, direct group
 membership is traversed recursively twice without the eventual transitive-membership index, and
 the two closures must converge. Full role definitions are then resolved for every direct,
-inherited, and group-derived assignment in every subscription. Any extra pull grant or escalation
-path—including `roleAssignments/write`, role-definition mutation, ACR credential administration,
+inherited, group-derived, and active time-bound/PIM assignment in every subscription. For each
+service principal and recursively discovered group, the scanner follows the bounded, canonical
+`roleAssignmentScheduleInstances` pages for the exact principal. Eligibility without an active
+assignment schedule is not effective. Persistent role-assignment schedule mirrors are reconciled
+through their canonical origin role-assignment ID and must match the underlying reviewed grant.
+Any extra pull grant or escalation path—including
+`roleAssignments/write`, role-assignment or eligibility schedule-request writes, role-management
+policy administration, role-definition mutation, ACR credential administration, quarantine reads,
 custom roles, or a sibling registry in another subscription—fails closed. The scanner verifies
 every referenced registry's live permission mode, and the proof exact-matches each reviewed
 assignment's principal, registry scope, role, condition version, and canonical repository

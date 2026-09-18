@@ -192,6 +192,7 @@ def _publisher_image_pull_evidence() -> tuple[
             "transitiveGroupsComplete": True,
             "directMembershipTraversalComplete": True,
             "convergedMembershipReadbacks": True,
+            "roleAssignmentScheduleInstancesComplete": True,
             "siblingRegistriesChecked": True,
             "acrEscalationPathsChecked": True,
             "evidenceDigest": "sha256:" + "d" * 64,
@@ -292,6 +293,7 @@ def _evaluate_publisher_image_pull_evidence(
         "wc027ParsedEffectiveAcrAccess.transitiveGroupsComplete == true",
         "wc027ParsedEffectiveAcrAccess.directMembershipTraversalComplete == true",
         "wc027ParsedEffectiveAcrAccess.convergedMembershipReadbacks == true",
+        "wc027ParsedEffectiveAcrAccess.roleAssignmentScheduleInstancesComplete == true",
         "wc027ParsedEffectiveAcrAccess.siblingRegistriesChecked == true",
         "wc027ParsedEffectiveAcrAccess.acrEscalationPathsChecked == true",
         "wc027ParsedEffectiveAcrAccess.tenantSubscriptionHierarchyComplete == true",
@@ -446,6 +448,7 @@ def _evaluate_publisher_image_pull_evidence(
         and effective_access.get("transitiveGroupsComplete") is True
         and effective_access.get("directMembershipTraversalComplete") is True
         and effective_access.get("convergedMembershipReadbacks") is True
+        and effective_access.get("roleAssignmentScheduleInstancesComplete") is True
         and effective_access.get("siblingRegistriesChecked") is True
         and effective_access.get("acrEscalationPathsChecked") is True
         and str(effective_access.get("evidenceDigest", "")).startswith(
@@ -822,6 +825,7 @@ def test_pr103_readiness_requires_pr102_effective_acr_assignment_scan() -> None:
         "wc027ParsedEffectiveAcrAccess.tenantSubscriptionHierarchyComplete == true",
         "wc027ParsedEffectiveAcrAccess.directMembershipTraversalComplete == true",
         "wc027ParsedEffectiveAcrAccess.convergedMembershipReadbacks == true",
+        "wc027ParsedEffectiveAcrAccess.roleAssignmentScheduleInstancesComplete == true",
         "wc027ParsedEffectiveAcrAccess.acrEscalationPathsChecked == true",
         "param wc027ReadinessEvaluationTimeUtc string = utcNow(",
         "dateTimeToEpoch(wc027ReadinessEvaluationTimeUtc)",
@@ -880,6 +884,7 @@ def test_publisher_digest_pull_readiness_is_bounded_and_activation_gated() -> No
         "tenantSubscriptionHierarchyComplete",
         "directMembershipTraversalComplete",
         "convergedMembershipReadbacks",
+        "roleAssignmentScheduleInstancesComplete",
         "acrEscalationPathsChecked",
         "evidenceDigest",
         "verify_wc027_acr_effective_access.py",
@@ -1034,6 +1039,7 @@ function global:python {
         transitiveGroupsComplete = $true
         directMembershipTraversalComplete = $true
         convergedMembershipReadbacks = $true
+        roleAssignmentScheduleInstancesComplete = $true
         siblingRegistriesChecked = $true
         acrEscalationPathsChecked = $true
         evidenceDigest = 'sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd'
@@ -1227,6 +1233,7 @@ def test_legacy_digest_pull_evidence_uses_null_repository_conditions() -> None:
         "effective-groups",
         "effective-direct-membership",
         "effective-convergence",
+        "effective-schedules",
         "effective-escalation",
         "effective-hierarchy",
         "effective-stale",
@@ -1299,6 +1306,10 @@ def test_publisher_digest_pull_evidence_rejects_drift(mutation: str) -> None:
             False,
         ),
         "effective-convergence": ("convergedMembershipReadbacks", False),
+        "effective-schedules": (
+            "roleAssignmentScheduleInstancesComplete",
+            False,
+        ),
         "effective-escalation": ("acrEscalationPathsChecked", False),
         "effective-hierarchy": ("tenantSubscriptionHierarchyComplete", False),
         "effective-stale": ("verifiedAt", "2020-01-01T00:00:00.000Z"),

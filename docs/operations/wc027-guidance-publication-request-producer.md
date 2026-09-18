@@ -285,13 +285,26 @@ from the corresponding deployment's `registryPullPrincipalId`,
 assignment outputs as `ManagedIdentityPrincipalId` and
 `RegistryPullRoleAssignmentResourceId`. The scanner rejects anonymous pull; incomplete Graph or
 assignment results; missing reviewed assignments; condition, scope, or role drift; and every
-additional direct, inherited, transitive-group, custom-role, or sibling-registry pull grant.
+additional direct, inherited, transitive-group, active time-bound/PIM, custom-role, or
+sibling-registry pull grant. For each reviewed service principal and every recursively discovered
+parent group, it queries `roleAssignmentScheduleInstances` at every governed subscription scope
+with the exact principal filter. Only assignment schedules whose UTC interval is active at the
+verification instant are effective; eligibility alone is not effective until activation produces
+a role-assignment schedule instance. Persistent-assignment schedule mirrors are joined through
+their canonical `originRoleAssignmentId`, must agree with the underlying role assignment, and do
+not double-count one of the exact three reviewed assignments. Pagination follows only canonical
+`management.azure.com`
+continuations and fails closed on malformed pages, API errors, duplicate instances, or page,
+instance, and total-call bounds. Quarantine and quarantined-artifact read permissions are treated
+as pull-capable whether they appear in `actions` or `dataActions`. Role-assignment and
+role-eligibility schedule request writes, approval-required eligibility writes, and role-management
+policy administration are escalation paths at scopes that can govern ACR.
 Pass the publisher deployment's exact image-pull identity resource output as
 `ManagedIdentityResourceId`; the probe live-reads that user-assigned identity before and after the
 pull and binds its resource, client, and principal IDs to both the effective scan and Docker login.
-The deployment-verifier identity must be able to read the tenant root management-group descendants
-and role assignments in every descendant subscription; incomplete hierarchy visibility fails
-closed.
+The deployment-verifier identity must be able to read the tenant root management-group descendants,
+role assignments, and role-assignment schedule instances in every descendant subscription;
+incomplete hierarchy or PIM visibility fails closed.
 
 Pass the script's compact JSON output unchanged as `wc027PublisherImagePullEvidenceJson`; the root
 gate matches the registry, image, client and principal identity, role assignment, mode, canonical

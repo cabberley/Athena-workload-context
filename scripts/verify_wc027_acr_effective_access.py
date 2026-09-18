@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 from uuid import UUID
 
 SCHEMA_VERSION = "athena.wc027AcrEffectiveAccessEvidence.v1"
@@ -19,12 +19,31 @@ MAX_GRAPH_MEMBERSHIP_PAGES = 16
 MAX_TRANSITIVE_GROUPS = 4096
 MAX_TENANT_HIERARCHY_PAGES = 64
 MAX_GOVERNED_SUBSCRIPTIONS = 4096
+MAX_ROLE_ASSIGNMENT_SCHEDULE_PAGES = 64
+MAX_ROLE_ASSIGNMENT_SCHEDULE_API_CALLS = 16_384
+MAX_ROLE_ASSIGNMENT_SCHEDULE_INSTANCES = 65_536
+ROLE_ASSIGNMENT_SCHEDULE_API_VERSION = "2020-10-01"
 ACR_LEGACY_PULL_ACTION = "Microsoft.ContainerRegistry/registries/pull/read"
 ACR_REPOSITORY_CONTENT_READ_DATA_ACTION = (
     "Microsoft.ContainerRegistry/registries/repositories/content/read"
 )
+ACR_QUARANTINE_READ_ACTION = "Microsoft.ContainerRegistry/registries/quarantine/read"
+ACR_QUARANTINED_ARTIFACTS_READ_ACTION = (
+    "Microsoft.ContainerRegistry/registries/quarantinedArtifacts/read"
+)
+ACR_PULL_CAPABLE_ACTIONS = (
+    ACR_LEGACY_PULL_ACTION,
+    ACR_REPOSITORY_CONTENT_READ_DATA_ACTION,
+    ACR_QUARANTINE_READ_ACTION,
+    ACR_QUARANTINED_ARTIFACTS_READ_ACTION,
+)
 ACR_ESCALATION_ACTIONS = (
     "Microsoft.Authorization/roleAssignments/write",
+    "Microsoft.Authorization/roleAssignmentScheduleRequests/write",
+    "Microsoft.Authorization/roleEligibilityScheduleRequests/write",
+    "Microsoft.Authorization/roleEligibilityScheduleRequests/whenApprovalRequired/write",
+    "Microsoft.Authorization/roleManagementPolicies/write",
+    "Microsoft.Authorization/roleManagementPolicies/approvalRule/action",
     "Microsoft.Authorization/roleDefinitions/write",
     "Microsoft.ContainerRegistry/registries/write",
     "Microsoft.ContainerRegistry/registries/listCredentials/action",
@@ -49,6 +68,44 @@ _EXPECTED_REPOSITORIES_BY_LABEL = {
     "feed-producer": "athena/wc027-enrichment-feed-producer",
     "publisher": "athena/wc027-guidance-authority-publisher",
 }
+_ROLE_ASSIGNMENT_SCHEDULE_STATUSES = frozenset(
+    {
+        "Accepted",
+        "PendingEvaluation",
+        "Granted",
+        "Denied",
+        "PendingProvisioning",
+        "Provisioned",
+        "PendingRevocation",
+        "Revoked",
+        "Canceled",
+        "Failed",
+        "PendingApprovalProvisioning",
+        "PendingApproval",
+        "FailedAsResourceIsLocked",
+        "PendingAdminDecision",
+        "AdminApproved",
+        "AdminDenied",
+        "TimedOut",
+        "ProvisioningStarted",
+        "Invalid",
+        "PendingScheduleCreation",
+        "ScheduleCreated",
+        "PendingExternalProvisioning",
+    }
+)
+_INACTIVE_ROLE_ASSIGNMENT_SCHEDULE_STATUSES = frozenset(
+    {
+        "Denied",
+        "Revoked",
+        "Canceled",
+        "Failed",
+        "FailedAsResourceIsLocked",
+        "AdminDenied",
+        "TimedOut",
+        "Invalid",
+    }
+)
 type JsonRunner = Callable[[Sequence[str], str], object]
 
 
@@ -74,6 +131,12 @@ class _RolePermissionProfile:
     not_data_actions: frozenset[str]
 
 
+@dataclass(slots=True)
+class _RoleAssignmentScheduleScanBudget:
+    api_calls: int = 0
+    instances: int = 0
+
+
 def verify_effective_access(
     expected_assignments: Sequence[ExpectedAssignment],
     *,
@@ -81,6 +144,10 @@ def verify_effective_access(
     run_json: JsonRunner,
     verified_at: datetime | None = None,
 ) -> dict[str, object]:
+    timestamp = verified_at or datetime.now(UTC)
+    if timestamp.tzinfo is None or timestamp.utcoffset() != UTC.utcoffset(timestamp):
+        raise EffectiveAccessError("verified_at must be a UTC timestamp")
+    timestamp = timestamp.astimezone(UTC)
     canonical_subscription_id = _canonical_uuid(
         subscription_id,
         field="subscription ID",
@@ -160,10 +227,30 @@ def verify_effective_access(
         )
 
     observed_expected_ids: set[str] = set()
+    transitive_groups_by_principal = {
+        principal_id: _transitive_group_ids(
+            principal_id,
+            run_json=run_json,
+        )
+        for principal_id in sorted(expected_by_principal)
+    }
+    minimum_schedule_calls = sum(
+        (1 + len(group_ids)) * len(governed_subscription_ids)
+        for group_ids in transitive_groups_by_principal.values()
+    )
+    if minimum_schedule_calls > MAX_ROLE_ASSIGNMENT_SCHEDULE_API_CALLS:
+        raise EffectiveAccessError(
+            "active role-assignment schedule query set exceeds its API call bound"
+        )
+    schedule_budget = _RoleAssignmentScheduleScanBudget()
     for principal_id in sorted(expected_by_principal):
         assignments = _resolved_effective_role_assignments(
             principal_id,
+            group_ids=transitive_groups_by_principal[principal_id],
             subscription_ids=governed_subscription_ids,
+            governed_subscription_ids=governed_subscription_id_set,
+            active_at=timestamp,
+            schedule_budget=schedule_budget,
             run_json=run_json,
         )
         for index, raw_assignment in enumerate(assignments):
@@ -201,8 +288,8 @@ def verify_effective_access(
             if matched_expected is None or assignment_principal_id != principal_id:
                 raise EffectiveAccessError(
                     "effective ACR access contains an unreviewed direct, inherited, "
-                    "group-derived, custom-role, or sibling-registry pull-capable "
-                    "assignment"
+                    "group-derived, active-PIM, custom-role, or sibling-registry "
+                    "pull-capable assignment"
                 )
             _require_exact_expected_assignment(
                 matched_expected,
@@ -218,9 +305,6 @@ def verify_effective_access(
             "effective ACR access is missing an exact reviewed pull assignment"
         )
 
-    timestamp = verified_at or datetime.now(UTC)
-    if timestamp.tzinfo is None or timestamp.utcoffset() != UTC.utcoffset(timestamp):
-        raise EffectiveAccessError("verified_at must be a UTC timestamp")
     evidence: dict[str, object] = {
         "schemaVersion": SCHEMA_VERSION,
         "verified": True,
@@ -237,6 +321,7 @@ def verify_effective_access(
         "transitiveGroupsComplete": True,
         "directMembershipTraversalComplete": True,
         "convergedMembershipReadbacks": True,
+        "roleAssignmentScheduleInstancesComplete": True,
         "siblingRegistriesChecked": True,
         "acrEscalationPathsChecked": True,
         "expectedAssignmentIds": sorted(expected_ids),
@@ -611,29 +696,35 @@ def _require_registry_posture(
 def _resolved_effective_role_assignments(
     principal_id: str,
     *,
+    group_ids: Sequence[str],
     subscription_ids: Sequence[str],
+    governed_subscription_ids: frozenset[str],
+    active_at: datetime,
+    schedule_budget: _RoleAssignmentScheduleScanBudget,
     run_json: JsonRunner,
 ) -> list[dict[str, Any]]:
     documents: list[object] = []
-    for subscription_id in subscription_ids:
-        documents.append(
-            _effective_role_assignments(
-                principal_id,
-                subscription_id=subscription_id,
-                run_json=run_json,
-            )
-        )
-    for group_id in sorted(
-        _transitive_group_ids(
-            principal_id,
-            run_json=run_json,
-        )
-    ):
+    principal_types = (
+        (principal_id, "ServicePrincipal"),
+        *((group_id, "Group") for group_id in sorted(group_ids)),
+    )
+    for effective_principal_id, principal_type in principal_types:
         for subscription_id in subscription_ids:
             documents.append(
                 _effective_role_assignments(
-                    group_id,
+                    effective_principal_id,
                     subscription_id=subscription_id,
+                    run_json=run_json,
+                )
+            )
+            documents.append(
+                _active_role_assignment_schedule_instances(
+                    effective_principal_id,
+                    principal_type=principal_type,
+                    subscription_id=subscription_id,
+                    governed_subscription_ids=governed_subscription_ids,
+                    active_at=active_at,
+                    schedule_budget=schedule_budget,
                     run_json=run_json,
                 )
             )
@@ -690,6 +781,276 @@ def _effective_role_assignments(
             ),
         ),
         field=f"effective ACR assignments for {principal_id}",
+    )
+
+
+def _active_role_assignment_schedule_instances(
+    principal_id: str,
+    *,
+    principal_type: str,
+    subscription_id: str,
+    governed_subscription_ids: frozenset[str],
+    active_at: datetime,
+    schedule_budget: _RoleAssignmentScheduleScanBudget,
+    run_json: JsonRunner,
+) -> list[dict[str, Any]]:
+    subscription_scope = f"/subscriptions/{subscription_id}"
+    query = urlencode(
+        (
+            ("api-version", ROLE_ASSIGNMENT_SCHEDULE_API_VERSION),
+            ("$filter", f"principalId eq {principal_id}"),
+        ),
+        quote_via=quote,
+    )
+    next_url: str | None = (
+        f"https://{ARM_HOST}{subscription_scope}/providers/"
+        f"Microsoft.Authorization/roleAssignmentScheduleInstances?{query}"
+    )
+    active_assignments: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+    seen_instance_ids: set[str] = set()
+    for page_number in range(1, MAX_ROLE_ASSIGNMENT_SCHEDULE_PAGES + 1):
+        if next_url is None:
+            return active_assignments
+        _validate_role_assignment_schedule_instances_url(
+            next_url,
+            subscription_id=subscription_id,
+            principal_id=principal_id,
+            first_page=page_number == 1,
+        )
+        if next_url in seen_urls:
+            raise EffectiveAccessError(
+                "active role-assignment schedule pagination contains a cycle"
+            )
+        seen_urls.add(next_url)
+        if schedule_budget.api_calls >= MAX_ROLE_ASSIGNMENT_SCHEDULE_API_CALLS:
+            raise EffectiveAccessError(
+                "active role-assignment schedule API calls exceed their bound"
+            )
+        schedule_budget.api_calls += 1
+        page = _mapping(
+            run_json(
+                [
+                    "az",
+                    "rest",
+                    "--method",
+                    "get",
+                    "--url",
+                    next_url,
+                    "--only-show-errors",
+                    "--output",
+                    "json",
+                ],
+                (
+                    "active role-assignment schedules for "
+                    f"{principal_type} {principal_id} in {subscription_scope} "
+                    f"page {page_number}"
+                ),
+            ),
+            field="active role-assignment schedule page",
+        )
+        values = page.get("value")
+        if not isinstance(values, list):
+            raise EffectiveAccessError(
+                "active role-assignment schedule page must contain an array"
+            )
+        schedule_budget.instances += len(values)
+        if schedule_budget.instances > MAX_ROLE_ASSIGNMENT_SCHEDULE_INSTANCES:
+            raise EffectiveAccessError(
+                "active role-assignment schedule instances exceed their bound"
+            )
+        for instance_index, raw_instance in enumerate(values):
+            instance_id, active_assignment = _role_assignment_schedule_instance(
+                raw_instance,
+                principal_id=principal_id,
+                principal_type=principal_type,
+                governed_subscription_ids=governed_subscription_ids,
+                active_at=active_at,
+                field=(
+                    "active role-assignment schedule "
+                    f"page {page_number} item {instance_index}"
+                ),
+            )
+            normalized_instance_id = instance_id.casefold()
+            if normalized_instance_id in seen_instance_ids:
+                raise EffectiveAccessError(
+                    "active role-assignment schedule pages contain a duplicate"
+                )
+            seen_instance_ids.add(normalized_instance_id)
+            if active_assignment is not None:
+                active_assignments.append(active_assignment)
+        continuation = page.get("nextLink")
+        if continuation is None:
+            next_url = None
+        elif isinstance(continuation, str) and continuation:
+            next_url = continuation
+        else:
+            raise EffectiveAccessError(
+                "active role-assignment schedule continuation is invalid"
+            )
+    raise EffectiveAccessError(
+        "active role-assignment schedule pagination exceeded its bound"
+    )
+
+
+def _validate_role_assignment_schedule_instances_url(
+    url: str,
+    *,
+    subscription_id: str,
+    principal_id: str,
+    first_page: bool,
+) -> None:
+    if len(url) > 16_384:
+        raise EffectiveAccessError(
+            "active role-assignment schedule continuation is oversized"
+        )
+    parsed = urlparse(url)
+    expected_path = (
+        f"/subscriptions/{subscription_id}/providers/"
+        "Microsoft.Authorization/roleAssignmentScheduleInstances"
+    )
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    normalized_query: dict[str, list[str]] = {}
+    for key, values in query.items():
+        normalized_key = key.casefold()
+        if normalized_key in normalized_query:
+            raise EffectiveAccessError(
+                "active role-assignment schedule continuation is invalid"
+            )
+        normalized_query[normalized_key] = values
+    allowed_query_keys = {
+        "api-version",
+        "$filter",
+        "$skiptoken",
+        "$skip",
+    }
+    continuation_keys = {"$skiptoken", "$skip"} & normalized_query.keys()
+    if (
+        parsed.scheme != "https"
+        or parsed.netloc.casefold() != ARM_HOST
+        or parsed.path.casefold() != expected_path.casefold()
+        or parsed.fragment
+        or parsed.username is not None
+        or parsed.password is not None
+        or any(key not in allowed_query_keys for key in normalized_query)
+        or any(len(values) != 1 or not values[0] for values in normalized_query.values())
+        or normalized_query.get("api-version")
+        != [ROLE_ASSIGNMENT_SCHEDULE_API_VERSION]
+        or normalized_query.get("$filter") != [f"principalId eq {principal_id}"]
+        or (first_page and continuation_keys)
+        or (not first_page and len(continuation_keys) != 1)
+    ):
+        raise EffectiveAccessError(
+            "active role-assignment schedule continuation is invalid"
+        )
+
+
+def _role_assignment_schedule_instance(
+    value: object,
+    *,
+    principal_id: str,
+    principal_type: str,
+    governed_subscription_ids: frozenset[str],
+    active_at: datetime,
+    field: str,
+) -> tuple[str, dict[str, Any] | None]:
+    resource = _mapping(value, field=field)
+    instance_name = _canonical_uuid(
+        resource.get("name"),
+        field=f"{field} name",
+    )
+    if str(resource.get("type", "")).casefold() != (
+        "Microsoft.Authorization/roleAssignmentScheduleInstances"
+    ).casefold():
+        raise EffectiveAccessError(f"{field} type is invalid")
+    properties = _mapping(
+        resource.get("properties"),
+        field=f"{field} properties",
+    )
+    schedule_principal_id = _canonical_uuid(
+        properties.get("principalId"),
+        field=f"{field} principal ID",
+    )
+    if schedule_principal_id != principal_id:
+        raise EffectiveAccessError(f"{field} principal does not match its query")
+    if properties.get("principalType") != principal_type:
+        raise EffectiveAccessError(f"{field} principal type does not match its query")
+    scope = _canonical_governed_scope(
+        properties.get("scope"),
+        governed_subscription_ids=governed_subscription_ids,
+        field=f"{field} scope",
+    )
+    instance_id = _string(
+        resource.get("id"),
+        field=f"{field} ID",
+    )
+    scope_prefix = "" if scope == "/" else scope
+    expected_instance_id = (
+        f"{scope_prefix}/providers/Microsoft.Authorization/"
+        f"roleAssignmentScheduleInstances/{instance_name}"
+    )
+    if instance_id.casefold() != expected_instance_id.casefold():
+        raise EffectiveAccessError(f"{field} ID is not canonical for its scope")
+    origin_role_assignment_id = _canonical_role_assignment_origin_id(
+        properties.get("originRoleAssignmentId"),
+        scope=scope,
+        field=f"{field} origin role assignment ID",
+    )
+    role_definition_id = _string(
+        properties.get("roleDefinitionId"),
+        field=f"{field} role definition ID",
+    )
+    assignment_type = properties.get("assignmentType")
+    if assignment_type not in {"Activated", "Assigned"}:
+        raise EffectiveAccessError(f"{field} assignment type is invalid")
+    member_type = properties.get("memberType")
+    if member_type not in {"Direct", "Inherited", "Group"}:
+        raise EffectiveAccessError(f"{field} member type is invalid")
+    status = properties.get("status")
+    if status not in _ROLE_ASSIGNMENT_SCHEDULE_STATUSES:
+        raise EffectiveAccessError(f"{field} status is invalid")
+    start_at = _utc_datetime(
+        properties.get("startDateTime"),
+        field=f"{field} startDateTime",
+    )
+    if "endDateTime" not in properties:
+        raise EffectiveAccessError(f"{field} endDateTime is missing")
+    raw_end_at = properties["endDateTime"]
+    end_at = (
+        None
+        if raw_end_at is None
+        else _utc_datetime(
+            raw_end_at,
+            field=f"{field} endDateTime",
+        )
+    )
+    if end_at is not None and end_at <= start_at:
+        raise EffectiveAccessError(f"{field} time window is invalid")
+    condition_version = _optional_string(
+        properties.get("conditionVersion"),
+        field=f"{field} conditionVersion",
+    )
+    condition = _optional_string(
+        properties.get("condition"),
+        field=f"{field} condition",
+    )
+    if (
+        active_at < start_at
+        or (end_at is not None and active_at >= end_at)
+        or status in _INACTIVE_ROLE_ASSIGNMENT_SCHEDULE_STATUSES
+    ):
+        return instance_id, None
+    return (
+        instance_id,
+        {
+            "id": origin_role_assignment_id,
+            "principalId": schedule_principal_id,
+            "principalType": principal_type,
+            "roleDefinitionId": role_definition_id,
+            "scope": scope,
+            "conditionVersion": condition_version,
+            "condition": condition,
+        },
     )
 
 
@@ -913,15 +1274,34 @@ def _merge_assignment_documents(
                 continue
             for property_name in (
                 "principalId",
+                "principalType",
                 "roleDefinitionId",
                 "scope",
+                "conditionVersion",
+                "condition",
             ):
                 existing_value = existing.get(property_name)
                 incoming_value = assignment.get(property_name)
                 if (
                     existing_value not in (None, "")
                     and incoming_value not in (None, "")
-                    and str(existing_value).casefold() != str(incoming_value).casefold()
+                    and (
+                        (
+                            property_name
+                            in {
+                                "principalId",
+                                "principalType",
+                                "roleDefinitionId",
+                                "scope",
+                            }
+                            and str(existing_value).casefold()
+                            != str(incoming_value).casefold()
+                        )
+                        or (
+                            property_name in {"conditionVersion", "condition"}
+                            and existing_value != incoming_value
+                        )
+                    )
                 ):
                     raise EffectiveAccessError(f"{field} returned conflicting duplicate assignment")
                 if existing_value in (None, "") and incoming_value not in (None, ""):
@@ -967,12 +1347,6 @@ def _role_definition_grants_acr_pull(
     resource: Mapping[str, object],
 ) -> bool:
     profiles = _role_permission_profiles(resource)
-    required_reads = (
-        (ACR_LEGACY_PULL_ACTION, False),
-        (ACR_LEGACY_PULL_ACTION, True),
-        (ACR_REPOSITORY_CONTENT_READ_DATA_ACTION, False),
-        (ACR_REPOSITORY_CONTENT_READ_DATA_ACTION, True),
-    )
     return any(
         _permission_profile_grants_action(
             profile,
@@ -980,7 +1354,8 @@ def _role_definition_grants_acr_pull(
             is_data_action=is_data_action,
         )
         for profile in profiles
-        for action, is_data_action in required_reads
+        for action in ACR_PULL_CAPABLE_ACTIONS
+        for is_data_action in (False, True)
     )
 
 
@@ -1261,6 +1636,72 @@ def _canonical_role_assignment_resource_id(
     return assignment_id
 
 
+def _canonical_governed_scope(
+    value: object,
+    *,
+    governed_subscription_ids: frozenset[str],
+    field: str,
+) -> str:
+    scope = _string(value, field=field)
+    if scope == "/":
+        return scope
+    if (
+        any(alias in scope for alias in ("//", "?", "#", "%"))
+        or scope.endswith("/")
+    ):
+        raise EffectiveAccessError(f"{field} is not canonical")
+    segments = scope.split("/")
+    normalized = scope.casefold()
+    if normalized.startswith("/subscriptions/"):
+        if (
+            len(segments) < 3
+            or segments[0] != ""
+            or segments[1].casefold() != "subscriptions"
+            or any(not segment for segment in segments[1:])
+        ):
+            raise EffectiveAccessError(f"{field} is not canonical")
+        scope_subscription_id = _canonical_uuid(
+            segments[2],
+            field=f"{field} subscription ID",
+        )
+        if scope_subscription_id not in governed_subscription_ids:
+            raise EffectiveAccessError(f"{field} is outside the governed subscriptions")
+        return scope
+    if normalized.startswith("/providers/microsoft.management/managementgroups/"):
+        if (
+            len(segments) != 5
+            or segments[0] != ""
+            or segments[1].casefold() != "providers"
+            or segments[2].casefold() != "microsoft.management"
+            or segments[3].casefold() != "managementgroups"
+            or not segments[4]
+        ):
+            raise EffectiveAccessError(f"{field} is not canonical")
+        return scope
+    raise EffectiveAccessError(f"{field} is outside the governed hierarchy")
+
+
+def _canonical_role_assignment_origin_id(
+    value: object,
+    *,
+    scope: str,
+    field: str,
+) -> str:
+    origin_role_assignment_id = _string(value, field=field)
+    assignment_guid = _canonical_uuid(
+        origin_role_assignment_id.rsplit("/", 1)[-1],
+        field=f"{field} UUID",
+    )
+    scope_prefix = "" if scope == "/" else scope
+    expected_id = (
+        f"{scope_prefix}/providers/Microsoft.Authorization/"
+        f"roleAssignments/{assignment_guid}"
+    )
+    if origin_role_assignment_id.casefold() != expected_id.casefold():
+        raise EffectiveAccessError(f"{field} is not canonical for its scope")
+    return origin_role_assignment_id
+
+
 def _canonical_uuid(value: object, *, field: str) -> str:
     if not isinstance(value, str) or value != value.strip():
         raise EffectiveAccessError(f"{field} must be a canonical UUID")
@@ -1283,6 +1724,25 @@ def _string(value: object, *, field: str) -> str:
     if not isinstance(value, str) or not value or value != value.strip():
         raise EffectiveAccessError(f"{field} must be a non-empty string")
     return value
+
+
+def _optional_string(value: object, *, field: str) -> str | None:
+    if value is None:
+        return None
+    return _string(value, field=field)
+
+
+def _utc_datetime(value: object, *, field: str) -> datetime:
+    timestamp = _string(value, field=field)
+    if not (timestamp.endswith("Z") or timestamp.endswith("+00:00")):
+        raise EffectiveAccessError(f"{field} must be a UTC timestamp")
+    try:
+        parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise EffectiveAccessError(f"{field} must be a valid UTC timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() != UTC.utcoffset(parsed):
+        raise EffectiveAccessError(f"{field} must be a UTC timestamp")
+    return parsed.astimezone(UTC)
 
 
 def _run_json(command: Sequence[str], field: str) -> object:

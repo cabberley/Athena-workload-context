@@ -243,6 +243,7 @@ function Get-EffectiveAccessEvidence {
         $evidence.transitiveGroupsComplete -ne $true -or
         $evidence.directMembershipTraversalComplete -ne $true -or
         $evidence.convergedMembershipReadbacks -ne $true -or
+        $evidence.roleAssignmentScheduleInstancesComplete -ne $true -or
         $evidence.siblingRegistriesChecked -ne $true -or
         $evidence.acrEscalationPathsChecked -ne $true -or
         @($evidence.expectedAssignmentIds).Count -ne 3 -or
