@@ -5792,6 +5792,20 @@ def _parse_security_group_membership(
         method=method,
     )
     groups: set[str] = set()
+    security_enabled_by_group_id: dict[str, bool] = {}
+
+    def register_group_claim(group_id: str, *, security_enabled: bool) -> None:
+        if group_id in security_enabled_by_group_id:
+            if security_enabled_by_group_id[group_id] != security_enabled:
+                raise PreflightInputError(
+                    "Graph group-membership evidence contains conflicting "
+                    "securityEnabled claims for a group"
+                )
+            raise PreflightInputError("Graph group-membership evidence contains a duplicate group")
+        security_enabled_by_group_id[group_id] = security_enabled
+        if security_enabled:
+            groups.add(group_id)
+
     if method == "getmembergroups":
         if _get_case_insensitive(membership, "securityEnabledOnly") is not True:
             raise PreflightInputError("getMemberGroups evidence must set securityEnabledOnly true")
@@ -5802,16 +5816,15 @@ def _parse_security_group_membership(
                 raw_group_id,
                 field_name="Graph security-group id",
             )
-            if group_id in groups:
-                raise PreflightInputError(
-                    "Graph group-membership evidence contains a duplicate group"
-                )
             principal_registry.register(
                 group_id,
                 "group",
                 field_name="Graph security-group id",
             )
-            groups.add(group_id)
+            register_group_claim(
+                group_id,
+                security_enabled=True,
+            )
     else:
         for raw_item in values:
             item = _mapping(
@@ -5845,12 +5858,10 @@ def _parse_security_group_membership(
             )
             if type(security_enabled) is not bool:
                 raise PreflightInputError("Graph group membership omits securityEnabled")
-            if security_enabled:
-                if object_id in groups:
-                    raise PreflightInputError(
-                        "Graph group-membership evidence contains a duplicate group"
-                    )
-                groups.add(object_id)
+            register_group_claim(
+                object_id,
+                security_enabled=security_enabled,
+            )
     return frozenset(groups)
 
 

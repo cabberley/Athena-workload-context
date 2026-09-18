@@ -883,6 +883,37 @@ def _group_membership_evidence(
     }
 
 
+def _transitive_group_membership_evidence(
+    effective_principal_id: str,
+    page_values: list[list[dict[str, object]]],
+) -> dict[str, object]:
+    initial_url = (
+        "https://graph.microsoft.com/v1.0/servicePrincipals/"
+        f"{effective_principal_id}/transitiveMemberOf"
+    )
+    request_urls = [
+        initial_url,
+        *(f"{initial_url}?%24skiptoken=synthetic-{index}" for index in range(1, len(page_values))),
+    ]
+    return {
+        "tenantId": _TENANT_ID,
+        "method": "transitiveMemberOf",
+        "pages": [
+            {
+                "requestUrl": request_url,
+                "statusCode": 200,
+                "value": values,
+                "@odata.nextLink": (
+                    request_urls[index + 1] if index + 1 < len(request_urls) else None
+                ),
+            }
+            for index, (request_url, values) in enumerate(
+                zip(request_urls, page_values, strict=True)
+            )
+        ],
+    }
+
+
 def _deny_assignment_evidence() -> dict[str, object]:
     target_query = urlencode(
         {
@@ -11923,6 +11954,193 @@ def test_guarded_rbac_rejects_all_principals_zero_guid_as_client_id() -> None:
     with pytest.raises(
         PreflightInputError,
         match="All Principals zero GUID as a workload identity",
+    ):
+        _evaluate_guarded_rbac(
+            evidence,
+            _production_policy(
+                principal_id,
+                expected_assignments=[assignment],
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    ("first_security_enabled", "second_security_enabled", "message"),
+    [
+        pytest.param(True, True, "duplicate group", id="true-true"),
+        pytest.param(False, False, "duplicate group", id="false-false"),
+        pytest.param(
+            True,
+            False,
+            "conflicting securityEnabled claims",
+            id="true-false",
+        ),
+        pytest.param(
+            False,
+            True,
+            "conflicting securityEnabled claims",
+            id="false-true",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "across_pages",
+    [
+        pytest.param(False, id="same-page"),
+        pytest.param(True, id="page-boundary"),
+    ],
+)
+def test_guarded_rbac_rejects_repeated_canonical_transitive_group_claims(
+    first_security_enabled: bool,
+    second_security_enabled: bool,
+    message: str,
+    *,
+    across_pages: bool,
+) -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    group_id = "22222222-2222-2222-2222-abcdefabcdef"
+    assignment = _guarded_assignment(
+        principal_id=principal_id,
+        role_name="AcrPull",
+        scope=_RG_SCOPE,
+    )
+    evidence = _guarded_evidence([assignment])
+    principal = _first_principal_artifact(evidence)
+    claims = [
+        {
+            "@odata.type": "#microsoft.graph.group",
+            "id": group_id,
+            "securityEnabled": first_security_enabled,
+        },
+        {
+            "@odata.type": "#microsoft.graph.group",
+            "id": group_id.upper(),
+            "securityEnabled": second_security_enabled,
+        },
+    ]
+    principal["groupMembership"] = _transitive_group_membership_evidence(
+        principal_id,
+        [[claims[0]], [claims[1]]] if across_pages else [claims],
+    )
+
+    with pytest.raises(PreflightInputError, match=message):
+        _evaluate_guarded_rbac(
+            evidence,
+            _production_policy(
+                principal_id,
+                expected_assignments=[assignment],
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "security_enabled"),
+    [
+        pytest.param("missing", None, id="missing"),
+        pytest.param("value", None, id="null"),
+        pytest.param("value", "true", id="string"),
+        pytest.param("value", 1, id="integer"),
+    ],
+)
+def test_guarded_rbac_rejects_malformed_transitive_group_security_enabled(
+    mutation: str,
+    security_enabled: object,
+) -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignment = _guarded_assignment(
+        principal_id=principal_id,
+        role_name="AcrPull",
+        scope=_RG_SCOPE,
+    )
+    evidence = _guarded_evidence([assignment])
+    principal = _first_principal_artifact(evidence)
+    claim: dict[str, object] = {
+        "@odata.type": "#microsoft.graph.group",
+        "id": "22222222-2222-2222-2222-222222222222",
+    }
+    if mutation == "value":
+        claim["securityEnabled"] = security_enabled
+    principal["groupMembership"] = _transitive_group_membership_evidence(
+        principal_id,
+        [[claim]],
+    )
+
+    with pytest.raises(
+        PreflightInputError,
+        match="Graph group membership omits securityEnabled",
+    ):
+        _evaluate_guarded_rbac(
+            evidence,
+            _production_policy(
+                principal_id,
+                expected_assignments=[assignment],
+            ),
+        )
+
+
+def test_guarded_rbac_rejects_duplicate_canonical_get_member_groups_ids() -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    group_id = "22222222-2222-2222-2222-abcdefabcdef"
+    assignment = _guarded_assignment(
+        principal_id=principal_id,
+        role_name="AcrPull",
+        scope=_RG_SCOPE,
+    )
+    evidence = _guarded_evidence([assignment])
+    principal = _first_principal_artifact(evidence)
+    principal["groupMembership"] = _group_membership_evidence(
+        principal_id,
+        [group_id, group_id.upper()],
+    )
+
+    with pytest.raises(
+        PreflightInputError,
+        match="duplicate group",
+    ):
+        _evaluate_guarded_rbac(
+            evidence,
+            _production_policy(
+                principal_id,
+                expected_assignments=[assignment],
+            ),
+        )
+
+
+def test_guarded_rbac_bounds_transitive_group_claims_across_pages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    principal_id = "11111111-1111-1111-1111-111111111111"
+    assignment = _guarded_assignment(
+        principal_id=principal_id,
+        role_name="AcrPull",
+        scope=_RG_SCOPE,
+    )
+    evidence = _guarded_evidence([assignment])
+    principal = _first_principal_artifact(evidence)
+    principal["groupMembership"] = _transitive_group_membership_evidence(
+        principal_id,
+        [
+            [
+                {
+                    "@odata.type": "#microsoft.graph.group",
+                    "id": "22222222-2222-2222-2222-222222222222",
+                    "securityEnabled": False,
+                }
+            ],
+            [
+                {
+                    "@odata.type": "#microsoft.graph.group",
+                    "id": "33333333-3333-3333-3333-333333333333",
+                    "securityEnabled": True,
+                }
+            ],
+        ],
+    )
+    monkeypatch.setattr(wc029_preflight_module, "MAX_ASSIGNMENTS", 1)
+
+    with pytest.raises(
+        PreflightInputError,
+        match="Graph group-membership evidence must contain at most 1 items",
     ):
         _evaluate_guarded_rbac(
             evidence,
