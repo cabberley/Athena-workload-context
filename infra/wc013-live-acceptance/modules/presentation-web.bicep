@@ -29,6 +29,13 @@ param presentationImageRegistryServer string
 @maxLength(2048)
 param presentationImageRegistryResourceId string
 
+@description('Reviewed role-assignment permissions mode for the presentation image registry.')
+@allowed([
+  'LegacyRegistryPermissions'
+  'AbacRepositoryPermissions'
+])
+param presentationImageRegistryRoleAssignmentMode string
+
 @description('Digest-pinned WC-013 delivery image used by the presentation asset gateway sidecar.')
 @minLength(1)
 @maxLength(2048)
@@ -75,7 +82,6 @@ param presentationIdentityPrincipalId string
 param tags object = {}
 
 var presentationName = '${namePrefix}-presentation'
-var presentationIdentityName = last(split(presentationIdentityResourceId, '/'))
 var rejectedImageDigestSuffix = '@sha256:0000000000000000000000000000000000000000000000000000000000000000'
 var expectedPresentationImageRegistryServer = '${toLower(last(split(presentationImageRegistryResourceId, '/')))}.azurecr.io'
 var validatedPresentationImageRegistryServer = presentationImageRegistryServer == toLower(presentationImageRegistryServer) && presentationImageRegistryServer == expectedPresentationImageRegistryServer
@@ -139,9 +145,24 @@ module presentationImagePull './acr-pull-rbac.bicep' = {
     split(presentationImageRegistryResourceId, '/')[4]
   )
   params: {
-    registryName: last(split(presentationImageRegistryResourceId, '/'))
-    identityName: presentationIdentityName
+    registryResourceId: presentationImageRegistryResourceId
     identityPrincipalId: presentationIdentityPrincipalId
+    image: validatedPresentationImage
+    registryRoleAssignmentMode: presentationImageRegistryRoleAssignmentMode
+  }
+}
+
+module presentationDeliveryImagePull './acr-pull-rbac.bicep' = if (presentationImageRegistryRoleAssignmentMode == 'AbacRepositoryPermissions') {
+  name: 'wc013-presentation-delivery-image-pull'
+  scope: resourceGroup(
+    split(presentationImageRegistryResourceId, '/')[2],
+    split(presentationImageRegistryResourceId, '/')[4]
+  )
+  params: {
+    registryResourceId: presentationImageRegistryResourceId
+    identityPrincipalId: presentationIdentityPrincipalId
+    image: validatedDeliveryImage
+    registryRoleAssignmentMode: presentationImageRegistryRoleAssignmentMode
   }
 }
 
@@ -149,6 +170,7 @@ module presentationApp 'br/public:avm/res/app/container-app:0.23.0' = {
   name: 'wc013-private-presentation-app'
   dependsOn: [
     presentationImagePull
+    presentationDeliveryImagePull
   ]
   params: {
     name: presentationName
@@ -309,3 +331,38 @@ output identityClientId string = presentationIdentityClientId
 
 @description('Principal ID of the presentation AcrPull and presentation-assets Reader identity.')
 output identityPrincipalId string = presentationIdentityPrincipalId
+
+@description('Exact current presentation ACR pull assignment evidence.')
+output acrPullAssignments array = concat([
+  {
+    label: 'presentation'
+    assignmentResourceId: presentationImagePull.outputs.roleAssignmentResourceId
+    principalId: presentationIdentityPrincipalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: presentationImagePull.outputs.roleDefinitionResourceId
+    roleAssignmentMode: presentationImagePull.outputs.roleAssignmentMode
+    anonymousPullEnabled: presentationImagePull.outputs.anonymousPullEnabled
+    scope: presentationImagePull.outputs.registryResourceId
+    image: validatedPresentationImage
+    repositoryName: presentationImagePull.outputs.repositoryName
+    conditionVersion: presentationImagePull.outputs.?conditionVersion
+    condition: presentationImagePull.outputs.?condition
+  }
+], presentationImageRegistryRoleAssignmentMode == 'AbacRepositoryPermissions'
+  ? [
+      {
+        label: 'presentation-delivery'
+        assignmentResourceId: presentationDeliveryImagePull!.outputs.roleAssignmentResourceId
+        principalId: presentationIdentityPrincipalId
+        principalType: 'ServicePrincipal'
+        roleDefinitionId: presentationDeliveryImagePull!.outputs.roleDefinitionResourceId
+        roleAssignmentMode: presentationDeliveryImagePull!.outputs.roleAssignmentMode
+        anonymousPullEnabled: presentationDeliveryImagePull!.outputs.anonymousPullEnabled
+        scope: presentationDeliveryImagePull!.outputs.registryResourceId
+        image: validatedDeliveryImage
+        repositoryName: presentationDeliveryImagePull!.outputs.repositoryName
+        conditionVersion: presentationDeliveryImagePull!.outputs.?conditionVersion
+        condition: presentationDeliveryImagePull!.outputs.?condition
+      }
+    ]
+  : [])

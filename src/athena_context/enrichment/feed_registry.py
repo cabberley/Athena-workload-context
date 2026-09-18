@@ -160,17 +160,21 @@ class IncidentFeedRegistryPort(Protocol):
         record: IncidentFeedRegistryRecord,
         *,
         authority: CurrentIncidentStateSnapshot,
+        before_irreversible_write: Callable[[], None] | None = None,
     ) -> None: ...
 
     def list_records(
         self,
         *,
         as_of: UtcDateTime,
+        before_irreversible_write: Callable[[], None] | None = None,
     ) -> tuple[IncidentFeedRegistryRecord, ...]: ...
 
     def prune_expired(
         self,
         plan: IncidentFeedRegistryPrunePlan,
+        *,
+        before_irreversible_write: Callable[[], None] | None = None,
     ) -> None: ...
 
 

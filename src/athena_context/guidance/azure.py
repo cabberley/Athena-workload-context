@@ -30,6 +30,8 @@ from athena_context.azure_adapters import (
     production_managed_identity_credential,
 )
 from athena_context.contracts import (
+    WC027_GUIDANCE_ACTIVATION_MAX_LIFETIME_SECONDS,
+    GuidancePublicationRequestDeliveryBudget,
     PublishedGuidanceAuthorityActivation,
     PublishedGuidanceAuthorityBinding,
     VersionPinnedBlobReference,
@@ -157,6 +159,24 @@ class AzureBlobGuidanceAuthorityArtifactWriter:
             contentDigest=request.hashes.payload_sha256,
         )
 
+    def read_reference(
+        self,
+        reference: VersionPinnedBlobReference,
+    ) -> bytes:
+        if type(reference) is not VersionPinnedBlobReference:
+            raise TypeError(
+                "reference must be an exact VersionPinnedBlobReference"
+            )
+        if _GUIDANCE_AUTHORITY_ASSET_PATH.fullmatch(reference.name) is None:
+            raise ValueError("artifact path is outside guidance authority storage")
+        return self._reader.read(
+            ArtifactReadRequest(
+                blob_name=reference.name,
+                version_id=reference.version,
+                expected_payload_sha256=reference.content_digest,
+            )
+        ).payload
+
 
 class AzureTableGuidanceAuthorityActivationStore:
     """CAS store for one active authority binding per incident."""
@@ -204,6 +224,7 @@ class AzureTableGuidanceAuthorityActivationStore:
             "RowKey": activation.incident_id,
             "activationDigest": activation.activation_digest,
             "payload": activation.canonical_bytes().decode("utf-8"),
+            "triggerDeliveryStatus": "pending",
         }
         try:
             if expected_etag is None:
@@ -223,6 +244,50 @@ class AzureTableGuidanceAuthorityActivationStore:
         return GuidanceAuthorityActivationSnapshot(
             activation=activation,
             etag=etag,
+            trigger_delivery_status="pending",
+        )
+
+    def mark_feed_materialized(
+        self,
+        activation: PublishedGuidanceAuthorityActivation,
+        *,
+        expected_etag: str,
+    ) -> GuidanceAuthorityActivationSnapshot:
+        entity = {
+            "PartitionKey": self._partition_key,
+            "RowKey": activation.incident_id,
+            "activationDigest": activation.activation_digest,
+            "payload": activation.canonical_bytes().decode("utf-8"),
+            "triggerDeliveryStatus": "materialized",
+        }
+        try:
+            metadata = self._table.update_entity(
+                entity=entity,
+                mode=UpdateMode.REPLACE,
+                etag=expected_etag,
+                match_condition=MatchConditions.IfNotModified,
+            )
+        except (ResourceModifiedError, ResourceNotFoundError) as exc:
+            raise GuidanceAuthorityActivationConflictError(
+                "guidance feed materialization status CAS conflict"
+            ) from exc
+        except (
+            HttpResponseError,
+            ServiceRequestError,
+            ServiceResponseError,
+        ):
+            current = self.read_current(incident_id=activation.incident_id)
+            if (
+                current is None
+                or current.activation != activation
+                or current.trigger_delivery_status != "materialized"
+            ):
+                raise
+            return current
+        return GuidanceAuthorityActivationSnapshot(
+            activation=activation,
+            etag=self._operation_etag(metadata),
+            trigger_delivery_status="materialized",
         )
 
     def _snapshot(
@@ -235,15 +300,29 @@ class AzureTableGuidanceAuthorityActivationStore:
         activation = PublishedGuidanceAuthorityActivation.model_validate_json(
             payload
         )
+        stored_status = entity.get("triggerDeliveryStatus")
+        legacy_status_missing = (
+            stored_status is None
+            and activation.schema_version == "athena.wc027PublishedGuidanceAuthorityActivation.v1"
+        )
         if (
             activation.incident_id != entity.get("RowKey")
             or activation.activation_digest != entity.get("activationDigest")
             or payload.encode("utf-8") != activation.canonical_bytes()
+            or (
+                not legacy_status_missing
+                and stored_status not in {"pending", "submitted", "materialized"}
+            )
         ):
             raise ValueError("guidance activation row is not canonical")
         return GuidanceAuthorityActivationSnapshot(
             activation=activation,
             etag=self._entity_etag(entity),
+            trigger_delivery_status=(
+                "pending"
+                if legacy_status_missing or stored_status == "submitted"
+                else stored_status
+            ),
         )
 
     @staticmethod
@@ -273,11 +352,35 @@ class AzureServiceBusGuidanceAuthorityTrigger:
         binding: PublishedGuidanceAuthorityBinding,
         *,
         time_to_live_seconds: int,
+        delivery_budget: GuidancePublicationRequestDeliveryBudget,
     ) -> None:
         from azure.servicebus import ServiceBusMessage
 
-        if not 1 <= time_to_live_seconds <= 900:
-            raise ValueError("guidance trigger TTL must be between 1 and 900 seconds")
+        if (
+            type(delivery_budget)
+            is not GuidancePublicationRequestDeliveryBudget
+        ):
+            raise TypeError(
+                "delivery_budget must be an exact "
+                "GuidancePublicationRequestDeliveryBudget"
+            )
+        if not (
+            delivery_budget.feed_trigger_minimum_time_to_live_seconds
+            <= time_to_live_seconds
+            <= WC027_GUIDANCE_ACTIVATION_MAX_LIFETIME_SECONDS
+            - delivery_budget.feed_processing_seconds
+        ):
+            raise ValueError(
+                "guidance trigger TTL does not retain the reviewed feed "
+                "delivery budget"
+            )
+        application_properties: dict[str | bytes, Any] = {
+            "schemaVersion": (
+                "athena.wc027PublishedGuidanceAuthorityBinding.v2"
+            ),
+            "bindingDigest": binding.binding_digest,
+        }
+        application_properties.update(delivery_budget.broker_properties())
         message = ServiceBusMessage(
             binding.canonical_bytes(),
             content_type="application/json",
@@ -286,12 +389,7 @@ class AzureServiceBusGuidanceAuthorityTrigger:
                 binding.incident_bound_request.incident_subject.incident_id
             ),
             time_to_live=timedelta(seconds=time_to_live_seconds),
-            application_properties={
-                "schemaVersion": (
-                    "athena.wc027PublishedGuidanceAuthorityBinding.v2"
-                ),
-                "bindingDigest": binding.binding_digest,
-            },
+            application_properties=application_properties,
         )
         cast(Any, self._sender).send_messages(message)
 

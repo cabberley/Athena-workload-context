@@ -106,10 +106,18 @@ class _Registry:
         self.raise_after_put: IncidentFeedRegistryError | None = None
         self.forced_record: IncidentFeedRegistryRecord | None = None
 
-    def put(self, record: IncidentFeedRegistryRecord, *, authority) -> None:
+    def put(
+        self,
+        record: IncidentFeedRegistryRecord,
+        *,
+        authority,
+        before_irreversible_write=None,
+    ) -> None:
         self.operations.append("registry.put")
         validate_incident_feed_registry_record_authority(record, authority)
         if self.forced_record is not None:
+            if before_irreversible_write is not None:
+                before_irreversible_write()
             self.records[record.entry.incident_id] = self.forced_record
             raise IncidentFeedRegistryConflictError("synthetic conflicting replay")
         current = self.records.get(record.entry.incident_id)
@@ -125,22 +133,26 @@ class _Registry:
                 raise IncidentFeedRegistryConflictError(
                     "synthetic conflicting current authority"
                 )
+        if before_irreversible_write is not None:
+            before_irreversible_write()
         self.records[record.entry.incident_id] = record
         if self.raise_after_put is not None:
             failure = self.raise_after_put
             self.raise_after_put = None
             raise failure
 
-    def list_records(self, *, as_of):
+    def list_records(self, *, as_of, before_irreversible_write=None):
         del as_of
+        del before_irreversible_write
         self.operations.append("registry.list")
         return tuple(
             self.records[incident_id]
             for incident_id in sorted(self.records)
         )
 
-    def prune_expired(self, plan) -> None:
+    def prune_expired(self, plan, *, before_irreversible_write=None) -> None:
         del plan
+        del before_irreversible_write
 
 
 class _IndexPublication:
@@ -163,6 +175,7 @@ class _IndexPublication:
         self,
         *,
         published_at,
+        before_irreversible_write=None,
     ) -> IncidentFeedIndexPublicationReceipt:
         self.operations.append("feed-index.publish")
         self.calls += 1
@@ -218,6 +231,8 @@ class _IndexPublication:
         existing = self._receipts.get(index_bytes)
         if existing is not None:
             return existing
+        if before_irreversible_write is not None:
+            before_irreversible_write()
         receipt = IncidentFeedIndexPublicationReceipt(
             index=index,
             index_reference=VersionPinnedBlobReference(

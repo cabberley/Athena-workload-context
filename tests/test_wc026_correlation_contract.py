@@ -870,6 +870,9 @@ def _inventory(
 def _request(
     *,
     binding_mode: str = "publishedRuntime",
+    issued_at: datetime | None = None,
+    trusted_as_of: datetime | None = None,
+    expires_at: datetime | None = None,
     change_pair: tuple[
         ChangeEvidenceArtifact,
         ChangeEvidencePersistenceHandoff,
@@ -893,6 +896,9 @@ def _request(
         raise ValueError("provide change_pair or change_pairs, not both")
     if incident_evidence_id is not None and incident_evidence_ids is not None:
         raise ValueError("provide incident_evidence_id or incident_evidence_ids")
+    selected_issued_at = issued_at or NOW
+    selected_trusted_as_of = trusted_as_of or NOW + timedelta(minutes=1)
+    selected_expires_at = expires_at or selected_issued_at + timedelta(minutes=10)
     bundle = bundle_override or _bundle()
     handoff = _monitoring_handoff(bundle=bundle)
     context_binding = _context_binding(
@@ -1078,9 +1084,9 @@ def _request(
         "algorithmId": CORRELATION_ALGORITHM_ID,
         "ruleCatalogDigest": rule_catalog_digest,
         "incidentRevision": 1,
-        "issuedAt": NOW,
-        "trustedAsOf": NOW + timedelta(minutes=1),
-        "expiresAt": NOW + timedelta(minutes=10),
+        "issuedAt": selected_issued_at,
+        "trustedAsOf": selected_trusted_as_of,
+        "expiresAt": selected_expires_at,
         "contextBinding": context_binding,
         "incidentAnchor": transition,
         "monitoringHandoff": handoff,

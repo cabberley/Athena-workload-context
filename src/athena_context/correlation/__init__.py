@@ -12,6 +12,7 @@ from athena_context.correlation.verification import (
     TrustedMonitoringHandoffVerifier,
     TrustedMonitoringIntentAssetVerifier,
     VerifiedCorrelationReport,
+    verify_published_context_authority,
 )
 
 __all__ = [
@@ -26,4 +27,5 @@ __all__ = [
     "TrustedMonitoringIntentAssetVerifier",
     "VerifiedCorrelationReport",
     "classify_confidence",
+    "verify_published_context_authority",
 ]

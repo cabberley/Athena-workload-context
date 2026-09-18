@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 from urllib.parse import urlsplit
@@ -30,6 +30,7 @@ from athena_context.azure_adapters import (
     KeyVaultTrustedKeyResolver,
 )
 from athena_context.contracts import (
+    GuidancePublicationRequestDeliveryBudget,
     MonitoringCollectorContract,
     PublishedGuidanceAuthorityBinding,
     TrustedKeyAnchor,
@@ -88,6 +89,9 @@ from athena_context.eventing.notification_v2 import (
 from athena_context.eventing.runtime import AzureServiceBusNotificationOutbox
 from athena_context.guidance.azure import (
     AzureTableGuidanceAuthorityActivationStore,
+)
+from athena_context.guidance.publication import (
+    GuidanceAuthorityActivationConflictError,
 )
 from athena_context.presentation_assets import (
     PresentationAssetReadResult,
@@ -183,6 +187,7 @@ class Wc027EnrichmentFeedProductionConfiguration:
     enrichment_key: _KeyAuthority
     feed_key: _KeyAuthority
     notification_key: _KeyAuthority
+    delivery_budget: GuidancePublicationRequestDeliveryBudget
 
     @classmethod
     def model_validate_json(
@@ -207,6 +212,7 @@ class Wc027EnrichmentFeedProductionConfiguration:
                 "correlationSources",
                 "guidanceAuthoritySource",
                 "guidanceActivation",
+                "deliveryBudget",
                 "monitoringCollectorContract",
                 "monitoringCollectorKey",
                 "keys",
@@ -422,6 +428,9 @@ class Wc027EnrichmentFeedProductionConfiguration:
                     guidance_activation["identityResourceId"],
                     "guidanceActivation.identityResourceId",
                 ),
+            ),
+            delivery_budget=GuidancePublicationRequestDeliveryBudget.model_validate(
+                root["deliveryBudget"]
             ),
             monitoring_collector_contract=(
                 MonitoringCollectorContract.model_validate_json(
@@ -965,6 +974,8 @@ def build_wc027_enrichment_feed_runtime(
         enrichment_publication=enrichment,
         feed_publication=feed,
         notification_publication=notification,
+        delivery_budget=configuration.delivery_budget,
+        clock=utc_now_millisecond,
     )
 
 
@@ -987,6 +998,12 @@ def submit_wc027_enrichment_feed_trigger(
             "managed_identity_client_id",
         )
     )
+    delivery_budget = GuidancePublicationRequestDeliveryBudget.reviewed()
+    application_properties: dict[str | bytes, Any] = {
+        "schemaVersion": WC027_ENRICHMENT_TRIGGER_SCHEMA_VERSION,
+        "bindingDigest": binding.binding_digest,
+    }
+    application_properties.update(delivery_budget.broker_properties())
     with (
         ServiceBusClient(
             fully_qualified_namespace=namespace,
@@ -1003,10 +1020,10 @@ def submit_wc027_enrichment_feed_trigger(
                 session_id=(
                     binding.incident_bound_request.incident_subject.incident_id
                 ),
-                application_properties={
-                    "schemaVersion": WC027_ENRICHMENT_TRIGGER_SCHEMA_VERSION,
-                    "bindingDigest": binding.binding_digest,
-                },
+                time_to_live=timedelta(
+                    seconds=delivery_budget.feed_minimum_remaining_lifetime_seconds
+                ),
+                application_properties=application_properties,
             )
         )
     return binding.binding_id
@@ -1060,9 +1077,14 @@ def run_wc027_enrichment_feed_worker(
         if not messages:
             return False
         message = messages[0]
+        processing_started_at = utc_now_millisecond()
         try:
             binding = parse_wc027_enrichment_trigger(_message_body(message))
-            validate_wc027_enrichment_broker_metadata(message, binding)
+            validate_wc027_enrichment_broker_metadata(
+                message,
+                binding,
+                expected_delivery_budget=configuration.delivery_budget,
+            )
             runtime = build_wc027_enrichment_feed_runtime(
                 configuration,
                 binding=binding,
@@ -1072,11 +1094,12 @@ def run_wc027_enrichment_feed_worker(
             )
             runtime.publish(
                 binding,
-                published_at=utc_now_millisecond(),
+                published_at=processing_started_at,
             )
             receiver.complete_message(message)
             return True
         except (
+            GuidanceAuthorityActivationConflictError,
             Wc027EnrichmentSourceNotReadyError,
             NotificationV2SourceNotReadyError,
             IncidentFeedRegistryIncompleteError,
