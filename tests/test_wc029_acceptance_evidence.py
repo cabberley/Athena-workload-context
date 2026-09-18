@@ -5674,6 +5674,72 @@ def _scenario(bundle: BundleFixture, scenario_class: str) -> dict[str, Any]:
     )
 
 
+def _scenario_artifact_id(
+    bundle: BundleFixture,
+    scenario_class: str,
+    phase: str,
+    evidence_class: str,
+) -> str:
+    scenario = _scenario(bundle, scenario_class)
+    matches = [
+        artifact_id
+        for artifact_id in scenario["phases"][phase]
+        if _declaration(bundle, artifact_id)["evidenceClass"] == evidence_class
+    ]
+    assert len(matches) == 1
+    return str(matches[0])
+
+
+def _mutate_mode_shape_index(
+    bundle: BundleFixture,
+    mutation: str,
+) -> None:
+    if mutation == "incident-mode-correlation-shape":
+        _scenario(bundle, "disk-capacity-pressure")["evidenceMode"] = "incident-producing"
+        return
+    if mutation == "correlation-mode-incident-shape":
+        _scenario(bundle, "web-tier-failure")["evidenceMode"] = "correlation-only"
+        return
+
+    scenario_class = (
+        "disk-capacity-pressure"
+        if mutation in {"missing-correlation-attestation", "extra-incident-attestation"}
+        else "web-tier-failure"
+    )
+    scenario = _scenario(bundle, scenario_class)
+    expected_class = (
+        "correlation-only-report-attestation"
+        if scenario["evidenceMode"] == "correlation-only"
+        else "correlation-report-attestation"
+    )
+    expected_id = _scenario_artifact_id(
+        bundle,
+        scenario_class,
+        "observe",
+        expected_class,
+    )
+    if mutation.startswith("missing-"):
+        scenario["phases"]["observe"].remove(expected_id)
+        bundle.index["artifacts"] = [
+            item for item in bundle.index["artifacts"] if item["artifactId"] != expected_id
+        ]
+        return
+
+    opposite_class = (
+        "correlation-report-attestation"
+        if expected_class == "correlation-only-report-attestation"
+        else "correlation-only-report-attestation"
+    )
+    duplicate = dict(_declaration(bundle, expected_id))
+    duplicate_id = f"{scenario['scenarioId']}-unexpected-report-attestation"
+    duplicate["artifactId"] = duplicate_id
+    duplicate["evidenceClass"] = opposite_class
+    duplicate["expectedSchemaVersion"] = acceptance._EXPECTED_SCHEMA_BY_CLASS[opposite_class]
+    duplicate["path"] = f"artifacts/{duplicate_id}.json"
+    bundle.index["artifacts"].append(duplicate)
+    scenario["phases"]["observe"].append(duplicate_id)
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     value = json.loads(path.read_text(encoding="utf-8"))
     assert isinstance(value, dict)
@@ -7866,6 +7932,201 @@ def test_rbac_bundle_cannot_allow_its_own_broad_assignment(
         _aggregate(bundle)
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "incident-mode-correlation-shape",
+        "correlation-mode-incident-shape",
+    ],
+)
+def test_index_cross_validates_declared_mode_against_artifact_shape(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    bundle = _build_bundle(tmp_path)
+    scenario_class = (
+        "disk-capacity-pressure"
+        if mutation == "incident-mode-correlation-shape"
+        else "web-tier-failure"
+    )
+    original_phase_order = {
+        phase: tuple(artifact_ids)
+        for phase, artifact_ids in _scenario(bundle, scenario_class)["phases"].items()
+    }
+
+    _mutate_mode_shape_index(bundle, mutation)
+
+    with pytest.raises(ValidationError, match="evidence mode"):
+        acceptance.Wc029AcceptanceEvidenceIndex.model_validate_json(
+            _canonical_bytes(bundle.index)
+        )
+    assert {
+        phase: tuple(artifact_ids)
+        for phase, artifact_ids in _scenario(bundle, scenario_class)["phases"].items()
+    } == original_phase_order
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing-correlation-attestation",
+        "extra-incident-attestation",
+        "missing-incident-attestation",
+        "extra-correlation-attestation",
+    ],
+)
+def test_index_requires_exact_mode_specific_report_attestations(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    bundle = _build_bundle(tmp_path)
+    _mutate_mode_shape_index(bundle, mutation)
+
+    with pytest.raises(ValidationError, match="attestation|incident-producing"):
+        acceptance.Wc029AcceptanceEvidenceIndex.model_validate_json(
+            _canonical_bytes(bundle.index)
+        )
+
+
+@pytest.mark.parametrize(
+    "evidence_class",
+    [
+        "correlation-only-report-attestation",
+        "correlation-report-attestation",
+        "incident-omission",
+        "queue-state",
+    ],
+)
+def test_mode_specific_artifact_lookup_uses_bounded_domain_error(
+    evidence_class: acceptance.EvidenceClass,
+) -> None:
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match=f"missing required {evidence_class} evidence",
+    ):
+        acceptance._require_scenario_artifact(
+            {},
+            evidence_class,
+            scenario_id="scenario-synthetic-mode-shape",
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "incident-mode-correlation-shape",
+        "correlation-mode-incident-shape",
+        "missing-correlation-attestation",
+        "extra-incident-attestation",
+        "missing-incident-attestation",
+        "extra-correlation-attestation",
+    ],
+)
+def test_cli_mode_shape_failures_are_bounded_exit_two_without_traceback(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    mutation: str,
+) -> None:
+    bundle = _build_bundle(tmp_path)
+    _mutate_mode_shape_index(bundle, mutation)
+    _rewrite_index(bundle)
+
+    result = acceptance.main(_cli_arguments(bundle))
+
+    captured = capsys.readouterr()
+    error = json.loads(captured.err)
+    assert result == 2
+    assert error["complete"] is False
+    assert "acceptance index failed closed validation" in error["error"]
+    assert "Traceback" not in captured.err
+    assert "KeyError" not in captured.err
+    assert list(bundle.output.iterdir()) == []
+
+
+def test_mode_shape_validation_preserves_canonical_order_and_run_lineage(
+    tmp_path: Path,
+) -> None:
+    bundle = _build_bundle(tmp_path)
+    index_path = bundle.root / "acceptance-index.json"
+    original_index_bytes = index_path.read_bytes()
+    original_phase_order = {
+        str(scenario["scenarioClass"]): {
+            phase: tuple(artifact_ids)
+            for phase, artifact_ids in scenario["phases"].items()
+        }
+        for scenario in bundle.index["scenarios"]
+    }
+    original_manifest_bytes = {
+        scenario_class: bundle.artifact_paths[
+            f"scenario-{scenario_class}-execution-manifest"
+        ].read_bytes()
+        for scenario_class in acceptance.REQUIRED_SCENARIO_CLASSES
+    }
+    global_execution = acceptance.Wc029JobExecutionEvidence.model_validate_json(
+        bundle.artifact_paths["global-job-execution"].read_bytes()
+    )
+    expected_run_lineage = acceptance._acceptance_run_lineage_digest(
+        acceptance_id=_ACCEPTANCE_ID,
+        run_id=_RUN_ID,
+        approved_inventory_sha256=bundle.approved_inventory_sha256,
+        execution=global_execution,
+    )
+
+    record = _aggregate(bundle)
+
+    assert index_path.read_bytes() == original_index_bytes
+    assert tuple(item.scenario_class for item in record.scenarios) == (
+        acceptance.REQUIRED_SCENARIO_CLASSES
+    )
+    assert record.run_lineage_digest == expected_run_lineage
+    phase_rank = {
+        "plan": 0,
+        "apply": 1,
+        "observe": 2,
+        "recover": 3,
+        "verify": 4,
+    }
+    for scenario in record.scenarios:
+        scenario_class = scenario.scenario_class
+        assert scenario.evidence_mode == _SCENARIO_MODES[scenario_class]
+        for phase, artifact_ids in scenario.phases.items():
+            assert artifact_ids == tuple(sorted(original_phase_order[scenario_class][phase]))
+
+        manifest_path = bundle.artifact_paths[
+            f"scenario-{scenario_class}-execution-manifest"
+        ]
+        assert manifest_path.read_bytes() == original_manifest_bytes[scenario_class]
+        manifest = acceptance.Wc029ScenarioExecutionManifest.model_validate_json(
+            manifest_path.read_bytes()
+        )
+        assert manifest.run_lineage_digest == expected_run_lineage
+        assert tuple((item.phase, item.artifact_id) for item in manifest.artifacts) == tuple(
+            sorted(
+                (
+                    (item.phase, item.artifact_id)
+                    for item in manifest.artifacts
+                ),
+                key=lambda item: (phase_rank[item[0]], item[1]),
+            )
+        )
+        for binding in manifest.artifacts:
+            assert binding.artifact_lineage_digest == (
+                acceptance._scenario_artifact_run_lineage_digest(
+                    acceptance_run_lineage_digest=expected_run_lineage,
+                    scenario_id=manifest.scenario_id,
+                    scenario_execution_id=manifest.scenario_execution_id,
+                    artifact_id=binding.artifact_id,
+                    phase=binding.phase,
+                    content_sha256=binding.content_sha256,
+                    input_digest=binding.input_digest,
+                )
+            )
+        report = CorrelationReport.model_validate_json(
+            bundle.artifact_paths[f"scenario-{scenario_class}-report"].read_bytes()
+        )
+        assert report.no_auto_remediation is True
+
+
 def test_scenario_mode_is_derived_and_stale_monitoring_is_rejected(
     tmp_path: Path,
 ) -> None:
@@ -7874,7 +8135,7 @@ def test_scenario_mode_is_derived_and_stale_monitoring_is_rejected(
     _rewrite_index(mode)
     with pytest.raises(
         acceptance.Wc029AcceptanceEvidenceError,
-        match="trusted deployed capability",
+        match="acceptance index failed closed validation",
     ):
         _aggregate(mode)
 
