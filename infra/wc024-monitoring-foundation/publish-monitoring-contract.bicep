@@ -124,6 +124,7 @@ var expectedTargetScopeIds = union(
       contractInputs.signingKeyVaultResourceId
       contractInputs.signingKeyArmResourceId
       contractInputs.networkWatcherResourceId
+      contractInputs.resourceGraphQueryScopeId
     ],
     contractInputs.workspaceTableResourceIds,
     contractInputs.resourceReadScopeIds,
@@ -287,7 +288,7 @@ module bootstrapTargetValidationGate 'modules/monitoring-publication-validation-
 
 var inventory = monitoringEffectiveRbacInventory
 var effectiveRbacInventoryJson = string(inventory)
-var validatedEffectiveRbacInventoryJson = length(effectiveRbacInventoryJson) <= 55000
+var validatedEffectiveRbacInventoryJson = length(effectiveRbacInventoryJson) <= 62000
   ? effectiveRbacInventoryJson
   : fail('monitoring contract publication limits the compact effective-RBAC inventory to 55,000 characters so total deployment-script environment data remains transport-safe')
 module inventoryAttestationValidation 'modules/monitoring-rbac-inventory-attestation-validation.bicep' = {
@@ -404,6 +405,7 @@ var principalEvidenceIsComplete = collectorEvidence.queryFilter == 'assignedTo(p
 var normalizedResourceReadScopeIds = map(contractInputs.resourceReadScopeIds, scopeId => toLower(scopeId))
 var normalizedSignalReadScopeIds = map(contractInputs.signalReadScopeIds, scopeId => toLower(scopeId))
 var normalizedResourceLogReadScopeIds = map(contractInputs.resourceLogReadScopeIds, scopeId => toLower(scopeId))
+var normalizedResourceGraphQueryScopeId = toLower(contractInputs.resourceGraphQueryScopeId)
 var normalizedResourceHealthScopeIds = map(contractInputs.resourceHealthScopeIds, scopeId => toLower(scopeId))
 var expectedEvidenceWriterCondition = '(((!(ActionMatches{\'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read\'} AND NOT SubOperationMatches{\'Blob.List\'})) AND !(ActionMatches{\'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action\'})) OR (@Resource[Microsoft.Storage/storageAccounts/blobServices/containers:name] StringEquals \'monitoring-evidence\' AND (@Resource[Microsoft.Storage/storageAccounts/blobServices/containers/blobs:path] StringLike \'wc024-monitoring/commits/*/manifest.json\' OR @Resource[Microsoft.Storage/storageAccounts/blobServices/containers/blobs:path] StringLike \'wc024-monitoring/commits/*/recovery.json\' OR @Resource[Microsoft.Storage/storageAccounts/blobServices/containers/blobs:path] StringLike \'wc024-monitoring/wc024-*/evidence.json\'))) AND (!(ActionMatches{\'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read\'} AND SubOperationMatches{\'Blob.List\'})))'
 var expectedCollectorGrantBindings = [
@@ -421,6 +423,13 @@ var expectedCollectorGrantBindings = [
     roleDefinitionId: toLower(contractInputs.resourceLogReaderRoleDefinitionId)
     roleDefinitionName: contractInputs.resourceLogReaderRoleName
     assignmentScopeIds: normalizedResourceLogReadScopeIds
+  }
+  {
+    roleDefinitionId: toLower(contractInputs.resourceGraphQueryRoleDefinitionId)
+    roleDefinitionName: contractInputs.resourceGraphQueryRoleName
+    assignmentScopeIds: [
+      normalizedResourceGraphQueryScopeId
+    ]
   }
   {
     roleDefinitionId: toLower(contractInputs.resourceHealthRoleDefinitionId)
@@ -500,6 +509,10 @@ var expectedCustomRoleDefinitions = [
     actions: map(contractInputs.resourceLogAllowedOperations, action => toLower(action))
   }
   {
+    roleDefinitionId: toLower(contractInputs.resourceGraphQueryRoleDefinitionId)
+    actions: map(contractInputs.resourceGraphQueryAllowedOperations, action => toLower(action))
+  }
+  {
     roleDefinitionId: toLower(contractInputs.resourceHealthRoleDefinitionId)
     actions: map(contractInputs.resourceHealthAllowedOperations, action => toLower(action))
   }
@@ -552,7 +565,7 @@ var invalidVerifierRoleDefinitions = filter(
   )) != length(contractInputs.rbacInventoryVerifierAllowedDataActions)
 )
 var verifierRoleDefinitionMatches = length(verifierRoleDefinitions) == 1 && empty(invalidVerifierRoleDefinitions)
-var exactExpectedAssignmentCount = length(normalizedResourceReadScopeIds) + length(normalizedSignalReadScopeIds) + length(normalizedResourceLogReadScopeIds) + length(normalizedResourceHealthScopeIds) + 4
+var exactExpectedAssignmentCount = length(normalizedResourceReadScopeIds) + length(normalizedSignalReadScopeIds) + length(normalizedResourceLogReadScopeIds) + length(normalizedResourceHealthScopeIds) + 5
 var globalRepeatedReadPagesAreStable = !empty(inventory.firstRoleDefinitionRawPageDigests) && string(inventory.firstRoleDefinitionRawPageDigests) == string(inventory.secondRoleDefinitionRawPageDigests) && !empty(inventory.firstDenyAssignmentRawPageDigests) && string(inventory.firstDenyAssignmentRawPageDigests) == string(inventory.secondDenyAssignmentRawPageDigests) && !empty(inventory.firstPimScheduleInstanceRawPageDigests) && string(inventory.firstPimScheduleInstanceRawPageDigests) == string(inventory.secondPimScheduleInstanceRawPageDigests)
 var collectorEffectivePrincipalIds = union(
   [
@@ -675,8 +688,10 @@ var verifierAttachmentEvidence = verifierEvidence.attachmentEvidence
 var verifierAttachmentMatches = toLower(verifierAttachmentEvidence.identityResourceId) == toLower(contractInputs.rbacInventoryVerifierIdentityResourceId) && verifierAttachmentEvidence.associatedResourcesRequestPath == expectedVerifierAssociatedResourcesRequestPath && verifierAttachmentEvidence.federatedIdentityCredentialsRequestPath == expectedVerifierFederatedCredentialsRequestPath && empty(verifierAttachmentEvidence.associatedResourceIds) && empty(verifierAttachmentEvidence.federatedIdentityCredentialIds) && !contains(verifierAttachmentEvidence, 'associatedResourceConfigurationRequestPaths') && !contains(verifierAttachmentEvidence, 'associatedResourceIdentityResourceIds') && !contains(verifierAttachmentEvidence, 'firstAssociatedResourceConfigurationDigests') && !contains(verifierAttachmentEvidence, 'secondAssociatedResourceConfigurationDigests') && verifierAttachmentEvidence.allPagesRetrieved == true && verifierAttachmentEvidence.firstReadCompletedAt < verifierAttachmentEvidence.secondReadCompletedAt && verifierAttachmentEvidence.secondReadCompletedAt <= inventory.collectedAt && string(verifierAttachmentEvidence.firstAssociatedResourceRawPageDigests) == string(verifierAttachmentEvidence.secondAssociatedResourceRawPageDigests) && string(verifierAttachmentEvidence.firstFederatedCredentialRawPageDigests) == string(verifierAttachmentEvidence.secondFederatedCredentialRawPageDigests)
 var verifierEvidenceMatches = toLower(verifierEvidence.identityResourceId) == toLower(contractInputs.rbacInventoryVerifierIdentityResourceId) && toLower(verifierEvidence.identityClientId) == toLower(contractInputs.rbacInventoryVerifierIdentityClientId) && toLower(verifierEvidence.identityPrincipalId) == toLower(contractInputs.rbacInventoryVerifierIdentityPrincipalId) && toLower(verifierEvidence.identityTenantId) == toLower(contractInputs.rbacInventoryVerifierIdentityTenantId) && toLower(verifierEvidence.identityPrincipalId) != toLower(reviewAuthority.reviewerPrincipalId) && toLower(verifierEvidence.reviewerKeyArmResourceId) == toLower(contractInputs.rbacInventoryReviewerKeyArmResourceId) && toLower(verifierEvidence.roleDefinitionId) == toLower(contractInputs.rbacInventoryVerifierRoleDefinitionId) && verifierEvidence.roleDefinitionName == contractInputs.rbacInventoryVerifierRoleName && toLower(verifierEvidence.roleAssignmentId) == toLower(contractInputs.rbacInventoryVerifierRoleAssignmentId) && verifierEvidence.allowedDataActions == contractInputs.rbacInventoryVerifierAllowedDataActions && verifierEvidence.assignmentCount == 1 && verifierGrantMatches && verifierPrincipalEvidenceMatches && verifierAttachmentMatches
 var inventorySourceMatches = inventory.sourceReference.name == 'monitoring-rbac/${inventory.collectionRunId}/effective-rbac-inventory.json' && inventory.sourceReference.contentDigest == inventory.sourceManifestDigest && inventory.inventoryDigest == validatedReviewedInventoryDigest
+var resourceHealthAuthorizationSummaryMatches = inventory.resourceGraphQueryRoleActions == map(contractInputs.resourceGraphQueryAllowedOperations, action => toLower(action)) && inventory.resourceHealthRoleActions == map(contractInputs.resourceHealthAllowedOperations, action => toLower(action))
+var resourceGraphQueryScopeIsExact = normalizedResourceGraphQueryScopeId == toLower(subscriptionScope)
 
-var inventoryCoreIsValid = inventory.schemaVersion == 'athena.wc028MonitoringEffectiveRbacInventory.v4' && inventory.scopeCollectionMode == 'subscriptionAssignedToAllInheritedAndUnfilteredWithProtectedScopes' && inventory.ancestorScopeCollectionComplete == true && inventory.subscriptionDescendantCollectionComplete == true && managementGroupAncestryIsComplete && hierarchyEvidenceIsComplete && inventoryIsFresh && inventorySourceMatches && toLower(inventory.subscriptionId) == toLower(handoff.subscriptionId) && toLower(inventory.tenantId) == toLower(handoff.tenantId) && toLower(inventory.collectorPrincipalId) == toLower(handoff.monitoringReaderPrincipalId) && toLower(inventory.athenaContextPrincipalId) == toLower(handoff.athenaContextPrincipalId) && toLower(collectorEvidence.principalId) == toLower(inventory.collectorPrincipalId) && toLower(contextEvidence.principalId) == toLower(inventory.athenaContextPrincipalId) && toLower(inventory.attestorIdentityResourceId) == toLower(contractInputs.rbacAttestorIdentityResourceId) && toLower(inventory.attestorClientId) == toLower(contractInputs.rbacAttestorIdentityClientId) && toLower(inventory.attestorPrincipalId) == toLower(contractInputs.rbacAttestorPrincipalId) && toLower(inventory.attestorTenantId) == toLower(contractInputs.rbacAttestorTenantId) && collectorTargetsMatch && contextTargetsMatch && runtimeSupportTargetsMatch
+var inventoryCoreIsValid = inventory.schemaVersion == 'athena.wc028MonitoringEffectiveRbacInventory.v5' && inventory.scopeCollectionMode == 'subscriptionAssignedToAllInheritedAndUnfilteredWithProtectedScopes' && inventory.ancestorScopeCollectionComplete == true && inventory.subscriptionDescendantCollectionComplete == true && managementGroupAncestryIsComplete && hierarchyEvidenceIsComplete && inventoryIsFresh && inventorySourceMatches && resourceHealthAuthorizationSummaryMatches && resourceGraphQueryScopeIsExact && toLower(inventory.subscriptionId) == toLower(handoff.subscriptionId) && toLower(inventory.tenantId) == toLower(handoff.tenantId) && toLower(inventory.collectorPrincipalId) == toLower(handoff.monitoringReaderPrincipalId) && toLower(inventory.athenaContextPrincipalId) == toLower(handoff.athenaContextPrincipalId) && toLower(collectorEvidence.principalId) == toLower(inventory.collectorPrincipalId) && toLower(contextEvidence.principalId) == toLower(inventory.athenaContextPrincipalId) && toLower(inventory.attestorIdentityResourceId) == toLower(contractInputs.rbacAttestorIdentityResourceId) && toLower(inventory.attestorClientId) == toLower(contractInputs.rbacAttestorIdentityClientId) && toLower(inventory.attestorPrincipalId) == toLower(contractInputs.rbacAttestorPrincipalId) && toLower(inventory.attestorTenantId) == toLower(contractInputs.rbacAttestorTenantId) && collectorTargetsMatch && contextTargetsMatch && runtimeSupportTargetsMatch
 var inventoryReadStabilityIsValid = inventory.groupMembershipCollectionComplete == true && inventory.roleDefinitionCollectionComplete == true && inventory.denyAssignmentCollectionComplete == true && inventory.denyAssignmentIncludeInherited == true && inventory.pimScheduleInstanceCollectionComplete == true && inventory.pimScheduleInstanceIncludeInherited == true && inventory.repeatedReadStable == true && independentReadTimesAreValid && inventory.firstRawSnapshotDigest == inventory.secondRawSnapshotDigest && globalRepeatedReadPagesAreStable && principalEvidenceIsComplete
 var inventoryAssignmentCountIsValid = empty(inventory.athenaContextGrants) && inventory.assignmentCount == exactExpectedAssignmentCount
 var inventoryAttachmentsAreValid = protectedScopesMatch && collectorAttachmentMatches && attestorAttachmentMatches && verifierEvidenceMatches
@@ -694,7 +709,7 @@ module inventoryCoreValidationGate 'modules/monitoring-publication-validation-ga
   name: 'validate-monitoring-effective-rbac-core'
   params: {
     valid: inventoryCoreIsValid
-    failureMessage: 'monitoring contract publication requires a fresh v4 inventory with the exact source, handoff identities, and collectable target scopes'
+    failureMessage: 'monitoring contract publication requires a fresh v5 inventory with exact Resource Graph query and per-VM Resource Health authorization evidence'
   }
 }
 
@@ -819,6 +834,10 @@ module collectorContract 'modules/monitoring-collector-contract.bicep' = {
     resourceLogAllowedOperations: contractInputs.resourceLogAllowedOperations
     resourceLogReadScopeIds: contractInputs.resourceLogReadScopeIds
     logAnalyticsDataReaderRoleDefinitionId: contractInputs.logAnalyticsDataReaderRoleDefinitionId
+    resourceGraphQueryRoleDefinitionId: contractInputs.resourceGraphQueryRoleDefinitionId
+    resourceGraphQueryRoleName: contractInputs.resourceGraphQueryRoleName
+    resourceGraphQueryScopeId: contractInputs.resourceGraphQueryScopeId
+    resourceGraphQueryAllowedOperations: contractInputs.resourceGraphQueryAllowedOperations
     resourceHealthRoleDefinitionId: contractInputs.resourceHealthRoleDefinitionId
     resourceHealthRoleName: contractInputs.resourceHealthRoleName
     resourceHealthScopeIds: contractInputs.resourceHealthScopeIds

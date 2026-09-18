@@ -45,7 +45,7 @@ def test_wc027_runtime_is_private_keyless_and_session_ordered() -> None:
     assert "param monitoringAcquisitionAuthority object" in source
     assert "param monitoringAcquisitionAuthorityDigest string" in source
     assert "athena.wc027EnrichmentFeedRuntimeConfiguration.v2" in source
-    assert "athena.wc028MonitoringCollectorContract.v9" in source
+    assert "athena.wc028MonitoringCollectorContract.v10" in source
     assert "athena.wc028MonitoringAcquisitionReceipt.v6" in source
     assert "athena.wc028MonitoringAcquisitionAuthority.v6" in source
     assert "monitoringAcquisitionAuthority: validatedMonitoringAcquisitionAuthority" in source

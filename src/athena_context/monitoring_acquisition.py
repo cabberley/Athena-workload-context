@@ -1946,7 +1946,7 @@ def _validated_azure_client_contract(
         raise TypeError("Azure acquisition client requires an exact collector contract")
     if reviewed_contract.schema_version != MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION:
         raise MonitoringAcquisitionError(
-            "Azure acquisition client requires collector contract schema v7"
+            "Azure acquisition client requires collector contract schema v10"
         )
     return reviewed_contract
 
@@ -2473,7 +2473,12 @@ class AzureActivityLogAcquisitionClient(_AzureAcquisitionClientBase):
         if type(request) is not ActivityLogQueryRequest:
             raise TypeError("Azure Activity Log requires an exact query request")
         self._require_request_contract(request)
-        subscription_id = _arm_subscription_id(self._reviewed_contract.workload_resource_group_id)
+        query_scope_id = cast(str, self._reviewed_contract.resource_graph_query_scope_id)
+        subscription_id = _arm_subscription_id(query_scope_id)
+        if query_scope_id != f"/subscriptions/{subscription_id}":
+            raise MonitoringAcquisitionError(
+                "Resource Health query scope is not the exact reviewed subscription"
+            )
         workload_scope = self._reviewed_contract.workload_resource_group_id
         if any(
             _arm_subscription_id(resource_id) != subscription_id
@@ -3351,7 +3356,7 @@ class AzureMonitoringAdapter:
             != MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION
         ):
             raise MonitoringAcquisitionError(
-                "Azure monitoring acquisition requires collector contract schema v7"
+                "Azure monitoring acquisition requires collector contract schema v10"
             )
         self._credential = ManagedIdentityCredential(
             client_id=self._reviewed_contract.collector_identity_client_id

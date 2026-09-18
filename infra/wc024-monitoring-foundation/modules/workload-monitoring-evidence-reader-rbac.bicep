@@ -39,7 +39,7 @@ var expectedSignalReaderActions = [
 ]
 var resourceHealthRoleDefinitionGuid = '0790d6f2-9553-5b63-84ac-56596b7e4072'
 var resourceHealthAllowedOperations = [
-  'Microsoft.ResourceGraph/resources/read'
+  'Microsoft.ResourceHealth/availabilityStatuses/read'
 ]
 
 resource signalReaderRoleDefinition 'Microsoft.Authorization/roleDefinitions@2022-04-01' existing = {
@@ -71,7 +71,7 @@ resource resourceHealthRoleDefinition 'Microsoft.Authorization/roleDefinitions@2
   name: resourceHealthRoleDefinitionGuid
   properties: {
     roleName: 'Athena WC-028 VM Resource Health Reader'
-    description: 'Read only HealthResources availability-status rows through Azure Resource Graph for exact approved workload VMs.'
+    description: 'Read Resource Health availability status only for exact approved workload VMs. Azure Resource Graph query submission is authorized separately at subscription scope.'
     type: 'CustomRole'
     permissions: [
       {

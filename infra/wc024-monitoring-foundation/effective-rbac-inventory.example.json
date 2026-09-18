@@ -1,7 +1,7 @@
 {
   "activePimScheduleInstances": [],
   "ancestorScopeCollectionComplete": true,
-  "assignmentCount": 64,
+  "assignmentCount": 65,
   "athenaContextGrants": [],
   "athenaContextPrincipalEvidence": {
     "allPagesRetrieved": true,
@@ -114,6 +114,19 @@
       "inheritance": "direct",
       "roleDefinitionId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.authorization/roledefinitions/0790d6f2-9553-5b63-84ac-56596b7e4072",
       "roleDefinitionName": "Athena WC-028 VM Resource Health Reader"
+    },
+    {
+      "assignedPrincipalId": "11111111-1111-1111-1111-111111111111",
+      "assignedPrincipalType": "ServicePrincipal",
+      "assignmentScopeIds": [
+        "/subscriptions/00000000-0000-0000-0000-000000000000"
+      ],
+      "effectivePrincipalId": "11111111-1111-1111-1111-111111111111",
+      "grantDigest": "sha256:a4e44ab273d327edd203cac6a9a0a4c5a181b3323e7382cbf0499b4d8c78d494",
+      "groupDerived": false,
+      "inheritance": "direct",
+      "roleDefinitionId": "/subscriptions/00000000-0000-0000-0000-000000000000/providers/microsoft.authorization/roledefinitions/5687977f-aa06-5699-8e18-1a54a074b532",
+      "roleDefinitionName": "Athena WC-028 Resource Graph Query Submitter"
     },
     {
       "assignedPrincipalId": "11111111-1111-1111-1111-111111111111",
@@ -338,13 +351,13 @@
   "firstPimScheduleInstanceRawPageDigests": [
     "sha256:8959f9366f36fe82895ee188994b77fe18ec6cf00b06532747ed2462fb817320"
   ],
-  "firstRawSnapshotDigest": "sha256:5033933499a9214fdca7e10edfa342219fa6997fca42fa6026e4c21e7ecbf712",
+  "firstRawSnapshotDigest": "sha256:2472994f593d53fec0d8f08721e3a9e0189ccd2e2de4377b5469984236846db6",
   "firstReadCompletedAt": "2026-09-10T01:54:00Z",
   "firstRoleDefinitionRawPageDigests": [
-    "sha256:a8a9072dd9e50a2d9fd1df596bc20ad47fd3c74a59386e35e89db39cf5680ecb"
+    "sha256:55f2b7876c25f65985c85e03d46ac856bdb7bfbb6712f6bce59b26be0064572f"
   ],
   "groupMembershipCollectionComplete": true,
-  "inventoryDigest": "sha256:563243c6358b52bd911f43a836e9e71a711bc9605107262bd2641803a380e0dc",
+  "inventoryDigest": "sha256:61073fbe2c3da3d637b6aada2310e140e05b06d0912a726e3c76b8246d8eab16",
   "managementGroupAncestry": [
     "/providers/microsoft.management/managementgroups/00000000-0000-0000-0000-000000000003"
   ],
@@ -495,8 +508,11 @@
     "secondReadCompletedAt": "2026-09-10T01:53:00Z"
   },
   "repeatedReadStable": true,
-  "resourceHealthRoleActions": [
+  "resourceGraphQueryRoleActions": [
     "microsoft.resourcegraph/resources/read"
+  ],
+  "resourceHealthRoleActions": [
+    "microsoft.resourcehealth/availabilitystatuses/read"
   ],
   "resourceLogReaderRoleActions": [
     "microsoft.insights/logs/heartbeat/read",
@@ -641,6 +657,18 @@
       "roleDefinitionName": "Athena WC016 Approved Signal Reader synthetic00000"
     },
     {
+      "actions": [
+        "microsoft.resourcegraph/resources/read"
+      ],
+      "dataActions": [],
+      "definitionDigest": "sha256:c3fc971e845b236c96f2122720f6d8d06df4651eaac7948f695023b834ee2ae0",
+      "notActions": [],
+      "notDataActions": [],
+      "rawDefinitionDigest": "sha256:2b8a8486f1cf81159259e12ab52b26a0d0ed2810fe4d0db35c487b8c9029b73f",
+      "roleDefinitionId": "/subscriptions/00000000-0000-0000-0000-000000000000/providers/microsoft.authorization/roledefinitions/5687977f-aa06-5699-8e18-1a54a074b532",
+      "roleDefinitionName": "Athena WC-028 Resource Graph Query Submitter"
+    },
+    {
       "actions": [],
       "dataActions": [
         "microsoft.storage/storageaccounts/blobservices/containers/blobs/add/action",
@@ -694,13 +722,13 @@
     },
     {
       "actions": [
-        "microsoft.resourcegraph/resources/read"
+        "microsoft.resourcehealth/availabilitystatuses/read"
       ],
       "dataActions": [],
-      "definitionDigest": "sha256:42ad1f83832281859fc1cb60373da391d2eb60d15240425483cc9558476607c7",
+      "definitionDigest": "sha256:b77e9b6f5c313605c3e37683d27ba8f187ddc1f49c49050f0d9bf96f4a825910",
       "notActions": [],
       "notDataActions": [],
-      "rawDefinitionDigest": "sha256:40dd176fa85cb0ae0643f959a825d2a3ccbdfb8cd564ace494ccbdf53132eda9",
+      "rawDefinitionDigest": "sha256:475b2bb9ce8794d5fcf6c58efef477a6e33fe62f5b4bdd573d0c4d24c50bdc98",
       "roleDefinitionId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.authorization/roledefinitions/0790d6f2-9553-5b63-84ac-56596b7e4072",
       "roleDefinitionName": "Athena WC-028 VM Resource Health Reader"
     },
@@ -771,7 +799,7 @@
     "transitiveGroupIds": []
   },
   "runtimeSupportPrincipalId": "66666666-6666-6666-6666-666666666670",
-  "schemaVersion": "athena.wc028MonitoringEffectiveRbacInventory.v4",
+  "schemaVersion": "athena.wc028MonitoringEffectiveRbacInventory.v5",
   "scopeCollectionMode": "subscriptionAssignedToAllInheritedAndUnfilteredWithProtectedScopes",
   "secondDenyAssignmentRawPageDigests": [
     "sha256:0594ae3648fdbbec62d39aba86a3ba20a849f088b70e92f13c367da9ee9bc95c"
@@ -779,10 +807,10 @@
   "secondPimScheduleInstanceRawPageDigests": [
     "sha256:8959f9366f36fe82895ee188994b77fe18ec6cf00b06532747ed2462fb817320"
   ],
-  "secondRawSnapshotDigest": "sha256:5033933499a9214fdca7e10edfa342219fa6997fca42fa6026e4c21e7ecbf712",
+  "secondRawSnapshotDigest": "sha256:2472994f593d53fec0d8f08721e3a9e0189ccd2e2de4377b5469984236846db6",
   "secondReadCompletedAt": "2026-09-10T01:55:00Z",
   "secondRoleDefinitionRawPageDigests": [
-    "sha256:a8a9072dd9e50a2d9fd1df596bc20ad47fd3c74a59386e35e89db39cf5680ecb"
+    "sha256:55f2b7876c25f65985c85e03d46ac856bdb7bfbb6712f6bce59b26be0064572f"
   ],
   "signalReaderRoleActions": [
     "microsoft.compute/virtualmachines/instanceview/read",

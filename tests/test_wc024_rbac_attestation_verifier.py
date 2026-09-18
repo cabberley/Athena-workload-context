@@ -42,10 +42,16 @@ def _reviewed_payload(
     if inventory is None:
         source_manifest_digest = "sha256:" + "e" * 64
         inventory_payload: dict[str, object] = {
-            "schemaVersion": "athena.wc028MonitoringEffectiveRbacInventory.v4",
+            "schemaVersion": "athena.wc028MonitoringEffectiveRbacInventory.v5",
             "collectionRunId": "monitoring-rbac-" + "a" * 32,
             "sourceManifestDigest": source_manifest_digest,
             "assignmentCount": 0,
+            "resourceGraphQueryRoleActions": [
+                "microsoft.resourcegraph/resources/read",
+            ],
+            "resourceHealthRoleActions": [
+                "microsoft.resourcehealth/availabilitystatuses/read",
+            ],
         }
         inventory_digest = compute_artifact_digest(inventory_payload)
         inventory = {
@@ -223,6 +229,21 @@ def test_deployment_verifier_matches_full_checked_in_inventory_canonicalization(
     )
 
 
+def test_full_inventory_and_verifier_environment_fit_azure_deployment_script_limit() -> None:
+    inventory = json.loads(
+        (
+            ROOT / "infra" / "wc024-monitoring-foundation" / "effective-rbac-inventory.example.json"
+        ).read_text(encoding="utf-8")
+    )
+    environment, _ = _reviewed_payload(inventory=inventory)
+    caller_environment_payload = "|".join(
+        f"{name}={value}" for name, value in environment.items()
+    )
+
+    assert len(json.dumps(inventory, separators=(",", ":")).encode("utf-8")) <= 62_000
+    assert len(caller_environment_payload.encode("utf-8")) <= 64_000
+
+
 def test_deployment_verifier_rejects_inventory_changed_after_review(
     tmp_path: Path,
 ) -> None:
@@ -238,6 +259,41 @@ def test_deployment_verifier_rejects_inventory_changed_after_review(
 
     assert result.returncode == 1
     assert "inventory digest is invalid" in result.stderr
+    assert not output_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value", "message"),
+    (
+        (
+            "resourceGraphQueryRoleActions",
+            [],
+            "Resource Graph query permission",
+        ),
+        (
+            "resourceHealthRoleActions",
+            ["microsoft.resourcegraph/resources/read"],
+            "Resource Health availability permission",
+        ),
+    ),
+)
+def test_deployment_verifier_rejects_missing_resource_health_permissions(
+    tmp_path: Path,
+    field_name: str,
+    value: object,
+    message: str,
+) -> None:
+    _, inventory = _reviewed_payload()
+    inventory[field_name] = value
+    inventory_payload = dict(inventory)
+    inventory_payload.pop("inventoryDigest")
+    inventory["inventoryDigest"] = compute_artifact_digest(inventory_payload)
+    environment, _ = _reviewed_payload(inventory=inventory)
+
+    result, output_path = _run_verifier(tmp_path, environment)
+
+    assert result.returncode == 1
+    assert message in result.stderr
     assert not output_path.exists()
 
 

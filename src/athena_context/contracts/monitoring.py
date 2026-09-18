@@ -44,8 +44,11 @@ MONITORING_PREVIOUS_MEASURED_RBAC_COLLECTOR_CONTRACT_SCHEMA_VERSION = (
 MONITORING_PREVIOUS_PERMISSION_ATTESTED_COLLECTOR_CONTRACT_SCHEMA_VERSION = (
     "athena.wc028MonitoringCollectorContract.v8"
 )
-MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION = (
+MONITORING_PREVIOUS_TRUST_HARDENED_COLLECTOR_CONTRACT_SCHEMA_VERSION = (
     "athena.wc028MonitoringCollectorContract.v9"
+)
+MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION = (
+    "athena.wc028MonitoringCollectorContract.v10"
 )
 MONITORING_EVIDENCE_HANDOFF_SCHEMA_VERSION = "athena.wc024MonitoringEvidenceHandoff.v1"
 MONITORING_PREVIOUS_ACQUISITION_RECEIPT_SCHEMA_VERSION = (
@@ -56,8 +59,11 @@ MONITORING_PREVIOUS_INCIDENT_BOUND_ACQUISITION_RECEIPT_SCHEMA_VERSION = (
 )
 MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION = "athena.wc028MonitoringAcquisitionReceipt.v6"
 MONITORING_ACQUISITION_HANDOFF_SCHEMA_VERSION = "athena.wc028MonitoringEvidenceHandoff.v2"
-MONITORING_EFFECTIVE_RBAC_INVENTORY_SCHEMA_VERSION = (
+MONITORING_PREVIOUS_EFFECTIVE_RBAC_INVENTORY_SCHEMA_VERSION = (
     "athena.wc028MonitoringEffectiveRbacInventory.v4"
+)
+MONITORING_EFFECTIVE_RBAC_INVENTORY_SCHEMA_VERSION = (
+    "athena.wc028MonitoringEffectiveRbacInventory.v5"
 )
 MONITORING_RUNTIME_REPLAY_BINDING_SCHEMA_VERSION = "athena.wc028MonitoringPersistenceReplay.v3"
 _LEGACY_MONITORING_IDENTITY_PROOF_AUDIENCE = "api://athena-monitoring-identity-proof"
@@ -94,6 +100,7 @@ type MonitoringReadOperation = Literal[
     "Microsoft.Network/networkWatchers/ipFlowVerify/read",
     "Microsoft.ResourceHealth/AvailabilityStatuses/read",
     "Microsoft.ResourceHealth/AvailabilityStatuses/current/read",
+    "Microsoft.ResourceHealth/availabilityStatuses/read",
     "Microsoft.ResourceGraph/resources/read",
     "Microsoft.Insights/logs/Heartbeat/read",
     "Microsoft.Insights/logs/VMConnection/read",
@@ -109,9 +116,13 @@ type MonitoringIpFlowVerifyOperation = Literal[
     "Microsoft.Network/networkWatchers/ipFlowVerify/action",
     "Microsoft.Network/networkWatchers/ipFlowVerify/read",
 ]
+type MonitoringResourceGraphQueryOperation = Literal[
+    "Microsoft.ResourceGraph/resources/read",
+]
 type MonitoringResourceHealthOperation = Literal[
     "Microsoft.ResourceHealth/AvailabilityStatuses/read",
     "Microsoft.ResourceHealth/AvailabilityStatuses/current/read",
+    "Microsoft.ResourceHealth/availabilityStatuses/read",
     "Microsoft.ResourceGraph/resources/read",
 ]
 type MonitoringResourceLogOperation = Literal[
@@ -190,6 +201,7 @@ _SIGNAL_READER_ROLE_DEFINITION_GUID = "2fda1d90-37da-55d9-8ac3-132fb7bdca5d"
 _RESOURCE_LOG_READER_ROLE_DEFINITION_GUID = "f33a4363-5d9a-5d50-9871-c08582234978"
 _LOG_ANALYTICS_DATA_READER_ROLE_DEFINITION_GUID = "3b03c2da-16b3-4a49-8834-0f8130efdd3b"
 _IP_FLOW_VERIFY_ROLE_DEFINITION_GUID = "3728cdf6-4efd-5282-bdfc-63b7872fd801"
+_RESOURCE_GRAPH_QUERY_ROLE_DEFINITION_GUID = "5687977f-aa06-5699-8e18-1a54a074b532"
 _RESOURCE_HEALTH_ROLE_DEFINITION_GUID = "0790d6f2-9553-5b63-84ac-56596b7e4072"
 _RBAC_ATTESTOR_ROLE_DEFINITION_GUID = "2a8d9aea-2688-5841-a7e4-82f23d0f1bac"
 _PREVIOUS_STORAGE_BLOB_DATA_CONTRIBUTOR_ROLE_DEFINITION_GUID = (
@@ -199,6 +211,7 @@ _KEY_VAULT_CRYPTO_USER_ROLE_DEFINITION_GUID = "12338af0-0e69-4776-bea7-57ae8d297
 _SIGNAL_READER_ROLE_NAME_PREFIX = "Athena WC016 Approved Signal Reader "
 _RESOURCE_LOG_READER_ROLE_NAME = "Athena WC-028 VM Resource Log Reader"
 _IP_FLOW_VERIFY_ROLE_NAME = "Athena WC-028 Network Watcher IP Flow Verify"
+_RESOURCE_GRAPH_QUERY_ROLE_NAME = "Athena WC-028 Resource Graph Query Submitter"
 _RESOURCE_HEALTH_ROLE_NAME = "Athena WC-028 VM Resource Health Reader"
 _RBAC_ATTESTOR_ROLE_NAME = "Athena WC-028 Effective RBAC Attestor"
 _PREVIOUS_STORAGE_BLOB_DATA_CONTRIBUTOR_ROLE_NAME = "Storage Blob Data Contributor"
@@ -326,8 +339,16 @@ _EXPECTED_PREVIOUS_ACQUISITION_READ_OPERATIONS: tuple[MonitoringReadOperation, .
     *_EXPECTED_READ_OPERATIONS,
     *_EXPECTED_IP_FLOW_VERIFY_OPERATIONS,
 )
-_EXPECTED_RESOURCE_HEALTH_OPERATIONS: tuple[MonitoringResourceHealthOperation, ...] = (
+_EXPECTED_PREVIOUS_PERMISSION_ATTESTED_RESOURCE_HEALTH_OPERATIONS: tuple[
+    MonitoringResourceHealthOperation, ...
+] = (
     "Microsoft.ResourceGraph/resources/read",
+)
+_EXPECTED_RESOURCE_GRAPH_QUERY_OPERATIONS: tuple[MonitoringResourceGraphQueryOperation, ...] = (
+    "Microsoft.ResourceGraph/resources/read",
+)
+_EXPECTED_RESOURCE_HEALTH_OPERATIONS: tuple[MonitoringResourceHealthOperation, ...] = (
+    "Microsoft.ResourceHealth/availabilityStatuses/read",
 )
 _EXPECTED_RESOURCE_LOG_OPERATIONS: tuple[MonitoringResourceLogOperation, ...] = (
     "Microsoft.Insights/Logs/Heartbeat/Read",
@@ -384,8 +405,16 @@ _EXPECTED_PREVIOUS_MEASURED_RBAC_READ_OPERATIONS: tuple[MonitoringReadOperation,
     *_EXPECTED_PREVIOUS_RESOURCE_HEALTH_OPERATIONS,
     *_EXPECTED_PREVIOUS_RESOURCE_LOG_OPERATIONS,
 )
+_EXPECTED_PREVIOUS_PERMISSION_ATTESTED_READ_OPERATIONS: tuple[
+    MonitoringReadOperation, ...
+] = (
+    *_EXPECTED_READ_OPERATIONS[3:],
+    *_EXPECTED_PREVIOUS_PERMISSION_ATTESTED_RESOURCE_HEALTH_OPERATIONS,
+    *_EXPECTED_RESOURCE_LOG_OPERATIONS,
+)
 _EXPECTED_ACQUISITION_READ_OPERATIONS: tuple[MonitoringReadOperation, ...] = (
     *_EXPECTED_READ_OPERATIONS[3:],
+    *_EXPECTED_RESOURCE_GRAPH_QUERY_OPERATIONS,
     *_EXPECTED_RESOURCE_HEALTH_OPERATIONS,
     *_EXPECTED_RESOURCE_LOG_OPERATIONS,
 )
@@ -1870,6 +1899,7 @@ class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
         "athena.wc028MonitoringEffectiveRbacInventory.v2",
         "athena.wc028MonitoringEffectiveRbacInventory.v3",
         "athena.wc028MonitoringEffectiveRbacInventory.v4",
+        "athena.wc028MonitoringEffectiveRbacInventory.v5",
     ] = Field(alias="schemaVersion")
     collection_run_id: str = Field(
         alias="collectionRunId",
@@ -1990,6 +2020,12 @@ class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
         alias="ipFlowVerifyRoleActions",
         min_length=2,
         max_length=2,
+    )
+    resource_graph_query_role_actions: tuple[str, ...] | None = Field(
+        default=None,
+        alias="resourceGraphQueryRoleActions",
+        min_length=1,
+        max_length=1,
     )
     resource_health_role_actions: tuple[str, ...] = Field(
         alias="resourceHealthRoleActions",
@@ -2193,10 +2229,16 @@ class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
     @field_validator(
         "signal_reader_role_actions",
         "resource_log_reader_role_actions",
+        "resource_graph_query_role_actions",
         "resource_health_role_actions",
     )
     @classmethod
-    def normalize_role_actions(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+    def normalize_role_actions(
+        cls,
+        values: tuple[str, ...] | None,
+    ) -> tuple[str, ...] | None:
+        if values is None:
+            return None
         normalized = tuple(sorted(item.casefold() for item in values))
         if len(normalized) != len(set(normalized)):
             raise ValueError("effective RBAC role actions must be sorted and unique")
@@ -2426,6 +2468,17 @@ class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
             self.runtime_support_grants,
             self.runtime_support_principal_evidence,
         )
+        if self.schema_version == MONITORING_EFFECTIVE_RBAC_INVENTORY_SCHEMA_VERSION:
+            if self.resource_graph_query_role_actions != tuple(
+                item.casefold() for item in _EXPECTED_RESOURCE_GRAPH_QUERY_OPERATIONS
+            ):
+                raise ValueError(
+                    "effective RBAC inventory v5 requires the exact Resource Graph query action"
+                )
+        elif self.resource_graph_query_role_actions is not None:
+            raise ValueError(
+                "effective RBAC inventory v1-v4 cannot contain Resource Graph query-role actions"
+            )
         if self.schema_version == "athena.wc028MonitoringEffectiveRbacInventory.v1":
             if (
                 any(
@@ -2492,7 +2545,11 @@ class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
                     )
                 )
                 or (
-                    self.schema_version != MONITORING_EFFECTIVE_RBAC_INVENTORY_SCHEMA_VERSION
+                    self.schema_version
+                    not in {
+                        MONITORING_PREVIOUS_EFFECTIVE_RBAC_INVENTORY_SCHEMA_VERSION,
+                        MONITORING_EFFECTIVE_RBAC_INVENTORY_SCHEMA_VERSION,
+                    }
                     and any(
                         item.condition is not None
                         for item in (
@@ -2657,7 +2714,7 @@ class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
                         or any(item is None for item in security_v4_fields)
                     ):
                         raise ValueError(
-                            "effective RBAC inventory v4 requires exact collectable scope evidence"
+                            "effective RBAC inventory v4+ requires exact collectable scope evidence"
                         )
                     collector_attachment = cast(
                         MonitoringManagedIdentityAttachmentEvidence,
@@ -2714,7 +2771,7 @@ class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
                         or exclusive_principals.second_read_completed_at > self.collected_at
                     ):
                         raise ValueError(
-                            "effective RBAC inventory v4 runtime and "
+                            "effective RBAC inventory v4+ runtime and "
                             "subscription-wide evidence is invalid"
                         )
                     normalized_record_digests.update(
@@ -2760,7 +2817,11 @@ class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
                         )
                     )
                     or (
-                        self.schema_version == MONITORING_EFFECTIVE_RBAC_INVENTORY_SCHEMA_VERSION
+                        self.schema_version
+                        in {
+                            MONITORING_PREVIOUS_EFFECTIVE_RBAC_INVENTORY_SCHEMA_VERSION,
+                            MONITORING_EFFECTIVE_RBAC_INVENTORY_SCHEMA_VERSION,
+                        }
                         and (
                             runtime_support_evidence is None
                             or runtime_support_evidence.role_assignment_raw_page_digests is not None
@@ -3146,6 +3207,7 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
         "athena.wc028MonitoringCollectorContract.v7",
         "athena.wc028MonitoringCollectorContract.v8",
         "athena.wc028MonitoringCollectorContract.v9",
+        "athena.wc028MonitoringCollectorContract.v10",
     ] = Field(alias="schemaVersion")
     collector_identity_resource_id: str = Field(
         alias="collectorIdentityResourceId",
@@ -3595,6 +3657,32 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
         default=None,
         alias="identityProofMaximumLifetimeSeconds",
     )
+    resource_graph_query_role_definition_id: str | None = Field(
+        default=None,
+        alias="resourceGraphQueryRoleDefinitionId",
+        min_length=1,
+        max_length=2048,
+    )
+    resource_graph_query_role_name: str | None = Field(
+        default=None,
+        alias="resourceGraphQueryRoleName",
+        min_length=1,
+        max_length=256,
+    )
+    resource_graph_query_scope_id: str | None = Field(
+        default=None,
+        alias="resourceGraphQueryScopeId",
+        min_length=1,
+        max_length=2048,
+    )
+    resource_graph_query_allowed_operations: (
+        tuple[MonitoringResourceGraphQueryOperation, ...] | None
+    ) = Field(
+        default=None,
+        alias="resourceGraphQueryAllowedOperations",
+        min_length=len(_EXPECTED_RESOURCE_GRAPH_QUERY_OPERATIONS),
+        max_length=len(_EXPECTED_RESOURCE_GRAPH_QUERY_OPERATIONS),
+    )
     resource_health_role_definition_id: str | None = Field(
         default=None,
         alias="resourceHealthRoleDefinitionId",
@@ -3918,6 +4006,7 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
         "runtime_support_storage_reader_role_definition_id",
         "runtime_support_storage_reader_role_assignment_id",
         "runtime_support_storage_reader_scope_id",
+        "resource_graph_query_scope_id",
     )
     @classmethod
     def canonicalize_reviewer_verifier_resource_id(
@@ -3958,6 +4047,7 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
                 MONITORING_PREVIOUS_PRODUCTION_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
                 MONITORING_PREVIOUS_MEASURED_RBAC_COLLECTOR_CONTRACT_SCHEMA_VERSION,
                 MONITORING_PREVIOUS_PERMISSION_ATTESTED_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+                MONITORING_PREVIOUS_TRUST_HARDENED_COLLECTOR_CONTRACT_SCHEMA_VERSION,
                 MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
             }
             and self.handoff_schema_version != MONITORING_ACQUISITION_HANDOFF_SCHEMA_VERSION
@@ -3965,11 +4055,13 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
             raise ValueError("collector contract version does not authorize its handoff schema")
         if self.signal_kinds != _EXPECTED_SIGNALS:
             raise ValueError("monitoring signals must use the complete reviewed generic allowlist")
-        if self.schema_version in {
-            MONITORING_PREVIOUS_PERMISSION_ATTESTED_COLLECTOR_CONTRACT_SCHEMA_VERSION,
-            MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
-        }:
+        if self.schema_version == MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION:
             expected_read_operations = _EXPECTED_ACQUISITION_READ_OPERATIONS
+        elif self.schema_version in {
+            MONITORING_PREVIOUS_PERMISSION_ATTESTED_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+            MONITORING_PREVIOUS_TRUST_HARDENED_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+        }:
+            expected_read_operations = _EXPECTED_PREVIOUS_PERMISSION_ATTESTED_READ_OPERATIONS
         elif (
             self.schema_version
             == MONITORING_PREVIOUS_MEASURED_RBAC_COLLECTOR_CONTRACT_SCHEMA_VERSION
@@ -4039,6 +4131,12 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
             self.resource_health_role_definition_id,
             self.resource_health_scope_ids,
             self.resource_health_allowed_operations,
+        )
+        resource_graph_query_fields = (
+            self.resource_graph_query_role_definition_id,
+            self.resource_graph_query_role_name,
+            self.resource_graph_query_scope_id,
+            self.resource_graph_query_allowed_operations,
         )
         measured_rbac_common_fields = (
             self.signal_reader_role_name,
@@ -4194,6 +4292,7 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
                 )
         if self.schema_version in {
             MONITORING_PREVIOUS_PERMISSION_ATTESTED_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+            MONITORING_PREVIOUS_TRUST_HARDENED_COLLECTOR_CONTRACT_SCHEMA_VERSION,
             MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
         }:
             if any(item is None for item in credential_fields) or any(
@@ -4207,7 +4306,10 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
                     "current collector contract requires credential-bound acquisition "
                     "without IP Flow authorization"
                 )
-            if self.schema_version == MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION:
+            if self.schema_version in {
+                MONITORING_PREVIOUS_TRUST_HARDENED_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+                MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+            }:
                 if (
                     any(item is None for item in runtime_binding_fields)
                     or self.collector_runtime_resource_id == self.rbac_attestor_runtime_resource_id
@@ -4253,6 +4355,7 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
             MONITORING_PREVIOUS_PRODUCTION_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
             MONITORING_PREVIOUS_MEASURED_RBAC_COLLECTOR_CONTRACT_SCHEMA_VERSION,
             MONITORING_PREVIOUS_PERMISSION_ATTESTED_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+            MONITORING_PREVIOUS_TRUST_HARDENED_COLLECTOR_CONTRACT_SCHEMA_VERSION,
             MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
         } and (
             any(item is None for item in identity_proof_policy_fields)
@@ -4282,6 +4385,7 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
                 )
         if self.schema_version in {
             MONITORING_PREVIOUS_PERMISSION_ATTESTED_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+            MONITORING_PREVIOUS_TRUST_HARDENED_COLLECTOR_CONTRACT_SCHEMA_VERSION,
             MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
         }:
             expected_current_audience = (
@@ -4323,24 +4427,35 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
             != MONITORING_PREVIOUS_INCIDENT_BOUND_ACQUISITION_RECEIPT_SCHEMA_VERSION
         ):
             raise ValueError("collector contracts v7-v8 must use acquisition receipt v5")
-        if (
-            self.schema_version == MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION
-            and self.acquisition_receipt_schema_version
-            != MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION
+        if self.schema_version in {
+            MONITORING_PREVIOUS_TRUST_HARDENED_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+            MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+        } and (
+            self.acquisition_receipt_schema_version != MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION
         ):
-            raise ValueError("current collector contract must use acquisition receipt v6")
+            raise ValueError("collector contracts v9-v10 must use acquisition receipt v6")
         if (
             self.schema_version == MONITORING_IDENTITY_PROOF_COLLECTOR_CONTRACT_SCHEMA_VERSION
-            and any(item is not None for item in resource_health_fields)
+            and any(
+                item is not None for item in (*resource_health_fields, *resource_graph_query_fields)
+            )
         ):
             raise ValueError(
                 "legacy identity-proof collector contract cannot contain Resource Health policy"
+            )
+        if (
+            self.schema_version != MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION
+            and any(item is not None for item in resource_graph_query_fields)
+        ):
+            raise ValueError(
+                "legacy collector contracts cannot contain Resource Graph query-role policy"
             )
         if self.schema_version in {
             MONITORING_PREVIOUS_PRODUCTION_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
             MONITORING_PREVIOUS_MEASURED_RBAC_COLLECTOR_CONTRACT_SCHEMA_VERSION,
         } and (
             any(item is None for item in resource_health_fields)
+            or any(item is not None for item in resource_graph_query_fields)
             or self.resource_health_allowed_operations
             != _EXPECTED_PREVIOUS_RESOURCE_HEALTH_OPERATIONS
         ):
@@ -4349,13 +4464,25 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
             )
         if self.schema_version in {
             MONITORING_PREVIOUS_PERMISSION_ATTESTED_COLLECTOR_CONTRACT_SCHEMA_VERSION,
-            MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+            MONITORING_PREVIOUS_TRUST_HARDENED_COLLECTOR_CONTRACT_SCHEMA_VERSION,
         } and (
             any(item is None for item in resource_health_fields)
+            or any(item is not None for item in resource_graph_query_fields)
+            or self.resource_health_allowed_operations
+            != _EXPECTED_PREVIOUS_PERMISSION_ATTESTED_RESOURCE_HEALTH_OPERATIONS
+        ):
+            raise ValueError(
+                "collector contracts v8-v9 require their exact historical Resource Graph policy"
+            )
+        if self.schema_version == MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION and (
+            any(item is None for item in (*resource_health_fields, *resource_graph_query_fields))
+            or self.resource_graph_query_allowed_operations
+            != _EXPECTED_RESOURCE_GRAPH_QUERY_OPERATIONS
             or self.resource_health_allowed_operations != _EXPECTED_RESOURCE_HEALTH_OPERATIONS
         ):
             raise ValueError(
-                "current collector contract requires exact current Resource Health policy"
+                "current collector contract requires separate exact Resource Graph query and "
+                "Resource Health availability policies"
             )
         legacy_measured_fields = (
             *measured_rbac_common_fields,
@@ -4364,6 +4491,7 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
         if self.schema_version not in {
             MONITORING_PREVIOUS_MEASURED_RBAC_COLLECTOR_CONTRACT_SCHEMA_VERSION,
             MONITORING_PREVIOUS_PERMISSION_ATTESTED_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+            MONITORING_PREVIOUS_TRUST_HARDENED_COLLECTOR_CONTRACT_SCHEMA_VERSION,
             MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
         } and any(
             item is not None
@@ -4423,7 +4551,10 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
             )
         ):
             raise ValueError("collector contract v8 requires its published measured RBAC policy")
-        if self.schema_version == MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION and (
+        if self.schema_version in {
+            MONITORING_PREVIOUS_TRUST_HARDENED_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+            MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+        } and (
             any(
                 item is None
                 for item in (
@@ -4439,7 +4570,7 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
             or self.workspace_access_control_mode != "workspaceAndResourceContext"
         ):
             raise ValueError(
-                "current collector contract requires permission-attested resource-context logs "
+                "collector contracts v9-v10 require permission-attested resource-context logs "
                 "and separate measured RBAC attestation"
             )
         try:
@@ -4497,6 +4628,7 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
             raise ValueError("collector contract v7 role names do not match deployed roles")
         if self.schema_version in {
             MONITORING_PREVIOUS_PERMISSION_ATTESTED_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+            MONITORING_PREVIOUS_TRUST_HARDENED_COLLECTOR_CONTRACT_SCHEMA_VERSION,
             MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
         } and (
             cast(str, self.signal_reader_role_name).startswith(_SIGNAL_READER_ROLE_NAME_PREFIX)
@@ -4507,10 +4639,19 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
         ):
             raise ValueError("current collector contract role names do not match deployed roles")
         if (
-            self.schema_version == MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION
+            self.schema_version
+            in {
+                MONITORING_PREVIOUS_TRUST_HARDENED_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+                MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+            }
             and self.evidence_writer_role_name != _EVIDENCE_WRITER_ROLE_NAME
         ):
             raise ValueError("current collector contract evidence-writer role name is invalid")
+        if (
+            self.schema_version == MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION
+            and self.resource_graph_query_role_name != _RESOURCE_GRAPH_QUERY_ROLE_NAME
+        ):
+            raise ValueError("current collector contract Resource Graph query role name is invalid")
 
         expected_role_definition_ids = (
             (
@@ -4593,6 +4734,7 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
             raise ValueError("signal-reader scopes must match the exact reviewed VMs")
         if self.schema_version in {
             MONITORING_PREVIOUS_MEASURED_RBAC_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+            MONITORING_PREVIOUS_TRUST_HARDENED_COLLECTOR_CONTRACT_SCHEMA_VERSION,
             MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
         }:
             expected_resource_log_role_definition_id = (
@@ -4616,6 +4758,7 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
         if self.schema_version in {
             MONITORING_PREVIOUS_PRODUCTION_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
             MONITORING_PREVIOUS_MEASURED_RBAC_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+            MONITORING_PREVIOUS_TRUST_HARDENED_COLLECTOR_CONTRACT_SCHEMA_VERSION,
             MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
         }:
             expected_resource_health_role_definition_id = (
@@ -4635,6 +4778,27 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
             ) != tuple(scope.casefold() for scope in expected_signal_read_scope_ids):
                 raise ValueError("Resource Health assignments must match the exact approved VMs")
         if self.schema_version == MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION:
+            expected_resource_graph_query_role_definition_id = (
+                f"/subscriptions/{monitoring_subscription}/providers/"
+                "Microsoft.Authorization/roleDefinitions/"
+                f"{_RESOURCE_GRAPH_QUERY_ROLE_DEFINITION_GUID}"
+            )
+            expected_resource_graph_query_scope_id = (
+                f"/subscriptions/{monitoring_subscription}"
+            )
+            if (
+                cast(str, self.resource_graph_query_role_definition_id).casefold()
+                != expected_resource_graph_query_role_definition_id.casefold()
+                or cast(str, self.resource_graph_query_scope_id).casefold().rstrip("/")
+                != expected_resource_graph_query_scope_id.casefold()
+            ):
+                raise ValueError(
+                    "Resource Graph query role must use the exact subscription-scoped definition"
+                )
+        if self.schema_version in {
+            MONITORING_PREVIOUS_TRUST_HARDENED_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+            MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+        }:
             table_plans = cast(
                 tuple[MonitoringResourceContextTablePlan, ...],
                 self.resource_context_table_plans,
@@ -4694,7 +4858,10 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
                 != (
                     _EXPECTED_RBAC_ATTESTOR_OPERATIONS
                     if self.schema_version
-                    == MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION
+                    in {
+                        MONITORING_PREVIOUS_TRUST_HARDENED_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+                        MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+                    }
                     else _EXPECTED_PREVIOUS_RBAC_ATTESTOR_OPERATIONS
                 )
             ):
@@ -4792,6 +4959,7 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
         if self.schema_version in {
             MONITORING_PREVIOUS_MEASURED_RBAC_COLLECTOR_CONTRACT_SCHEMA_VERSION,
             MONITORING_PREVIOUS_PERMISSION_ATTESTED_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+            MONITORING_PREVIOUS_TRUST_HARDENED_COLLECTOR_CONTRACT_SCHEMA_VERSION,
             MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
         }:
             evidence_container_id = cast(str, self.evidence_container_resource_id)
@@ -4801,7 +4969,11 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
                     _EVIDENCE_WRITER_ROLE_GUID_SEED,
                     evidence_container_id.casefold().rstrip("/"),
                 )
-                if self.schema_version == MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION
+                if self.schema_version
+                in {
+                    MONITORING_PREVIOUS_TRUST_HARDENED_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+                    MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+                }
                 else _PREVIOUS_STORAGE_BLOB_DATA_CONTRIBUTOR_ROLE_DEFINITION_GUID
             )
             expected_evidence_writer_role_id = (
@@ -4866,7 +5038,10 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
                 raise ValueError(
                     "evidence container must match the exact monitoring storage boundary"
                 )
-            if self.schema_version == MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION:
+            if self.schema_version in {
+                MONITORING_PREVIOUS_TRUST_HARDENED_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+                MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+            }:
                 evidence_blob_service_id = cast(
                     str,
                     self.evidence_blob_service_resource_id,
@@ -5049,7 +5224,12 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
                     != tuple(sorted(item.casefold() for item in _EXPECTED_RESOURCE_LOG_OPERATIONS))
                     or inventory.ip_flow_verify_role_actions is not None
                     or inventory.resource_health_role_actions
-                    != tuple(item.casefold() for item in _EXPECTED_RESOURCE_HEALTH_OPERATIONS)
+                    != tuple(
+                        item.casefold()
+                        for item in (
+                            _EXPECTED_PREVIOUS_PERMISSION_ATTESTED_RESOURCE_HEALTH_OPERATIONS
+                        )
+                    )
                     or inventory.attestor_identity_resource_id
                     != cast(str, self.rbac_attestor_identity_resource_id).casefold().rstrip("/")
                     or inventory.attestor_client_id != self.rbac_attestor_identity_client_id
@@ -5064,13 +5244,33 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
                     inventory,
                 )
             else:
+                current_resource_health_authorization = (
+                    self.schema_version == MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION
+                )
+                expected_inventory_schema_version = (
+                    MONITORING_EFFECTIVE_RBAC_INVENTORY_SCHEMA_VERSION
+                    if current_resource_health_authorization
+                    else MONITORING_PREVIOUS_EFFECTIVE_RBAC_INVENTORY_SCHEMA_VERSION
+                )
+                expected_resource_health_role_actions = (
+                    _EXPECTED_RESOURCE_HEALTH_OPERATIONS
+                    if current_resource_health_authorization
+                    else _EXPECTED_PREVIOUS_PERMISSION_ATTESTED_RESOURCE_HEALTH_OPERATIONS
+                )
+                expected_resource_graph_query_role_actions = (
+                    tuple(item.casefold() for item in _EXPECTED_RESOURCE_GRAPH_QUERY_OPERATIONS)
+                    if current_resource_health_authorization
+                    else None
+                )
                 if (
-                    inventory.schema_version != MONITORING_EFFECTIVE_RBAC_INVENTORY_SCHEMA_VERSION
+                    inventory.schema_version != expected_inventory_schema_version
                     or inventory.resource_log_reader_role_actions
                     != tuple(sorted(item.casefold() for item in _EXPECTED_RESOURCE_LOG_OPERATIONS))
                     or inventory.ip_flow_verify_role_actions is not None
+                    or inventory.resource_graph_query_role_actions
+                    != expected_resource_graph_query_role_actions
                     or inventory.resource_health_role_actions
-                    != tuple(item.casefold() for item in _EXPECTED_RESOURCE_HEALTH_OPERATIONS)
+                    != tuple(item.casefold() for item in expected_resource_health_role_actions)
                     or inventory.attestor_identity_resource_id
                     != cast(str, self.rbac_attestor_identity_resource_id).casefold().rstrip("/")
                     or inventory.attestor_client_id != self.rbac_attestor_identity_client_id
@@ -5078,7 +5278,8 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
                     or inventory.attestor_tenant_id != self.rbac_attestor_tenant_id
                 ):
                     raise ValueError(
-                        "current effective RBAC inventory does not bind the separate attestor"
+                        "version-bound effective RBAC inventory does not bind both authorization "
+                        "roles and the separate attestor"
                     )
                 _validate_current_effective_rbac_evidence(self, inventory)
                 if any(item is None for item in reviewer_attestation_fields):
@@ -5244,20 +5445,29 @@ def _expected_monitoring_effective_rbac_grants(
             role_definition_name=(
                 _EVIDENCE_WRITER_ROLE_NAME
                 if contract.schema_version
-                == MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION
+                in {
+                    MONITORING_PREVIOUS_TRUST_HARDENED_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+                    MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+                }
                 else _PREVIOUS_STORAGE_BLOB_DATA_CONTRIBUTOR_ROLE_NAME
             ),
             assignment_scope_ids=(cast(str, contract.evidence_container_resource_id),),
             condition=(
                 _EVIDENCE_WRITER_ASSIGNMENT_CONDITION
                 if contract.schema_version
-                == MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION
+                in {
+                    MONITORING_PREVIOUS_TRUST_HARDENED_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+                    MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+                }
                 else None
             ),
             condition_version=(
                 "2.0"
                 if contract.schema_version
-                == MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION
+                in {
+                    MONITORING_PREVIOUS_TRUST_HARDENED_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+                    MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION,
+                }
                 else None
             ),
         ),
@@ -5271,6 +5481,15 @@ def _expected_monitoring_effective_rbac_grants(
             assignment_scope_ids=(cast(str, contract.signing_key_arm_resource_id),),
         ),
     ]
+    if contract.resource_graph_query_role_definition_id is not None:
+        grants.append(
+            _effective_rbac_grant(
+                principal_id=principal_id,
+                role_definition_id=contract.resource_graph_query_role_definition_id,
+                role_definition_name=cast(str, contract.resource_graph_query_role_name),
+                assignment_scope_ids=(cast(str, contract.resource_graph_query_scope_id),),
+            )
+        )
     if contract.ip_flow_verify_role_definition_id is not None:
         grants.append(
             _effective_rbac_grant(
@@ -5311,6 +5530,11 @@ def _effective_grant_affects_acquisition_scope(
         *(item.casefold().rstrip("/") for item in contract.signal_read_scope_ids),
         *(item.casefold().rstrip("/") for item in contract.resource_log_read_scope_ids or ()),
         *(item.casefold().rstrip("/") for item in contract.resource_health_scope_ids or ()),
+        *(
+            (contract.resource_graph_query_scope_id.casefold().rstrip("/"),)
+            if contract.resource_graph_query_scope_id is not None
+            else ()
+        ),
     }
     if contract.ip_flow_verify_scope_id is not None:
         protected_scopes.add(contract.ip_flow_verify_scope_id.casefold().rstrip("/"))
@@ -5580,7 +5804,10 @@ def _validate_previous_permission_attested_effective_rbac_evidence(
             sorted(item.casefold() for item in _EXPECTED_RESOURCE_LOG_OPERATIONS)
         ),
         cast(str, contract.resource_health_role_definition_id).casefold(): tuple(
-            sorted(item.casefold() for item in _EXPECTED_RESOURCE_HEALTH_OPERATIONS)
+            sorted(
+                item.casefold()
+                for item in _EXPECTED_PREVIOUS_PERMISSION_ATTESTED_RESOURCE_HEALTH_OPERATIONS
+            )
         ),
         attestor_role_id: tuple(
             sorted(item.casefold() for item in _EXPECTED_PREVIOUS_RBAC_ATTESTOR_OPERATIONS)
@@ -5642,7 +5869,7 @@ def _validate_previous_permission_attested_effective_rbac_evidence(
                 "Microsoft.Compute/virtualMachines/instanceView/read",
                 "Microsoft.Insights/metrics/read",
                 *_EXPECTED_RESOURCE_LOG_OPERATIONS,
-                *_EXPECTED_RESOURCE_HEALTH_OPERATIONS,
+                *_EXPECTED_PREVIOUS_PERMISSION_ATTESTED_RESOURCE_HEALTH_OPERATIONS,
             )
         )
     for scope in contract.resource_read_scope_ids:
@@ -5703,8 +5930,18 @@ def _validate_current_effective_rbac_evidence(
     contract: MonitoringCollectorContract,
     inventory: MonitoringEffectiveRbacInventory,
 ) -> None:
-    if inventory.schema_version != MONITORING_EFFECTIVE_RBAC_INVENTORY_SCHEMA_VERSION:
-        raise ValueError("current collector contract requires effective RBAC inventory v4")
+    is_current_resource_health_authorization = (
+        contract.schema_version == MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION
+    )
+    expected_inventory_schema_version = (
+        MONITORING_EFFECTIVE_RBAC_INVENTORY_SCHEMA_VERSION
+        if is_current_resource_health_authorization
+        else MONITORING_PREVIOUS_EFFECTIVE_RBAC_INVENTORY_SCHEMA_VERSION
+    )
+    if inventory.schema_version != expected_inventory_schema_version:
+        raise ValueError(
+            "collector contract requires its version-bound effective RBAC inventory"
+        )
     expected_targets = _expected_effective_rbac_target_scopes(contract, inventory)
     collector_evidence = cast(
         MonitoringEffectiveRbacPrincipalEvidence,
@@ -5907,6 +6144,11 @@ def _validate_current_effective_rbac_evidence(
             "effective RBAC role-definition evidence is missing or contains an unreferenced role"
         )
 
+    expected_resource_health_operations = (
+        _EXPECTED_RESOURCE_HEALTH_OPERATIONS
+        if is_current_resource_health_authorization
+        else _EXPECTED_PREVIOUS_PERMISSION_ATTESTED_RESOURCE_HEALTH_OPERATIONS
+    )
     exact_control_plane_roles = {
         cast(str, contract.signal_reader_role_definition_id).casefold(): tuple(
             sorted(
@@ -5920,7 +6162,7 @@ def _validate_current_effective_rbac_evidence(
             sorted(item.casefold() for item in _EXPECTED_RESOURCE_LOG_OPERATIONS)
         ),
         cast(str, contract.resource_health_role_definition_id).casefold(): tuple(
-            sorted(item.casefold() for item in _EXPECTED_RESOURCE_HEALTH_OPERATIONS)
+            sorted(item.casefold() for item in expected_resource_health_operations)
         ),
         attestor_role_id: tuple(
             sorted(item.casefold() for item in _EXPECTED_RBAC_ATTESTOR_OPERATIONS)
@@ -5932,6 +6174,10 @@ def _validate_current_effective_rbac_evidence(
             sorted(item.casefold() for item in _EXPECTED_STORAGE_READBACK_OPERATIONS)
         ),
     }
+    if is_current_resource_health_authorization:
+        exact_control_plane_roles[
+            cast(str, contract.resource_graph_query_role_definition_id).casefold()
+        ] = tuple(sorted(item.casefold() for item in _EXPECTED_RESOURCE_GRAPH_QUERY_OPERATIONS))
     for role_id, expected_actions in exact_control_plane_roles.items():
         role = roles_by_id.get(role_id)
         if (
@@ -5999,8 +6245,16 @@ def _validate_current_effective_rbac_evidence(
                 "Microsoft.Compute/virtualMachines/instanceView/read",
                 "Microsoft.Insights/metrics/read",
                 *_EXPECTED_RESOURCE_LOG_OPERATIONS,
-                *_EXPECTED_RESOURCE_HEALTH_OPERATIONS,
+                *expected_resource_health_operations,
             )
+        )
+    if is_current_resource_health_authorization:
+        required_control_actions.extend(
+            (
+                cast(str, contract.resource_graph_query_scope_id),
+                action,
+            )
+            for action in _EXPECTED_RESOURCE_GRAPH_QUERY_OPERATIONS
         )
     for scope in contract.resource_read_scope_ids:
         required_control_actions.extend((scope, action) for action in _EXPECTED_READ_OPERATIONS[3:])
@@ -7356,6 +7610,10 @@ def verify_monitoring_acquisition_receipt_attestation(
         or reviewed_collector_contract.identity_proof_token_version is None
         or reviewed_collector_contract.identity_proof_required_role is None
         or reviewed_collector_contract.identity_proof_maximum_lifetime_seconds is None
+        or reviewed_collector_contract.resource_graph_query_role_definition_id is None
+        or reviewed_collector_contract.resource_graph_query_role_name is None
+        or reviewed_collector_contract.resource_graph_query_scope_id is None
+        or reviewed_collector_contract.resource_graph_query_allowed_operations is None
         or reviewed_collector_contract.resource_health_role_definition_id is None
         or reviewed_collector_contract.resource_health_scope_ids is None
         or reviewed_collector_contract.resource_health_allowed_operations is None

@@ -51,6 +51,10 @@ OUT_OF_SCOPE_VM_ID = (
     "resourceGroups/rg-synthetic-other/providers/Microsoft.Compute/"
     "virtualMachines/synthetic-out-of-scope"
 )
+UNAPPROVED_PEER_VM_ID = (
+    f"{_REVIEWED_CONTRACT.workload_resource_group_id}/providers/"
+    "Microsoft.Compute/virtualMachines/athena-hackathon-peer-01"
+)
 _CONTROL_ID = "monitoring-control-" + "1" * 32
 _CONTROL_DIGEST = "sha256:" + "2" * 64
 _SCOPE_DIGEST = "sha256:" + "3" * 64
@@ -703,6 +707,37 @@ def test_resource_health_client_reads_documented_healthresources_transition() ->
     assert "HealthResources" in body["query"]
     assert "previousAvailabilityState" in body["query"]
     assert PRODUCTION_WEB_ID.casefold() in body["query"]
+
+
+def test_resource_health_client_rejects_unapproved_peer_row() -> None:
+    request = _resource_health_request()
+    transport = _MockTransport(
+        _ResponseSpec(
+            {
+                "data": [
+                    {
+                        "resourceId": UNAPPROVED_PEER_VM_ID,
+                        "occurredAt": (NOW - timedelta(minutes=2)).isoformat(),
+                        "previousStatus": "Available",
+                        "currentStatus": "Unavailable",
+                        "reasonType": "PlatformInitiated",
+                    }
+                ],
+                "resultTruncated": False,
+            }
+        )
+    )
+    client = AzureResourceHealthAcquisitionClient(
+        credential=_Credential(),
+        reviewed_contract=_acquisition_collector_contract(),
+        _transport=transport,
+    )
+
+    with pytest.raises(
+        MonitoringAcquisitionError,
+        match="escaped its exact resource scope",
+    ):
+        client.query_resource_health(request)
 
 
 def test_resource_health_missing_reason_normalizes_to_unknown() -> None:

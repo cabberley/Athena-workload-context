@@ -42,7 +42,7 @@ def test_publisher_is_private_idempotent_and_uses_separated_authorities() -> Non
         "runtimeTrustDomainFingerprints",
         "athena.wc027GuidanceAuthorityPublisherConfiguration.v2",
         "athena.wc027EnrichmentFeedRuntimeConfiguration.v2",
-        "athena.wc028MonitoringCollectorContract.v9",
+        "athena.wc028MonitoringCollectorContract.v10",
         "athena.wc028MonitoringAcquisitionAuthority.v6",
         "monitoringAcquisitionTrust",
         (

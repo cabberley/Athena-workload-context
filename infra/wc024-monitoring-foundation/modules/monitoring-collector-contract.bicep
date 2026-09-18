@@ -96,6 +96,20 @@ param resourceLogReadScopeIds array
 @description('Built-in Log Analytics Data Reader role definition resource ID.')
 param logAnalyticsDataReaderRoleDefinitionId string
 
+@description('Exact custom role definition resource ID for Azure Resource Graph query submission.')
+param resourceGraphQueryRoleDefinitionId string
+
+@description('Exact custom role name for Azure Resource Graph query submission.')
+param resourceGraphQueryRoleName string
+
+@description('Exact subscription scope at which the Resource Graph query operation is authorized.')
+param resourceGraphQueryScopeId string
+
+@description('Exact Azure Resource Graph query operation allowlist.')
+@minLength(1)
+@maxLength(1)
+param resourceGraphQueryAllowedOperations array
+
 @description('Exact custom role definition resource ID for Resource Health availability reads.')
 param resourceHealthRoleDefinitionId string
 
@@ -433,7 +447,7 @@ var validatedAcquisitionWorkspaceAccessControlMode = workspaceAccessControlMode 
   : fail('production monitoring acquisition requires resource-context Log Analytics mode')
 
 output acquisitionCollectorContract object = union(collectorContract, {
-  schemaVersion: 'athena.wc028MonitoringCollectorContract.v9'
+  schemaVersion: 'athena.wc028MonitoringCollectorContract.v10'
   handoffSchemaVersion: 'athena.wc028MonitoringEvidenceHandoff.v2'
   acquisitionReceiptSchemaVersion: 'athena.wc028MonitoringAcquisitionReceipt.v6'
   workspaceAccessControlMode: validatedAcquisitionWorkspaceAccessControlMode
@@ -498,6 +512,10 @@ output acquisitionCollectorContract object = union(collectorContract, {
   identityProofTokenVersion: '1.0'
   identityProofRequiredRole: identityProofAppRoleValue
   identityProofMaximumLifetimeSeconds: 7200
+  resourceGraphQueryRoleDefinitionId: resourceGraphQueryRoleDefinitionId
+  resourceGraphQueryRoleName: resourceGraphQueryRoleName
+  resourceGraphQueryScopeId: resourceGraphQueryScopeId
+  resourceGraphQueryAllowedOperations: resourceGraphQueryAllowedOperations
   resourceHealthRoleDefinitionId: resourceHealthRoleDefinitionId
   resourceHealthRoleName: resourceHealthRoleName
   resourceHealthScopeIds: resourceHealthScopeIds
@@ -529,6 +547,7 @@ output acquisitionCollectorContract object = union(collectorContract, {
       collectorContract.allowedReadOperations,
       operation => !startsWith(toLower(operation), 'microsoft.operationalinsights/workspaces')
     ),
+    resourceGraphQueryAllowedOperations,
     resourceHealthAllowedOperations,
     resourceLogAllowedOperations
   )

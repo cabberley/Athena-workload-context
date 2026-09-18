@@ -36,7 +36,7 @@ guidance-binding key. An invalid signature is rejected before correlation, lifec
 versioned Blob, or unrelated Key Vault access. It does not trust the queued report as a reusable
 verified result. After that outer verification, it creates one production `CorrelationService`,
 rereads every exact version-pinned correlation input, verifies the configured authorities, and
-recomputes the report synchronously. Runtime configuration v2 embeds the exact WC-028 v9
+recomputes the report synchronously. Runtime configuration v2 embeds the exact WC-028 v10
 collector contract plus its canonical digest and the exact deployed acquisition-authority
 digest. Production monitoring verification rejects legacy v3 contracts and refuses any handoff or
 receipt whose contract or authority binding differs. The guidance-authority publisher repeats
@@ -73,7 +73,7 @@ endpoint/DNS boundary.
 `wc027FeedV2ProducerReady` remains false by default. Setting it true also requires the exact
 deployed `Microsoft.App/jobs` resource ID, the deployed configuration digest, the WC-016 runtime,
 an explicitly ready binding publisher, matching deployment-derived identity/RBAC evidence, the
-exact v9 collector-contract digest, and the exact acquisition-authority digest. The root readiness
+exact v10 collector-contract digest, and the exact acquisition-authority digest. The root readiness
 gate verifies both digests in the producer and publisher configurations and their deployed Job
 tags before Notification v2 can be enabled.
 

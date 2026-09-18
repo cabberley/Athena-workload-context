@@ -2,7 +2,7 @@
 
 - **Status:** Proposed
 - **Date:** 2026-09-13
-- **Amended:** 2026-09-16
+- **Amended:** 2026-09-18
 
 ## Context
 
@@ -41,7 +41,7 @@ The coordinator:
   Azure endpoints and audiences: resource-centric Azure Monitor Logs, exact-resource Activity Log
   filters, generated bounded Resource Graph change queries, and a bounded `HealthResources`
   availability-status query that returns documented current and previous VM states. The historical
-  IP Flow client remains parseable but current contract v9 rejects it before transport;
+  IP Flow client remains parseable but current contract v10 rejects it before transport;
 - normalizes Azure service values, resource IDs, UTC timestamps, enums, dynamic resource-candidate
   arrays, row ordering, truncation markers, and response byte counts into the existing strict
   acquisition result contracts while retaining duplicate source rows for downstream ambiguity
@@ -52,7 +52,7 @@ The coordinator:
   `oid`, `appid`/`azp`, app-only `idtyp`, exact application role, and `iat`/`nbf`/`exp`;
 - provisions that proof authority through the Microsoft Graph Bicep extension as a single-tenant
   application, enterprise application, one application-only role, and one direct assignment to
-  the collector managed identity. The v9 collector contract binds the application/client ID,
+  the   collector managed identity. The v10 collector contract binds the application/client ID,
   application object ID, service-principal ID, app-role ID, app-role-assignment ID, assigned
   principal, secure audience, token version, role value, and required `idtyp` access-token
   optional claim; phase two rejects any mismatch;
@@ -107,7 +107,7 @@ The coordinator:
   must not re-enable the runtime-support identity in init or main containers when restacked;
 - grants that runtime-support identity a separate exact storage-account-scoped custom role with
   only the four management-plane reads required for fresh versioning/public-access/immutability
-  verification. Inventory v4 binds its principal, exact direct grant, complete role definition,
+  verification. Inventory v5 binds its principal, exact direct grant, complete role definition,
   stable ancestor-aware assignment pages, and deny/PIM posture;
 - emits an immutable signed acquisition receipt containing collector-owned execution, call, result
   receipt, and issuance times plus every exact request/result digest; IP Flow entries also bind the
@@ -127,7 +127,7 @@ The coordinator:
   production correlation verification to revalidate the receipt signature, manifest, signed
   intent, context binding, deployed identities, acquisition authority, collector contract, and
   freshness;
-- requires WC-027 enrichment and guidance production configurations to carry the exact v9
+- requires WC-027 enrichment and guidance production configurations to carry the exact v10
   collector contract, its canonical digest, the full v6 acquisition authority, and its exact
   digest. Both
   production verifiers compare those deployed values before accepting a handoff or receipt;
@@ -173,15 +173,19 @@ The coordinator:
   budgeting, then requires those controls to satisfy exactly `requiredCoverageScopeDigests`; records,
   observations, coverage, and incident selection therefore remain one governed unit. Supporting
   Activity Log controls without their own required coverage are not executed.
-- provisions a separate Resource Health custom role containing only
-  `Microsoft.ResourceGraph/resources/read`, makes it assignable only in
-  `rg-athena-demo-workload`, and assigns it independently at each exact approved VM. The
-  production client queries only `HealthResources` availability-status rows for those VM IDs and
-  binds documented `previousAvailabilityState`, `availabilityState`, `occurredTime`, and
-  `reasonType`. A missing or empty `reasonType` is normalized to `Unknown` rather than aborting the
-  source, and remains usable only when the signed monitoring control explicitly allows `Unknown`;
-  built-in Reader remains limited to the already reviewed DCR/DCE-association and flow-log child
-  resources.
+- provisions two non-overlapping custom roles for the `HealthResources` path. The subscription-
+  scoped query role contains only `Microsoft.ResourceGraph/resources/read`, which authorizes the
+  Resource Graph request against the one reviewed subscription but grants no generic resource
+  read. The VM-scoped Resource Health role contains only the canonical
+  `Microsoft.ResourceHealth/availabilityStatuses/read` action and is assigned independently at
+  each exact approved VM. Azure Resource Graph therefore returns only availability-status rows
+  for resources on which that second permission is effective; an unapproved peer VM remains
+  invisible. The production client additionally queries only those approved VM IDs and rejects
+  any returned row outside them. It binds documented `previousAvailabilityState`,
+  `availabilityState`, `occurredTime`, and `reasonType`. A missing or empty `reasonType` is
+  normalized to `Unknown` rather than aborting the source, and remains usable only when the signed
+  monitoring control explicitly allows `Unknown`; built-in Reader remains limited to the already
+  reviewed DCR/DCE-association and flow-log child resources.
 - provisions a separate WC-028 resource-log role with only
   `Microsoft.Insights/Logs/Heartbeat/Read`, `Perf/Read`, `InsightsMetrics/Read`, `Syslog/Read`, and
   `VMConnection/Read`, assigns it only at the 11 exact approved VMs, and includes no invented NTA
@@ -199,7 +203,7 @@ The coordinator:
   inherited and all-descendant principal-query modes, exact collector-contract inputs, all
   protected target
   scopes, non-zero legacy-RBAC cleanup evidence, and a separately governed reviewer public-key
-  anchor. Effective RBAC inventory v4 then
+  anchor. Effective RBAC inventory v5 then
   binds subscription-wide inherited/group-expanded results for collector and context principals,
   an unfiltered all-principal subscription scan, approved runtime attachments, absence of
   federated credentials, exclusive writer/signer derivation, secure data-plane authentication
@@ -225,10 +229,10 @@ The coordinator:
   receipt-signing keys, incomplete principal or attachment evidence, additional writers/signers,
   insecure authorization modes, unexpected grants or roles, wrong Blob condition, missing
   versioning/immutability, zero cleanup evidence, expired evidence, digest/signature mismatch,
-  and unproved inherited parent-scope completeness before publishing a sealed v9 attestation
+  and unproved inherited parent-scope completeness before publishing a sealed v10 attestation
   object containing only the validated fields.
 
-  The verifier identity is itself included in inventory v4: exact
+  The verifier identity is itself included in inventory v5: exact
   resource/client/principal/tenant IDs, one deterministic direct keys/get-only grant at the
   reviewer key, inherited/group-expanded principal evidence, no transitive groups, no PIM, no
   federated credential, and no persistent associated resource. Its principal must differ from the
@@ -271,11 +275,12 @@ ambiguous incident transitions fail before the persistence transaction is entere
 - Receipt-bearing acquisitions use `athena.wc028MonitoringEvidenceBundle.v3` and
   `athena.wc028MonitoringEvidenceHandoff.v2`; legacy collection paths remain on their existing
   versioned contracts and cannot silently add receipt fields.
-- The deployment publishes `athena.wc028MonitoringCollectorContract.v9` while retaining parse
-  support for WC-024 v2 and legacy WC-028 v3-v8 contracts. Production verification requires the
-  full reviewed v9 contract, permission-attested resource-context logs, effective RBAC inventory
-  v4, separate attestor identity, exact conditioned Blob persistence, storage readback, identity
-  proof, and current Resource Health policy.
+- The deployment publishes `athena.wc028MonitoringCollectorContract.v10` while retaining parse
+  support for WC-024 v2 and legacy WC-028 v3-v9 contracts. Production verification requires the
+  full reviewed v10 contract, permission-attested resource-context logs, effective RBAC inventory
+  v5, separate attestor identity, exact conditioned Blob persistence, storage readback, identity
+  proof, a subscription-scoped Resource Graph query grant, and per-VM Resource Health
+  availability grants.
 - Legacy acquisition-authority v1-v5 documents remain readable, but only v6 authorities can execute
   production acquisition. Production receipt verification requires receipt v6, verifies its
   authority-specific logical and physical call budgets, and derives deployed
@@ -283,10 +288,11 @@ ambiguous incident transitions fail before the persistence transaction is entere
   collector contract rather than caller assertions.
 - Production collection transactions require cryptographic receipt verification before persistence;
   receiptless compatibility is isolated in an explicitly named legacy/test transaction type.
-- This slice removes the IP Flow role and Network Watcher assignment, adds one separate narrow
-  Resource Graph HealthResources role, one separate five-table resource-log role with exact per-VM
-  assignments, and one separate read-only RBAC attestor role. It leaves the shared WC-016
-  resource-group role unchanged and adds no Reader
+- This slice removes the IP Flow role and Network Watcher assignment, adds one query-only Resource
+  Graph role at the subscription, one Resource Health availability role with exact per-VM
+  assignments, one separate five-table resource-log role with exact per-VM assignments, and one
+  separate read-only RBAC attestor role. It leaves the shared WC-016 resource-group role unchanged
+  and adds no Reader
   broadening, diagnostic setting, alert, query deployment, Connection Monitor mutation, or write
   permission.
 
@@ -351,10 +357,14 @@ ambiguous incident transitions fail before the persistence transaction is entere
 - Log request v3 tests bind current and prior windows, collector execution time, `_ResourceId`,
   exact authority coverage, the permissions response, and the `Prefer` header without module
   globals.
-- IaC and contract tests require the exact Resource Health role ID,
-  `Microsoft.ResourceGraph/resources/read`, and all 11 approved VM scopes while proving Reader was
-  not broadened. Production client tests use the documented `HealthResources` transition shape and
-  no longer inject an unsupported `previousAvailabilityState` into the current-status endpoint.
+- IaC and contract tests require the exact subscription-scoped Resource Graph query role with only
+  `Microsoft.ResourceGraph/resources/read`, the exact Resource Health role with only
+  `Microsoft.ResourceHealth/availabilityStatuses/read`, and all 11 approved VM scopes while
+  proving Reader and generic VM read were not broadened. Effective-inventory tests reject either
+  omitted permission, a query grant below the subscription request scope, and a peer VM replacing
+  or extending the approved VM set. Production client tests use the documented `HealthResources`
+  transition shape, reject an unapproved returned row, and no longer inject an unsupported
+  `previousAvailabilityState` into the current-status endpoint.
 - Receipt signatures and deployed identity/authority bindings are reverified in the production
   correlation boundary.
 - Replacing the incident anchor and recomputing unsigned correlation request and inventory digests
@@ -366,7 +376,7 @@ ambiguous incident transitions fail before the persistence transaction is entere
   requests, an unapproved runtime attachment, any federated credential, an additional evidence
   writer or signer, insecure Storage/Key Vault authorization modes, a forged reviewer signature,
   workspace-context query targets, and persisted out-of-contract resources all fail before trusted
-  use. Every acquisition read scope remains protected even though v9 disables IP Flow Verify.
+  use. Every acquisition read scope remains protected even though v10 disables IP Flow Verify.
   Subscription-wide principal queries prevent an assignment on an unlisted descendant from
   hiding, while exact protected targets include the workspace and each reviewed table, workload
   VNet, Network Watcher hierarchy, evidence Storage hierarchy, signing Key Vault hierarchy, and

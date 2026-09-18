@@ -39,6 +39,9 @@ READER_RBAC = (WC024_ROOT / "modules" / "monitoring-evidence-reader-rbac.bicep")
 WORKLOAD_READER_RBAC = (
     WC024_ROOT / "modules" / "workload-monitoring-evidence-reader-rbac.bicep"
 ).read_text(encoding="utf-8")
+RESOURCE_GRAPH_QUERY_RBAC = (
+    WC024_ROOT / "modules" / "resource-graph-query-reader-rbac.bicep"
+).read_text(encoding="utf-8")
 NETWORK_WATCHER_READER_RBAC = (
     WC024_ROOT / "modules" / "network-watcher-monitoring-evidence-reader-rbac.bicep"
 ).read_text(encoding="utf-8")
@@ -652,11 +655,23 @@ def test_wc024_rbac_is_collector_only_and_narrow() -> None:
     assert "roleDefinitionId: resourceHealthRoleDefinition.id" in (resource_health_assignment)
     assert "roleDefinitionId: readerRoleDefinitionId" not in resource_health_assignment
     assert "0790d6f2-9553-5b63-84ac-56596b7e4072" in WORKLOAD_READER_RBAC
-    assert "Microsoft.ResourceGraph/resources/read" in WORKLOAD_READER_RBAC
+    assert "Microsoft.ResourceHealth/availabilityStatuses/read" in WORKLOAD_READER_RBAC
+    assert "Microsoft.ResourceGraph/resources/read" not in WORKLOAD_READER_RBAC
     assert "Microsoft.ResourceHealth/AvailabilityStatuses/current/read" not in (
         WORKLOAD_READER_RBAC
     )
+    assert "Microsoft.Compute/virtualMachines/read" not in WORKLOAD_READER_RBAC
     assert "resourceHealthAllowedOperations" in WORKLOAD_READER_RBAC
+    assert "5687977f-aa06-5699-8e18-1a54a074b532" in RESOURCE_GRAPH_QUERY_RBAC
+    assert "Microsoft.ResourceGraph/resources/read" in RESOURCE_GRAPH_QUERY_RBAC
+    assert "Microsoft.ResourceHealth/availabilityStatuses/read" not in (
+        RESOURCE_GRAPH_QUERY_RBAC
+    )
+    assert "scope: subscription()" in RESOURCE_GRAPH_QUERY_RBAC
+    assert "subscription().id" in RESOURCE_GRAPH_QUERY_RBAC
+    assert "*/read" not in RESOURCE_GRAPH_QUERY_RBAC
+    assert "Microsoft.Compute/virtualMachines/read" not in RESOURCE_GRAPH_QUERY_RBAC
+    assert "resource-graph-query-reader-assignment" in MAIN
     assert "dataActions: []" in WORKLOAD_READER_RBAC
     assert "expectedSignalReaderActions" in WORKLOAD_READER_RBAC
     assert "unexpectedSignalReaderActions" in WORKLOAD_READER_RBAC
@@ -814,7 +829,7 @@ def test_wc024_collector_contract_is_signed_handoff_ready_and_generic_only() -> 
     assert "logAnalyticsAccessCondition: logAnalyticsAccessCondition" in (COLLECTOR_CONTRACT)
     assert "resourceReadScopeIds: resourceReadScopeIds" in COLLECTOR_CONTRACT
     assert "signalReadScopeIds: signalReadScopeIds" in COLLECTOR_CONTRACT
-    assert "athena.wc028MonitoringCollectorContract.v9" in COLLECTOR_CONTRACT
+    assert "athena.wc028MonitoringCollectorContract.v10" in COLLECTOR_CONTRACT
     assert "athena.wc028MonitoringAcquisitionReceipt.v6" in COLLECTOR_CONTRACT
     assert "validatedAcquisitionWorkspaceAccessControlMode" in COLLECTOR_CONTRACT
     assert "resource-context Log Analytics mode" in COLLECTOR_CONTRACT
@@ -891,7 +906,11 @@ def test_wc024_collector_contract_is_signed_handoff_ready_and_generic_only() -> 
     assert "Microsoft.Resources/deployments@2025-04-01" in PUBLISH_CONTRACT
     assert "monitoringRbacBootstrapDeployment.properties.outputs" in PUBLISH_CONTRACT
     assert "athena.wc024MonitoringContractPublicationHandoff.v1" in PUBLISH_CONTRACT
-    assert "athena.wc028MonitoringEffectiveRbacInventory.v4" in PUBLISH_CONTRACT
+    assert "athena.wc028MonitoringEffectiveRbacInventory.v5" in PUBLISH_CONTRACT
+    assert "resourceGraphQueryRoleActions" in PUBLISH_CONTRACT
+    assert "resourceHealthRoleActions" in PUBLISH_CONTRACT
+    assert "resourceGraphQueryScopeIsExact" in PUBLISH_CONTRACT
+    assert "length(normalizedResourceHealthScopeIds) + 5" in PUBLISH_CONTRACT
     assert "expectedHandoffId = guid(" in PUBLISH_CONTRACT
     assert "handoff.handoffId == expectedHandoffId" in PUBLISH_CONTRACT
     assert "handoffTargetsAreUnique" in PUBLISH_CONTRACT
@@ -1004,6 +1023,13 @@ def test_wc024_collector_contract_is_signed_handoff_ready_and_generic_only() -> 
     assert "identityProofTokenVersion: '1.0'" in COLLECTOR_CONTRACT
     assert "identityProofRequiredRole: identityProofAppRoleValue" in COLLECTOR_CONTRACT
     assert "identityProofMaximumLifetimeSeconds: 7200" in COLLECTOR_CONTRACT
+    assert "resourceGraphQueryRoleDefinitionId: resourceGraphQueryRoleDefinitionId" in (
+        COLLECTOR_CONTRACT
+    )
+    assert "resourceGraphQueryScopeId: resourceGraphQueryScopeId" in COLLECTOR_CONTRACT
+    assert "resourceGraphQueryAllowedOperations: resourceGraphQueryAllowedOperations" in (
+        COLLECTOR_CONTRACT
+    )
     assert "resourceHealthRoleDefinitionId: resourceHealthRoleDefinitionId" in (COLLECTOR_CONTRACT)
     assert "resourceHealthScopeIds: resourceHealthScopeIds" in COLLECTOR_CONTRACT
     assert "resourceHealthAllowedOperations: resourceHealthAllowedOperations" in (
@@ -1131,8 +1157,8 @@ def test_wc024_phase_two_cryptographically_verifies_external_rbac_review() -> No
     assert "az keyvault key show --id" in RBAC_INVENTORY_ATTESTATION_VALIDATION
     assert "ATHENA_REVIEWER_JWK_JSON" in RBAC_INVENTORY_ATTESTATION_VALIDATION
     assert "ATHENA_INVENTORY_JSON" in RBAC_INVENTORY_ATTESTATION_VALIDATION
-    assert "@maxLength(55000)" in RBAC_INVENTORY_ATTESTATION_VALIDATION
-    assert "length(callerEnvironmentPayload) <= 60000" in (RBAC_INVENTORY_ATTESTATION_VALIDATION)
+    assert "@maxLength(62000)" in RBAC_INVENTORY_ATTESTATION_VALIDATION
+    assert "length(callerEnvironmentPayload) <= 64000" in (RBAC_INVENTORY_ATTESTATION_VALIDATION)
     assert "validatedEffectiveRbacInventoryJson" in RBAC_INVENTORY_ATTESTATION_VALIDATION
     assert "output validated bool" in RBAC_INVENTORY_ATTESTATION_VALIDATION
     assert "output validationDigest string" in RBAC_INVENTORY_ATTESTATION_VALIDATION
@@ -1245,9 +1271,9 @@ def test_wc024_inventory_example_fits_deployment_script_transport_budget() -> No
     )
     compact_inventory = json.dumps(inventory, separators=(",", ":"), ensure_ascii=True)
 
-    assert len(compact_inventory.encode("utf-8")) <= 60_000
-    assert "length(effectiveRbacInventoryJson) <= 55000" in PUBLISH_CONTRACT
-    assert "length(callerEnvironmentPayload) <= 60000" in (RBAC_INVENTORY_ATTESTATION_VALIDATION)
+    assert len(compact_inventory.encode("utf-8")) <= 62_000
+    assert "length(effectiveRbacInventoryJson) <= 62000" in PUBLISH_CONTRACT
+    assert "length(callerEnvironmentPayload) <= 64000" in (RBAC_INVENTORY_ATTESTATION_VALIDATION)
 
 
 def test_wc024_generator_metadata_normalization_is_recursive_and_only_metadata() -> None:

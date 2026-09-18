@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.47.16.16243",
-      "templateHash": "14046875026763117201"
+      "templateHash": "9964608788746215388"
     },
     "name": "Athena WC-024 generic monitoring foundation",
     "description": "Deploys private generic Azure Monitor, VNet flow-log, and isolated evidence-collector foundations without workload-intent-derived thresholds or paths."
@@ -3014,6 +3014,109 @@
     {
       "type": "Microsoft.Resources/deployments",
       "apiVersion": "2025-04-01",
+      "name": "resource-graph-query-reader-assignment",
+      "location": "[deployment().location]",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "collectorPrincipalId": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams'), '2025-04-01').outputs.collectorIdentityPrincipalId.value]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2018-05-01/subscriptionDeploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.47.16.16243",
+              "templateHash": "870515569191563226"
+            }
+          },
+          "parameters": {
+            "collectorPrincipalId": {
+              "type": "string",
+              "metadata": {
+                "description": "Principal ID of the only identity permitted to submit the reviewed Resource Graph query."
+              }
+            }
+          },
+          "variables": {
+            "resourceGraphQueryRoleDefinitionGuid": "5687977f-aa06-5699-8e18-1a54a074b532",
+            "resourceGraphQueryAllowedOperations": [
+              "Microsoft.ResourceGraph/resources/read"
+            ]
+          },
+          "resources": [
+            {
+              "type": "Microsoft.Authorization/roleDefinitions",
+              "apiVersion": "2022-04-01",
+              "name": "[variables('resourceGraphQueryRoleDefinitionGuid')]",
+              "properties": {
+                "roleName": "Athena WC-028 Resource Graph Query Submitter",
+                "description": "Submit Azure Resource Graph queries only within this subscription. Resource visibility remains independently limited by exact resource-provider read assignments.",
+                "type": "CustomRole",
+                "permissions": [
+                  {
+                    "actions": "[variables('resourceGraphQueryAllowedOperations')]",
+                    "notActions": [],
+                    "dataActions": [],
+                    "notDataActions": []
+                  }
+                ],
+                "assignableScopes": [
+                  "[subscription().id]"
+                ]
+              }
+            },
+            {
+              "type": "Microsoft.Authorization/roleAssignments",
+              "apiVersion": "2022-04-01",
+              "name": "[guid(subscription().id, parameters('collectorPrincipalId'), subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('resourceGraphQueryRoleDefinitionGuid')))]",
+              "properties": {
+                "principalId": "[parameters('collectorPrincipalId')]",
+                "principalType": "ServicePrincipal",
+                "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('resourceGraphQueryRoleDefinitionGuid'))]"
+              },
+              "dependsOn": [
+                "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('resourceGraphQueryRoleDefinitionGuid'))]"
+              ]
+            }
+          ],
+          "outputs": {
+            "resourceGraphQueryRoleDefinitionId": {
+              "type": "string",
+              "value": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('resourceGraphQueryRoleDefinitionGuid'))]"
+            },
+            "resourceGraphQueryRoleName": {
+              "type": "string",
+              "value": "[reference(subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('resourceGraphQueryRoleDefinitionGuid')), '2022-04-01').roleName]"
+            },
+            "resourceGraphQueryScopeId": {
+              "type": "string",
+              "value": "[subscription().id]"
+            },
+            "resourceGraphQueryAllowedOperations": {
+              "type": "array",
+              "value": "[variables('resourceGraphQueryAllowedOperations')]"
+            },
+            "resourceGraphQueryRoleAssignmentId": {
+              "type": "string",
+              "value": "[subscriptionResourceId('Microsoft.Authorization/roleAssignments', guid(subscription().id, parameters('collectorPrincipalId'), subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('resourceGraphQueryRoleDefinitionGuid'))))]"
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-seams')]"
+      ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
       "name": "workload-monitoring-evidence-reader-assignments",
       "resourceGroup": "[parameters('workloadResourceGroupName')]",
       "properties": {
@@ -3042,7 +3145,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.47.16.16243",
-              "templateHash": "1752966289820779357"
+              "templateHash": "4264391132699041733"
             }
           },
           "parameters": {
@@ -3096,7 +3199,7 @@
             ],
             "resourceHealthRoleDefinitionGuid": "0790d6f2-9553-5b63-84ac-56596b7e4072",
             "resourceHealthAllowedOperations": [
-              "Microsoft.ResourceGraph/resources/read"
+              "Microsoft.ResourceHealth/availabilityStatuses/read"
             ]
           },
           "resources": [
@@ -3127,7 +3230,7 @@
               "name": "[variables('resourceHealthRoleDefinitionGuid')]",
               "properties": {
                 "roleName": "Athena WC-028 VM Resource Health Reader",
-                "description": "Read only HealthResources availability-status rows through Azure Resource Graph for exact approved workload VMs.",
+                "description": "Read Resource Health availability status only for exact approved workload VMs. Azure Resource Graph query submission is authorized separately at subscription scope.",
                 "type": "CustomRole",
                 "permissions": [
                   {
@@ -4308,6 +4411,10 @@
               "identityProofAppRoleValue": "[reference(subscriptionResourceId('Microsoft.Resources/deployments', 'monitoring-identity-proof-authority'), '2025-04-01').outputs.identityProofAppRoleValue.value]",
               "identityProofAppRoleAssignmentId": "[reference(subscriptionResourceId('Microsoft.Resources/deployments', 'monitoring-identity-proof-authority'), '2025-04-01').outputs.identityProofAppRoleAssignmentId.value]",
               "identityProofAssignedPrincipalId": "[reference(subscriptionResourceId('Microsoft.Resources/deployments', 'monitoring-identity-proof-authority'), '2025-04-01').outputs.identityProofAssignedPrincipalId.value]",
+              "resourceGraphQueryRoleDefinitionId": "[reference(subscriptionResourceId('Microsoft.Resources/deployments', 'resource-graph-query-reader-assignment'), '2025-04-01').outputs.resourceGraphQueryRoleDefinitionId.value]",
+              "resourceGraphQueryRoleName": "[reference(subscriptionResourceId('Microsoft.Resources/deployments', 'resource-graph-query-reader-assignment'), '2025-04-01').outputs.resourceGraphQueryRoleName.value]",
+              "resourceGraphQueryScopeId": "[reference(subscriptionResourceId('Microsoft.Resources/deployments', 'resource-graph-query-reader-assignment'), '2025-04-01').outputs.resourceGraphQueryScopeId.value]",
+              "resourceGraphQueryAllowedOperations": "[reference(subscriptionResourceId('Microsoft.Resources/deployments', 'resource-graph-query-reader-assignment'), '2025-04-01').outputs.resourceGraphQueryAllowedOperations.value]",
               "resourceHealthRoleDefinitionId": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments'), '2025-04-01').outputs.resourceHealthRoleDefinitionId.value]",
               "resourceHealthRoleName": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments'), '2025-04-01').outputs.resourceHealthRoleName.value]",
               "resourceHealthScopeIds": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments'), '2025-04-01').outputs.resourceHealthScopeIds.value]",
@@ -4560,6 +4667,7 @@
         "[subscriptionResourceId('Microsoft.Resources/deployments', 'monitoring-storage-readback-reader')]",
         "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-storage-readback-reader-assignment')]",
         "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('networkWatcherResourceGroupName')), 'Microsoft.Resources/deployments', 'network-watcher-monitoring-evidence-reader-assignment')]",
+        "[subscriptionResourceId('Microsoft.Resources/deployments', 'resource-graph-query-reader-assignment')]",
         "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments')]"
       ]
     }

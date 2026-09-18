@@ -39,7 +39,7 @@ _ISO_DATETIME_PATTERN = re.compile(
 )
 _ISO_DATETIME_PREFIX_PATTERN = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}")
 _MAX_SAFE_INTEGER = 9_007_199_254_740_991
-_MAX_INVENTORY_JSON_BYTES = 100_000
+_MAX_INVENTORY_JSON_BYTES = 62_000
 
 
 def _fail(message: str) -> NoReturn:
@@ -233,6 +233,16 @@ def _load_and_validate_inventory(
     digest_payload.pop("inventoryDigest", None)
     if _artifact_digest(digest_payload) != claimed_inventory_digest:
         _fail("effective-RBAC inventory digest is invalid")
+    if inventory.get("schemaVersion") != "athena.wc028MonitoringEffectiveRbacInventory.v5":
+        _fail("effective-RBAC inventory must use schema v5")
+    if inventory.get("resourceGraphQueryRoleActions") != [
+        "microsoft.resourcegraph/resources/read"
+    ]:
+        _fail("effective-RBAC inventory omits the exact Resource Graph query permission")
+    if inventory.get("resourceHealthRoleActions") != [
+        "microsoft.resourcehealth/availabilitystatuses/read"
+    ]:
+        _fail("effective-RBAC inventory omits the exact Resource Health availability permission")
     return inventory
 
 

@@ -76,7 +76,7 @@ param signature string
 
 @description('Compact JSON for the complete effective-RBAC inventory.')
 @minLength(1)
-@maxLength(55000)
+@maxLength(62000)
 param effectiveRbacInventoryJson string
 
 var verifierSourceBase64 = base64(loadTextContent('../scripts/verify-rbac-inventory-attestation.py'))
@@ -99,7 +99,7 @@ var callerEnvironmentPayload = join([
   'ATHENA_SIGNATURE=${signature}'
   'ATHENA_INVENTORY_JSON=${effectiveRbacInventoryJson}'
 ], '\n')
-var validatedEffectiveRbacInventoryJson = length(callerEnvironmentPayload) <= 60000
+var validatedEffectiveRbacInventoryJson = length(callerEnvironmentPayload) <= 64000
   ? effectiveRbacInventoryJson
   : fail('monitoring RBAC attestation verification limits caller-supplied environment data to 60,000 characters')
 

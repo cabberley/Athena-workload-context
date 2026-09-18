@@ -188,6 +188,29 @@ Required separation:
 - notification dispatcher: exact v2 queue/table/Logic App rights only; and
 - no generic Contributor assignment for a runtime identity.
 
+Resource Health acquisition has two deliberately separate grants. Record and compare both before
+accepting the phase-one handoff:
+
+- `Athena WC-028 Resource Graph Query Submitter` is assigned directly once at
+  `/subscriptions/<subscription-id>` and its full role definition contains only
+  `Microsoft.ResourceGraph/resources/read`;
+- `Athena WC-028 VM Resource Health Reader` is assigned directly at each of the 11 reviewed VM
+  resource IDs and its full role definition contains only
+  `Microsoft.ResourceHealth/availabilityStatuses/read`;
+- the Resource Graph role has no Resource Health, generic VM, wildcard read, data, or write action;
+  the Resource Health role has no Resource Graph, generic VM, wildcard read, data, or write action;
+  and
+- no Resource Health assignment exists at resource-group, subscription, management-group, or
+  tenant scope, and no Resource Graph query assignment exists only below the subscription query
+  scope.
+
+Fail the gate if either role, action, or assignment shape is absent or broader. Under the collector
+identity, execute the reviewed `HealthResources` query with one approved VM and one clearly
+synthetic unapproved peer VM in the KQL filter. The approved VM may be returned; the peer must not
+be returned. The production adapter must also reject the response if Azure returns any row whose
+`properties.targetResourceId` is outside the contract's exact approved VM list. KQL filtering is
+defense in depth and is not accepted as a substitute for the per-VM Resource Health assignments.
+
 For the WC-028 monitoring collector, do not substitute the generic CLI listing above for the
 phase-two contract-publication evidence. Use the phase-one handoff's exact requests and perform
 two complete reads:
@@ -231,7 +254,10 @@ phase-two AzureCLI script resolve that Key Vault JWK; caller-supplied modulus/fi
 are not a trust root.
 `publish-monitoring-contract.bicep` must report
 `effectiveRbacCryptographicReviewVerified=true`; a caller-supplied digest without a valid detached
-signature is not acceptance evidence.
+signature is not acceptance evidence. Publication requires collector contract v10 and effective
+RBAC inventory v5; v9/v4 artifacts are historical parse-only evidence. The canonical inventory
+must remain at or below 62,000 bytes, and the complete deployment-script environment payload must
+remain at or below 64,000 characters.
 
 ## Phase 4: deploy
 
@@ -244,7 +270,7 @@ After deployment:
 2. repeat RBAC checks;
 3. verify all Container Apps revisions use the reviewed image digests;
 4. verify Storage shared-key and public access remain disabled where required, Blob versioning and
-   the evidence immutability policy still match the published v9 contract, and the cleanup digest
+   the evidence immutability policy still match the published v10 contract, and the cleanup digest
    is non-zero;
 5. verify monitoring/runtime workspace isolation;
 6. verify exact key versions and trusted fingerprints; and
