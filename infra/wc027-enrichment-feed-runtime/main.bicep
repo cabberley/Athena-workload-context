@@ -23,6 +23,13 @@ param registryServer string
 @description('Existing Azure Container Registry resource ID.')
 param registryResourceId string
 
+@description('Reviewed ACR role-assignment permissions mode.')
+@allowed([
+  'LegacyRegistryPermissions'
+  'AbacRepositoryPermissions'
+])
+param registryRoleAssignmentMode string
+
 @description('Existing private Premium Service Bus namespace name.')
 param serviceBusNamespaceName string
 
@@ -36,6 +43,9 @@ param triggerSubmitterIdentityResourceIds array
 
 @description('Broker identity resource ID attached to the Job and used by the scaler, ACR pull, and queue RBAC.')
 param brokerIdentityResourceId string
+
+@description('Server-returned service-principal object ID for the broker identity.')
+param brokerIdentityPrincipalId string
 
 @description('Producer identity resource ID that reads v1 incident-assets read-only without list access.')
 param incidentReaderIdentityResourceId string
@@ -222,12 +232,26 @@ var triggerQueueName = 'wc027-enrichment-feed-requests'
 var serviceBusDataReceiverRoleDefinitionId = '4f6c0938-94ea-4d52-8e5a-2e02b7ef8e7d'
 var serviceBusDataSenderRoleDefinitionId = '69a216fc-b8fb-44d8-bc22-1f3c2cd27a39'
 var acrPullRoleDefinitionId = '7f951dda-4ed3-4680-a7ca-43fe172d538d'
+var acrRepositoryReaderRoleDefinitionId = 'b93aa761-3e63-49ed-ac28-beffa264f7ac'
+var registryScopedResourceId = resourceId(
+  split(registryResourceId, '/')[2],
+  split(registryResourceId, '/')[4],
+  'Microsoft.ContainerRegistry/registries',
+  last(split(registryResourceId, '/'))
+)
+var registryPullRoleDefinitionGuid = registryRoleAssignmentMode == 'LegacyRegistryPermissions'
+  ? acrPullRoleDefinitionId
+  : acrRepositoryReaderRoleDefinitionId
+var registryPullRoleDefinitionId = subscriptionResourceId(
+  split(registryResourceId, '/')[2],
+  'Microsoft.Authorization/roleDefinitions',
+  registryPullRoleDefinitionGuid
+)
 var storageBlobDataReaderRoleDefinitionId = '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1'
 var storageTableDataContributorRoleDefinitionId = '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3'
 var storageTableDataReaderRoleDefinitionId = '76199698-9eea-4c19-bc75-cec21354c6b6'
-var keyVaultCryptoUserRoleDefinitionId = '12338af0-0e69-4776-bea7-57ae8d297424'
 
-var expectedRegistryServer = '${toLower(registry.name)}.azurecr.io'
+var expectedRegistryServer = '${toLower(last(split(registryResourceId, '/')))}.azurecr.io'
 var imagePrefix = '${expectedRegistryServer}/athena/wc027-enrichment-feed-producer@sha256:'
 var imageDigest = replace(producerImage, imagePrefix, '')
 var imageDigestWithoutDigits = replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(
@@ -246,16 +270,31 @@ var validatedProducerImage = registryServer == expectedRegistryServer && produce
 ) && length(imageDigest) == 64 && empty(imageDigestInvalidCharacters) && imageDigest != '0000000000000000000000000000000000000000000000000000000000000000'
   ? producerImage
   : fail('producerImage must be a real digest-pinned image in the supplied registry')
-
-resource registry 'Microsoft.ContainerRegistry/registries@2025-04-01' existing = {
-  name: last(split(registryResourceId, '/'))
-  scope: resourceGroup(split(registryResourceId, '/')[2], split(registryResourceId, '/')[4])
-}
+var producerImageRepositoryName = replace(
+  first(split(validatedProducerImage, '@sha256:')),
+  '${expectedRegistryServer}/',
+  ''
+)
+var registryPullRoleAssignmentId = extensionResourceId(
+  registryScopedResourceId,
+  'Microsoft.Authorization/roleAssignments',
+  registryRoleAssignmentMode == 'AbacRepositoryPermissions'
+    ? guid(
+        registryScopedResourceId,
+        brokerIdentityPrincipalId,
+        registryPullRoleDefinitionId,
+        producerImageRepositoryName
+      )
+    : guid(registryScopedResourceId, brokerIdentityPrincipalId, registryPullRoleDefinitionId)
+)
 
 resource brokerIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2024-11-30' existing = {
   name: last(split(brokerIdentityResourceId, '/'))
   scope: resourceGroup(split(brokerIdentityResourceId, '/')[2], split(brokerIdentityResourceId, '/')[4])
 }
+var validatedBrokerIdentityPrincipalId = brokerIdentity.properties.principalId == brokerIdentityPrincipalId
+  ? brokerIdentityPrincipalId
+  : fail('brokerIdentityPrincipalId must match the server-returned managed identity principal ID')
 
 resource incidentReaderIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2024-11-30' existing = {
   name: last(split(incidentReaderIdentityResourceId, '/'))
@@ -388,14 +427,20 @@ resource triggerQueue 'Microsoft.ServiceBus/namespaces/queues@2026-01-01' = {
   parent: serviceBusNamespace
   name: triggerQueueName
   properties: {
+    status: 'Active'
+    autoDeleteOnIdle: 'P10675199DT2H48M5.4775807S'
     requiresSession: true
     requiresDuplicateDetection: true
     duplicateDetectionHistoryTimeWindow: 'P7D'
+    enableBatchedOperations: true
+    enableExpress: false
+    enablePartitioning: false
     deadLetteringOnMessageExpiration: true
     defaultMessageTimeToLive: 'P1D'
     lockDuration: 'PT5M'
     maxDeliveryCount: 10
     maxMessageSizeInKilobytes: 12288
+    maxSizeInMegabytes: 1024
   }
 }
 
@@ -512,10 +557,15 @@ resource monitoringIntentSourceContainer 'Microsoft.Storage/storageAccounts/blob
   name: monitoringIntentSourceContainerName
 }
 
-resource guidanceAuthoritySourceContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2025-01-01' existing = {
-  parent: correlationSourceBlobService
-  name: guidanceAuthoritySourceContainerName
+module guidanceAuthoritySourceContainer 'modules/private-container.bicep' = {
+  name: 'wc027-guidance-authority-source-container'
+  scope: resourceGroup(split(correlationSourceStorageAccountResourceId, '/')[2], split(correlationSourceStorageAccountResourceId, '/')[4])
+  params: {
+    storageAccountName: correlationSourceStorage.name
+    containerName: guidanceAuthoritySourceContainerName
+  }
 }
+var guidanceAuthoritySourceContainerId = '${correlationSourceStorageAccountResourceId}/blobServices/default/containers/${guidanceAuthoritySourceContainerName}'
 
 resource feedV2WriterRole 'Microsoft.Authorization/roleDefinitions@2022-04-01' = {
   name: guid(replayStorage.id, feedV2ContainerName, 'wc027-feed-v2-writer')
@@ -585,7 +635,7 @@ module guidanceAuthoritySourceReader 'modules/blob-reader-rbac.bicep' = {
   scope: resourceGroup(split(correlationSourceStorageAccountResourceId, '/')[2], split(correlationSourceStorageAccountResourceId, '/')[4])
   params: {
     storageAccountName: correlationSourceStorage.name
-    containerName: guidanceAuthoritySourceContainer.name
+    containerName: guidanceAuthoritySourceContainer.outputs.name
     identityResourceId: guidanceAuthorityReaderIdentity.id
   }
 }
@@ -816,68 +866,48 @@ module monitoringCollectorKeyVerifier 'modules/key-verifier-rbac.bicep' = {
   }
 }
 
-resource reportSignerRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(reportKey.id, reportSignerIdentity.id, keyVaultCryptoUserRoleDefinitionId)
-  scope: reportKey
-  properties: {
-    principalId: reportSignerIdentity.properties.principalId
-    principalType: 'ServicePrincipal'
-    roleDefinitionId: subscriptionResourceId(
-      'Microsoft.Authorization/roleDefinitions',
-      keyVaultCryptoUserRoleDefinitionId
-    )
+module reportSignerRbac 'modules/key-sign-verify-rbac.bicep' = {
+  name: 'wc027-report-key-sign-verify'
+  params: {
+    keyVaultName: keyVault.name
+    keyName: reportKey.name
+    identityResourceId: reportSignerIdentity.id
   }
 }
 
-resource guidanceSignerRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(guidanceKey.id, guidanceSignerIdentity.id, keyVaultCryptoUserRoleDefinitionId)
-  scope: guidanceKey
-  properties: {
-    principalId: guidanceSignerIdentity.properties.principalId
-    principalType: 'ServicePrincipal'
-    roleDefinitionId: subscriptionResourceId(
-      'Microsoft.Authorization/roleDefinitions',
-      keyVaultCryptoUserRoleDefinitionId
-    )
+module guidanceSignerRbac 'modules/key-sign-verify-rbac.bicep' = {
+  name: 'wc027-guidance-key-sign-verify'
+  params: {
+    keyVaultName: keyVault.name
+    keyName: guidanceKey.name
+    identityResourceId: guidanceSignerIdentity.id
   }
 }
 
-resource enrichmentSignerRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(enrichmentKey.id, enrichmentSignerIdentity.id, keyVaultCryptoUserRoleDefinitionId)
-  scope: enrichmentKey
-  properties: {
-    principalId: enrichmentSignerIdentity.properties.principalId
-    principalType: 'ServicePrincipal'
-    roleDefinitionId: subscriptionResourceId(
-      'Microsoft.Authorization/roleDefinitions',
-      keyVaultCryptoUserRoleDefinitionId
-    )
+module enrichmentSignerRbac 'modules/key-sign-verify-rbac.bicep' = {
+  name: 'wc027-enrichment-key-sign-verify'
+  params: {
+    keyVaultName: keyVault.name
+    keyName: enrichmentKey.name
+    identityResourceId: enrichmentSignerIdentity.id
   }
 }
 
-resource feedSignerRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(feedKey.id, feedSignerIdentity.id, keyVaultCryptoUserRoleDefinitionId)
-  scope: feedKey
-  properties: {
-    principalId: feedSignerIdentity.properties.principalId
-    principalType: 'ServicePrincipal'
-    roleDefinitionId: subscriptionResourceId(
-      'Microsoft.Authorization/roleDefinitions',
-      keyVaultCryptoUserRoleDefinitionId
-    )
+module feedSignerRbac 'modules/key-sign-verify-rbac.bicep' = {
+  name: 'wc027-feed-key-sign-verify'
+  params: {
+    keyVaultName: keyVault.name
+    keyName: feedKey.name
+    identityResourceId: feedSignerIdentity.id
   }
 }
 
-resource notificationSignerRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(notificationKey.id, notificationSignerIdentity.id, keyVaultCryptoUserRoleDefinitionId)
-  scope: notificationKey
-  properties: {
-    principalId: notificationSignerIdentity.properties.principalId
-    principalType: 'ServicePrincipal'
-    roleDefinitionId: subscriptionResourceId(
-      'Microsoft.Authorization/roleDefinitions',
-      keyVaultCryptoUserRoleDefinitionId
-    )
+module notificationSignerRbac 'modules/key-sign-verify-rbac.bicep' = {
+  name: 'wc027-notification-key-sign-verify'
+  params: {
+    keyVaultName: keyVault.name
+    keyName: notificationKey.name
+    identityResourceId: notificationSignerIdentity.id
   }
 }
 
@@ -888,8 +918,10 @@ module producerImagePull 'modules/acr-pull-rbac.bicep' = {
     split(registryResourceId, '/')[4]
   )
   params: {
-    registryName: registry.name
-    identityResourceId: brokerIdentity.id
+    registryResourceId: registryResourceId
+    identityPrincipalId: validatedBrokerIdentityPrincipalId
+    image: validatedProducerImage
+    registryRoleAssignmentMode: registryRoleAssignmentMode
   }
 }
 
@@ -965,7 +997,7 @@ var runtimeConfiguration = {
   }
   guidanceAuthoritySource: {
     blobEndpoint: correlationSourceBlobEndpoint
-    containerName: guidanceAuthoritySourceContainer.name
+    containerName: guidanceAuthoritySourceContainer.outputs.name
     identityClientId: guidanceAuthorityReaderIdentity.properties.clientId
     identityResourceId: guidanceAuthorityReaderIdentity.id
   }
@@ -1060,11 +1092,21 @@ var guidanceBindingKeyVerifierRoleId = extensionResourceId('/subscriptions/${spl
 var changeKeyVerifierRoleId = extensionResourceId('/subscriptions/${split(changeKeyResourceId, '/')[2]}/resourceGroups/${split(changeKeyResourceId, '/')[4]}', 'Microsoft.Authorization/roleDefinitions', guid(changeKey.id, 'athena-wc027-key-verifier'))
 var monitoringIntentKeyVerifierRoleId = extensionResourceId('/subscriptions/${split(monitoringIntentKeyResourceId, '/')[2]}/resourceGroups/${split(monitoringIntentKeyResourceId, '/')[4]}', 'Microsoft.Authorization/roleDefinitions', guid(monitoringIntentKey.id, 'athena-wc027-key-verifier'))
 var monitoringCollectorKeyVerifierRoleId = extensionResourceId('/subscriptions/${split(monitoringCollectorKeyResourceId, '/')[2]}/resourceGroups/${split(monitoringCollectorKeyResourceId, '/')[4]}', 'Microsoft.Authorization/roleDefinitions', guid(monitoringCollectorKey.id, 'athena-wc027-key-verifier'))
+var reportSignerRoleId = extensionResourceId(resourceGroup().id, 'Microsoft.Authorization/roleDefinitions', guid(reportKey.id, 'athena-wc027-key-sign-verify'))
+var reportSignerAssignmentId = extensionResourceId(reportKey.id, 'Microsoft.Authorization/roleAssignments', guid(reportKey.id, reportSignerIdentity.id, reportSignerRoleId))
+var guidanceSignerRoleId = extensionResourceId(resourceGroup().id, 'Microsoft.Authorization/roleDefinitions', guid(guidanceKey.id, 'athena-wc027-key-sign-verify'))
+var guidanceSignerAssignmentId = extensionResourceId(guidanceKey.id, 'Microsoft.Authorization/roleAssignments', guid(guidanceKey.id, guidanceSignerIdentity.id, guidanceSignerRoleId))
+var enrichmentSignerRoleId = extensionResourceId(resourceGroup().id, 'Microsoft.Authorization/roleDefinitions', guid(enrichmentKey.id, 'athena-wc027-key-sign-verify'))
+var enrichmentSignerAssignmentId = extensionResourceId(enrichmentKey.id, 'Microsoft.Authorization/roleAssignments', guid(enrichmentKey.id, enrichmentSignerIdentity.id, enrichmentSignerRoleId))
+var feedSignerRoleId = extensionResourceId(resourceGroup().id, 'Microsoft.Authorization/roleDefinitions', guid(feedKey.id, 'athena-wc027-key-sign-verify'))
+var feedSignerAssignmentId = extensionResourceId(feedKey.id, 'Microsoft.Authorization/roleAssignments', guid(feedKey.id, feedSignerIdentity.id, feedSignerRoleId))
+var notificationSignerRoleId = extensionResourceId(resourceGroup().id, 'Microsoft.Authorization/roleDefinitions', guid(notificationKey.id, 'athena-wc027-key-sign-verify'))
+var notificationSignerAssignmentId = extensionResourceId(notificationKey.id, 'Microsoft.Authorization/roleAssignments', guid(notificationKey.id, notificationSignerIdentity.id, notificationSignerRoleId))
 
 var coreRbacResourceIds = [
   triggerReceiver.id
   notificationSender.id
-  extensionResourceId(registry.id, 'Microsoft.Authorization/roleAssignments', guid(registry.id, brokerIdentity.id, acrPullRoleDefinitionId))
+  registryPullRoleAssignmentId
   feedV2WriterRole.id
   feedV2Writer.id
   feedV2ProducerReader.id
@@ -1074,7 +1116,7 @@ var coreRbacResourceIds = [
   extensionResourceId(changeSourceContainer.id, 'Microsoft.Authorization/roleAssignments', guid(changeSourceContainer.id, changeReaderIdentity.id, storageBlobDataReaderRoleDefinitionId))
   extensionResourceId(contextAuthoritySourceContainer.id, 'Microsoft.Authorization/roleAssignments', guid(contextAuthoritySourceContainer.id, contextAuthorityReaderIdentity.id, storageBlobDataReaderRoleDefinitionId))
   extensionResourceId(monitoringIntentSourceContainer.id, 'Microsoft.Authorization/roleAssignments', guid(monitoringIntentSourceContainer.id, monitoringIntentReaderIdentity.id, storageBlobDataReaderRoleDefinitionId))
-  extensionResourceId(guidanceAuthoritySourceContainer.id, 'Microsoft.Authorization/roleAssignments', guid(guidanceAuthoritySourceContainer.id, guidanceAuthorityReaderIdentity.id, storageBlobDataReaderRoleDefinitionId))
+  extensionResourceId(guidanceAuthoritySourceContainerId, 'Microsoft.Authorization/roleAssignments', guid(guidanceAuthoritySourceContainerId, guidanceAuthorityReaderIdentity.id, storageBlobDataReaderRoleDefinitionId))
   registryWriter.id
   guidanceActivationReader.id
   incidentKeyVerifierRoleId
@@ -1089,11 +1131,16 @@ var coreRbacResourceIds = [
   extensionResourceId(monitoringIntentKey.id, 'Microsoft.Authorization/roleAssignments', guid(monitoringIntentKey.id, trustReaderIdentity.id, monitoringIntentKeyVerifierRoleId))
   monitoringCollectorKeyVerifierRoleId
   extensionResourceId(monitoringCollectorKey.id, 'Microsoft.Authorization/roleAssignments', guid(monitoringCollectorKey.id, trustReaderIdentity.id, monitoringCollectorKeyVerifierRoleId))
-  reportSignerRole.id
-  guidanceSignerRole.id
-  enrichmentSignerRole.id
-  feedSignerRole.id
-  notificationSignerRole.id
+  reportSignerRoleId
+  reportSignerAssignmentId
+  guidanceSignerRoleId
+  guidanceSignerAssignmentId
+  enrichmentSignerRoleId
+  enrichmentSignerAssignmentId
+  feedSignerRoleId
+  feedSignerAssignmentId
+  notificationSignerRoleId
+  notificationSignerAssignmentId
 ]
 var triggerSubmitterRbacResourceIds = map(
   triggerSubmitterIdentityResourceIds,
@@ -1186,12 +1233,20 @@ resource producerJob 'Microsoft.App/jobs@2025-01-01' = {
   }
   dependsOn: [
     producerImagePull
+    reportSignerRbac
+    guidanceSignerRbac
+    enrichmentSignerRbac
+    feedSignerRbac
+    notificationSignerRbac
     triggerSubmitters
   ]
 }
 
 @description('Resource ID proving that the WC-027 producer Job/config was deployed.')
 output producerJobResourceId string = producerJob.id
+
+@description('Exact digest-pinned image deployed to the WC-027 producer Job.')
+output producerImage string = validatedProducerImage
 
 @description('Digest of the exact non-secret runtime configuration deployed to the Job.')
 output deployedRuntimeConfigurationDigest string = startsWith(runtimeConfigurationDigest, 'sha256:')
@@ -1213,8 +1268,53 @@ output feedV2WriterRoleDefinitionId string = feedV2WriterRole.id
 @description('Distinct private container isolating WC-027 enrichment and feed-v2 artifacts.')
 output feedV2ContainerName string = feedV2Container.name
 
+@description('Exact resource ID of the private WC-027 enrichment and feed-v2 container.')
+output feedV2ContainerResourceId string = feedV2Container.id
+
+@description('Exact resource ID of the WC-027 feed registry table.')
+output feedRegistryTableResourceId string = feedRegistry.id
+
+@description('Exact resource ID of the shared WC-027 guidance activation table.')
+output guidanceActivationTableResourceId string = guidanceActivation.id
+
+@description('Exact resource ID of the private WC-027 guidance-authority source container.')
+output guidanceAuthoritySourceContainerResourceId string = guidanceAuthoritySourceContainerId
+
 @description('Signed-binding trigger queue name.')
 output triggerQueueName string = triggerQueue.name
+
+@description('Exact resource ID of the signed-binding trigger queue.')
+output triggerQueueResourceId string = triggerQueue.id
+
+@description('Existing Notification v2 outbox queue name used by the producer.')
+output notificationQueueName string = notificationQueue.name
+
+@description('Exact resource ID of the existing Notification v2 outbox queue.')
+output notificationQueueResourceId string = notificationQueue.id
+
+@description('Server-returned ACR resource ID guarded against the reviewed registry resource ID.')
+output registryResourceId string = producerImagePull.outputs.registryResourceId
+
+@description('Live ACR role-assignment permissions mode used for producer image pull.')
+output registryRoleAssignmentMode string = producerImagePull.outputs.roleAssignmentMode
+
+@description('Live ACR anonymous-pull posture. This must remain explicitly false.')
+output registryAnonymousPullEnabled bool = producerImagePull.outputs.anonymousPullEnabled
+
+@description('Exact ACR repository parsed from the reviewed producer image.')
+output registryRepositoryName string = producerImagePull.outputs.repositoryName
+
+@description('Mode-compatible ACR pull role definition resource ID.')
+output registryPullRoleDefinitionId string = producerImagePull.outputs.roleDefinitionResourceId
+
+@description('Deterministic producer ACR pull role assignment resource ID.')
+output registryPullRoleAssignmentResourceId string = producerImagePull.outputs.roleAssignmentResourceId
+
+@description('Exact condition version on the producer ACR pull assignment, or null in legacy mode.')
+output registryPullConditionVersion string? = producerImagePull.outputs.?conditionVersion
+
+@description('Exact repository-scoped condition on the producer ACR pull assignment, or null in legacy mode.')
+output registryPullCondition string? = producerImagePull.outputs.?condition
 
 @description('Private Service Bus namespace host used by the runtime configuration.')
 output namespaceHostName string = serviceBusNamespaceHostName

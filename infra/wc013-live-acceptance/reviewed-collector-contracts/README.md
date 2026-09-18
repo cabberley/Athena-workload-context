@@ -17,7 +17,10 @@ Build `Dockerfile.wc013-controller` in the existing private ACR before ARM valid
 a digest-pinned Python base, installs the controller and dependencies at build time, runs as
 `10001:10001`, and fixes its entrypoint to `athena-context wc013-collector-controller`. Put its
 exact ACR RepoDigest in `collectorControllerImage`; Bicep rejects the all-zero placeholder and grants
-the GitHub OIDC identity only `AcrPull` in addition to its exact Job permissions.
+the GitHub OIDC identity only the mode-compatible pull role (`AcrPull` for legacy permissions or
+`Container Registry Repository Reader` for ABAC repository permissions) in addition to its exact
+Job permissions. The ABAC role assignment carries condition version `2.0` and the canonical exact
+repository-name condition parsed from that reviewed controller image.
 
 The reviewed deployment artifact pins the same complete image reference. At execution, the workflow
 uses only SHA-pinned checkout and `azure/login` actions on `ubuntu-24.04`. Before Azure login,
@@ -113,7 +116,7 @@ The controller identity receives only:
 - `Microsoft.App/jobs/read`;
 - `Microsoft.App/jobs/start/action`;
 - `Microsoft.App/jobs/executions/read`; and
-- `AcrPull` on the existing controller-image registry.
+- the mode-compatible read-only image-pull role on the existing controller-image registry.
 
 It receives neither `Microsoft.Resources/deployments/read` nor a built-in Reader role. The
 controller's contract model independently requires a lowercase Azure Container Registry login

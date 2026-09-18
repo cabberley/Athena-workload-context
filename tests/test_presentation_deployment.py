@@ -172,9 +172,12 @@ def test_presentation_bicep_is_private_and_reads_only_presentation_assets() -> N
     assert "maxReplicas: 1" in presentation
     assert "path: '/healthz'" in presentation
     assert "presentationImagePull" in presentation
+    assert "presentationDeliveryImagePull" in presentation
     assert "dependsOn:" in presentation
     assert "presentationImagePull" in acr_pull or "acrPullRoleDefinitionId" in acr_pull
     assert "7f951dda-4ed3-4680-a7ca-43fe172d538d" in acr_pull
+    assert "b93aa761-3e63-49ed-ac28-beffa264f7ac" in acr_pull
+    assert "StringEqualsIgnoreCase \\'${validatedRepositoryName}\\'" in acr_pull
     for forbidden in (
         "Key Vault Crypto User",
         "Storage Table",
@@ -307,7 +310,45 @@ def test_controller_identity_oidc_and_workflow_are_closed_and_separate() -> None
     controller_pull = orchestration[controller_pull_start:controller_pull_end]
     assert "collectorControllerIdentity.outputs.principalId" in controller_pull
     assert "acceptanceImageRegistryResourceId" in controller_pull
-    assert "7f951dda-4ed3-4680-a7ca-43fe172d538d" in acr_pull
+    assert "acceptanceImageRegistryRoleAssignmentMode" in controller_pull
+    assert orchestration.count("registryResourceId: acceptanceImageRegistryResourceId") == 6
+    assert orchestration.count("image: validatedAcceptanceImage") == 4
+    assert "image: validatedControllerImage" in orchestration
+    assert "image: validatedWc016DetectorImage" in orchestration
+    assert orchestration.count("image: validatedWc016OrchestratorImage") == 4
+    assert (
+        orchestration.count("registryRoleAssignmentMode: acceptanceImageRegistryRoleAssignmentMode")
+        == 6
+    )
+    for expected in (
+        "7f951dda-4ed3-4680-a7ca-43fe172d538d",
+        "b93aa761-3e63-49ed-ac28-beffa264f7ac",
+        "reference(registry.id, '2025-04-01', 'Full')",
+        "registryRuntime.properties.?anonymousPullEnabled == false",
+        "guid(registry.id, identityPrincipalId, pullRoleDefinitionResourceId)",
+        "principalType: 'ServicePrincipal'",
+        "roleDefinitionId: guardedPullRoleDefinitionResourceId",
+        "output registryResourceId string = runtimeRegistryResourceId",
+        "output anonymousPullEnabled bool = validatedAnonymousPullEnabled",
+    ):
+        assert expected in acr_pull
+    assert "identityName" not in acr_pull
+    for expected in (
+        "var wc013AcrPullAssignments = concat(",
+        "wc013AcrPullAssignments: wc013AcrPullAssignments",
+        "label: 'acceptance'",
+        "label: 'evidence'",
+        "label: 'controller'",
+        "label: 'wc016-detector'",
+        "label: 'wc016-orchestrator'",
+        "label: 'wc016-notification'",
+        "presentationWeb.outputs.acrPullAssignments",
+        "anonymousPullEnabled: acceptanceImagePull.outputs.anonymousPullEnabled",
+    ):
+        assert expected in orchestration
+    assert "label: 'presentation-delivery'" in _read(
+        "infra/wc013-live-acceptance/modules/presentation-web.bicep"
+    )
 
     assert "environment: athena-live" in workflow
     assert "github.ref == 'refs/heads/main'" in workflow

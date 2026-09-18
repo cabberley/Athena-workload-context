@@ -36,6 +36,11 @@ az bicep build-params --file infra/wc025-change-ingestion/main.example.biceppara
 ./infra/wc029-monitoring-prerequisites/Test-MonitoringReadiness.ps1
 ```
 
+Repository CI runs `tests/Test-Wc029MonitoringReadiness.ps1`. That wrapper parses the live
+readiness script and executes only its deterministic DCR-routing and retention helpers against
+synthetic adversarial objects. It does not authenticate to Azure or invoke `az`, so the CI step
+requires PowerShell only and deliberately does not provision Azure CLI credentials.
+
 The checked-in WC-029 parameter file keeps every mutation gate off. Before an operator enables an
 extension family, create a separately reviewed immutable parameter artifact, run subscription
 validate and full-payload what-if, and apply the zero-delete/public-exposure/RBAC gates from the

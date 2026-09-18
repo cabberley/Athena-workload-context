@@ -47,6 +47,7 @@ param wc008PinnedAssertionDigest = 'sha256:0000000000000000000000000000000000000
 param acceptanceImage = 'athenasynth.azurecr.io/athena/wc013-live@sha256:0000000000000000000000000000000000000000000000000000000000000000'
 param acceptanceImageRegistryServer = 'athenasynth.azurecr.io'
 param acceptanceImageRegistryResourceId = '/subscriptions/33333333-3333-3333-3333-333333333333/resourceGroups/athena-synth-shared-rg/providers/Microsoft.ContainerRegistry/registries/athenasynth'
+param acceptanceImageRegistryRoleAssignmentMode = 'LegacyRegistryPermissions'
 // Synthetic controller image shape; replace with the reviewed ACR RepoDigest before validation.
 param collectorControllerImage = 'athenasynth.azurecr.io/athena/wc013-controller@sha256:2222222222222222222222222222222222222222222222222222222222222222'
 // Synthetic non-placeholder digest shape; replace with a real ACR manifest digest before deployment.
@@ -54,6 +55,7 @@ param collectorControllerImage = 'athenasynth.azurecr.io/athena/wc013-controller
 param presentationImage = 'athenasynth.azurecr.io/athena/presentation-web@sha256:1111111111111111111111111111111111111111111111111111111111111111'
 param presentationImageRegistryServer = 'athenasynth.azurecr.io'
 param presentationImageRegistryResourceId = '/subscriptions/33333333-3333-3333-3333-333333333333/resourceGroups/athena-synth-shared-rg/providers/Microsoft.ContainerRegistry/registries/athenasynth'
+param presentationImageRegistryRoleAssignmentMode = 'LegacyRegistryPermissions'
 
 // WC-016 images deliberately use rejected all-zero digests until the deployer supplies RepoDigests.
 param wc016DetectorImage = 'athenasynth.azurecr.io/athena/wc016-detector@sha256:0000000000000000000000000000000000000000000000000000000000000000'
