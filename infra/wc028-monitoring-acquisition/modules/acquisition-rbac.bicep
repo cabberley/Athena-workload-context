@@ -110,15 +110,15 @@ resource monitoringEvidenceCreateOnlyRole 'Microsoft.Authorization/roleDefinitio
   }
 }
 
-resource monitoringIntentKeyReaderRole 'Microsoft.Authorization/roleDefinitions@2022-04-01' = {
+resource runtimeSupportMonitoringIntentKeyReaderRole 'Microsoft.Authorization/roleDefinitions@2022-04-01' = {
   name: guid(
     subscription().id,
-    'athena-wc028-monitoring-intent-key-reader',
+    'athena-wc028-runtime-support-monitoring-intent-key-reader',
     toLower(monitoringIntentSigningKeyResourceId)
   )
   properties: {
-    roleName: 'Athena WC028 Monitoring Intent Key Reader'
-    description: 'Read only the public material and properties of the exact monitoring-intent signing key.'
+    roleName: 'Athena WC028 Runtime Support Monitoring Intent Key Reader'
+    description: 'Allow only public-key material and metadata reads when assigned to the exact monitoring-intent signing key for the separate runtime-support identity.'
     type: 'CustomRole'
     permissions: [
       {
@@ -147,12 +147,12 @@ module collectorMonitoringEvidenceWriter 'monitoring-evidence-writer-assignment.
   }
 }
 
-module runtimeSupportMonitoringIntentKeyReader 'key-reader-assignment.bicep' = {
-  name: 'wc028-monitoring-intent-key-reader-assignment'
+module runtimeSupportMonitoringIntentKeyReaderAssignment 'key-reader-assignment.bicep' = {
+  name: 'wc028-runtime-support-monitoring-intent-key-reader-assignment'
   scope: intentKeyResourceGroup
   params: {
     principalId: runtimeSupportPrincipalId
-    roleDefinitionId: monitoringIntentKeyReaderRole.id
+    roleDefinitionId: runtimeSupportMonitoringIntentKeyReaderRole.id
     vaultName: intentKeyVault.name
     keyName: monitoringIntentSigningKey.name
     expectedKeyResourceId: validatedMonitoringIntentSigningKeyResourceId
@@ -160,4 +160,4 @@ module runtimeSupportMonitoringIntentKeyReader 'key-reader-assignment.bicep' = {
 }
 
 output monitoringEvidenceCreateOnlyRoleDefinitionId string = monitoringEvidenceCreateOnlyRole.id
-output monitoringIntentKeyReaderRoleDefinitionId string = monitoringIntentKeyReaderRole.id
+output runtimeSupportMonitoringIntentKeyReaderRoleDefinitionId string = runtimeSupportMonitoringIntentKeyReaderRole.id

@@ -1,9 +1,9 @@
 targetScope = 'resourceGroup'
 
-@description('Principal ID of the reused WC-024 monitoring collector identity.')
+@description('Principal ID of the separate WC-028 runtime-support identity.')
 param principalId string
 
-@description('Subscription-level custom role permitting only exact Key Vault key reads.')
+@description('Subscription-level runtime-support custom role permitting only public-key material and metadata reads.')
 param roleDefinitionId string
 
 @description('Existing Key Vault containing the monitoring-intent signing key.')
@@ -26,9 +26,9 @@ resource key 'Microsoft.KeyVault/vaults/keys@2024-11-01' existing = {
 
 var validatedKeyResourceId = toLower(key.id) == toLower(expectedKeyResourceId)
   ? key.id
-  : fail('monitoring intent key reader assignment escaped the reviewed key')
+  : fail('runtime-support monitoring intent key reader assignment escaped the reviewed key')
 
-resource collectorMonitoringIntentKeyReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+resource runtimeSupportMonitoringIntentKeyReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(validatedKeyResourceId, principalId, roleDefinitionId)
   scope: key
   properties: {
@@ -38,4 +38,4 @@ resource collectorMonitoringIntentKeyReader 'Microsoft.Authorization/roleAssignm
   }
 }
 
-output roleAssignmentResourceId string = collectorMonitoringIntentKeyReader.id
+output roleAssignmentResourceId string = runtimeSupportMonitoringIntentKeyReader.id

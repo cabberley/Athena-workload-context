@@ -513,7 +513,7 @@ resource acquisitionJob 'Microsoft.App/jobs@2025-01-01' = {
             }
             {
               name: 'ATHENA_WC028_DEPLOYED_RUNTIME_SUPPORT_INTENT_KEY_READER_ROLE_DEFINITION_ID'
-              value: acquisitionRbac.outputs.monitoringIntentKeyReaderRoleDefinitionId
+              value: acquisitionRbac.outputs.runtimeSupportMonitoringIntentKeyReaderRoleDefinitionId
             }
             {
               name: 'ATHENA_WC028_DEPLOYED_RUNTIME_SUPPORT_RBAC_INVENTORY_DIGEST'

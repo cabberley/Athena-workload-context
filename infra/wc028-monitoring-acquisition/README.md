@@ -120,12 +120,25 @@ Before deploying this version over an existing WC-028 runtime, run
 `remove-obsolete-collector-rbac.ps1` with the previous registry, workload resource group,
 change-evidence container, monitoring-evidence container, monitoring-intent key, exact historical
 Network Watcher, and exact collector resource/principal pair. The script deletes only the six exact
-legacy collector assignments, including the deterministic Network Watcher IP Flow assignment and
-the broad monitoring-evidence contributor assignment. It recomputes all four historical custom
-role-definition IDs from their original ARM `guid()` preimages, validates any existing definition's
-exact permissions and assignable scope without trusting its mutable display name, removes it by
-exact ID, verifies every reviewed assignment and definition is absent, and emits
-`cleanupEvidenceDigest`.
+legacy collector assignment targets, including Network Watcher IP Flow and the broad
+monitoring-evidence contributor assignment. Before mutation it enumerates every custom role
+definition available in the subscription without a name or GUID filter. Each historical custom role
+must resolve uniquely by its exact reviewed name, description, single assignable scope, and
+permissions. Duplicate, renamed, or body-mismatched candidates fail closed. A missing role is
+accepted only as a per-target absence proof from that complete enumeration.
+
+The script separately enumerates every subscription-descendant assignment for the exact collector
+principal. Each assignment target must either be found uniquely and deleted by its returned Azure
+resource ID or be proved absent in that complete query. The custom-role targets use the actual role
+definition IDs returned by the trusted role enumeration; the two built-in targets use their
+published fixed IDs. Fresh, independent complete role and assignment enumerations prove
+post-cleanup absence. The cleanup evidence records the resolution and absence proof for every
+target before emitting `cleanupEvidenceDigest`.
+
+No deployment-derived ARM `guid()` result is embedded in this branch, so the cleanup script does
+not locally implement `guid()` and never treats a reconstructed ID miss as evidence of absence. It
+records the reviewed historical preimages only as readiness evidence. A renamed role with the exact
+historical body is surfaced for manual review rather than deleted automatically.
 
 The cleanup uses only supported exact lookups: `az resource show --ids` for the reviewed
 `NetworkWatcherRG/NetworkWatcher_australiaeast` resource and `az group show --name` for the
@@ -147,8 +160,9 @@ After the PR #99 dependency gate is replaced during the final restack, the deplo
 add only:
 
 - `AcrPull` for the runtime-support identity on the existing registry;
-- public-key read access for the runtime-support identity on the exact monitoring-intent signing
-  key; and
+- the `Athena WC028 Runtime Support Monitoring Intent Key Reader` role, permitting only public-key
+  material and metadata reads for the runtime-support identity on the exact monitoring-intent
+  signing key; and
 - exact known-name Blob reads plus add-only Blob creation for the collector on the existing
   `monitoring-evidence` container. The assignment condition explicitly denies the `Blob.List`
   suboperation.
@@ -163,6 +177,12 @@ Runtime recomputes the SHA-256 readiness digest and requires a fresh storage-rea
 return the exact same validated contract immediately before any durable writer call. This draft
 deliberately wires a verifier that fails closed because current PR #99 has not yet published the
 required storage contract or narrow runtime read authorization.
+
+The runtime's local ARM `guid()` mirror remains only a defense-in-depth, fail-closed consistency
+check for that deployment-produced storage-readiness binding. The independently recomputed SHA-256
+readiness digest, exact resource IDs and protection values, Bicep validation, and fresh live
+readback remain authoritative; the local GUID mirror is not used for RBAC discovery, deletion, or
+absence claims.
 
 It adds no built-in Reader, Contributor, Owner, Blob overwrite/delete/list, diagnostic-setting,
 alert-rule, or Connection Monitor mutation permission. Existing WC-024 grants continue to

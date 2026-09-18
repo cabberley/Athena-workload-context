@@ -128,7 +128,9 @@ _BLOCKED_PR99_CONTRACT_SCHEMA_VERSION = "athena.wc028MonitoringCollectorContract
 _ACR_PULL_ROLE_DEFINITION_GUID = "7f951dda-4ed3-4680-a7ca-43fe172d538d"
 _ACR_PULL_ROLE_NAME = "AcrPull"
 _ACR_PULL_ACTION = "Microsoft.ContainerRegistry/registries/pull/read"
-_MONITORING_INTENT_KEY_READER_ROLE_NAME = "Athena WC028 Monitoring Intent Key Reader"
+_MONITORING_INTENT_KEY_READER_ROLE_NAME = (
+    "Athena WC028 Runtime Support Monitoring Intent Key Reader"
+)
 _MONITORING_INTENT_KEY_READ_DATA_ACTION = "Microsoft.KeyVault/vaults/keys/read"
 _ZERO_DIGEST = f"sha256:{'0' * 64}"
 _NIL_GUID = "00000000-0000-0000-0000-000000000000"
@@ -341,6 +343,8 @@ def _monitoring_evidence_storage_readiness_preimage(
 
 
 def _arm_template_guid(*values: str) -> str:
+    """Mirror ARM guid() only as a fail-closed storage-readiness consistency check."""
+
     if not values or any(not value for value in values):
         raise ValueError("ARM guid inputs must be non-empty")
     return str(uuid5(_ARM_TEMPLATE_GUID_NAMESPACE, "-".join(values)))
@@ -1856,18 +1860,30 @@ def _guard_runtime_support_key_request(
         configuration=configuration,
         as_of=requested_at,
     )
+    request_error: BaseException | None = None
     try:
         yield
+    except BaseException as exc:
+        request_error = exc
+        raise
     finally:
-        completed_at = _utc_now_milliseconds()
-        if completed_at < requested_at:
-            raise MonitoringAcquisitionJobError(
-                "runtime-support Key Vault request interval is non-monotonic"
+        try:
+            completed_at = _utc_now_milliseconds()
+            if completed_at < requested_at:
+                raise MonitoringAcquisitionJobError(
+                    "runtime-support Key Vault request interval is non-monotonic"
+                )
+            _validate_runtime_support_effective_rbac(
+                configuration=configuration,
+                as_of=completed_at,
             )
-        _validate_runtime_support_effective_rbac(
-            configuration=configuration,
-            as_of=completed_at,
-        )
+        except (MonitoringAcquisitionJobError, ValueError) as revalidation_error:
+            if request_error is None:
+                raise
+            request_error.add_note(
+                "post-request runtime-support RBAC revalidation also failed: "
+                f"{revalidation_error}"
+            )
 
 
 def _validate_monitoring_intent_key_lifecycle(
@@ -3454,7 +3470,7 @@ class MonitoringEvidenceCommitPort:
                 correlation_request=rebuilt_correlation,
             )
 
-        if state is None:
+        if state is None or probe.recovery_state_result is None:
             raise MonitoringAcquisitionJobError(
                 "immutable evidence exists without its collector-signed recovery binding"
             )
@@ -3466,15 +3482,7 @@ class MonitoringEvidenceCommitPort:
             expected_signed_digest=(state.monitoring_evidence_storage_readiness_digest),
             verifier=self._storage_readiness_verifier,
         )
-        if probe.recovery_state_result is None:
-            state_reference = self._write(
-                writer=self._monitoring_writer,
-                current_reader=self._monitoring_current_reader,
-                blob_name=recovery_blob_name,
-                payload=state.canonical_bytes(),
-            )
-        else:
-            state_reference = self._reference_from_result(probe.recovery_state_result)
+        state_reference = self._reference_from_result(probe.recovery_state_result)
         if evidence_bundle is None:
             evidence_reference = self._write(
                 writer=self._monitoring_writer,

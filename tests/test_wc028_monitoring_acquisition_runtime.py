@@ -316,7 +316,9 @@ def _runtime_support_rbac_inventory(
         _with_digest(
             {
                 "roleDefinitionId": key_role_id,
-                "roleDefinitionName": "Athena WC028 Monitoring Intent Key Reader",
+                "roleDefinitionName": (
+                    "Athena WC028 Runtime Support Monitoring Intent Key Reader"
+                ),
                 "actions": (),
                 "notActions": (),
                 "dataActions": ("microsoft.keyvault/vaults/keys/read",),
@@ -347,7 +349,9 @@ def _runtime_support_rbac_inventory(
                 "assignedPrincipalType": "ServicePrincipal",
                 "effectivePrincipalId": support_principal_id,
                 "roleDefinitionId": key_role_id,
-                "roleDefinitionName": "Athena WC028 Monitoring Intent Key Reader",
+                "roleDefinitionName": (
+                    "Athena WC028 Runtime Support Monitoring Intent Key Reader"
+                ),
                 "assignmentScopeIds": (key_id,),
                 "inheritance": "direct",
                 "groupDerived": False,
@@ -2353,6 +2357,46 @@ def test_runtime_support_key_guard_rejects_reversed_request_interval(
     ):
         pass
 
+    assert clock_values == []
+
+
+def test_runtime_support_key_guard_preserves_request_error_when_postcheck_also_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configuration = Wc028MonitoringAcquisitionJobConfiguration.model_validate(
+        _configuration_payload()
+    )
+    clock_values = [NOW, NOW + timedelta(seconds=1)]
+    validation_calls = 0
+
+    def utc_now() -> datetime:
+        if not clock_values:
+            raise AssertionError("runtime-support key guard requested an unexpected timestamp")
+        return clock_values.pop(0)
+
+    def validate_rbac(**_kwargs: object) -> None:
+        nonlocal validation_calls
+        validation_calls += 1
+        if validation_calls == 2:
+            raise MonitoringAcquisitionJobError("synthetic post-request RBAC failure")
+
+    monkeypatch.setattr(runtime_module, "_utc_now_milliseconds", utc_now)
+    monkeypatch.setattr(runtime_module, "_validate_runtime_support_effective_rbac", validate_rbac)
+    request_error = ServiceRequestError("synthetic original request failure")
+
+    with (
+        pytest.raises(ServiceRequestError) as caught,
+        runtime_module._guard_runtime_support_key_request(configuration=configuration),
+    ):
+        raise request_error
+
+    assert caught.value is request_error
+    assert any(
+        "post-request runtime-support RBAC revalidation also failed" in note
+        and "synthetic post-request RBAC failure" in note
+        for note in caught.value.__notes__
+    )
+    assert validation_calls == 2
     assert clock_values == []
 
 
