@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Never
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 from uuid import UUID, uuid5
 
 from cryptography.hazmat.primitives import serialization
@@ -72,6 +72,8 @@ GRAPH_HOST = "graph.microsoft.com"
 ARM_HOST = "management.azure.com"
 MAX_TRANSITIVE_GROUPS = 10_000
 MAX_GRAPH_MEMBERSHIP_PAGES = 128
+MAX_AUTHORIZATION_SCAN_PAGES = 512
+MAX_AUTHORIZATION_SCAN_ITEMS = 10_000
 MAX_DENY_ASSIGNMENT_PAGES = 128
 MAX_DENY_ASSIGNMENTS = 10_000
 MAX_APPROVED_TRIGGER_QUEUE_TRANSITION_ASSIGNMENTS = 4
@@ -449,6 +451,10 @@ class OrchestrationError(ValueError):
     """Raised when deployment evidence or a cross-root handoff fails closed."""
 
 
+class TerminalEvidenceError(OrchestrationError):
+    """Raised when successful execution is followed by non-retryable evidence drift."""
+
+
 class _CommandFailure(OrchestrationError):
     def __init__(self, returncode: int, detail: str) -> None:
         self.returncode = returncode
@@ -462,6 +468,33 @@ class _RolePermissionProfile:
     not_actions: frozenset[str] = frozenset()
     data_actions: frozenset[str] = frozenset()
     not_data_actions: frozenset[str] = frozenset()
+
+
+@dataclass(slots=True)
+class _AuthorizationScanBudget:
+    remaining_pages: int
+    remaining_items: int
+
+    @classmethod
+    def bounded(cls) -> _AuthorizationScanBudget:
+        return cls(
+            remaining_pages=MAX_AUTHORIZATION_SCAN_PAGES,
+            remaining_items=MAX_AUTHORIZATION_SCAN_ITEMS,
+        )
+
+    def consume_page(self) -> None:
+        if self.remaining_pages < 1:
+            raise OrchestrationError(
+                "authorization assignment pagination exceeded its bounded page budget"
+            )
+        self.remaining_pages -= 1
+
+    def consume_item(self) -> None:
+        if self.remaining_items < 1:
+            raise OrchestrationError(
+                "authorization assignment evidence exceeded its bounded item budget"
+            )
+        self.remaining_items -= 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -4727,6 +4760,8 @@ def _retry_eventually_consistent[T](
     for attempt in range(1, READBACK_MAX_ATTEMPTS + 1):
         try:
             return operation()
+        except TerminalEvidenceError:
+            raise
         except OrchestrationError as exc:
             last_error = exc
             if attempt == READBACK_MAX_ATTEMPTS:
@@ -4738,6 +4773,18 @@ def _retry_eventually_consistent[T](
         f"{field} did not converge after {READBACK_MAX_ATTEMPTS} bounded read-only attempts: "
         f"{last_error}"
     ) from last_error
+
+
+def _retry_post_deployment_readiness(
+    operation: Callable[
+        [],
+        tuple[dict[str, object] | None, dict[str, object] | None],
+    ],
+) -> tuple[dict[str, object] | None, dict[str, object] | None]:
+    return _retry_eventually_consistent(
+        operation,
+        field="post-deployment readiness and authority checkpoint",
+    )
 
 
 def _deployment_read_command(
@@ -6059,11 +6106,49 @@ TABLE_DATA_CONTRIBUTOR_ROLE_ID = "0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3"
 TABLE_DATA_READER_ROLE_ID = "76199698-9eea-4c19-bc75-cec21354c6b6"
 KEY_VAULT_CRYPTO_USER_ROLE_ID = "12338af0-0e69-4776-bea7-57ae8d297424"
 ACR_LEGACY_PULL_ACTION = "Microsoft.ContainerRegistry/registries/pull/read"
+ACR_QUARANTINE_READ_ACTION = "Microsoft.ContainerRegistry/registries/quarantine/read"
 ACR_REPOSITORY_CONTENT_READ_DATA_ACTION = (
     "Microsoft.ContainerRegistry/registries/repositories/content/read"
 )
 ACR_REPOSITORY_METADATA_READ_DATA_ACTION = (
     "Microsoft.ContainerRegistry/registries/repositories/metadata/read"
+)
+ACR_QUARANTINED_ARTIFACTS_READ_DATA_ACTION = (
+    "Microsoft.ContainerRegistry/registries/quarantinedArtifacts/read"
+)
+ACR_REGISTRY_ESCALATION_ACTIONS = frozenset(
+    {
+        "Microsoft.ContainerRegistry/registries/write",
+        "Microsoft.ContainerRegistry/registries/listCredentials/action",
+        "Microsoft.ContainerRegistry/registries/generateCredentials/action",
+        "Microsoft.ContainerRegistry/registries/regenerateCredential/action",
+        "Microsoft.ContainerRegistry/registries/quarantine/write",
+        "Microsoft.ContainerRegistry/registries/scheduleRun/action",
+        "Microsoft.ContainerRegistry/registries/scopeMaps/write",
+        "Microsoft.ContainerRegistry/registries/tasks/listDetails/action",
+        "Microsoft.ContainerRegistry/registries/tasks/write",
+        "Microsoft.ContainerRegistry/registries/taskruns/listDetails/action",
+        "Microsoft.ContainerRegistry/registries/taskruns/write",
+        "Microsoft.ContainerRegistry/registries/tokens/write",
+        "Microsoft.ContainerRegistry/registries/updatePolicies/write",
+    }
+)
+ACR_REGISTRY_ESCALATION_DATA_ACTIONS = frozenset(
+    {
+        "Microsoft.ContainerRegistry/registries/quarantinedArtifacts/write",
+    }
+)
+AUTHORIZATION_ESCALATION_ACTIONS = frozenset(
+    {
+        "Microsoft.Authorization/elevateAccess/action",
+        "Microsoft.Authorization/roleAssignments/write",
+        "Microsoft.Authorization/roleAssignmentScheduleRequests/write",
+        "Microsoft.Authorization/roleDefinitions/write",
+        "Microsoft.Authorization/roleEligibilityScheduleRequests/write",
+        "Microsoft.Authorization/roleEligibilityScheduleRequests/whenApprovalRequired/write",
+        "Microsoft.Authorization/roleManagementPolicies/write",
+        "Microsoft.Authorization/roleManagementPolicies/approvalRule/action",
+    }
 )
 ACR_REPOSITORY_CONDITION_PREFIX = (
     "((!(ActionMatches{"
@@ -6076,6 +6161,19 @@ ACR_REPOSITORY_CONDITION_PREFIX = (
 ACR_REPOSITORY_CONDITION_SUFFIX = "'))"
 SERVICE_BUS_RECEIVE_DATA_ACTION = "Microsoft.ServiceBus/namespaces/messages/receive/action"
 SERVICE_BUS_SEND_DATA_ACTION = "Microsoft.ServiceBus/namespaces/messages/send/action"
+SERVICE_BUS_ESCALATION_ACTIONS = frozenset(
+    {
+        "Microsoft.ServiceBus/namespaces/write",
+        "Microsoft.ServiceBus/namespaces/authorizationRules/action",
+        "Microsoft.ServiceBus/namespaces/authorizationRules/write",
+        "Microsoft.ServiceBus/namespaces/authorizationRules/listkeys/action",
+        "Microsoft.ServiceBus/namespaces/authorizationRules/regenerateKeys/action",
+        "Microsoft.ServiceBus/namespaces/queues/authorizationRules/action",
+        "Microsoft.ServiceBus/namespaces/queues/authorizationRules/write",
+        "Microsoft.ServiceBus/namespaces/queues/authorizationRules/listkeys/action",
+        "Microsoft.ServiceBus/namespaces/queues/authorizationRules/regenerateKeys/action",
+    }
+)
 BLOB_READ_DATA_ACTION = "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read"
 BLOB_WRITE_DATA_ACTION = "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write"
 BLOB_ADD_DATA_ACTION = "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action"
@@ -6092,6 +6190,51 @@ KEY_READ_DATA_ACTION = "Microsoft.KeyVault/vaults/keys/read"
 KEY_VERIFY_DATA_ACTION = "Microsoft.KeyVault/vaults/keys/verify/action"
 KEY_SIGN_DATA_ACTION = "Microsoft.KeyVault/vaults/keys/sign/action"
 ALL_PRINCIPALS_ID = "00000000-0000-0000-0000-000000000000"
+ROLE_ASSIGNMENTS_API_VERSION = "2022-04-01"
+PIM_SCHEDULE_INSTANCES_API_VERSION = "2020-10-01"
+AUTHORIZATION_RESOURCE_API_VERSIONS = {
+    "roleAssignments": ROLE_ASSIGNMENTS_API_VERSION,
+    "roleAssignmentScheduleInstances": PIM_SCHEDULE_INSTANCES_API_VERSION,
+    "roleEligibilityScheduleInstances": PIM_SCHEDULE_INSTANCES_API_VERSION,
+}
+AUTHORIZATION_SCHEDULE_STATUSES = frozenset(
+    {
+        "accepted",
+        "pendingevaluation",
+        "granted",
+        "denied",
+        "pendingprovisioning",
+        "provisioned",
+        "pendingrevocation",
+        "revoked",
+        "canceled",
+        "failed",
+        "pendingapprovalprovisioning",
+        "pendingapproval",
+        "failedasresourceislocked",
+        "pendingadmindecision",
+        "adminapproved",
+        "admindenied",
+        "timedout",
+        "provisioningstarted",
+        "invalid",
+        "pendingschedulecreation",
+        "schedulecreated",
+        "pendingexternalprovisioning",
+    }
+)
+INACTIVE_AUTHORIZATION_SCHEDULE_STATUSES = frozenset(
+    {
+        "denied",
+        "revoked",
+        "canceled",
+        "failed",
+        "failedasresourceislocked",
+        "admindenied",
+        "timedout",
+        "invalid",
+    }
+)
 DENY_ASSIGNMENTS_API_VERSION = "2022-04-01"
 BUILT_IN_DATA_ROLE_IDS = frozenset(
     {
@@ -7641,6 +7784,84 @@ def _permission_profile_grants_action(
     ) and not any(_azure_permission_pattern_matches(pattern, action) for pattern in excluded)
 
 
+def _permission_profiles_grant_any_action(
+    profiles: Sequence[_RolePermissionProfile],
+    actions: frozenset[str],
+    *,
+    is_data_action: bool,
+) -> bool:
+    return any(
+        _permission_profile_grants_action(
+            profile,
+            action,
+            is_data_action=is_data_action,
+        )
+        for profile in profiles
+        for action in actions
+    )
+
+
+def _role_definition_grants_authorization_escalation(
+    profiles: Sequence[_RolePermissionProfile],
+) -> bool:
+    return _permission_profiles_grant_any_action(
+        profiles,
+        AUTHORIZATION_ESCALATION_ACTIONS,
+        is_data_action=False,
+    )
+
+
+def _scope_can_govern_acr(scope: str) -> bool:
+    normalized = scope.rstrip("/").casefold() or "/"
+    if normalized == "/" or normalized.startswith(
+        "/providers/microsoft.management/managementgroups/"
+    ):
+        return True
+    segments = [segment for segment in normalized.split("/") if segment]
+    if (
+        len(segments) == 2
+        and segments[0] == "subscriptions"
+        or len(segments) == 4
+        and segments[0] == "subscriptions"
+        and segments[2] == "resourcegroups"
+    ):
+        return True
+    try:
+        resource_type = _resource_type(scope)
+    except OrchestrationError:
+        return False
+    return resource_type == "microsoft.containerregistry/registries" or resource_type.startswith(
+        "microsoft.containerregistry/registries/"
+    )
+
+
+def _role_definition_grants_trigger_queue_access(
+    resource: Mapping[str, object],
+) -> bool:
+    profiles = _role_permission_profiles(
+        resource,
+        field="effective trigger-queue role definition",
+    )
+    return (
+        _permission_profiles_grant_any_action(
+            profiles,
+            frozenset(
+                {
+                    SERVICE_BUS_RECEIVE_DATA_ACTION,
+                    SERVICE_BUS_SEND_DATA_ACTION,
+                }
+            ),
+            is_data_action=True,
+        )
+        or _permission_profiles_grant_any_action(
+            profiles,
+            SERVICE_BUS_ESCALATION_ACTIONS,
+            is_data_action=False,
+        )
+        or _role_definition_grants_authorization_escalation(profiles)
+    )
+
+
 def _get_role_definition(
     role_definition_id: str,
     *,
@@ -7655,22 +7876,22 @@ def _get_role_definition(
         or urlparse(role_definition_id).query
         or urlparse(role_definition_id).fragment
     ):
-        raise OrchestrationError("effective ACR role definition ID is not canonical")
+        raise OrchestrationError("effective authorization role definition ID is not canonical")
     try:
         role_definition_guid = str(UUID(role_definition_id.rsplit("/", 1)[-1]))
     except ValueError as exc:
         raise OrchestrationError(
-            "effective ACR role definition ID must end in one canonical UUID"
+            "effective authorization role definition ID must end in one canonical UUID"
         ) from exc
     if role_definition_id.rsplit("/", 1)[-1] != role_definition_guid:
         raise OrchestrationError(
-            "effective ACR role definition ID must use canonical lowercase UUID form"
+            "effective authorization role definition ID must use canonical lowercase UUID form"
         )
     if normalized.startswith("/subscriptions/"):
         canonical_id = _canonical_subscription_resource_id(
             role_definition_id,
             subscription_id=subscription_id,
-            field="effective ACR role definition ID",
+            field="effective authorization role definition ID",
         )
     elif normalized.startswith("/providers/microsoft.management/managementgroups/"):
         segments = role_definition_id.split("/")
@@ -7685,11 +7906,11 @@ def _get_role_definition(
             or segments[7].casefold() != "roledefinitions"
         ):
             raise OrchestrationError(
-                "effective ACR management-group role definition ID is not canonical"
+                "effective authorization management-group role definition ID is not canonical"
             )
         _validate_resource_id_segment(
             segments[4],
-            field="effective ACR role definition management group",
+            field="effective authorization role definition management group",
         )
         canonical_id = role_definition_id
     elif normalized.startswith("/providers/microsoft.authorization/roledefinitions/"):
@@ -7701,11 +7922,13 @@ def _get_role_definition(
             or segments[2].casefold() != "microsoft.authorization"
             or segments[3].casefold() != "roledefinitions"
         ):
-            raise OrchestrationError("effective ACR tenant role definition ID is not canonical")
+            raise OrchestrationError(
+                "effective authorization tenant role definition ID is not canonical"
+            )
         canonical_id = role_definition_id
     else:
         raise OrchestrationError(
-            "effective ACR role definition is outside the governed subscription hierarchy"
+            "effective authorization role definition is outside the governed subscription hierarchy"
         )
     role = _mapping(
         _run_json(
@@ -7720,36 +7943,60 @@ def _get_role_definition(
                 "--output",
                 "json",
             ],
-            field="effective ACR role definition",
+            field="effective authorization role definition",
         ),
-        field="effective ACR role definition",
+        field="effective authorization role definition",
     )
     if str(role.get("id", "")).casefold() != normalized:
         raise OrchestrationError(
-            "effective ACR role definition readback does not match its assignment"
+            "effective authorization role definition readback does not match its assignment"
         )
     return role
 
 
-def _role_definition_grants_acr_pull(resource: Mapping[str, object]) -> bool:
+def _role_definition_grants_acr_pull(
+    resource: Mapping[str, object],
+    *,
+    assignment_scope: str,
+) -> bool:
+    if not _scope_can_govern_acr(assignment_scope):
+        return False
     profiles = _role_permission_profiles(
         resource,
         field="effective ACR role definition",
     )
-    required_reads = (
-        (ACR_LEGACY_PULL_ACTION, False),
-        (ACR_LEGACY_PULL_ACTION, True),
-        (ACR_REPOSITORY_CONTENT_READ_DATA_ACTION, False),
-        (ACR_REPOSITORY_CONTENT_READ_DATA_ACTION, True),
-    )
-    return any(
-        _permission_profile_grants_action(
-            profile,
-            action,
-            is_data_action=is_data_action,
+    return (
+        _permission_profiles_grant_any_action(
+            profiles,
+            frozenset(
+                {
+                    ACR_LEGACY_PULL_ACTION,
+                    ACR_QUARANTINE_READ_ACTION,
+                }
+            ),
+            is_data_action=False,
         )
-        for profile in profiles
-        for action, is_data_action in required_reads
+        or _permission_profiles_grant_any_action(
+            profiles,
+            frozenset(
+                {
+                    ACR_REPOSITORY_CONTENT_READ_DATA_ACTION,
+                    ACR_QUARANTINED_ARTIFACTS_READ_DATA_ACTION,
+                }
+            ),
+            is_data_action=True,
+        )
+        or _permission_profiles_grant_any_action(
+            profiles,
+            ACR_REGISTRY_ESCALATION_ACTIONS,
+            is_data_action=False,
+        )
+        or _permission_profiles_grant_any_action(
+            profiles,
+            ACR_REGISTRY_ESCALATION_DATA_ACTIONS,
+            is_data_action=True,
+        )
+        or _role_definition_grants_authorization_escalation(profiles)
     )
 
 
@@ -7791,6 +8038,10 @@ def _verify_exact_pull_capable_assignments(
             f"{field} expected ACR assignments contain an ungoverned principal"
         )
     role_definitions: dict[str, dict[str, Any]] = {}
+    budget = (
+        _AuthorizationScanBudget.bounded() if effective_assignments_by_principal is None else None
+    )
+    as_of = datetime.now(UTC)
     for principal_id in sorted(normalized_principal_ids):
         expected_assignment_ids = expected_by_principal.get(principal_id, set())
         assignments = (
@@ -7798,6 +8049,8 @@ def _verify_exact_pull_capable_assignments(
                 principal_id,
                 subscription_id=subscription_id,
                 field=f"{field} for {principal_id}",
+                budget=budget,
+                as_of=as_of,
             )
             if effective_assignments_by_principal is None
             else effective_assignments_by_principal.get(principal_id)
@@ -7812,6 +8065,13 @@ def _verify_exact_pull_capable_assignments(
                 raw_assignment,
                 field=f"{field} assignment {index}",
             )
+            assignment_scope = _canonical_authorization_assignment_scope(
+                assignment.get("scope"),
+                subscription_id=subscription_id,
+                field=f"{field} assignment {index} scope",
+            )
+            if not _scope_can_govern_acr(assignment_scope):
+                continue
             role_definition_id = _string(
                 assignment.get("roleDefinitionId"),
                 field=f"{field} assignment {index} role definition ID",
@@ -7824,7 +8084,10 @@ def _verify_exact_pull_capable_assignments(
                     subscription_id=subscription_id,
                 )
                 role_definitions[normalized_role_definition_id] = role_definition
-            if not _role_definition_grants_acr_pull(role_definition):
+            if not _role_definition_grants_acr_pull(
+                role_definition,
+                assignment_scope=assignment_scope,
+            ):
                 continue
             assignment_id = _string(
                 assignment.get("id"),
@@ -7840,7 +8103,7 @@ def _verify_exact_pull_capable_assignments(
             ):
                 raise OrchestrationError(
                     f"{field} contains an unreviewed direct, inherited, group-derived, "
-                    "or sibling-registry pull-capable assignment"
+                    "or sibling-registry pull-capable assignment or pull-escalating assignment"
                 )
             observed_expected_ids.add(assignment_id)
         if observed_expected_ids != expected_assignment_ids:
@@ -8696,27 +8959,41 @@ def _verify_complete_trigger_queue_assignment_set(
             "approved trigger-queue transition assignments exceed the bounded maximum"
         )
 
-    scoped_assignments = _merge_effective_role_assignment_documents(
-        [
-            _run_json(
-                [
-                    "az",
-                    "role",
-                    "assignment",
-                    "list",
-                    "--subscription",
-                    subscription_id,
-                    "--scope",
-                    trigger_queue_scope,
-                    "--only-show-errors",
-                    "--output",
-                    "json",
-                ],
-                field=f"complete role assignments at {trigger_queue_scope}",
-            )
-        ],
-        field="complete trigger-queue role assignments",
+    all_scoped_assignments = _authorization_assignments_at_or_above_scope(
+        trigger_queue_scope,
+        subscription_id=subscription_id,
+        field="complete trigger-queue authorization assignments",
+        include_eligibility=True,
     )
+    role_definitions: dict[str, dict[str, Any]] = {}
+    scoped_assignments: list[dict[str, Any]] = []
+    for index, assignment in enumerate(all_scoped_assignments):
+        assignment_scope = _canonical_authorization_assignment_scope(
+            assignment.get("scope"),
+            subscription_id=subscription_id,
+            field=f"trigger-queue authorization assignment {index} scope",
+        )
+        if not _scope_contains_resource(assignment_scope, trigger_queue_scope):
+            raise OrchestrationError(
+                "trigger-queue atScope evidence contains an unrelated assignment scope"
+            )
+        if assignment_scope.casefold() == trigger_queue_scope.casefold():
+            scoped_assignments.append(assignment)
+            continue
+        role_definition_id = _string(
+            assignment.get("roleDefinitionId"),
+            field=f"trigger-queue authorization assignment {index} role definition ID",
+        )
+        normalized_role_definition_id = role_definition_id.casefold()
+        role_definition = role_definitions.get(normalized_role_definition_id)
+        if role_definition is None:
+            role_definition = _get_role_definition(
+                role_definition_id,
+                subscription_id=subscription_id,
+            )
+            role_definitions[normalized_role_definition_id] = role_definition
+        if _role_definition_grants_trigger_queue_access(role_definition):
+            scoped_assignments.append(assignment)
     observed_resource_ids = {
         resource_id.casefold(): resource_id
         for resource_id in (
@@ -8733,7 +9010,9 @@ def _verify_complete_trigger_queue_assignment_set(
         *transition_assignment_ids,
     }
     if observed_assignment_ids - allowed_assignment_ids:
-        raise OrchestrationError("trigger queue contains an unreviewed or obsolete role assignment")
+        raise OrchestrationError(
+            "trigger queue contains an unreviewed or obsolete role assignment or schedule"
+        )
     if normalized_required_ids - observed_assignment_ids:
         raise OrchestrationError(
             "trigger-queue assignment evidence is incomplete for the current binding"
@@ -9531,6 +9810,395 @@ def _transitive_group_ids(principal_id: str) -> set[str]:
     return group_ids
 
 
+def _canonical_authorization_assignment_scope(
+    value: object,
+    *,
+    subscription_id: str,
+    field: str,
+) -> str:
+    scope = _string(value, field=field)
+    if scope == "/":
+        return scope
+    if scope != scope.strip() or scope.endswith("/"):
+        raise OrchestrationError(f"{field} must be one canonical Azure scope")
+    if scope.casefold().startswith("/subscriptions/"):
+        return _canonical_subscription_resource_id(
+            scope,
+            subscription_id=subscription_id,
+            field=field,
+        )
+    segments = scope.split("/")
+    if (
+        len(segments) != 5
+        or segments[0] != ""
+        or segments[1].casefold() != "providers"
+        or segments[2].casefold() != "microsoft.management"
+        or segments[3].casefold() != "managementgroups"
+    ):
+        raise OrchestrationError(f"{field} is outside the governed subscription hierarchy")
+    _validate_resource_id_segment(
+        segments[4],
+        field=f"{field} management group",
+    )
+    return scope
+
+
+def _parse_authorization_schedule_time(
+    value: object,
+    *,
+    field: str,
+    required: bool,
+) -> datetime | None:
+    if value is None and not required:
+        return None
+    timestamp = _string(value, field=field)
+    if timestamp != timestamp.strip() or len(timestamp) > 128:
+        raise OrchestrationError(f"{field} must be one bounded UTC timestamp")
+    try:
+        parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise OrchestrationError(f"{field} must be one ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None:
+        raise OrchestrationError(f"{field} must include a UTC offset")
+    return parsed.astimezone(UTC)
+
+
+def _active_or_upcoming_authorization_schedule(
+    properties: Mapping[str, object],
+    *,
+    field: str,
+    as_of: datetime,
+) -> bool:
+    if as_of.tzinfo is None:
+        raise OrchestrationError(f"{field} evaluation time must include a UTC offset")
+    as_of = as_of.astimezone(UTC)
+    status = _string(
+        properties.get("status"),
+        field=f"{field} status",
+    )
+    if status != status.strip() or status.casefold() not in AUTHORIZATION_SCHEDULE_STATUSES:
+        raise OrchestrationError(f"{field} status is unknown")
+    start = _parse_authorization_schedule_time(
+        properties.get("startDateTime"),
+        field=f"{field} startDateTime",
+        required=True,
+    )
+    end = _parse_authorization_schedule_time(
+        properties.get("endDateTime"),
+        field=f"{field} endDateTime",
+        required=False,
+    )
+    if start is None:
+        raise OrchestrationError(f"{field} startDateTime is missing")
+    if end is not None and end <= start:
+        raise OrchestrationError(f"{field} schedule interval is invalid")
+    if status.casefold() in INACTIVE_AUTHORIZATION_SCHEDULE_STATUSES:
+        return False
+    return end is None or end > as_of
+
+
+def _authorization_assignment_from_resource(
+    resource: Mapping[str, object],
+    *,
+    resource_type: str,
+    subscription_id: str,
+    field: str,
+    as_of: datetime,
+) -> dict[str, Any] | None:
+    expected_type = f"Microsoft.Authorization/{resource_type}"
+    actual_type = resource.get("type")
+    if actual_type is not None and (
+        not isinstance(actual_type, str) or actual_type.casefold() != expected_type.casefold()
+    ):
+        raise OrchestrationError(f"{field} has an unexpected authorization resource type")
+    resource_id = _string(
+        resource.get("id"),
+        field=f"{field} ID",
+    )
+    marker = f"/providers/microsoft.authorization/{resource_type.casefold()}/"
+    normalized_resource_id = resource_id.casefold()
+    if (
+        resource_id != resource_id.strip()
+        or resource_id.endswith("/")
+        or any(character in resource_id for character in ("\\", "?", "#"))
+        or marker not in normalized_resource_id
+    ):
+        raise OrchestrationError(f"{field} ID is not canonical")
+    try:
+        canonical_resource_name = str(UUID(resource_id.rsplit("/", 1)[-1]))
+    except ValueError as exc:
+        raise OrchestrationError(f"{field} ID must end in one canonical UUID") from exc
+    if resource_id.rsplit("/", 1)[-1] != canonical_resource_name:
+        raise OrchestrationError(f"{field} ID must use canonical lowercase UUID form")
+    properties = _mapping(
+        resource.get("properties"),
+        field=f"{field} properties",
+    )
+    principal_id = _canonical_directory_object_id(
+        properties.get("principalId"),
+        field=f"{field} principal ID",
+    )
+    scope = _canonical_authorization_assignment_scope(
+        properties.get("scope"),
+        subscription_id=subscription_id,
+        field=f"{field} scope",
+    )
+    resource_scope = resource_id[: normalized_resource_id.rindex(marker)] or "/"
+    if resource_scope.casefold() != scope.casefold():
+        raise OrchestrationError(f"{field} ID does not match its assignment scope")
+    role_definition_id = _string(
+        properties.get("roleDefinitionId"),
+        field=f"{field} role definition ID",
+    )
+    if (
+        role_definition_id != role_definition_id.strip()
+        or not role_definition_id.startswith("/")
+        or any(character in role_definition_id for character in ("\\", "?", "#"))
+    ):
+        raise OrchestrationError(f"{field} role definition ID is not canonical")
+    if resource_type != "roleAssignments":
+        member_type = _string(
+            properties.get("memberType"),
+            field=f"{field} memberType",
+        )
+        if member_type not in {"Direct", "Group", "Inherited"}:
+            raise OrchestrationError(f"{field} memberType is unknown")
+        if resource_type == "roleAssignmentScheduleInstances":
+            assignment_type = _string(
+                properties.get("assignmentType"),
+                field=f"{field} assignmentType",
+            )
+            if assignment_type not in {"Activated", "Assigned"}:
+                raise OrchestrationError(f"{field} assignmentType is unknown")
+        if not _active_or_upcoming_authorization_schedule(
+            properties,
+            field=field,
+            as_of=as_of,
+        ):
+            return None
+    principal_type = properties.get("principalType")
+    if principal_type is not None and (
+        not isinstance(principal_type, str)
+        or principal_type
+        not in {
+            "User",
+            "Group",
+            "ServicePrincipal",
+            "ForeignGroup",
+            "Device",
+            "AgentUser",
+            "AgentServicePrincipal",
+        }
+    ):
+        raise OrchestrationError(f"{field} principalType is unknown")
+    normalized: dict[str, Any] = {
+        "id": resource_id,
+        "principalId": principal_id,
+        "roleDefinitionId": role_definition_id,
+        "scope": scope,
+        "authorizationEvidenceKinds": [resource_type],
+    }
+    for property_name in (
+        "principalType",
+        "conditionVersion",
+        "condition",
+        "status",
+        "startDateTime",
+        "endDateTime",
+        "memberType",
+        "assignmentType",
+    ):
+        if property_name in properties:
+            normalized[property_name] = properties[property_name]
+    expanded = properties.get("expandedProperties")
+    if expanded is not None:
+        expanded_properties = _mapping(
+            expanded,
+            field=f"{field} expanded properties",
+        )
+        expanded_role = expanded_properties.get("roleDefinition")
+        if expanded_role is not None:
+            role = _mapping(
+                expanded_role,
+                field=f"{field} expanded role definition",
+            )
+            display_name = role.get("displayName")
+            if display_name is not None:
+                normalized["roleDefinitionName"] = _string(
+                    display_name,
+                    field=f"{field} role definition display name",
+                )
+    return normalized
+
+
+def _validate_authorization_assignment_url(
+    url: str,
+    *,
+    scope: str,
+    resource_type: str,
+    filter_value: str,
+    is_continuation: bool,
+) -> None:
+    if len(url) > 16_384:
+        raise OrchestrationError(
+            "authorization assignment pagination returned an oversized continuation URL"
+        )
+    parsed = urlparse(url)
+    expected_path = f"{scope.rstrip('/')}/providers/Microsoft.Authorization/{resource_type}"
+    raw_query = parse_qs(parsed.query, keep_blank_values=True)
+    query: dict[str, list[str]] = {}
+    for key, values in raw_query.items():
+        normalized_key = key.casefold()
+        if normalized_key in query:
+            raise OrchestrationError(
+                "authorization assignment pagination returned duplicate query fields"
+            )
+        query[normalized_key] = values
+    api_version = AUTHORIZATION_RESOURCE_API_VERSIONS[resource_type]
+    if (
+        parsed.scheme != "https"
+        or parsed.netloc.casefold() != ARM_HOST
+        or parsed.path.casefold() != expected_path.casefold()
+        or parsed.fragment
+        or parsed.username is not None
+        or parsed.password is not None
+        or query.get("api-version") != [api_version]
+        or any(key not in {"api-version", "$filter", "$skiptoken"} for key in query)
+        or any(len(values) != 1 for values in query.values())
+        or ("$filter" in query and query["$filter"] != [filter_value])
+        or ("$skiptoken" in query and not query["$skiptoken"][0])
+        or is_continuation != ("$skiptoken" in query)
+    ):
+        raise OrchestrationError(
+            "authorization assignment pagination returned an untrusted continuation URL"
+        )
+
+
+def _authorization_assignment_pages(
+    *,
+    scope: str,
+    resource_type: str,
+    filter_value: str,
+    subscription_id: str,
+    field: str,
+    budget: _AuthorizationScanBudget,
+    as_of: datetime,
+) -> list[dict[str, Any]]:
+    api_version = AUTHORIZATION_RESOURCE_API_VERSIONS[resource_type]
+    next_url: str | None = (
+        f"https://{ARM_HOST}{scope.rstrip('/')}/providers/"
+        f"Microsoft.Authorization/{resource_type}?"
+        + urlencode(
+            {
+                "api-version": api_version,
+                "$filter": filter_value,
+            }
+        )
+    )
+    assignments: dict[str, dict[str, Any]] = {}
+    seen_urls: set[str] = set()
+    page_number = 0
+    is_continuation = False
+    while next_url is not None:
+        budget.consume_page()
+        page_number += 1
+        _validate_authorization_assignment_url(
+            next_url,
+            scope=scope,
+            resource_type=resource_type,
+            filter_value=filter_value,
+            is_continuation=is_continuation,
+        )
+        if next_url in seen_urls:
+            raise OrchestrationError("authorization assignment pagination contains a cycle")
+        seen_urls.add(next_url)
+        page = _mapping(
+            _run_json(
+                [
+                    "az",
+                    "rest",
+                    "--method",
+                    "get",
+                    "--url",
+                    next_url,
+                    "--only-show-errors",
+                    "--output",
+                    "json",
+                ],
+                field=f"{field} {resource_type} page {page_number}",
+            ),
+            field=f"{field} {resource_type} page {page_number}",
+        )
+        values = page.get("value")
+        if not isinstance(values, list):
+            raise OrchestrationError("authorization assignment page must contain a value array")
+        for index, raw_assignment in enumerate(values):
+            budget.consume_item()
+            assignment = _authorization_assignment_from_resource(
+                _mapping(
+                    raw_assignment,
+                    field=f"{field} {resource_type} page {page_number} item {index}",
+                ),
+                resource_type=resource_type,
+                subscription_id=subscription_id,
+                field=f"{field} {resource_type} page {page_number} item {index}",
+                as_of=as_of,
+            )
+            if assignment is None:
+                continue
+            assignment_id = str(assignment["id"]).casefold()
+            existing = assignments.get(assignment_id)
+            if existing is not None and _canonical_json_bytes(existing) != _canonical_json_bytes(
+                assignment
+            ):
+                raise OrchestrationError(
+                    "authorization assignment pagination returned conflicting duplicate evidence"
+                )
+            assignments[assignment_id] = assignment
+        continuation = page.get("nextLink")
+        if continuation is None:
+            next_url = None
+        elif not isinstance(continuation, str) or not continuation:
+            raise OrchestrationError("authorization assignment continuation is invalid")
+        else:
+            next_url = continuation
+            is_continuation = True
+    return [assignments[key] for key in sorted(assignments)]
+
+
+def _authorization_assignments(
+    *,
+    scope: str,
+    filter_value: str,
+    subscription_id: str,
+    field: str,
+    include_eligibility: bool,
+    budget: _AuthorizationScanBudget,
+    as_of: datetime,
+) -> list[dict[str, Any]]:
+    resource_types = [
+        "roleAssignments",
+        "roleAssignmentScheduleInstances",
+    ]
+    if include_eligibility:
+        resource_types.append("roleEligibilityScheduleInstances")
+    return _merge_effective_role_assignment_documents(
+        [
+            _authorization_assignment_pages(
+                scope=scope,
+                resource_type=resource_type,
+                filter_value=filter_value,
+                subscription_id=subscription_id,
+                field=field,
+                budget=budget,
+                as_of=as_of,
+            )
+            for resource_type in resource_types
+        ],
+        field=field,
+    )
+
+
 def _merge_effective_role_assignment_documents(
     documents: Sequence[object],
     *,
@@ -9558,20 +10226,65 @@ def _merge_effective_role_assignment_documents(
                 "roleDefinitionId",
                 "roleDefinitionName",
                 "scope",
+                "conditionVersion",
+                "condition",
+                "principalType",
+                "status",
+                "startDateTime",
+                "endDateTime",
+                "memberType",
+                "assignmentType",
             ):
                 existing_value = existing.get(property_name)
                 incoming_value = assignment.get(property_name)
                 if (
                     existing_value not in (None, "")
                     and incoming_value not in (None, "")
-                    and str(existing_value).casefold() != str(incoming_value).casefold()
+                    and (
+                        (
+                            property_name
+                            in {
+                                "principalId",
+                                "roleDefinitionId",
+                                "roleDefinitionName",
+                                "scope",
+                            }
+                            and str(existing_value).casefold() != str(incoming_value).casefold()
+                        )
+                        or (
+                            property_name
+                            not in {
+                                "principalId",
+                                "roleDefinitionId",
+                                "roleDefinitionName",
+                                "scope",
+                            }
+                            and existing_value != incoming_value
+                        )
+                    )
                 ):
                     raise OrchestrationError(
                         f"{field} returned conflicting duplicate assignment {assignment_id}"
                     )
                 if existing_value in (None, "") and incoming_value not in (None, ""):
                     existing[property_name] = incoming_value
-    return list(merged.values())
+            evidence_kinds: set[str] = set()
+            for candidate in (
+                existing.get("authorizationEvidenceKinds"),
+                assignment.get("authorizationEvidenceKinds"),
+            ):
+                if candidate is None:
+                    continue
+                if not isinstance(candidate, list) or any(
+                    not isinstance(item, str) or not item for item in candidate
+                ):
+                    raise OrchestrationError(
+                        f"{field} contains invalid authorization evidence kinds"
+                    )
+                evidence_kinds.update(candidate)
+            if evidence_kinds:
+                existing["authorizationEvidenceKinds"] = sorted(evidence_kinds)
+    return [merged[key] for key in sorted(merged)]
 
 
 def _effective_role_assignments(
@@ -9579,49 +10292,58 @@ def _effective_role_assignments(
     *,
     subscription_id: str,
     field: str,
+    include_eligibility: bool = True,
+    budget: _AuthorizationScanBudget | None = None,
+    as_of: datetime | None = None,
 ) -> list[dict[str, Any]]:
-    subscription_scope = f"/subscriptions/{subscription_id}"
-    query_documents = (
-        _run_json(
-            [
-                "az",
-                "role",
-                "assignment",
-                "list",
-                "--subscription",
-                subscription_id,
-                "--assignee-object-id",
-                principal_id,
-                "--all",
-                "--only-show-errors",
-                "--output",
-                "json",
-            ],
-            field=f"{field} at or below the subscription",
-        ),
-        _run_json(
-            [
-                "az",
-                "role",
-                "assignment",
-                "list",
-                "--subscription",
-                subscription_id,
-                "--assignee-object-id",
-                principal_id,
-                "--scope",
-                subscription_scope,
-                "--include-inherited",
-                "--only-show-errors",
-                "--output",
-                "json",
-            ],
-            field=f"{field} inherited from subscription ancestors",
-        ),
+    canonical_principal_id = _canonical_directory_object_id(
+        principal_id,
+        field=f"{field} principal ID",
     )
-    return _merge_effective_role_assignment_documents(
-        query_documents,
+    subscription_scope = f"/subscriptions/{subscription_id}"
+    scan_budget = _AuthorizationScanBudget.bounded() if budget is None else budget
+    observed_at = datetime.now(UTC) if as_of is None else as_of.astimezone(UTC)
+    assignments = _authorization_assignments(
+        scope=subscription_scope,
+        filter_value=f"principalId eq '{canonical_principal_id}'",
+        subscription_id=subscription_id,
         field=field,
+        include_eligibility=include_eligibility,
+        budget=scan_budget,
+        as_of=observed_at,
+    )
+    for assignment in assignments:
+        if (
+            _canonical_directory_object_id(
+                assignment.get("principalId"),
+                field=f"{field} returned principal ID",
+            )
+            != canonical_principal_id
+        ):
+            raise OrchestrationError(f"{field} returned an assignment for another principal")
+    return assignments
+
+
+def _authorization_assignments_at_or_above_scope(
+    scope: str,
+    *,
+    subscription_id: str,
+    field: str,
+    include_eligibility: bool = True,
+) -> list[dict[str, Any]]:
+    canonical_scope = _canonical_subscription_resource_id(
+        scope,
+        subscription_id=subscription_id,
+        field=f"{field} scope",
+    )
+    return _authorization_assignments(
+        scope=canonical_scope,
+        filter_value="atScope()",
+        subscription_id=subscription_id,
+        field=field,
+        include_eligibility=include_eligibility,
+        budget=_AuthorizationScanBudget.bounded(),
+        as_of=datetime.now(UTC),
     )
 
 
@@ -9630,12 +10352,18 @@ def _resolved_effective_role_assignments(
     *,
     subscription_id: str,
     field: str,
+    budget: _AuthorizationScanBudget | None = None,
+    as_of: datetime | None = None,
 ) -> list[dict[str, Any]]:
+    scan_budget = _AuthorizationScanBudget.bounded() if budget is None else budget
+    observed_at = datetime.now(UTC) if as_of is None else as_of.astimezone(UTC)
     documents: list[object] = [
         _effective_role_assignments(
             principal_id,
             subscription_id=subscription_id,
             field=f"{field} for service principal {principal_id}",
+            budget=scan_budget,
+            as_of=observed_at,
         )
     ]
     for group_id in sorted(_transitive_group_ids(principal_id)):
@@ -9644,6 +10372,8 @@ def _resolved_effective_role_assignments(
                 group_id,
                 subscription_id=subscription_id,
                 field=f"{field} for transitive group {group_id}",
+                budget=scan_budget,
+                as_of=observed_at,
             )
         )
     return _merge_effective_role_assignment_documents(
@@ -9658,11 +10388,15 @@ def _verify_no_broad_effective_assignments(
     subscription_id: str,
 ) -> dict[str, list[dict[str, Any]]]:
     assignments_by_principal: dict[str, list[dict[str, Any]]] = {}
+    budget = _AuthorizationScanBudget.bounded()
+    as_of = datetime.now(UTC)
     for principal_id in sorted(principal_ids):
         assignments = _resolved_effective_role_assignments(
             principal_id,
             subscription_id=subscription_id,
             field=f"effective role assignments for {principal_id}",
+            budget=budget,
+            as_of=as_of,
         )
         assignments_by_principal[principal_id.casefold()] = assignments
         violations = evaluate_role_assignments(assignments)
@@ -10364,6 +11098,10 @@ def _verify_exact_effective_assignments(
             ).update(normalized_assignment_ids)
     governed_scopes = _governed_rbac_scopes(set(assignment_principals))
     principal_ids = set(reviewed_assignments_by_principal)
+    budget = (
+        _AuthorizationScanBudget.bounded() if effective_assignments_by_principal is None else None
+    )
+    as_of = datetime.now(UTC)
     for principal_id in sorted(principal_ids):
         allowed_assignment_ids = reviewed_assignments_by_principal[principal_id]
         assignments = (
@@ -10371,6 +11109,8 @@ def _verify_exact_effective_assignments(
                 principal_id,
                 subscription_id=subscription_id,
                 field=f"exact role assignments for {principal_id}",
+                budget=budget,
+                as_of=as_of,
             )
             if effective_assignments_by_principal is None
             else effective_assignments_by_principal.get(principal_id.casefold())
@@ -11038,9 +11778,11 @@ def _verify_digest_pinned_job_image_pull(
             raise OrchestrationError(
                 "digest-pinned image-pull execution did not reach a terminal state"
             )
+        except TerminalEvidenceError:
+            raise
         except OrchestrationError as exc:
             if successful_execution_seen:
-                raise OrchestrationError(
+                raise TerminalEvidenceError(
                     "successful digest-pinned image-pull execution failed terminal "
                     f"evidence validation: {exc}"
                 ) from exc
@@ -14523,7 +15265,7 @@ def apply(args: argparse.Namespace) -> Path:
     (
         post_deployment_authority_inventory,
         image_pull_evidence,
-    ) = _retry_eventually_consistent(
+    ) = _retry_post_deployment_readiness(
         lambda: _verify_deployed_stage_state(
             stage=stage,
             outputs=outputs,
@@ -14536,8 +15278,7 @@ def apply(args: argparse.Namespace) -> Path:
             authority_container_id=authority_container_id,
             reviewed_authority_inventory=reviewed_authority_blob_inventory,
             subscription_id=subscription_id,
-        ),
-        field="post-deployment readiness and authority checkpoint",
+        )
     )
     bindings = _parameter_bindings(stage, effective_parameters)
     handoff_outputs = _handoff_outputs(stage, outputs)

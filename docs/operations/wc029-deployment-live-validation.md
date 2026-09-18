@@ -229,25 +229,22 @@ For every managed-identity service principal, first enumerate
 permissions, unavailable pages, cycles, untrusted continuation URLs, duplicate groups, or a
 truncated count fail closed.
 
-Record both assignment sets for the service principal and for every resolved transitive group.
-`--all` enumerates assignments at or below the subscription but does not return parent
-management-group grants, so run the scoped inherited query separately and review the
-de-duplicated union by assignment ID:
+For the service principal and every resolved transitive group, the orchestrator queries the ARM
+Authorization provider at subscription scope with `$filter=principalId eq '<object-id>'`. It
+boundedly follows every trusted `nextLink` and merges, by exact resource ID:
 
-```powershell
-$atOrBelowSubscription = az role assignment list `
-  --subscription $SubscriptionId `
-  --assignee-object-id '<principal-id>' `
-  --all `
-  --output json
+- classic `roleAssignments@2022-04-01`;
+- current or upcoming `roleAssignmentScheduleInstances@2020-10-01`; and
+- `roleEligibilityScheduleInstances@2020-10-01`, because latent activation is prohibited for
+  these governed runtime identities.
 
-$inheritedFromAncestors = az role assignment list `
-  --subscription $SubscriptionId `
-  --assignee-object-id '<principal-id>' `
-  --scope "/subscriptions/$SubscriptionId" `
-  --include-inherited `
-  --output json
-```
+One shared page and item budget covers all three resource types and every transitive group in one
+effective-assignment scan. Active, pending, and future-start schedules remain relevant until their
+end time. Expired or explicitly terminal schedules do not grant current or future authority.
+Unknown status, assignment type, membership type, timestamp, principal, role, scope, resource ID,
+continuation, duplicate, or over-budget evidence fails closed. Every server-provided continuation
+must preserve the exact ARM host, collection path, API version, and filter and include one
+non-empty `$skipToken`; a cursorless repeated first page is never accepted as complete evidence.
 
 Required separation:
 
@@ -260,13 +257,19 @@ Required separation:
 - no generic Contributor assignment for a runtime identity.
 
 Without separate reviewed management-group hierarchy evidence, treat every assignment returned by
-the inherited query at a management-group scope as applying to every governed subscription
-resource and reject it unless that exact assignment is explicitly reviewed.
+the principal-filtered query at a management-group scope as applying to every governed
+subscription resource and reject it unless that exact assignment is explicitly reviewed.
 
-The orchestrator performs these membership and assignment queries itself. Azure CLI must return a
-fully materialized assignment array for every principal and group; a leaked continuation object,
-malformed response, or unavailable assignment query fails closed rather than being interpreted as
-an empty page.
+The dedicated producer trigger queue also receives a separate `$filter=atScope()` scan across the
+same three Authorization resource types. It accepts only the exact current classic assignments and
+the bounded reviewed transition set. Active/upcoming PIM assignments, activatable eligibility,
+unknown exact-scope assignments, and inherited queue send/receive or RBAC-escalation grants fail
+closed. Roles that can create classic assignments, create or activate assignment/eligibility
+schedules, alter custom roles, or weaken role-management policy are schedule-administration
+authority and are not treated as harmless inherited access. Inherited Service Bus namespace
+mutation, authorization-rule creation/update, connection-string/key listing, and key-regeneration
+permissions are likewise queue-access escalation because they can re-enable local authentication
+or mint SAS access without a Service Bus data-role assignment.
 
 For every exact queue, Blob container, Table, Key Vault key, and ACR registry scope used by a
 governed identity, readiness also calls the ARM `denyAssignments` endpoint with
@@ -498,7 +501,16 @@ separate digest. Readiness re-reads every current assignment and each registry m
 effective role definition across direct, inherited, and transitive-group assignments throughout
 the governed subscription, and rejects all extra pull-capable grants even when they target a
 sibling registry. This includes `AcrPush`, Repository Writer/Contributor, and custom roles whose
-effective actions or data actions grant legacy pull or repository content read.
+effective permissions grant legacy pull, quarantine pull, quarantined-artifact read, or repository
+content read. Classification evaluates each permission in its actual `Actions` or `DataActions`
+plane and applies the matching `NotActions` or `NotDataActions` exclusions. Registry control
+permissions that can enable pull, retrieve or mint credentials, change quarantine/policy state, or
+create tokens/scope maps are also pull-escalating. ACR Tasks creation or execution authority is
+pull-escalating because Tasks management can exercise full registry data-plane access. The same is
+true for applicable classic-role, PIM schedule, eligibility, custom-role, and
+role-management-policy write authority. Registry and ancestor scopes can affect their descendants;
+a sibling registry is still an unreviewed ACR authority domain, while a role assigned only to an
+unrelated non-ACR resource cannot govern a registry.
 
 The same complete pull-capable scan applies to every WC-027 producer and publisher principal,
 including principals with no reviewed ACR assignment. Only the exact reviewed producer and
@@ -516,16 +528,19 @@ evidence. The probe does not pass `--registry-identity`, create RBAC, or invoke 
 entry point. Because live anonymous pull is explicitly false and the Job registry configuration
 contains only the reviewed managed identity, a successful probe is evidence of identity-authorized
 pull rather than public access. Any anonymous-pull or role-mode failure observed after an execution
-reaches `Succeeded` is terminal and cannot be retried into accepted evidence.
+reaches `Succeeded` raises the dedicated terminal evidence exception. The image-pull retry and
+every outer apply/readiness retry propagate it unchanged, so a false-to-true ACR posture drift can
+never be retried after the environment later returns to false and accepted as successful evidence.
 
 Producer verification also models the publisher transition explicitly.
 Before a publisher exists, no extra sender assignment is required. During partial recovery,
 publisher retry, or a later producer upgrade, only the deterministic assignment ID produced by
 `guid(triggerQueue.id, brokerIdentity.id, serviceBusDataSenderRoleDefinitionId)` is accepted, and
 its live principal, queue scope, sender role, principal type, and absent condition are revalidated.
-The complete set of direct assignments at the dedicated trigger queue must contain only the current
-producer assignments, the current deterministic publisher assignment when present, and at most
-four exact retired queue transition pairs. Record each assignment ID and retired principal ID with
+The complete at-scope Authorization evidence for the dedicated trigger queue must contain only the
+current producer assignments, the current deterministic publisher assignment when present, and at
+most four exact retired queue transition pairs; inherited queue or schedule-administration
+authority is rejected as described above. Record each assignment ID and retired principal ID with
 `prepare-revocation --rotation-transition-assignment`; do not overload the what-if
 `--allow-change` list. The reviewed revocation plan carries a bounded maximum of 32 transition
 assignments across all rotated-identity scopes,

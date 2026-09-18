@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 from scripts import wc029_deployment_orchestration as orchestration
@@ -136,6 +138,83 @@ def _deny_assignment(
             ],
             "condition": condition,
             "conditionVersion": condition_version,
+        },
+    }
+
+
+def _authorization_resource(
+    *,
+    resource_type: str,
+    resource_id: str,
+    principal_id: str,
+    role_definition_id: str,
+    scope: str,
+    role_definition_name: str | None = None,
+    status: str = "Provisioned",
+    start_date_time: str = "2026-01-01T00:00:00Z",
+    end_date_time: str | None = "2099-01-01T00:00:00Z",
+    member_type: str = "Direct",
+    assignment_type: str = "Assigned",
+) -> dict[str, object]:
+    properties: dict[str, object] = {
+        "principalId": principal_id,
+        "principalType": ("Group" if member_type == "Group" else "ServicePrincipal"),
+        "roleDefinitionId": role_definition_id,
+        "scope": scope,
+    }
+    if resource_type != "roleAssignments":
+        properties.update(
+            {
+                "status": status,
+                "startDateTime": start_date_time,
+                "endDateTime": end_date_time,
+                "memberType": member_type,
+            }
+        )
+    if resource_type == "roleAssignmentScheduleInstances":
+        properties["assignmentType"] = assignment_type
+    if role_definition_name is not None:
+        properties["expandedProperties"] = {
+            "roleDefinition": {
+                "displayName": role_definition_name,
+            }
+        }
+    return {
+        "id": resource_id,
+        "type": f"Microsoft.Authorization/{resource_type}",
+        "properties": properties,
+    }
+
+
+def _authorization_request(command: object) -> tuple[str, str, str]:
+    arguments = list(command)
+    assert arguments[:2] == ["az", "rest"]
+    url = arguments[arguments.index("--url") + 1]
+    parsed = urlparse(url)
+    resource_type = parsed.path.rstrip("/").rsplit("/", 1)[-1]
+    filter_value = parse_qs(parsed.query)["$filter"][0]
+    return url, resource_type, filter_value
+
+
+def _role_definition(
+    role_definition_id: str,
+    *,
+    actions: list[str] | None = None,
+    not_actions: list[str] | None = None,
+    data_actions: list[str] | None = None,
+    not_data_actions: list[str] | None = None,
+) -> dict[str, object]:
+    return {
+        "id": role_definition_id,
+        "properties": {
+            "permissions": [
+                {
+                    "actions": [] if actions is None else actions,
+                    "notActions": [] if not_actions is None else not_actions,
+                    "dataActions": [] if data_actions is None else data_actions,
+                    "notDataActions": ([] if not_data_actions is None else not_data_actions),
+                }
+            ]
         },
     }
 
@@ -3774,8 +3853,8 @@ def test_prospective_publisher_sender_transition_is_exact(
     monkeypatch.setattr(orchestration, "_get_resource", get_resource)
     monkeypatch.setattr(
         orchestration,
-        "_run_json",
-        lambda command, *, field: effective_assignments,
+        "_authorization_assignments_at_or_above_scope",
+        lambda _scope, **_kwargs: effective_assignments,
     )
     additional = orchestration._verify_trigger_queue_assignment_set(
         producer_expected_assignments=producer_expected,
@@ -3845,8 +3924,8 @@ def test_prospective_publisher_sender_rejects_nondeterministic_assignment_id(
     )
     monkeypatch.setattr(
         orchestration,
-        "_run_json",
-        lambda command, *, field: scope_assignments,
+        "_authorization_assignments_at_or_above_scope",
+        lambda _scope, **_kwargs: scope_assignments,
     )
 
     with pytest.raises(
@@ -3907,8 +3986,8 @@ def test_prospective_publisher_sender_rejects_wrong_existing_principal(
     assert prospective_id == prospective_resource_id.casefold()
     monkeypatch.setattr(
         orchestration,
-        "_run_json",
-        lambda command, *, field: [
+        "_authorization_assignments_at_or_above_scope",
+        lambda _scope, **_kwargs: [
             {"id": own_assignment_id, "scope": trigger_queue_id},
             {"id": prospective_resource_id, "scope": trigger_queue_id},
         ],
@@ -4008,8 +4087,8 @@ def test_broker_identity_rotation_requires_controlled_stale_sender_revocation(
     ]
     monkeypatch.setattr(
         orchestration,
-        "_run_json",
-        lambda command, *, field: list(scope_assignments),
+        "_authorization_assignments_at_or_above_scope",
+        lambda _scope, **_kwargs: list(scope_assignments),
     )
 
     def get_resource(resource_id: str, *, subscription_id: str) -> dict[str, object]:
@@ -4106,8 +4185,8 @@ def test_same_name_uami_trigger_assignment_reuse_requires_current_principal(
     live_principal_id = current_principal_id
     monkeypatch.setattr(
         orchestration,
-        "_run_json",
-        lambda _command, *, field: [{"id": assignment_id, "scope": queue_scope}],
+        "_authorization_assignments_at_or_above_scope",
+        lambda _scope, **_kwargs: [{"id": assignment_id, "scope": queue_scope}],
     )
 
     def get_resource(resource_id: str, *, subscription_id: str) -> dict[str, object]:
@@ -4596,8 +4675,8 @@ def test_fresh_producer_plan_allows_empty_trigger_queue_assignment_set(
     )
     monkeypatch.setattr(
         orchestration,
-        "_run_json",
-        lambda command, *, field: [],
+        "_authorization_assignments_at_or_above_scope",
+        lambda _scope, **_kwargs: [],
     )
     monkeypatch.setattr(
         orchestration,
@@ -4623,6 +4702,356 @@ def test_fresh_producer_plan_allows_empty_trigger_queue_assignment_set(
                     )
                 )
             },
+            required_current_assignment_ids=set(),
+            approved_transitions=[],
+            transition_state="present",
+            subscription_id=SUBSCRIPTION_ID,
+        )
+        == {}
+    )
+
+
+def test_trigger_queue_scope_scan_pages_classic_and_pim_at_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    principal_id = "96969696-3333-4333-8333-333333333333"
+    queue_scope = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
+        "Microsoft.ServiceBus/namespaces/athena/queues/requests"
+    )
+    subscription_scope = f"/subscriptions/{SUBSCRIPTION_ID}"
+    role_definition_id = (
+        f"{subscription_scope}/providers/Microsoft.Authorization/roleDefinitions/"
+        f"{orchestration.SERVICE_BUS_DATA_SENDER_ROLE_ID}"
+    )
+    classic_id = (
+        f"{queue_scope}/providers/Microsoft.Authorization/roleAssignments/"
+        "96969696-4444-4444-8444-444444444444"
+    )
+    schedule_id = (
+        f"{subscription_scope}/providers/Microsoft.Authorization/"
+        "roleAssignmentScheduleInstances/96969696-5555-4555-8555-555555555555"
+    )
+    eligibility_id = (
+        f"{queue_scope}/providers/Microsoft.Authorization/"
+        "roleEligibilityScheduleInstances/96969696-6666-4666-8666-666666666666"
+    )
+    filters: list[str] = []
+
+    def run_json(command: object, *, field: str) -> object:
+        url, resource_type, filter_value = _authorization_request(command)
+        filters.append(filter_value)
+        assert filter_value == "atScope()"
+        if resource_type == "roleAssignments":
+            if "$skipToken" not in parse_qs(urlparse(url).query):
+                return {
+                    "value": [],
+                    "nextLink": f"{url}&%24skipToken=classic-page-2",
+                }
+            return {
+                "value": [
+                    _authorization_resource(
+                        resource_type=resource_type,
+                        resource_id=classic_id,
+                        principal_id=principal_id,
+                        role_definition_id=role_definition_id,
+                        scope=queue_scope,
+                    )
+                ]
+            }
+        resource_id = (
+            schedule_id if resource_type == "roleAssignmentScheduleInstances" else eligibility_id
+        )
+        assignment_scope = (
+            subscription_scope
+            if resource_type == "roleAssignmentScheduleInstances"
+            else queue_scope
+        )
+        return {
+            "value": [
+                _authorization_resource(
+                    resource_type=resource_type,
+                    resource_id=resource_id,
+                    principal_id=principal_id,
+                    role_definition_id=role_definition_id,
+                    scope=assignment_scope,
+                    member_type=(
+                        "Inherited"
+                        if resource_type == "roleAssignmentScheduleInstances"
+                        else "Direct"
+                    ),
+                )
+            ]
+        }
+
+    monkeypatch.setattr(orchestration, "_run_json", run_json)
+    assignments = orchestration._authorization_assignments_at_or_above_scope(
+        queue_scope,
+        subscription_id=SUBSCRIPTION_ID,
+        field="synthetic trigger queue",
+    )
+
+    assert {str(item["id"]) for item in assignments} == {
+        classic_id,
+        schedule_id,
+        eligibility_id,
+    }
+    assert filters == ["atScope()", "atScope()", "atScope()", "atScope()"]
+
+
+def test_trigger_queue_rejects_active_pim_assignment_at_exact_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    principal_id = "97979797-1111-4111-8111-111111111111"
+    queue_scope = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
+        "Microsoft.ServiceBus/namespaces/athena/queues/requests"
+    )
+    expected_assignment_id = (
+        f"{queue_scope}/providers/Microsoft.Authorization/roleAssignments/"
+        "97979797-2222-4222-8222-222222222222"
+    )
+    schedule_id = (
+        f"{queue_scope}/providers/Microsoft.Authorization/"
+        "roleAssignmentScheduleInstances/97979797-3333-4333-8333-333333333333"
+    )
+    expected = orchestration._ExpectedRoleAssignment(
+        label="planned trigger receiver",
+        principal_id=principal_id,
+        scope=queue_scope,
+        role_definition_id=(
+            f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+            "Microsoft.Authorization/roleDefinitions/"
+            f"{orchestration.SERVICE_BUS_DATA_RECEIVER_ROLE_ID}"
+        ),
+    )
+    monkeypatch.setattr(
+        orchestration,
+        "_authorization_assignments_at_or_above_scope",
+        lambda _scope, **_kwargs: [
+            {
+                "id": schedule_id,
+                "principalId": principal_id,
+                "roleDefinitionId": expected.role_definition_id,
+                "scope": queue_scope,
+                "authorizationEvidenceKinds": ["roleAssignmentScheduleInstances"],
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        orchestration,
+        "_get_resource",
+        lambda *_args, **_kwargs: pytest.fail(
+            "unreviewed PIM evidence must fail before assignment readback"
+        ),
+    )
+
+    with pytest.raises(
+        orchestration.OrchestrationError,
+        match="unreviewed or obsolete role assignment or schedule",
+    ):
+        orchestration._verify_complete_trigger_queue_assignment_set(
+            current_expected_assignments={expected_assignment_id.casefold(): expected},
+            required_current_assignment_ids=set(),
+            approved_transitions=[],
+            transition_state="present",
+            subscription_id=SUBSCRIPTION_ID,
+        )
+
+
+def test_trigger_queue_rejects_inherited_schedule_administration_permission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue_scope = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
+        "Microsoft.ServiceBus/namespaces/athena/queues/requests"
+    )
+    expected_assignment_id = (
+        f"{queue_scope}/providers/Microsoft.Authorization/roleAssignments/"
+        "98989898-1111-4111-8111-111111111111"
+    )
+    expected = orchestration._ExpectedRoleAssignment(
+        label="planned trigger receiver",
+        principal_id="98989898-2222-4222-8222-222222222222",
+        scope=queue_scope,
+        role_definition_id=(
+            f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+            "Microsoft.Authorization/roleDefinitions/"
+            f"{orchestration.SERVICE_BUS_DATA_RECEIVER_ROLE_ID}"
+        ),
+    )
+    ancestor_scope = f"/subscriptions/{SUBSCRIPTION_ID}"
+    schedule_admin_role_id = (
+        f"{ancestor_scope}/providers/Microsoft.Authorization/roleDefinitions/"
+        "98989898-3333-4333-8333-333333333333"
+    )
+    eligibility_id = (
+        f"{ancestor_scope}/providers/Microsoft.Authorization/"
+        "roleEligibilityScheduleInstances/98989898-4444-4444-8444-444444444444"
+    )
+    monkeypatch.setattr(
+        orchestration,
+        "_authorization_assignments_at_or_above_scope",
+        lambda _scope, **_kwargs: [
+            {
+                "id": eligibility_id,
+                "principalId": "98989898-5555-4555-8555-555555555555",
+                "roleDefinitionId": schedule_admin_role_id,
+                "scope": ancestor_scope,
+                "authorizationEvidenceKinds": ["roleEligibilityScheduleInstances"],
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        orchestration,
+        "_get_role_definition",
+        lambda role_definition_id, *, subscription_id: _role_definition(
+            role_definition_id,
+            actions=["Microsoft.Authorization/roleAssignmentScheduleRequests/write"],
+        ),
+    )
+
+    with pytest.raises(
+        orchestration.OrchestrationError,
+        match="unreviewed or obsolete role assignment or schedule",
+    ):
+        orchestration._verify_complete_trigger_queue_assignment_set(
+            current_expected_assignments={expected_assignment_id.casefold(): expected},
+            required_current_assignment_ids=set(),
+            approved_transitions=[],
+            transition_state="present",
+            subscription_id=SUBSCRIPTION_ID,
+        )
+
+
+@pytest.mark.parametrize(
+    "resource_type",
+    (
+        "roleAssignments",
+        "roleAssignmentScheduleInstances",
+    ),
+)
+def test_trigger_queue_rejects_inherited_service_bus_control_plane_escalation(
+    monkeypatch: pytest.MonkeyPatch,
+    resource_type: str,
+) -> None:
+    queue_scope = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
+        "Microsoft.ServiceBus/namespaces/athena/queues/requests"
+    )
+    expected_assignment_id = (
+        f"{queue_scope}/providers/Microsoft.Authorization/roleAssignments/"
+        "98989898-6666-4666-8666-666666666666"
+    )
+    expected = orchestration._ExpectedRoleAssignment(
+        label="planned trigger receiver",
+        principal_id="98989898-7777-4777-8777-777777777777",
+        scope=queue_scope,
+        role_definition_id=(
+            f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+            "Microsoft.Authorization/roleDefinitions/"
+            f"{orchestration.SERVICE_BUS_DATA_RECEIVER_ROLE_ID}"
+        ),
+    )
+    ancestor_scope = f"/subscriptions/{SUBSCRIPTION_ID}"
+    service_bus_admin_role_id = (
+        f"{ancestor_scope}/providers/Microsoft.Authorization/roleDefinitions/"
+        "98989898-8888-4888-8888-888888888888"
+    )
+    inherited_assignment_id = (
+        f"{ancestor_scope}/providers/Microsoft.Authorization/{resource_type}/"
+        "98989898-9999-4999-8999-999999999999"
+    )
+    monkeypatch.setattr(
+        orchestration,
+        "_authorization_assignments_at_or_above_scope",
+        lambda _scope, **_kwargs: [
+            {
+                "id": inherited_assignment_id,
+                "principalId": "98989898-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                "roleDefinitionId": service_bus_admin_role_id,
+                "scope": ancestor_scope,
+                "authorizationEvidenceKinds": [resource_type],
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        orchestration,
+        "_get_role_definition",
+        lambda role_definition_id, *, subscription_id: _role_definition(
+            role_definition_id,
+            actions=["Microsoft.ServiceBus/*"],
+        ),
+    )
+
+    with pytest.raises(
+        orchestration.OrchestrationError,
+        match="unreviewed or obsolete role assignment or schedule",
+    ):
+        orchestration._verify_complete_trigger_queue_assignment_set(
+            current_expected_assignments={expected_assignment_id.casefold(): expected},
+            required_current_assignment_ids=set(),
+            approved_transitions=[],
+            transition_state="present",
+            subscription_id=SUBSCRIPTION_ID,
+        )
+
+
+def test_trigger_queue_control_plane_escalation_honors_not_actions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue_scope = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
+        "Microsoft.ServiceBus/namespaces/athena/queues/requests"
+    )
+    expected_assignment_id = (
+        f"{queue_scope}/providers/Microsoft.Authorization/roleAssignments/"
+        "98989898-abab-4bab-8bab-abababababab"
+    )
+    expected = orchestration._ExpectedRoleAssignment(
+        label="planned trigger receiver",
+        principal_id="98989898-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        scope=queue_scope,
+        role_definition_id=(
+            f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+            "Microsoft.Authorization/roleDefinitions/"
+            f"{orchestration.SERVICE_BUS_DATA_RECEIVER_ROLE_ID}"
+        ),
+    )
+    ancestor_scope = f"/subscriptions/{SUBSCRIPTION_ID}"
+    service_bus_admin_role_id = (
+        f"{ancestor_scope}/providers/Microsoft.Authorization/roleDefinitions/"
+        "98989898-cccc-4ccc-8ccc-cccccccccccc"
+    )
+    inherited_assignment_id = (
+        f"{ancestor_scope}/providers/Microsoft.Authorization/roleAssignments/"
+        "98989898-dddd-4ddd-8ddd-dddddddddddd"
+    )
+    monkeypatch.setattr(
+        orchestration,
+        "_authorization_assignments_at_or_above_scope",
+        lambda _scope, **_kwargs: [
+            {
+                "id": inherited_assignment_id,
+                "principalId": "98989898-eeee-4eee-8eee-eeeeeeeeeeee",
+                "roleDefinitionId": service_bus_admin_role_id,
+                "scope": ancestor_scope,
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        orchestration,
+        "_get_role_definition",
+        lambda role_definition_id, *, subscription_id: _role_definition(
+            role_definition_id,
+            actions=["Microsoft.ServiceBus/*"],
+            not_actions=sorted(orchestration.SERVICE_BUS_ESCALATION_ACTIONS),
+        ),
+    )
+
+    assert (
+        orchestration._verify_complete_trigger_queue_assignment_set(
+            current_expected_assignments={expected_assignment_id.casefold(): expected},
             required_current_assignment_ids=set(),
             approved_transitions=[],
             transition_state="present",
@@ -5113,7 +5542,10 @@ def test_image_pull_probe_rechecks_anonymous_pull_after_success(
     monkeypatch.setattr(orchestration, "_get_resource", get_resource)
     monkeypatch.setattr(orchestration, "_run_json", run_json)
     monkeypatch.setattr(orchestration, "READBACK_MAX_ATTEMPTS", 2)
-    with pytest.raises(orchestration.OrchestrationError, match="terminal.*anonymousPullEnabled"):
+    with pytest.raises(
+        orchestration.TerminalEvidenceError,
+        match="terminal.*anonymousPullEnabled",
+    ):
         orchestration._verify_digest_pinned_job_image_pull(
             job_resource_id=str(outputs["producerJobResourceId"]),
             image=str(outputs["producerImage"]),
@@ -5130,6 +5562,33 @@ def test_image_pull_probe_rechecks_anonymous_pull_after_success(
         )
     assert registry_reads == 2
     assert start_attempts == 1
+
+
+def test_apply_level_readiness_retry_propagates_terminal_acr_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+
+    def readiness() -> tuple[dict[str, object] | None, dict[str, object] | None]:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise orchestration.TerminalEvidenceError(
+                "anonymousPullEnabled drifted from false to true after success"
+            )
+        return None, None
+
+    monkeypatch.setattr(
+        orchestration.time,
+        "sleep",
+        lambda _seconds: pytest.fail("terminal evidence must not reach an outer retry sleep"),
+    )
+    with pytest.raises(
+        orchestration.TerminalEvidenceError,
+        match="false to true",
+    ):
+        orchestration._retry_post_deployment_readiness(readiness)
+    assert attempts == 1
 
 
 def test_legacy_acr_assignment_requires_reviewed_manual_revocation(
@@ -5416,9 +5875,7 @@ def test_wc013_acr_inventory_rejects_stale_pull_grants(
 
     def resolved_assignments(
         principal_id: str,
-        *,
-        subscription_id: str,
-        field: str,
+        **_kwargs: object,
     ) -> list[dict[str, object]]:
         expected = next(
             item
@@ -5528,9 +5985,7 @@ def test_wc013_abac_effective_set_requires_both_presentation_repositories(
 
     def resolved_assignments(
         principal_id: str,
-        *,
-        subscription_id: str,
-        field: str,
+        **_kwargs: object,
     ) -> list[dict[str, object]]:
         return [
             {
@@ -5595,6 +6050,173 @@ def test_wc013_abac_effective_set_requires_both_presentation_repositories(
 
 
 @pytest.mark.parametrize(
+    ("action", "is_data_action"),
+    (
+        (orchestration.ACR_QUARANTINE_READ_ACTION, False),
+        (orchestration.ACR_QUARANTINED_ARTIFACTS_READ_DATA_ACTION, True),
+    ),
+)
+def test_acr_pull_classification_includes_quarantine_planes(
+    action: str,
+    is_data_action: bool,
+) -> None:
+    role_definition_id = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+        "Microsoft.Authorization/roleDefinitions/"
+        "90909090-1111-4111-8111-111111111111"
+    )
+    role = _role_definition(
+        role_definition_id,
+        actions=[] if is_data_action else [action],
+        data_actions=[action] if is_data_action else [],
+    )
+    assert orchestration._role_definition_grants_acr_pull(
+        role,
+        assignment_scope=REGISTRY_RESOURCE_ID,
+    )
+
+
+@pytest.mark.parametrize(
+    ("actions", "not_actions", "data_actions", "not_data_actions"),
+    (
+        (
+            [orchestration.ACR_QUARANTINE_READ_ACTION],
+            [orchestration.ACR_QUARANTINE_READ_ACTION],
+            [],
+            [],
+        ),
+        (
+            [],
+            [],
+            [orchestration.ACR_QUARANTINED_ARTIFACTS_READ_DATA_ACTION],
+            [orchestration.ACR_QUARANTINED_ARTIFACTS_READ_DATA_ACTION],
+        ),
+        (
+            ["Microsoft.ContainerRegistry/registries/*"],
+            [
+                orchestration.ACR_LEGACY_PULL_ACTION,
+                orchestration.ACR_QUARANTINE_READ_ACTION,
+                *sorted(orchestration.ACR_REGISTRY_ESCALATION_ACTIONS),
+            ],
+            ["Microsoft.ContainerRegistry/registries/*"],
+            [
+                orchestration.ACR_REPOSITORY_CONTENT_READ_DATA_ACTION,
+                orchestration.ACR_QUARANTINED_ARTIFACTS_READ_DATA_ACTION,
+                *sorted(orchestration.ACR_REGISTRY_ESCALATION_DATA_ACTIONS),
+            ],
+        ),
+    ),
+)
+def test_acr_pull_classification_honors_not_actions_and_not_data_actions(
+    actions: list[str],
+    not_actions: list[str],
+    data_actions: list[str],
+    not_data_actions: list[str],
+) -> None:
+    role_definition_id = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+        "Microsoft.Authorization/roleDefinitions/"
+        "90909090-2222-4222-8222-222222222222"
+    )
+    assert not orchestration._role_definition_grants_acr_pull(
+        _role_definition(
+            role_definition_id,
+            actions=actions,
+            not_actions=not_actions,
+            data_actions=data_actions,
+            not_data_actions=not_data_actions,
+        ),
+        assignment_scope=REGISTRY_RESOURCE_ID,
+    )
+
+
+def test_acr_pull_escalation_uses_sibling_registry_and_ancestor_scope_semantics() -> None:
+    sibling_registry = REGISTRY_RESOURCE_ID.replace(
+        "/registries/athena",
+        "/registries/sibling",
+    )
+    storage_scope = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
+        "Microsoft.Storage/storageAccounts/athena"
+    )
+    registry_admin_role_id = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+        "Microsoft.Authorization/roleDefinitions/"
+        "90909090-3333-4333-8333-333333333333"
+    )
+    registry_admin = _role_definition(
+        registry_admin_role_id,
+        actions=["Microsoft.ContainerRegistry/registries/write"],
+    )
+    schedule_admin = _role_definition(
+        registry_admin_role_id,
+        actions=["Microsoft.Authorization/roleAssignmentScheduleRequests/write"],
+    )
+
+    assert orchestration._role_definition_grants_acr_pull(
+        registry_admin,
+        assignment_scope=sibling_registry,
+    )
+    assert orchestration._role_definition_grants_acr_pull(
+        schedule_admin,
+        assignment_scope=f"/subscriptions/{SUBSCRIPTION_ID}",
+    )
+    assert not orchestration._role_definition_grants_acr_pull(
+        registry_admin,
+        assignment_scope=storage_scope,
+    )
+
+
+def test_acr_tasks_pim_assignment_is_pull_escalating(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    principal_id = "90909090-4444-4444-8444-444444444444"
+    sibling_registry = REGISTRY_RESOURCE_ID.replace(
+        "/registries/athena",
+        "/registries/sibling",
+    )
+    role_definition_id = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+        "Microsoft.Authorization/roleDefinitions/"
+        "90909090-5555-4555-8555-555555555555"
+    )
+    schedule_id = (
+        f"{sibling_registry}/providers/Microsoft.Authorization/"
+        "roleAssignmentScheduleInstances/90909090-6666-4666-8666-666666666666"
+    )
+    monkeypatch.setattr(
+        orchestration,
+        "_get_role_definition",
+        lambda requested_role_definition_id, *, subscription_id: _role_definition(
+            requested_role_definition_id,
+            actions=["Microsoft.ContainerRegistry/registries/tasks/write"],
+        ),
+    )
+
+    with pytest.raises(
+        orchestration.OrchestrationError,
+        match="pull-escalating assignment",
+    ):
+        orchestration._verify_exact_pull_capable_assignments(
+            {principal_id},
+            expected_acr_assignments_by_principal={},
+            subscription_id=SUBSCRIPTION_ID,
+            field="synthetic ACR PIM assignments",
+            effective_assignments_by_principal={
+                principal_id: [
+                    {
+                        "id": schedule_id,
+                        "principalId": principal_id,
+                        "roleDefinitionId": role_definition_id,
+                        "scope": sibling_registry,
+                        "authorizationEvidenceKinds": ["roleAssignmentScheduleInstances"],
+                    }
+                ]
+            },
+        )
+
+
+@pytest.mark.parametrize(
     ("role_id", "actions", "data_actions", "stale_scope"),
     (
         (
@@ -5640,6 +6262,54 @@ def test_wc013_abac_effective_set_requires_both_presentation_repositories(
             "92929292-2222-4222-8222-222222222222",
             [],
             ["Microsoft.ContainerRegistry/registries/repositories/content/read"],
+            f"/subscriptions/{SUBSCRIPTION_ID}",
+        ),
+        (
+            "93939393-1111-4111-8111-111111111111",
+            [orchestration.ACR_QUARANTINE_READ_ACTION],
+            [],
+            REGISTRY_RESOURCE_ID,
+        ),
+        (
+            "94949494-2222-4222-8222-222222222222",
+            [],
+            [orchestration.ACR_QUARANTINED_ARTIFACTS_READ_DATA_ACTION],
+            REGISTRY_RESOURCE_ID.replace("/registries/athena", "/registries/sibling"),
+        ),
+        (
+            "95959595-3333-4333-8333-333333333333",
+            ["Microsoft.ContainerRegistry/registries/write"],
+            [],
+            REGISTRY_RESOURCE_ID.replace("/registries/athena", "/registries/sibling"),
+        ),
+        (
+            "96969696-4444-4444-8444-444444444444",
+            ["Microsoft.Authorization/roleAssignments/write"],
+            [],
+            f"/subscriptions/{SUBSCRIPTION_ID}",
+        ),
+        (
+            "97979797-5555-4555-8555-555555555555",
+            ["Microsoft.Authorization/roleAssignmentScheduleRequests/write"],
+            [],
+            f"/subscriptions/{SUBSCRIPTION_ID}",
+        ),
+        (
+            "98989898-6666-4666-8666-666666666666",
+            ["Microsoft.ContainerRegistry/registries/tasks/write"],
+            [],
+            REGISTRY_RESOURCE_ID.replace("/registries/athena", "/registries/sibling"),
+        ),
+        (
+            "99999999-7777-4777-8777-777777777777",
+            ["Microsoft.ContainerRegistry/registries/scheduleRun/action"],
+            [],
+            REGISTRY_RESOURCE_ID,
+        ),
+        (
+            "aaaaaaaa-8888-4888-8888-888888888888",
+            ["Microsoft.ContainerRegistry/registries/taskruns/write"],
+            [],
             f"/subscriptions/{SUBSCRIPTION_ID}",
         ),
     ),
@@ -5710,9 +6380,7 @@ def test_wc013_rejects_every_extra_pull_capable_role_definition(
 
     def resolved_assignments(
         principal_id: str,
-        *,
-        subscription_id: str,
-        field: str,
+        **_kwargs: object,
     ) -> list[dict[str, object]]:
         expected = next(
             item
@@ -5827,9 +6495,7 @@ def test_wc013_rejects_group_derived_and_inherited_custom_pull_grants(
 
     def effective_assignments(
         principal_id: str,
-        *,
-        subscription_id: str,
-        field: str,
+        **_kwargs: object,
     ) -> list[dict[str, object]]:
         if principal_id == group_id:
             return [
@@ -6940,8 +7606,11 @@ def test_effective_broad_rbac_is_rejected(
         "54545454-5454-5454-5454-545454545454"
     )
 
-    def run_json(_command: object, *, field: str) -> object:
-        assert "effective role assignments" in field
+    def effective_assignments(
+        requested_principal_id: str,
+        **_kwargs: object,
+    ) -> list[dict[str, object]]:
+        assert requested_principal_id == principal_id
         return [
             {
                 "id": assignment_id,
@@ -6951,12 +7620,369 @@ def test_effective_broad_rbac_is_rejected(
             }
         ]
 
-    monkeypatch.setattr(orchestration, "_run_json", run_json)
+    monkeypatch.setattr(
+        orchestration,
+        "_effective_role_assignments",
+        effective_assignments,
+    )
     monkeypatch.setattr(orchestration, "_transitive_group_ids", lambda _principal_id: set())
     with pytest.raises(orchestration.OrchestrationError, match="prohibited broad RBAC"):
         orchestration._verify_no_broad_effective_assignments(
             {principal_id},
             subscription_id=SUBSCRIPTION_ID,
+        )
+
+
+def test_effective_assignment_pages_merge_classic_active_and_eligible_pim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    principal_id = "56565656-1111-4111-8111-111111111111"
+    queue_scope = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
+        "Microsoft.ServiceBus/namespaces/athena/queues/requests"
+    )
+    resource_group_scope = f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg"
+    subscription_scope = f"/subscriptions/{SUBSCRIPTION_ID}"
+    management_group_scope = "/providers/Microsoft.Management/managementGroups/synthetic-parent"
+    role_definition_id = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+        "Microsoft.Authorization/roleDefinitions/"
+        f"{orchestration.SERVICE_BUS_DATA_RECEIVER_ROLE_ID}"
+    )
+    classic_direct_id = (
+        f"{queue_scope}/providers/Microsoft.Authorization/roleAssignments/"
+        "56565656-2222-4222-8222-222222222222"
+    )
+    classic_inherited_id = (
+        f"{subscription_scope}/providers/Microsoft.Authorization/roleAssignments/"
+        "56565656-3333-4333-8333-333333333333"
+    )
+    active_schedule_id = (
+        f"{resource_group_scope}/providers/Microsoft.Authorization/"
+        "roleAssignmentScheduleInstances/56565656-4444-4444-8444-444444444444"
+    )
+    upcoming_eligibility_id = (
+        f"{management_group_scope}/providers/Microsoft.Authorization/"
+        "roleEligibilityScheduleInstances/56565656-5555-4555-8555-555555555555"
+    )
+    expired_schedule_id = (
+        f"{queue_scope}/providers/Microsoft.Authorization/"
+        "roleAssignmentScheduleInstances/56565656-6666-4666-8666-666666666666"
+    )
+    requested_types: list[str] = []
+
+    def run_json(command: object, *, field: str) -> object:
+        url, resource_type, filter_value = _authorization_request(command)
+        assert filter_value == f"principalId eq '{principal_id}'"
+        requested_types.append(resource_type)
+        query = parse_qs(urlparse(url).query)
+        if resource_type == "roleAssignments":
+            if "$skipToken" not in query:
+                return {
+                    "value": [
+                        _authorization_resource(
+                            resource_type=resource_type,
+                            resource_id=classic_direct_id,
+                            principal_id=principal_id,
+                            role_definition_id=role_definition_id,
+                            scope=queue_scope,
+                        )
+                    ],
+                    "nextLink": f"{url}&%24skipToken=classic-page-2",
+                }
+            return {
+                "value": [
+                    _authorization_resource(
+                        resource_type=resource_type,
+                        resource_id=classic_inherited_id,
+                        principal_id=principal_id,
+                        role_definition_id=role_definition_id,
+                        scope=subscription_scope,
+                    )
+                ]
+            }
+        if resource_type == "roleAssignmentScheduleInstances":
+            return {
+                "value": [
+                    _authorization_resource(
+                        resource_type=resource_type,
+                        resource_id=active_schedule_id,
+                        principal_id=principal_id,
+                        role_definition_id=role_definition_id,
+                        scope=resource_group_scope,
+                        member_type="Inherited",
+                    ),
+                    _authorization_resource(
+                        resource_type=resource_type,
+                        resource_id=expired_schedule_id,
+                        principal_id=principal_id,
+                        role_definition_id=role_definition_id,
+                        scope=queue_scope,
+                        status="Revoked",
+                        start_date_time="2025-01-01T00:00:00Z",
+                        end_date_time="2025-02-01T00:00:00Z",
+                    ),
+                ]
+            }
+        assert resource_type == "roleEligibilityScheduleInstances"
+        return {
+            "value": [
+                _authorization_resource(
+                    resource_type=resource_type,
+                    resource_id=upcoming_eligibility_id,
+                    principal_id=principal_id,
+                    role_definition_id=role_definition_id,
+                    scope=management_group_scope,
+                    start_date_time="2026-10-01T00:00:00Z",
+                    member_type="Inherited",
+                )
+            ]
+        }
+
+    monkeypatch.setattr(orchestration, "_run_json", run_json)
+    assignments = orchestration._effective_role_assignments(
+        principal_id,
+        subscription_id=SUBSCRIPTION_ID,
+        field="synthetic effective assignments",
+        as_of=datetime(2026, 9, 18, tzinfo=UTC),
+    )
+
+    assert {str(item["id"]) for item in assignments} == {
+        classic_direct_id,
+        classic_inherited_id,
+        active_schedule_id,
+        upcoming_eligibility_id,
+    }
+    assert requested_types == [
+        "roleAssignments",
+        "roleAssignments",
+        "roleAssignmentScheduleInstances",
+        "roleEligibilityScheduleInstances",
+    ]
+
+
+def test_effective_assignment_unknown_pim_status_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    principal_id = "57575757-1111-4111-8111-111111111111"
+    scope = f"/subscriptions/{SUBSCRIPTION_ID}"
+    role_definition_id = (
+        f"{scope}/providers/Microsoft.Authorization/roleDefinitions/"
+        f"{orchestration.SERVICE_BUS_DATA_RECEIVER_ROLE_ID}"
+    )
+    schedule_id = (
+        f"{scope}/providers/Microsoft.Authorization/roleAssignmentScheduleInstances/"
+        "57575757-2222-4222-8222-222222222222"
+    )
+
+    def run_json(command: object, *, field: str) -> object:
+        _, resource_type, _ = _authorization_request(command)
+        if resource_type == "roleAssignments":
+            return {"value": []}
+        assert resource_type == "roleAssignmentScheduleInstances"
+        return {
+            "value": [
+                _authorization_resource(
+                    resource_type=resource_type,
+                    resource_id=schedule_id,
+                    principal_id=principal_id,
+                    role_definition_id=role_definition_id,
+                    scope=scope,
+                    status="SyntheticUnknown",
+                )
+            ]
+        }
+
+    monkeypatch.setattr(orchestration, "_run_json", run_json)
+    with pytest.raises(orchestration.OrchestrationError, match="status is unknown"):
+        orchestration._effective_role_assignments(
+            principal_id,
+            subscription_id=SUBSCRIPTION_ID,
+            field="synthetic effective assignments",
+            as_of=datetime(2026, 9, 18, tzinfo=UTC),
+        )
+
+
+@pytest.mark.parametrize(
+    ("resource_type", "assignment_scope"),
+    (
+        (
+            "roleAssignmentScheduleInstances",
+            (
+                f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
+                "Microsoft.ServiceBus/namespaces/athena/queues/requests"
+            ),
+        ),
+        (
+            "roleEligibilityScheduleInstances",
+            "/providers/Microsoft.Management/managementGroups/synthetic-parent",
+        ),
+    ),
+)
+def test_direct_and_inherited_pim_assignments_are_unreviewed(
+    resource_type: str,
+    assignment_scope: str,
+) -> None:
+    principal_id = "58585858-1111-4111-8111-111111111111"
+    governed_scope = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
+        "Microsoft.ServiceBus/namespaces/athena/queues/requests"
+    )
+    expected_assignment_id = (
+        f"{governed_scope}/providers/Microsoft.Authorization/roleAssignments/"
+        "58585858-2222-4222-8222-222222222222"
+    )
+    pim_assignment_id = (
+        f"{assignment_scope}/providers/Microsoft.Authorization/{resource_type}/"
+        "58585858-3333-4333-8333-333333333333"
+    )
+
+    with pytest.raises(
+        orchestration.OrchestrationError,
+        match="unreviewed effective role assignment",
+    ):
+        orchestration._verify_exact_effective_assignments(
+            {principal_id: {expected_assignment_id.casefold()}},
+            additional_allowed_assignments_by_principal={},
+            subscription_id=SUBSCRIPTION_ID,
+            effective_assignments_by_principal={
+                principal_id: [
+                    {
+                        "id": expected_assignment_id,
+                        "scope": governed_scope,
+                    },
+                    {
+                        "id": pim_assignment_id,
+                        "scope": assignment_scope,
+                        "authorizationEvidenceKinds": [resource_type],
+                    },
+                ]
+            },
+        )
+
+
+def test_transitive_group_eligibility_is_enforced(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    principal_id = "59595959-1111-4111-8111-111111111111"
+    group_id = "59595959-2222-4222-8222-222222222222"
+    queue_scope = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
+        "Microsoft.ServiceBus/namespaces/athena/queues/requests"
+    )
+    expected_assignment_id = (
+        f"{queue_scope}/providers/Microsoft.Authorization/roleAssignments/"
+        "59595959-3333-4333-8333-333333333333"
+    )
+    eligibility_id = (
+        f"{queue_scope}/providers/Microsoft.Authorization/"
+        "roleEligibilityScheduleInstances/59595959-4444-4444-8444-444444444444"
+    )
+
+    def effective_assignments(
+        requested_principal_id: str,
+        **_kwargs: object,
+    ) -> list[dict[str, object]]:
+        if requested_principal_id == principal_id:
+            return [{"id": expected_assignment_id, "scope": queue_scope}]
+        assert requested_principal_id == group_id
+        return [
+            {
+                "id": eligibility_id,
+                "principalId": group_id,
+                "scope": queue_scope,
+                "authorizationEvidenceKinds": ["roleEligibilityScheduleInstances"],
+            }
+        ]
+
+    monkeypatch.setattr(
+        orchestration,
+        "_transitive_group_ids",
+        lambda requested_principal_id: (
+            {group_id} if requested_principal_id == principal_id else set()
+        ),
+    )
+    monkeypatch.setattr(
+        orchestration,
+        "_effective_role_assignments",
+        effective_assignments,
+    )
+    with pytest.raises(
+        orchestration.OrchestrationError,
+        match="unreviewed effective role assignment",
+    ):
+        orchestration._verify_exact_effective_assignments(
+            {principal_id: {expected_assignment_id.casefold()}},
+            additional_allowed_assignments_by_principal={},
+            subscription_id=SUBSCRIPTION_ID,
+        )
+
+
+def test_effective_assignment_scan_has_one_shared_page_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests = 0
+
+    def run_json(command: object, *, field: str) -> object:
+        nonlocal requests
+        _authorization_request(command)
+        requests += 1
+        return {"value": []}
+
+    monkeypatch.setattr(orchestration, "_run_json", run_json)
+    monkeypatch.setattr(orchestration, "MAX_AUTHORIZATION_SCAN_PAGES", 2)
+    with pytest.raises(orchestration.OrchestrationError, match="page budget"):
+        orchestration._effective_role_assignments(
+            "60606060-1111-4111-8111-111111111111",
+            subscription_id=SUBSCRIPTION_ID,
+            field="synthetic bounded effective assignments",
+        )
+    assert requests == 2
+
+
+def test_effective_assignment_scan_has_one_shared_item_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    principal_id = "61616161-1111-4111-8111-111111111111"
+    scope = f"/subscriptions/{SUBSCRIPTION_ID}"
+    role_definition_id = (
+        f"{scope}/providers/Microsoft.Authorization/roleDefinitions/"
+        f"{orchestration.SERVICE_BUS_DATA_RECEIVER_ROLE_ID}"
+    )
+    assignment_ids = (
+        (
+            f"{scope}/providers/Microsoft.Authorization/roleAssignments/"
+            "61616161-2222-4222-8222-222222222222"
+        ),
+        (
+            f"{scope}/providers/Microsoft.Authorization/roleAssignments/"
+            "61616161-3333-4333-8333-333333333333"
+        ),
+    )
+
+    def run_json(command: object, *, field: str) -> object:
+        _, resource_type, _ = _authorization_request(command)
+        assert resource_type == "roleAssignments"
+        return {
+            "value": [
+                _authorization_resource(
+                    resource_type=resource_type,
+                    resource_id=assignment_id,
+                    principal_id=principal_id,
+                    role_definition_id=role_definition_id,
+                    scope=scope,
+                )
+                for assignment_id in assignment_ids
+            ]
+        }
+
+    monkeypatch.setattr(orchestration, "_run_json", run_json)
+    monkeypatch.setattr(orchestration, "MAX_AUTHORIZATION_SCAN_ITEMS", 1)
+    with pytest.raises(orchestration.OrchestrationError, match="item budget"):
+        orchestration._effective_role_assignments(
+            principal_id,
+            subscription_id=SUBSCRIPTION_ID,
+            field="synthetic bounded effective assignments",
         )
 
 
@@ -6978,8 +8004,14 @@ def test_unreviewed_effective_assignment_is_rejected(
     governed_scope = orchestration._role_assignment_scope(expected_assignment)
     monkeypatch.setattr(
         orchestration,
-        "_run_json",
-        lambda _command, *, field: [{"id": unexpected_assignment, "scope": governed_scope}],
+        "_effective_role_assignments",
+        lambda requested_principal_id, **_kwargs: [
+            {
+                "id": unexpected_assignment,
+                "principalId": requested_principal_id,
+                "scope": governed_scope,
+            }
+        ],
     )
     monkeypatch.setattr(orchestration, "_transitive_group_ids", lambda _principal_id: set())
     with pytest.raises(
@@ -7016,15 +8048,20 @@ def test_effective_assignment_allowlist_is_bound_to_exact_principal(
         "84848484-8484-8484-8484-848484848484"
     )
 
-    def run_json(command: object, *, field: str) -> object:
-        arguments = list(command)
-        principal = arguments[arguments.index("--assignee-object-id") + 1]
-        if principal == first_principal:
+    def effective_assignments(
+        principal_id: str,
+        **_kwargs: object,
+    ) -> list[dict[str, object]]:
+        if principal_id == first_principal:
             return [{"id": first_assignment, "scope": queue_scope}]
-        assert principal == second_principal
+        assert principal_id == second_principal
         return [{"id": first_assignment, "scope": queue_scope}]
 
-    monkeypatch.setattr(orchestration, "_run_json", run_json)
+    monkeypatch.setattr(
+        orchestration,
+        "_effective_role_assignments",
+        effective_assignments,
+    )
     monkeypatch.setattr(orchestration, "_transitive_group_ids", lambda _principal_id: set())
 
     with pytest.raises(
@@ -7858,16 +8895,11 @@ def test_management_group_service_bus_data_owner_is_treated_as_inherited(
         "87878787-8787-8787-8787-878787878787"
     )
 
-    def run_json(command: object, *, field: str) -> object:
-        arguments = list(command)
-        if "--all" in arguments:
-            assert "--scope" not in arguments
-            assert "--include-inherited" not in arguments
-            return []
-        assert "--all" not in arguments
-        assert "--include-inherited" in arguments
-        scope_index = arguments.index("--scope")
-        assert arguments[scope_index + 1] == f"/subscriptions/{SUBSCRIPTION_ID}"
+    def effective_assignments(
+        requested_principal_id: str,
+        **_kwargs: object,
+    ) -> list[dict[str, object]]:
+        assert requested_principal_id == principal_id
         return [
             {
                 "id": management_group_assignment,
@@ -7877,7 +8909,11 @@ def test_management_group_service_bus_data_owner_is_treated_as_inherited(
             }
         ]
 
-    monkeypatch.setattr(orchestration, "_run_json", run_json)
+    monkeypatch.setattr(
+        orchestration,
+        "_effective_role_assignments",
+        effective_assignments,
+    )
     monkeypatch.setattr(orchestration, "_transitive_group_ids", lambda _principal_id: set())
 
     with pytest.raises(
@@ -7917,6 +8953,11 @@ def test_transitive_group_assignments_are_fully_paged_and_enforced(
         "transitiveMemberOf/microsoft.graph.group"
         "?$select=id&$count=true&$top=999&$skiptoken=synthetic"
     )
+    receiver_role_definition_id = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+        "Microsoft.Authorization/roleDefinitions/"
+        f"{orchestration.SERVICE_BUS_DATA_RECEIVER_ROLE_ID}"
+    )
     graph_urls: list[str] = []
     queried_assignees: list[str] = []
 
@@ -7924,50 +8965,62 @@ def test_transitive_group_assignments_are_fully_paged_and_enforced(
         arguments = list(command)
         if arguments[:2] == ["az", "rest"]:
             url = arguments[arguments.index("--url") + 1]
-            graph_urls.append(url)
-            if len(graph_urls) == 1:
+            if urlparse(url).netloc.casefold() == "graph.microsoft.com":
+                graph_urls.append(url)
+                if len(graph_urls) == 1:
+                    return {
+                        "@odata.count": 2,
+                        "value": [
+                            {
+                                "@odata.type": "#microsoft.graph.group",
+                                "id": group_ids[0],
+                            }
+                        ],
+                        "@odata.nextLink": next_link,
+                    }
+                assert url == next_link
                 return {
-                    "@odata.count": 2,
                     "value": [
                         {
                             "@odata.type": "#microsoft.graph.group",
-                            "id": group_ids[0],
+                            "id": group_ids[1],
                         }
                     ],
-                    "@odata.nextLink": next_link,
                 }
-            assert url == next_link
+        _, resource_type, filter_value = _authorization_request(command)
+        assignee = next(
+            candidate for candidate in (principal_id, *group_ids) if candidate in filter_value
+        )
+        queried_assignees.append(assignee)
+        if resource_type != "roleAssignments":
+            return {"value": []}
+        if assignee == principal_id:
             return {
                 "value": [
-                    {
-                        "@odata.type": "#microsoft.graph.group",
-                        "id": group_ids[1],
-                    }
+                    _authorization_resource(
+                        resource_type=resource_type,
+                        resource_id=expected_assignment,
+                        principal_id=principal_id,
+                        role_definition_id=receiver_role_definition_id,
+                        role_definition_name="Azure Service Bus Data Receiver",
+                        scope=queue_scope,
+                    )
                 ]
             }
-        assignee = arguments[arguments.index("--assignee-object-id") + 1]
-        queried_assignees.append(assignee)
-        if "--all" not in arguments:
-            return []
-        if assignee == principal_id:
-            return [
-                {
-                    "id": expected_assignment,
-                    "principalId": principal_id,
-                    "roleDefinitionName": "Azure Service Bus Data Receiver",
-                    "scope": queue_scope,
-                }
-            ]
         if assignee == group_ids[1]:
-            return [
-                {
-                    "id": group_assignment,
-                    "principalId": group_ids[1],
-                    "roleDefinitionName": "Azure Service Bus Data Owner",
-                    "scope": queue_scope,
-                }
-            ]
-        return []
+            return {
+                "value": [
+                    _authorization_resource(
+                        resource_type=resource_type,
+                        resource_id=group_assignment,
+                        principal_id=group_ids[1],
+                        role_definition_id=receiver_role_definition_id,
+                        role_definition_name="Azure Service Bus Data Owner",
+                        scope=queue_scope,
+                    )
+                ]
+            }
+        return {"value": []}
 
     monkeypatch.setattr(orchestration, "_run_json", run_json)
     evidence = orchestration._verify_no_broad_effective_assignments(
@@ -8029,21 +9082,57 @@ def test_transitive_group_membership_unavailable_fails_closed(
 def test_effective_assignment_incomplete_page_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        orchestration,
-        "_run_json",
-        lambda _command, *, field: {
-            "value": [],
-            "nextLink": "https://management.azure.com/synthetic-next-page",
-        },
-    )
+    requests = 0
 
-    with pytest.raises(orchestration.OrchestrationError, match="must be an array"):
+    def run_json(command: object, *, field: str) -> object:
+        nonlocal requests
+        requests += 1
+        url, resource_type, _ = _authorization_request(command)
+        assert resource_type == "roleAssignments"
+        if requests == 1:
+            return {
+                "value": [],
+                "nextLink": f"{url}&%24skipToken=synthetic",
+            }
+        return {}
+
+    monkeypatch.setattr(orchestration, "_run_json", run_json)
+
+    with pytest.raises(orchestration.OrchestrationError, match="value array"):
         orchestration._effective_role_assignments(
             "93939393-1111-4111-8111-111111111111",
             subscription_id=SUBSCRIPTION_ID,
             field="synthetic paged role assignments",
         )
+    assert requests == 2
+
+
+def test_effective_assignment_continuation_requires_a_cursor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests = 0
+
+    def run_json(command: object, *, field: str) -> object:
+        nonlocal requests
+        requests += 1
+        url, resource_type, _ = _authorization_request(command)
+        assert resource_type == "roleAssignments"
+        return {
+            "value": [],
+            "nextLink": url,
+        }
+
+    monkeypatch.setattr(orchestration, "_run_json", run_json)
+    with pytest.raises(
+        orchestration.OrchestrationError,
+        match="untrusted continuation",
+    ):
+        orchestration._effective_role_assignments(
+            "93939393-2222-4222-8222-222222222222",
+            subscription_id=SUBSCRIPTION_ID,
+            field="synthetic paged role assignments",
+        )
+    assert requests == 1
 
 
 def test_effective_assignment_query_unavailable_fails_closed(
