@@ -238,8 +238,12 @@ sets, registries, and images instead of trusting labels or counts. Evidence olde
 minutes, generated after the trusted deployment evaluation instant, or lacking a final post-pull
 scan is rejected. This allows the required later rebase and its governed legacy-assignment
 migration to reconcile without semantic divergence. When PR #99's collector contract v10 becomes
-the integration base, exact collector schema and digest references must be updated without
-changing or aliasing this ACR evidence contract.
+the integration base, PR #103 consumes it only through shared `MonitoringCollectorContract`
+construction/imports and the tests that pin `collectorContractDigest`. The rebase uses canonical
+helpers, recomputes current digest-based fixtures, preserves PR #99's exact schema/version checks,
+and leaves historical v9 fixtures unchanged. PR #99-owned Resource Health IaC and the reviewed
+operation tuple remain outside this branch. None of that work changes or aliases this ACR evidence
+contract.
 
 ## Consequences
 

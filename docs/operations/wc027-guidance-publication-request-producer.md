@@ -336,10 +336,14 @@ must reach root deployment within five minutes. Root uses its default
 `wc027ReadinessEvaluationTimeUtc` deployment instant to reject stale or future evidence; do not
 override that value during normal validation.
 
-After PR #99 introduces collector contract v10, the final integration rebase must update every
-exact collector schema-version and digest reference. That collector-contract reconciliation must
-not weaken or alias the authoritative WC-027 ACR evidence schema or its digest-covered
-`completeness` and `paginationBudgets` fields.
+After PR #99 introduces collector contract v10, PR #103 is affected only through its shared
+`MonitoringCollectorContract` construction/import paths and tests that pin the expected
+`collectorContractDigest`. During the final integration rebase, consume v10 through the canonical
+monitoring-contract helpers and recompute only the current digest-based fixtures. Preserve PR #99's
+exact schema/version checks, leave historical v9 fixtures unchanged, and do not edit the PR
+#99-owned Resource Health IaC or reviewed operation tuple as part of this branch. That
+collector-contract reconciliation must not weaken or alias the authoritative WC-027 ACR evidence
+schema or its digest-covered `completeness` and `paginationBudgets` fields.
 
 The publisher independently exact-reads every referenced outbox Blob version before invoking its
 existing publication/activation service. Broker metadata without matching durable request bytes is
