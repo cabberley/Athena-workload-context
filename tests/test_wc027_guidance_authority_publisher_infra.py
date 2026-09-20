@@ -1257,7 +1257,7 @@ def test_publisher_digest_pull_readiness_is_bounded_and_activation_gated() -> No
             "16384",
             "request-assignment",
             False,
-            "noncanonical property names",
+            "property names.",
         ),
         (
             False,
