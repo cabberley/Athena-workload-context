@@ -8,7 +8,7 @@ import re
 import stat
 import sys
 import uuid
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
@@ -568,6 +568,7 @@ class RbacPolicy:
 
 type PreflightKind = Literal["rbac", "what-if"]
 type PreflightOutputFormat = Literal["json", "text"]
+type _UtcClock = Callable[[], datetime]
 type PropertyPathToken = str | int
 type _ScopeTokens = tuple[str, ...]
 type _CanonicalPaginationRequestIdentity = tuple[
@@ -1034,6 +1035,19 @@ def _current_utc(now: datetime | None) -> datetime:
     if now.tzinfo is None or now.utcoffset() is None:
         raise PreflightInputError("current time must be timezone-aware")
     return now.astimezone(UTC)
+
+
+def _system_utc_clock() -> datetime:
+    return datetime.now(UTC)
+
+
+def _fixed_utc_clock(now: datetime) -> _UtcClock:
+    fixed_now = _current_utc(now)
+
+    def read() -> datetime:
+        return fixed_now
+
+    return read
 
 
 def _validate_attestation_window(
@@ -9089,6 +9103,7 @@ def _consume_release_ledger(
     kind: PreflightKind,
     rendered: str,
     safe: bool,
+    clock: _UtcClock,
 ) -> None:
     collection_binding: dict[str, object] = {
         "schemaVersion": "athena.wc029CollectionBinding.v1",
@@ -9119,6 +9134,12 @@ def _consume_release_ledger(
             _SecureLedgerDirectory(ledger_path, trusted_root) as secure_ledger,
             secure_ledger.exclusive_lock(),
         ):
+            # Evaluation and lock acquisition may outlive the reviewed evidence window.
+            _validate_attestation_window(
+                collected_at=manifest.collected_at,
+                expires_at=manifest.expires_at,
+                now=_current_utc(clock()),
+            )
             for name, payload, mismatch_message, create_message in (
                 (
                     f"{manifest.collection_run_id}.collection.json",
@@ -9189,13 +9210,23 @@ def run_preflight_check(
     release_ledger_path: Path | None = None,
     trusted_release_ledger_root: Path | None = None,
     now: datetime | None = None,
+    clock: _UtcClock | None = None,
 ) -> int:
     """Run one offline preflight check without adding policy or Azure I/O."""
 
     try:
         document = load_json_file(input_path)
-        validation_now = _current_utc(now) if require_attestation else now
+        validation_clock: _UtcClock | None = None
+        validation_now = now
         if require_attestation:
+            if now is not None and clock is not None:
+                raise ValueError("now and clock cannot both be supplied")
+            validation_clock = (
+                clock
+                if clock is not None
+                else (_system_utc_clock if now is None else _fixed_utc_clock(now))
+            )
+            validation_now = _current_utc(validation_clock())
             if (
                 expected_collection_run_id is None
                 or expected_deployment_execution_id is None
@@ -9261,6 +9292,7 @@ def run_preflight_check(
             assert attestation_manifest_digest is not None
             assert release_ledger_path is not None
             assert trusted_release_ledger_root is not None
+            assert validation_clock is not None
             artifact_root = _mapping(
                 document,
                 field_name=f"attested {kind} artifact",
@@ -9279,6 +9311,7 @@ def run_preflight_check(
                 kind=kind,
                 rendered=rendered,
                 safe=not violations,
+                clock=validation_clock,
             )
     except PreflightInputError as exc:
         if output_format == "json":

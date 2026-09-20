@@ -8,7 +8,9 @@ import stat
 import subprocess
 import tempfile
 import uuid
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from io import StringIO
@@ -413,6 +415,35 @@ def _what_if_cli_args(
         _PARAMETERS_DIGEST,
         *extra,
     ]
+
+
+def _run_attested_what_if_with_clock(
+    input_path: Path,
+    *,
+    clock: Callable[[], datetime],
+    stdout: StringIO,
+    stderr: StringIO,
+) -> int:
+    trusted_root = input_path.parent / "trusted-release-ledger-root"
+    release_ledger = trusted_root / "release-ledger"
+    release_ledger.mkdir(parents=True, exist_ok=True)
+    return wc029_preflight_module.run_preflight_check(
+        kind="what-if",
+        input_path=input_path,
+        output_format="text",
+        stdout=stdout,
+        stderr=stderr,
+        require_attestation=True,
+        expected_collection_run_id=_COLLECTION_RUN_ID,
+        expected_deployment_execution_id=_DEPLOYMENT_EXECUTION_ID,
+        attestation_manifest_digest=_artifact_manifest_digest(input_path),
+        deployment_digest=_DEPLOYMENT_DIGEST,
+        template_digest=_TEMPLATE_DIGEST,
+        parameters_digest=_PARAMETERS_DIGEST,
+        release_ledger_path=release_ledger,
+        trusted_release_ledger_root=trusted_root,
+        clock=clock,
+    )
 
 
 def _rbac_cli_args(
@@ -7094,6 +7125,170 @@ def test_public_cli_consumes_shared_manifest_once_per_artifact_kind(
         f"{_DEPLOYMENT_EXECUTION_ID}.rbac.consumed.json",
         f"{_DEPLOYMENT_EXECUTION_ID}.what-if.consumed.json",
     ]
+
+
+def test_run_preflight_rechecks_expiry_crossed_during_evaluation(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expires_at = datetime(2026, 9, 21, 1, 0, tzinfo=UTC)
+    current_time = expires_at - timedelta(seconds=1)
+    input_path = tmp_path / "what-if.json"
+    input_path.write_text(
+        json.dumps(
+            _attested_what_if(
+                _what_if(_change(_STORAGE_ID, "NoChange")),
+                collected_at=expires_at - timedelta(minutes=10),
+                expires_at=expires_at,
+            )
+        ),
+        encoding="utf-8",
+    )
+    original_evaluate = wc029_preflight_module.evaluate_what_if
+
+    def evaluate_and_expire(
+        *args: object,
+        **kwargs: object,
+    ) -> tuple[PreflightViolation, ...]:
+        nonlocal current_time
+        violations = original_evaluate(*args, **kwargs)
+        current_time = expires_at
+        return violations
+
+    monkeypatch.setattr(
+        wc029_preflight_module,
+        "evaluate_what_if",
+        evaluate_and_expire,
+    )
+    stdout = StringIO()
+    stderr = StringIO()
+
+    exit_code = _run_attested_what_if_with_clock(
+        input_path,
+        clock=lambda: current_time,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert exit_code == 3
+    assert stdout.getvalue() == ""
+    assert "attestation has expired" in stderr.getvalue()
+    ledger_path = tmp_path / "trusted-release-ledger-root" / "release-ledger"
+    assert sorted(path.name for path in ledger_path.iterdir()) == [".wc029-ledger.lock"]
+
+
+@pytest.mark.parametrize(
+    ("resume_offset", "expected_exit_code"),
+    [
+        pytest.param(timedelta(microseconds=-1), 0, id="just-before-expiry"),
+        pytest.param(timedelta(0), 3, id="exact-expiry"),
+        pytest.param(timedelta(microseconds=1), 3, id="after-expiry"),
+    ],
+)
+def test_run_preflight_rechecks_expiry_after_suspension_at_boundary(
+    tmp_path,
+    resume_offset: timedelta,
+    expected_exit_code: int,
+) -> None:
+    expires_at = datetime(2026, 9, 21, 1, 0, tzinfo=UTC)
+    input_path = tmp_path / "what-if.json"
+    input_path.write_text(
+        json.dumps(
+            _attested_what_if(
+                _what_if(_change(_STORAGE_ID, "NoChange")),
+                collected_at=expires_at - timedelta(minutes=10),
+                expires_at=expires_at,
+            )
+        ),
+        encoding="utf-8",
+    )
+    readings = iter(
+        (
+            expires_at - timedelta(seconds=1),
+            expires_at + resume_offset,
+        )
+    )
+    stdout = StringIO()
+    stderr = StringIO()
+
+    exit_code = _run_attested_what_if_with_clock(
+        input_path,
+        clock=lambda: next(readings),
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert exit_code == expected_exit_code
+    ledger_path = tmp_path / "trusted-release-ledger-root" / "release-ledger"
+    if expected_exit_code == 0:
+        assert stdout.getvalue() == "WC-029 preflight: SAFE\nCheck: what-if\nBlockers: 0\n"
+        assert stderr.getvalue() == ""
+        assert (ledger_path / f"{_DEPLOYMENT_EXECUTION_ID}.what-if.consumed.json").is_file()
+    else:
+        assert stdout.getvalue() == ""
+        assert "attestation has expired" in stderr.getvalue()
+        assert sorted(path.name for path in ledger_path.iterdir()) == [".wc029-ledger.lock"]
+
+
+def test_run_preflight_rechecks_exact_expiry_after_ledger_lock_contention(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expires_at = datetime(2026, 9, 21, 1, 0, tzinfo=UTC)
+    current_time = expires_at - timedelta(microseconds=1)
+    input_path = tmp_path / "what-if.json"
+    input_path.write_text(
+        json.dumps(
+            _attested_what_if(
+                _what_if(_change(_STORAGE_ID, "NoChange")),
+                collected_at=expires_at - timedelta(minutes=10),
+                expires_at=expires_at,
+            )
+        ),
+        encoding="utf-8",
+    )
+    trusted_root = tmp_path / "trusted-release-ledger-root"
+    ledger_path = trusted_root / "release-ledger"
+    ledger_path.mkdir(parents=True)
+    lock_attempted = Event()
+    original_exclusive_lock = _SecureLedgerDirectory.exclusive_lock
+
+    @contextmanager
+    def tracked_exclusive_lock(
+        ledger: _SecureLedgerDirectory,
+    ) -> Iterator[None]:
+        lock_attempted.set()
+        with original_exclusive_lock(ledger):
+            yield
+
+    stdout = StringIO()
+    stderr = StringIO()
+    with (
+        ThreadPoolExecutor(max_workers=1) as executor,
+        _SecureLedgerDirectory(ledger_path, trusted_root) as lock_holder,
+        original_exclusive_lock(lock_holder),
+    ):
+        monkeypatch.setattr(
+            _SecureLedgerDirectory,
+            "exclusive_lock",
+            tracked_exclusive_lock,
+        )
+        future = executor.submit(
+            _run_attested_what_if_with_clock,
+            input_path,
+            clock=lambda: current_time,
+            stdout=stdout,
+            stderr=stderr,
+        )
+        assert lock_attempted.wait(timeout=10)
+        assert not future.done()
+        current_time = expires_at
+    exit_code = future.result(timeout=20)
+
+    assert exit_code == 3
+    assert stdout.getvalue() == ""
+    assert "attestation has expired" in stderr.getvalue()
+    assert sorted(path.name for path in ledger_path.iterdir()) == [".wc029-ledger.lock"]
 
 
 def test_public_cli_requires_ledger_beneath_trusted_root(tmp_path) -> None:
