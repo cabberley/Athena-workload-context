@@ -5619,6 +5619,37 @@ def _require_loaded_artifact(
     return artifact
 
 
+def _require_mapping_entry[Value](
+    items: Mapping[str, Value],
+    key: str,
+    *,
+    label: str,
+) -> Value:
+    try:
+        return items[key]
+    except KeyError as exc:
+        raise Wc029AcceptanceEvidenceError(
+            f"{label} is missing required key {key}"
+        ) from exc
+
+
+def _require_bound_subject(
+    artifact: _LoadedArtifact,
+    artifacts: Mapping[str, _LoadedArtifact],
+) -> _LoadedArtifact:
+    subject_id = artifact.declaration.binds_artifact_id
+    if subject_id is None:
+        raise Wc029AcceptanceEvidenceError(
+            f"signed artifact {artifact.declaration.artifact_id} "
+            "is missing its bound subject"
+        )
+    return _require_loaded_artifact(
+        artifacts,
+        subject_id,
+        label=f"attestation {artifact.declaration.artifact_id}",
+    )
+
+
 def _require_model[Model: BaseModel](
     artifact: _LoadedArtifact,
     model: type[Model],
@@ -6207,15 +6238,6 @@ def _validate_signed_artifacts(
             )
         used_purposes.add(purpose)
         evidence_class = artifact.declaration.evidence_class
-        subject = (
-            None
-            if artifact.declaration.binds_artifact_id is None
-            else _require_loaded_artifact(
-                artifacts,
-                artifact.declaration.binds_artifact_id,
-                label=f"attestation {artifact.declaration.artifact_id}",
-            )
-        )
         if evidence_class == "monitoring-evidence":
             handoff = _require_model(artifact, MonitoringEvidenceHandoff)
             monitoring_attestation = handoff.collector_attestation
@@ -6260,7 +6282,10 @@ def _validate_signed_artifacts(
                 artifact,
                 PublishedCorrelationReportAttestation,
             )
-            report = _require_model(cast(_LoadedArtifact, subject), CorrelationReport)
+            report = _require_model(
+                _require_bound_subject(artifact, artifacts),
+                CorrelationReport,
+            )
             statement = report_attestation.statement
             if (
                 statement.report_id != report.report_id
@@ -6288,7 +6313,7 @@ def _validate_signed_artifacts(
                 Wc029CorrelationOnlyReportAttestation,
             )
             report = _require_model(
-                cast(_LoadedArtifact, subject),
+                _require_bound_subject(artifact, artifacts),
                 CorrelationReport,
             )
             correlation_only_statement = correlation_only_attestation.statement
@@ -6316,7 +6341,7 @@ def _validate_signed_artifacts(
                 Wc029PublicationAuthorityAttestation,
             )
             authority_evidence = _require_model(
-                cast(_LoadedArtifact, subject),
+                _require_bound_subject(artifact, artifacts),
                 Wc029PublicationAuthorityEvidence,
             )
             authority = authority_evidence.authority
@@ -6343,7 +6368,7 @@ def _validate_signed_artifacts(
                 artifact,
                 Wc029JobPlatformCaptureAttestation,
             )
-            readback_artifact = cast(_LoadedArtifact, subject)
+            readback_artifact = _require_bound_subject(artifact, artifacts)
             readback = _require_model(
                 readback_artifact,
                 Wc029JobReadbackEvidence,
@@ -6444,7 +6469,7 @@ def _validate_signed_artifacts(
                 Wc029GlobalCaptureAttestation,
             )
             global_capture_manifest = _require_model(
-                cast(_LoadedArtifact, subject),
+                _require_bound_subject(artifact, artifacts),
                 Wc029GlobalCaptureManifest,
             )
             if (
@@ -6476,7 +6501,10 @@ def _validate_signed_artifacts(
                 artifact,
                 IncidentStateAttestation,
             )
-            state = _require_model(cast(_LoadedArtifact, subject), IncidentState)
+            state = _require_model(
+                _require_bound_subject(artifact, artifacts),
+                IncidentState,
+            )
             preimage = incident_state_signature_preimage(state)
             if (
                 state_attestation.result_digest != state.result_digest
@@ -6497,7 +6525,10 @@ def _validate_signed_artifacts(
                 artifact,
                 IncidentGuidanceAttestation,
             )
-            guidance = _require_model(cast(_LoadedArtifact, subject), IncidentGuidance)
+            guidance = _require_model(
+                _require_bound_subject(artifact, artifacts),
+                IncidentGuidance,
+            )
             if (
                 guidance_attestation.guidance_id != guidance.guidance_id
                 or guidance_attestation.guidance_digest != guidance.guidance_digest
@@ -6522,7 +6553,7 @@ def _validate_signed_artifacts(
                 IncidentEnrichmentAttestation,
             )
             manifest = _require_model(
-                cast(_LoadedArtifact, subject),
+                _require_bound_subject(artifact, artifacts),
                 IncidentEnrichmentManifest,
             )
             if (
@@ -6552,7 +6583,7 @@ def _validate_signed_artifacts(
                 IncidentEnrichmentFeedPointerAttestation,
             )
             pointer = _require_model(
-                cast(_LoadedArtifact, subject),
+                _require_bound_subject(artifact, artifacts),
                 IncidentEnrichmentFeedPointer,
             )
             if (
@@ -6578,7 +6609,7 @@ def _validate_signed_artifacts(
                 IncidentFeedIndexAttestationV2,
             )
             feed_index = _require_model(
-                cast(_LoadedArtifact, subject),
+                _require_bound_subject(artifact, artifacts),
                 IncidentFeedIndexV2,
             )
             if (
@@ -6606,7 +6637,7 @@ def _validate_signed_artifacts(
                 ActiveIncidentIndexAttestation,
             )
             source_index = _require_model(
-                cast(_LoadedArtifact, subject),
+                _require_bound_subject(artifact, artifacts),
                 ActiveIncidentIndex,
             )
             if (
@@ -6631,7 +6662,7 @@ def _validate_signed_artifacts(
                 Wc029ScenarioExecutionAttestation,
             )
             execution_manifest = _require_model(
-                cast(_LoadedArtifact, subject),
+                _require_bound_subject(artifact, artifacts),
                 Wc029ScenarioExecutionManifest,
             )
             if (
@@ -6691,6 +6722,33 @@ def _artifact_owners(
     return owners
 
 
+def _require_artifact_owner(
+    owners: Mapping[str, tuple[str, ScenarioPhase] | None],
+    artifact_id: str,
+    *,
+    label: str,
+) -> tuple[str, ScenarioPhase] | None:
+    return _require_mapping_entry(
+        owners,
+        artifact_id,
+        label=f"{label} ownership index",
+    )
+
+
+def _require_owner_scenario(
+    scenario_by_id: Mapping[str, Wc029ScenarioEvidence],
+    owner: tuple[str, ScenarioPhase],
+    *,
+    label: str,
+) -> Wc029ScenarioEvidence:
+    scenario = scenario_by_id.get(owner[0])
+    if scenario is None:
+        raise Wc029AcceptanceEvidenceError(
+            f"{label} owner references unknown scenario {owner[0]}"
+        )
+    return scenario
+
+
 def _validate_job_evidence(
     index: Wc029AcceptanceEvidenceIndex,
     inventory: Wc029VersionInventory,
@@ -6729,7 +6787,12 @@ def _validate_job_evidence(
     global_readback_ids = {
         item.declaration.artifact_id
         for item, _readback in readbacks
-        if owners[item.declaration.artifact_id] is None
+        if _require_artifact_owner(
+            owners,
+            item.declaration.artifact_id,
+            label="Job read-back",
+        )
+        is None
     }
     if set(capture_readback_ids) != global_readback_ids or len(capture_readback_ids) != len(
         set(capture_readback_ids)
@@ -6767,7 +6830,11 @@ def _validate_job_evidence(
                 f"Job execution {artifact.declaration.artifact_id} "
                 "does not match its exact approved Job inventory record"
             )
-        owner = owners[artifact.declaration.artifact_id]
+        owner = _require_artifact_owner(
+            owners,
+            artifact.declaration.artifact_id,
+            label="Job execution",
+        )
         if owner is None:
             if execution.scope != "global":
                 raise Wc029AcceptanceEvidenceError("global Job execution has scenario scope")
@@ -6783,9 +6850,11 @@ def _validate_job_evidence(
         used_job_ids.add(execution.job_inventory_id)
 
     for artifact, readback in readbacks:
-        execution_artifact, execution = executions[
-            cast(str, artifact.declaration.binds_artifact_id)
-        ]
+        execution_artifact, execution = _require_mapping_entry(
+            executions,
+            cast(str, artifact.declaration.binds_artifact_id),
+            label="Job read-back execution index",
+        )
         if (
             readback.execution_id != execution.execution_id
             or readback.execution_digest != execution.execution_digest
@@ -6811,7 +6880,11 @@ def _validate_job_evidence(
                 f"Job read-back {artifact.declaration.artifact_id} "
                 "does not bind its exact successful execution"
             )
-        owner = owners[artifact.declaration.artifact_id]
+        owner = _require_artifact_owner(
+            owners,
+            artifact.declaration.artifact_id,
+            label="Job read-back",
+        )
         for result in readback.result_artifacts:
             result_artifact = artifacts.get(result.artifact_id)
             if (
@@ -6826,7 +6899,11 @@ def _validate_job_evidence(
                 raise Wc029AcceptanceEvidenceError(
                     "Job read-back result artifact reference is invalid"
                 )
-            result_owner = owners[result.artifact_id]
+            result_owner = _require_artifact_owner(
+                owners,
+                result.artifact_id,
+                label="Job result artifact",
+            )
             if owner is None:
                 if result_owner is not None:
                     raise Wc029AcceptanceEvidenceError(
@@ -7003,11 +7080,23 @@ def _validate_global_capture(
         )
     manifest_bindings = {item.artifact_id: item for item in manifest.artifacts}
     for artifact_id, requirement in requirements.items():
-        bound_artifact = artifacts.get(artifact_id)
-        binding = manifest_bindings[artifact_id]
+        bound_artifact = _require_loaded_artifact(
+            artifacts,
+            artifact_id,
+            label="signed global capture manifest",
+        )
+        binding = _require_mapping_entry(
+            manifest_bindings,
+            artifact_id,
+            label="signed global capture manifest bindings",
+        )
+        owner = _require_artifact_owner(
+            owners,
+            artifact_id,
+            label="global capture artifact",
+        )
         if (
-            bound_artifact is None
-            or owners.get(artifact_id) is not None
+            owner is not None
             or binding.evidence_class != requirement.evidence_class
             or binding.content_sha256 != bound_artifact.record.content_sha256
             or not _global_capture_requirement_matches(
@@ -7064,7 +7153,11 @@ def _validate_global_capture(
 
     timestamped_evidence: list[UtcDateTime] = []
     for artifact_id in requirements:
-        artifact = artifacts[artifact_id]
+        artifact = _require_loaded_artifact(
+            artifacts,
+            artifact_id,
+            label="signed global capture manifest",
+        )
         model = artifact.model
         if isinstance(model, Wc029DeploymentReadbackEvidence):
             timestamped_evidence.append(model.observed_at)
@@ -7074,8 +7167,13 @@ def _validate_global_capture(
             timestamped_evidence.append(model.observed_at)
     for scenario in index.scenarios:
         selected = _scenario_artifacts_by_class(scenario, artifacts)
+        scenario_manifest_artifact = _require_scenario_artifact(
+            selected,
+            "scenario-execution-manifest",
+            scenario_id=scenario.scenario_id,
+        )
         scenario_manifest = _require_model(
-            selected["scenario-execution-manifest"],
+            scenario_manifest_artifact,
             Wc029ScenarioExecutionManifest,
         )
         timestamped_evidence.extend(
@@ -7265,16 +7363,24 @@ def _canonical_scenario_set_digest(
     selected_attestation_ids: set[str] = set()
     for scenario in index.scenarios:
         selected = _scenario_artifacts_by_class(scenario, artifacts)
-        selected_manifest_ids.add(selected["scenario-execution-manifest"].declaration.artifact_id)
-        selected_attestation_ids.add(
-            selected["scenario-execution-attestation"].declaration.artifact_id
+        manifest_artifact = _require_scenario_artifact(
+            selected,
+            "scenario-execution-manifest",
+            scenario_id=scenario.scenario_id,
         )
+        attestation_artifact = _require_scenario_artifact(
+            selected,
+            "scenario-execution-attestation",
+            scenario_id=scenario.scenario_id,
+        )
+        selected_manifest_ids.add(manifest_artifact.declaration.artifact_id)
+        selected_attestation_ids.add(attestation_artifact.declaration.artifact_id)
         manifest = _require_model(
-            selected["scenario-execution-manifest"],
+            manifest_artifact,
             Wc029ScenarioExecutionManifest,
         )
         attestation = _require_model(
-            selected["scenario-execution-attestation"],
+            attestation_artifact,
             Wc029ScenarioExecutionAttestation,
         )
         if (
@@ -7298,7 +7404,7 @@ def _canonical_scenario_set_digest(
                 scenarioExecutionId=manifest.scenario_execution_id,
                 runLineageDigest=manifest.run_lineage_digest,
                 manifestDigest=manifest.manifest_digest,
-                attestationDigest=selected["scenario-execution-attestation"].record.content_sha256,
+                attestationDigest=attestation_artifact.record.content_sha256,
                 intervalStartedAt=manifest.phase_windows[0].started_at,
                 intervalCompletedAt=manifest.phase_windows[-1].completed_at,
             )
@@ -7818,16 +7924,36 @@ def _validate_incident_bound_request(
     binding_preimage = canonicalize_json(binding_payload).encode("utf-8")
     keys = {item.purpose: item for item in inventory.keys}
     public_keys = _load_public_keys(inventory, artifacts)
+    incident_key = _require_mapping_entry(
+        keys,
+        "incident",
+        label="incident-bound request key inventory",
+    )
+    report_key = _require_mapping_entry(
+        keys,
+        "report",
+        label="incident-bound request key inventory",
+    )
+    incident_public_key = _require_mapping_entry(
+        public_keys,
+        "incident",
+        label="incident-bound request public keys",
+    )
+    report_public_key = _require_mapping_entry(
+        public_keys,
+        "report",
+        label="incident-bound request public keys",
+    )
     if (
         bound_request.correlation_request.canonical_bytes() != request.canonical_bytes()
         or subject.incident_state.canonical_bytes() != active_state.canonical_bytes()
         or subject.incident_state_attestation.canonical_bytes()
         != active_state_attestation.canonical_bytes()
         or subject.subject_attestation.key_vault_key_id.casefold()
-        != keys["incident"].key_vault_key_id.casefold()
+        != incident_key.key_vault_key_id.casefold()
         or subject.subject_attestation.signed_preimage_digest != sha256_hex(subject_preimage)
         or bound_request.binding_attestation.key_vault_key_id.casefold()
-        != keys["report"].key_vault_key_id.casefold()
+        != report_key.key_vault_key_id.casefold()
         or bound_request.binding_attestation.signed_preimage_digest != sha256_hex(binding_preimage)
         or report_attestation.statement.incident_subject_id != subject.subject_id
         or report_attestation.statement.incident_subject_digest != subject.subject_digest
@@ -7839,14 +7965,14 @@ def _validate_incident_bound_request(
             "incident-bound request does not bind the accepted correlation context"
         )
     _verify_signature(
-        public_keys["incident"],
+            incident_public_key,
         preimage=subject_preimage,
         signature=subject.subject_attestation.detached_signature,
         standard_base64=False,
         artifact_id="incident correlation subject",
     )
     _verify_signature(
-        public_keys["report"],
+        report_public_key,
         preimage=binding_preimage,
         signature=bound_request.binding_attestation.detached_signature,
         standard_base64=False,
@@ -7963,6 +8089,11 @@ def _validate_signed_scenario_execution(
         for artifact_id in artifact_ids
     }
     for artifact_id, binding in bindings.items():
+        phase = _require_mapping_entry(
+            phase_by_id,
+            artifact_id,
+            label=f"scenario {scenario.scenario_id} phase index",
+        )
         bound = _require_loaded_artifact(
             artifacts,
             artifact_id,
@@ -7977,12 +8108,12 @@ def _validate_signed_scenario_execution(
             scenario_id=scenario.scenario_id,
             scenario_execution_id=execution_manifest.scenario_execution_id,
             artifact_id=artifact_id,
-            phase=phase_by_id[artifact_id],
+            phase=phase,
             content_sha256=bound.record.content_sha256,
             input_digest=expected_input_digest,
         )
         if (
-            binding.phase != phase_by_id[artifact_id]
+            binding.phase != phase
             or binding.content_sha256 != bound.record.content_sha256
             or binding.input_digest != expected_input_digest
             or binding.artifact_lineage_digest != expected_run_lineage_digest
@@ -8253,6 +8384,36 @@ def _validate_scenario_lifecycle(
     )
     key_by_purpose = {item.purpose: item for item in inventory.keys}
     public_keys = _load_public_keys(inventory, artifacts)
+    report_key = _require_mapping_entry(
+        key_by_purpose,
+        "report",
+        label="incident lifecycle key inventory",
+    )
+    guidance_key = _require_mapping_entry(
+        key_by_purpose,
+        "guidance",
+        label="incident lifecycle key inventory",
+    )
+    enrichment_key = _require_mapping_entry(
+        key_by_purpose,
+        "enrichment",
+        label="incident lifecycle key inventory",
+    )
+    report_public_key = _require_mapping_entry(
+        public_keys,
+        "report",
+        label="incident lifecycle public keys",
+    )
+    guidance_public_key = _require_mapping_entry(
+        public_keys,
+        "guidance",
+        label="incident lifecycle public keys",
+    )
+    enrichment_public_key = _require_mapping_entry(
+        public_keys,
+        "enrichment",
+        label="incident lifecycle public keys",
+    )
     try:
         validate_published_correlation_report_assets(
             enrichment.correlation_report_asset,
@@ -8262,22 +8423,22 @@ def _validate_scenario_lifecycle(
             expected_authority_proof_digest=(
                 published_manifest.context_binding.publication_authority_reference.content_digest
             ),
-            trusted_report_key_id=key_by_purpose["report"].key_vault_key_id,
-            report_signature_verifier=_signature_verifier(public_keys["report"]),
+            trusted_report_key_id=report_key.key_vault_key_id,
+            report_signature_verifier=_signature_verifier(report_public_key),
         )
         validate_incident_guidance_assets(
             enrichment.guidance_asset,
             guidance,
             guidance_attestation,
-            trusted_guidance_key_id=(key_by_purpose["guidance"].key_vault_key_id),
-            guidance_signature_verifier=_signature_verifier(public_keys["guidance"]),
+            trusted_guidance_key_id=guidance_key.key_vault_key_id,
+            guidance_signature_verifier=_signature_verifier(guidance_public_key),
         )
         validate_incident_enrichment_assets(
             active_feed.enrichment_asset,
             enrichment,
             enrichment_attestation,
-            trusted_enrichment_key_id=(key_by_purpose["enrichment"].key_vault_key_id),
-            enrichment_signature_verifier=_signature_verifier(public_keys["enrichment"]),
+            trusted_enrichment_key_id=enrichment_key.key_vault_key_id,
+            enrichment_signature_verifier=_signature_verifier(enrichment_public_key),
         )
     except ValueError as exc:
         raise Wc029AcceptanceEvidenceError(
@@ -8379,8 +8540,16 @@ def _validate_scenario_lifecycle(
         raise Wc029AcceptanceEvidenceError(
             "authoritative v1 active source index does not bind exact incident state"
         )
-    feed_key = next(item for item in inventory.keys if item.purpose == "feed")
-    feed_public_key = _load_public_keys(inventory, artifacts)["feed"]
+    feed_key = _require_mapping_entry(
+        key_by_purpose,
+        "feed",
+        label="incident lifecycle key inventory",
+    )
+    feed_public_key = _require_mapping_entry(
+        public_keys,
+        "feed",
+        label="incident lifecycle public keys",
+    )
     try:
         validate_incident_enrichment_feed_pointer_assets(
             active_entry,
@@ -8625,11 +8794,20 @@ def _validate_scenario_evidence(
         index.version_inventory_artifact_id,
         label="acceptance index",
     ).record.content_sha256
-    global_execution_artifact = next(
-        artifacts[artifact_id]
-        for artifact_id in index.global_artifact_ids
-        if artifacts[artifact_id].declaration.evidence_class == "job-execution"
-    )
+    global_execution_artifacts: list[_LoadedArtifact] = []
+    for artifact_id in index.global_artifact_ids:
+        artifact = _require_loaded_artifact(
+            artifacts,
+            artifact_id,
+            label="global evidence index",
+        )
+        if artifact.declaration.evidence_class == "job-execution":
+            global_execution_artifacts.append(artifact)
+    if len(global_execution_artifacts) != 1:
+        raise Wc029AcceptanceEvidenceError(
+            "global evidence requires exactly one Job execution"
+        )
+    global_execution_artifact = global_execution_artifacts[0]
     global_execution = _require_model(
         global_execution_artifact,
         Wc029JobExecutionEvidence,
@@ -9145,24 +9323,49 @@ def _validate_global_chronology(
     change_request_digests: list[str] = []
     for scenario in index.scenarios:
         selected = _scenario_artifacts_by_class(scenario, artifacts)
+        plan_artifact = _require_scenario_artifact(
+            selected,
+            "scenario-plan",
+            scenario_id=scenario.scenario_id,
+        )
+        execution_manifest_artifact = _require_scenario_artifact(
+            selected,
+            "scenario-execution-manifest",
+            scenario_id=scenario.scenario_id,
+        )
+        report_artifact = _require_scenario_artifact(
+            selected,
+            "correlation-report",
+            scenario_id=scenario.scenario_id,
+        )
+        request_artifact = _require_scenario_artifact(
+            selected,
+            "correlation-request",
+            scenario_id=scenario.scenario_id,
+        )
+        monitoring_artifact = _require_scenario_artifact(
+            selected,
+            "monitoring-evidence",
+            scenario_id=scenario.scenario_id,
+        )
         plan = _require_model(
-            selected["scenario-plan"],
+            plan_artifact,
             Wc029ScenarioPlanEvidence,
         )
         execution_manifest = _require_model(
-            selected["scenario-execution-manifest"],
+            execution_manifest_artifact,
             Wc029ScenarioExecutionManifest,
         )
         report = _require_model(
-            selected["correlation-report"],
+            report_artifact,
             CorrelationReport,
         )
         request = _require_model(
-            selected["correlation-request"],
+            request_artifact,
             CorrelationRequest,
         )
         monitoring = _require_model(
-            selected["monitoring-evidence"],
+            monitoring_artifact,
             MonitoringEvidenceHandoff,
         )
         intervals.append(
@@ -9225,13 +9428,24 @@ def _validate_specialized_evidence(
                 raise Wc029AcceptanceEvidenceError(
                     f"queue-state {declaration.artifact_id} scope does not match its index"
                 )
-            owner = owners[declaration.artifact_id]
+            owner = _require_artifact_owner(
+                owners,
+                declaration.artifact_id,
+                label="queue-state",
+            )
             if declaration.queue_scope == "scenario-verify":
+                if owner is None or owner[1] != "verify":
+                    raise Wc029AcceptanceEvidenceError(
+                        "scenario queue-state must verify one incident-producing scenario"
+                    )
+                owner_scenario = _require_owner_scenario(
+                    scenario_by_id,
+                    owner,
+                    label="scenario queue-state",
+                )
                 if (
-                    owner is None
-                    or owner[1] != "verify"
-                    or artifact.model.scenario_id != owner[0]
-                    or scenario_by_id[owner[0]].evidence_mode != "incident-producing"
+                    artifact.model.scenario_id != owner[0]
+                    or owner_scenario.evidence_mode != "incident-producing"
                 ):
                     raise Wc029AcceptanceEvidenceError(
                         "scenario queue-state must verify one incident-producing scenario"
@@ -9243,12 +9457,23 @@ def _validate_specialized_evidence(
         elif declaration.evidence_class == "incident-omission":
             if not isinstance(artifact.model, Wc029IncidentOmission):
                 raise Wc029AcceptanceEvidenceError("incident omission evidence is invalid")
-            owner = owners[declaration.artifact_id]
+            owner = _require_artifact_owner(
+                owners,
+                declaration.artifact_id,
+                label="incident omission",
+            )
+            if owner is None or owner[1] != "observe":
+                raise Wc029AcceptanceEvidenceError(
+                    "incident omission does not bind its correlation-only scenario"
+                )
+            owner_scenario = _require_owner_scenario(
+                scenario_by_id,
+                owner,
+                label="incident omission",
+            )
             if (
-                owner is None
-                or owner[1] != "observe"
-                or artifact.model.scenario_id != owner[0]
-                or scenario_by_id[owner[0]].evidence_mode != "correlation-only"
+                artifact.model.scenario_id != owner[0]
+                or owner_scenario.evidence_mode != "correlation-only"
             ):
                 raise Wc029AcceptanceEvidenceError(
                     "incident omission does not bind its correlation-only scenario"
@@ -9830,10 +10055,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             output_directory=args.output_directory,
             evidence_root=args.evidence_root,
         )
-    except Wc029AcceptanceEvidenceError as exc:
+    except (ValidationError, Wc029AcceptanceEvidenceError) as exc:
+        error = (
+            str(exc)
+            if isinstance(exc, Wc029AcceptanceEvidenceError)
+            else "acceptance evidence failed closed validation"
+        )
         print(
             json.dumps(
-                {"complete": False, "error": str(exc)},
+                {"complete": False, "error": error},
                 sort_keys=True,
                 separators=(",", ":"),
             ),

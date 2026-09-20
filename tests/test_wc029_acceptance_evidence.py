@@ -4959,6 +4959,25 @@ def _aggregate(
     )
 
 
+def _load_index_and_artifacts(
+    bundle: BundleFixture,
+) -> tuple[
+    acceptance.Wc029AcceptanceEvidenceIndex,
+    dict[str, acceptance._LoadedArtifact],
+]:
+    index = acceptance.Wc029AcceptanceEvidenceIndex.model_validate_json(
+        (bundle.root / "acceptance-index.json").read_bytes()
+    )
+    artifacts = {
+        declaration.artifact_id: acceptance._load_artifact(
+            bundle.artifact_paths[declaration.artifact_id].read_bytes(),
+            declaration,
+        )
+        for declaration in index.artifacts
+    }
+    return index, artifacts
+
+
 def _cli_arguments(bundle: BundleFixture) -> list[str]:
     return [
         str(bundle.root),
@@ -6995,6 +7014,72 @@ def test_signed_incident_continuity_rejects_predecessor_and_context_splicing(
         _aggregate(bundle)
 
 
+def test_incident_continuity_rejects_full_execution_binding_mismatch_matrix(
+    tmp_path: Path,
+) -> None:
+    bundle = _build_bundle(tmp_path)
+    manifest = acceptance.Wc029ScenarioExecutionManifest.model_validate_json(
+        bundle.artifact_paths[
+            "scenario-web-tier-failure-execution-manifest"
+        ].read_bytes()
+    )
+    assert manifest.incident_occurrence_continuity is not None
+    mismatches: tuple[tuple[str, object], ...] = (
+        ("scenarioId", "scenario-web-tier-failure-foreign"),
+        ("scenarioExecutionId", "wc029-execution-" + ("f" * 32)),
+        ("targetResourceId", _TARGETS["vm-failure"]),
+        ("correlationRequestDigest", "sha256:" + ("e" * 64)),
+    )
+    tested_combinations: set[tuple[str, ...]] = set()
+
+    for mask in range(1, 1 << len(mismatches)):
+        selected_mismatches = tuple(
+            (field, value)
+            for index, (field, value) in enumerate(mismatches)
+            if mask & (1 << index)
+        )
+        tested_combinations.add(tuple(field for field, _value in selected_mismatches))
+        continuity_payload = manifest.incident_occurrence_continuity.model_dump(
+            mode="python",
+            by_alias=True,
+            exclude={"continuity_digest"},
+        )
+        continuity_payload.update(dict(selected_mismatches))
+        continuity = _digest_bound_model(
+            acceptance.Wc029IncidentOccurrenceContinuity,
+            continuity_payload,
+            digest_field="continuityDigest",
+        )
+        manifest_payload = manifest.model_dump(
+            mode="python",
+            by_alias=True,
+            exclude={"manifest_digest"},
+        )
+        manifest_payload["incidentOccurrenceContinuity"] = continuity
+        invalid_manifest_payload = {
+            **manifest_payload,
+            "manifestDigest": compute_artifact_digest(
+                _json_value(
+                    {
+                        key: value
+                        for key, value in manifest_payload.items()
+                        if value is not None
+                    }
+                )
+            ),
+        }
+
+        with pytest.raises(
+            ValidationError,
+            match="incident occurrence continuity does not bind the scenario execution",
+        ):
+            acceptance.Wc029ScenarioExecutionManifest.model_validate(
+                invalid_manifest_payload
+            )
+
+    assert len(tested_combinations) == (1 << len(mismatches)) - 1
+
+
 def test_active_and_resolved_occurrence_receipts_must_be_distinct(
     tmp_path: Path,
 ) -> None:
@@ -8125,6 +8210,345 @@ def test_mode_shape_validation_preserves_canonical_order_and_run_lineage(
             bundle.artifact_paths[f"scenario-{scenario_class}-report"].read_bytes()
         )
         assert report.no_auto_remediation is True
+
+
+@pytest.mark.parametrize(
+    ("artifact_id", "expected_phase", "failure", "expected_error"),
+    [
+        (
+            "scenario-web-tier-failure-queue",
+            "verify",
+            "unknown-scenario",
+            "owner references unknown scenario",
+        ),
+        (
+            "scenario-web-tier-failure-queue",
+            "verify",
+            "phase-mismatch",
+            "must verify one incident-producing scenario",
+        ),
+        (
+            "scenario-web-tier-failure-queue",
+            "verify",
+            "missing-owner-key",
+            "ownership index is missing required key",
+        ),
+        (
+            "scenario-disk-capacity-pressure-incident-omission",
+            "observe",
+            "unknown-scenario",
+            "owner references unknown scenario",
+        ),
+        (
+            "scenario-disk-capacity-pressure-incident-omission",
+            "observe",
+            "phase-mismatch",
+            "does not bind its correlation-only scenario",
+        ),
+        (
+            "scenario-disk-capacity-pressure-incident-omission",
+            "observe",
+            "missing-owner-key",
+            "ownership index is missing required key",
+        ),
+    ],
+)
+def test_specialized_evidence_owner_failures_are_bounded_domain_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    artifact_id: str,
+    expected_phase: str,
+    failure: str,
+    expected_error: str,
+) -> None:
+    bundle = _build_bundle(tmp_path)
+    real_artifact_owners = acceptance._artifact_owners
+
+    def mutated_artifact_owners(
+        index: acceptance.Wc029AcceptanceEvidenceIndex,
+    ) -> dict[str, tuple[str, acceptance.ScenarioPhase] | None]:
+        owners = real_artifact_owners(index)
+        owner = owners[artifact_id]
+        assert owner is not None
+        assert owner[1] == expected_phase
+        if failure == "unknown-scenario":
+            owners[artifact_id] = ("scenario-unlisted-owner", owner[1])
+        elif failure == "phase-mismatch":
+            owners[artifact_id] = (
+                owner[0],
+                "observe" if owner[1] == "verify" else "verify",
+            )
+        else:
+            del owners[artifact_id]
+        return owners
+
+    monkeypatch.setattr(
+        acceptance,
+        "_artifact_owners",
+        mutated_artifact_owners,
+    )
+
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match=expected_error,
+    ):
+        _aggregate(bundle)
+
+
+@pytest.mark.parametrize(
+    ("scenario_class", "attestation_class"),
+    [
+        ("disk-capacity-pressure", "correlation-only-report-attestation"),
+        ("web-tier-failure", "correlation-report-attestation"),
+    ],
+)
+def test_signed_mode_attestations_require_a_bounded_subject_lookup(
+    tmp_path: Path,
+    scenario_class: str,
+    attestation_class: acceptance.EvidenceClass,
+) -> None:
+    bundle = _build_bundle(tmp_path)
+    index, artifacts = _load_index_and_artifacts(bundle)
+    inventory = acceptance.Wc029VersionInventory.model_validate_json(
+        bundle.artifact_paths[index.version_inventory_artifact_id].read_bytes()
+    )
+    attestation_id = _scenario_artifact_id(
+        bundle,
+        scenario_class,
+        "observe",
+        attestation_class,
+    )
+    attestation = artifacts[attestation_id]
+    artifacts[attestation_id] = replace(
+        attestation,
+        declaration=attestation.declaration.model_copy(
+            update={"binds_artifact_id": None}
+        ),
+    )
+
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="is missing its bound subject",
+    ):
+        acceptance._validate_signed_artifacts(inventory, artifacts)
+
+
+def test_mode_report_attestations_require_the_inventoried_report_key(
+    tmp_path: Path,
+) -> None:
+    bundle = _build_bundle(tmp_path)
+    index, artifacts = _load_index_and_artifacts(bundle)
+    inventory = acceptance.Wc029VersionInventory.model_validate_json(
+        bundle.artifact_paths[index.version_inventory_artifact_id].read_bytes()
+    )
+    report_key = next(item for item in inventory.keys if item.purpose == "report")
+    inventory_without_report_key = inventory.model_copy(
+        update={
+            "keys": tuple(item for item in inventory.keys if item.purpose != "report")
+        }
+    )
+    artifacts_without_report_key = dict(artifacts)
+    del artifacts_without_report_key[report_key.public_key_artifact_id]
+
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="requires absent key purpose report",
+    ):
+        acceptance._validate_signed_artifacts(
+            inventory_without_report_key,
+            artifacts_without_report_key,
+        )
+
+
+@pytest.mark.parametrize(
+    ("scenario_class", "attestation_class"),
+    [
+        ("disk-capacity-pressure", "correlation-only-report-attestation"),
+        ("web-tier-failure", "correlation-report-attestation"),
+    ],
+)
+def test_missing_mode_attestation_selection_is_a_bounded_domain_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scenario_class: str,
+    attestation_class: acceptance.EvidenceClass,
+) -> None:
+    bundle = _build_bundle(tmp_path)
+    real_select = acceptance._scenario_artifacts_by_class
+
+    def omit_mode_attestation(
+        scenario: acceptance.Wc029ScenarioEvidence,
+        artifacts: dict[str, acceptance._LoadedArtifact],
+    ) -> dict[acceptance.EvidenceClass, acceptance._LoadedArtifact]:
+        selected = real_select(scenario, artifacts)
+        if scenario.scenario_class == scenario_class:
+            selected.pop(attestation_class)
+        return selected
+
+    monkeypatch.setattr(
+        acceptance,
+        "_scenario_artifacts_by_class",
+        omit_mode_attestation,
+    )
+
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match=f"missing required {attestation_class} evidence",
+    ):
+        _aggregate(bundle)
+
+
+@pytest.mark.parametrize(
+    "missing_class",
+    [
+        "scenario-execution-manifest",
+        "scenario-execution-attestation",
+    ],
+)
+def test_scenario_set_manifest_construction_uses_bounded_artifact_lookups(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    missing_class: acceptance.EvidenceClass,
+) -> None:
+    bundle = _build_bundle(tmp_path)
+    index, artifacts = _load_index_and_artifacts(bundle)
+    real_select = acceptance._scenario_artifacts_by_class
+
+    def omit_manifest_evidence(
+        scenario: acceptance.Wc029ScenarioEvidence,
+        loaded: dict[str, acceptance._LoadedArtifact],
+    ) -> dict[acceptance.EvidenceClass, acceptance._LoadedArtifact]:
+        selected = real_select(scenario, loaded)
+        if scenario.scenario_class == "disk-capacity-pressure":
+            selected.pop(missing_class)
+        return selected
+
+    monkeypatch.setattr(
+        acceptance,
+        "_scenario_artifacts_by_class",
+        omit_manifest_evidence,
+    )
+
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match=f"missing required {missing_class} evidence",
+    ):
+        acceptance._canonical_scenario_set_digest(index, artifacts)
+
+
+def test_both_valid_evidence_modes_retain_their_exact_shapes(
+    tmp_path: Path,
+) -> None:
+    bundle = _build_bundle(tmp_path)
+    index, artifacts = _load_index_and_artifacts(bundle)
+    scenarios = {scenario.scenario_class: scenario for scenario in index.scenarios}
+
+    correlation_scenario = scenarios["disk-capacity-pressure"]
+    correlation_selected = acceptance._scenario_artifacts_by_class(
+        correlation_scenario,
+        artifacts,
+    )
+    assert correlation_scenario.evidence_mode == "correlation-only"
+    assert "incident-omission" in correlation_selected
+    assert "correlation-only-report-attestation" in correlation_selected
+    assert not acceptance._INCIDENT_ONLY_CLASSES.intersection(correlation_selected)
+
+    incident_scenario = scenarios["web-tier-failure"]
+    incident_selected = acceptance._scenario_artifacts_by_class(
+        incident_scenario,
+        artifacts,
+    )
+    incident_manifest = acceptance._require_model(
+        acceptance._require_scenario_artifact(
+            incident_selected,
+            "scenario-execution-manifest",
+            scenario_id=incident_scenario.scenario_id,
+        ),
+        acceptance.Wc029ScenarioExecutionManifest,
+    )
+    assert incident_scenario.evidence_mode == "incident-producing"
+    assert "correlation-report-attestation" in incident_selected
+    assert "incident-omission" not in incident_selected
+    assert incident_manifest.incident_occurrence_continuity is not None
+
+    assert _aggregate(bundle).evidence_status == "complete"
+
+
+@pytest.mark.parametrize(
+    ("location", "field", "value"),
+    [
+        ("scenario", "scenarioClass", "unsupported-scenario-class"),
+        ("scenario", "evidenceMode", "unsupported-evidence-mode"),
+        ("declaration", "evidenceClass", "unsupported-evidence-class"),
+    ],
+)
+def test_cli_malformed_class_or_mode_is_concise_exit_two(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    location: str,
+    field: str,
+    value: str,
+) -> None:
+    bundle = _build_bundle(tmp_path)
+    if location == "scenario":
+        _scenario(bundle, "disk-capacity-pressure")[field] = value
+    else:
+        _declaration(
+            bundle,
+            "scenario-disk-capacity-pressure-report-attestation",
+        )[field] = value
+    _rewrite_index(bundle)
+
+    result = acceptance.main(_cli_arguments(bundle))
+
+    captured = capsys.readouterr()
+    assert result == 2
+    assert json.loads(captured.err) == {
+        "complete": False,
+        "error": "acceptance index failed closed validation",
+    }
+    assert "Traceback" not in captured.err
+    assert list(bundle.output.iterdir()) == []
+
+
+def test_cli_maps_raw_pydantic_validation_error_to_concise_exit_two(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle = _build_bundle(tmp_path)
+    try:
+        acceptance.Wc029ScenarioEvidence.model_validate({})
+    except ValidationError as exc:
+        validation_error = exc
+    else:
+        raise AssertionError("invalid scenario unexpectedly validated")
+
+    def fail_with_validation_error(
+        _evidence_root: Path,
+        *,
+        approved_inventory_sha256: str,
+        index_file: str = "acceptance-index.json",
+    ) -> acceptance.Wc029AcceptanceEvidenceRecord:
+        del approved_inventory_sha256, index_file
+        raise validation_error
+
+    monkeypatch.setattr(
+        acceptance,
+        "aggregate_acceptance_evidence",
+        fail_with_validation_error,
+    )
+
+    result = acceptance.main(_cli_arguments(bundle))
+
+    captured = capsys.readouterr()
+    assert result == 2
+    assert json.loads(captured.err) == {
+        "complete": False,
+        "error": "acceptance evidence failed closed validation",
+    }
+    assert "Traceback" not in captured.err
+    assert list(bundle.output.iterdir()) == []
 
 
 def test_scenario_mode_is_derived_and_stale_monitoring_is_rejected(
