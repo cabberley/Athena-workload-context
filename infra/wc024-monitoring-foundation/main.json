@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.47.16.16243",
-      "templateHash": "9964608788746215388"
+      "templateHash": "1438596412333181139"
     },
     "name": "Athena WC-024 generic monitoring foundation",
     "description": "Deploys private generic Azure Monitor, VNet flow-log, and isolated evidence-collector foundations without workload-intent-derived thresholds or paths."
@@ -3015,7 +3015,7 @@
       "type": "Microsoft.Resources/deployments",
       "apiVersion": "2025-04-01",
       "name": "resource-graph-query-reader-assignment",
-      "location": "[deployment().location]",
+      "resourceGroup": "[parameters('workloadResourceGroupName')]",
       "properties": {
         "expressionEvaluationOptions": {
           "scope": "inner"
@@ -3027,13 +3027,13 @@
           }
         },
         "template": {
-          "$schema": "https://schema.management.azure.com/schemas/2018-05-01/subscriptionDeploymentTemplate.json#",
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
           "contentVersion": "1.0.0.0",
           "metadata": {
             "_generator": {
               "name": "bicep",
               "version": "0.47.16.16243",
-              "templateHash": "870515569191563226"
+              "templateHash": "16031972379696927633"
             }
           },
           "parameters": {
@@ -3057,7 +3057,7 @@
               "name": "[variables('resourceGraphQueryRoleDefinitionGuid')]",
               "properties": {
                 "roleName": "Athena WC-028 Resource Graph Query Submitter",
-                "description": "Submit Azure Resource Graph queries only within this subscription. Resource visibility remains independently limited by exact resource-provider read assignments.",
+                "description": "Submit Azure Resource Graph queries for the approved workload resource group. Resource visibility remains independently limited by exact resource-provider read assignments.",
                 "type": "CustomRole",
                 "permissions": [
                   {
@@ -3068,36 +3068,36 @@
                   }
                 ],
                 "assignableScopes": [
-                  "[subscription().id]"
+                  "[resourceGroup().id]"
                 ]
               }
             },
             {
               "type": "Microsoft.Authorization/roleAssignments",
               "apiVersion": "2022-04-01",
-              "name": "[guid(subscription().id, parameters('collectorPrincipalId'), subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('resourceGraphQueryRoleDefinitionGuid')))]",
+              "name": "[guid(resourceGroup().id, parameters('collectorPrincipalId'), resourceId('Microsoft.Authorization/roleDefinitions', variables('resourceGraphQueryRoleDefinitionGuid')))]",
               "properties": {
                 "principalId": "[parameters('collectorPrincipalId')]",
                 "principalType": "ServicePrincipal",
-                "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('resourceGraphQueryRoleDefinitionGuid'))]"
+                "roleDefinitionId": "[resourceId('Microsoft.Authorization/roleDefinitions', variables('resourceGraphQueryRoleDefinitionGuid'))]"
               },
               "dependsOn": [
-                "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('resourceGraphQueryRoleDefinitionGuid'))]"
+                "[resourceId('Microsoft.Authorization/roleDefinitions', variables('resourceGraphQueryRoleDefinitionGuid'))]"
               ]
             }
           ],
           "outputs": {
             "resourceGraphQueryRoleDefinitionId": {
               "type": "string",
-              "value": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('resourceGraphQueryRoleDefinitionGuid'))]"
+              "value": "[resourceId('Microsoft.Authorization/roleDefinitions', variables('resourceGraphQueryRoleDefinitionGuid'))]"
             },
             "resourceGraphQueryRoleName": {
               "type": "string",
-              "value": "[reference(subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('resourceGraphQueryRoleDefinitionGuid')), '2022-04-01').roleName]"
+              "value": "[reference(resourceId('Microsoft.Authorization/roleDefinitions', variables('resourceGraphQueryRoleDefinitionGuid')), '2022-04-01').roleName]"
             },
             "resourceGraphQueryScopeId": {
               "type": "string",
-              "value": "[subscription().id]"
+              "value": "[resourceGroup().id]"
             },
             "resourceGraphQueryAllowedOperations": {
               "type": "array",
@@ -3105,7 +3105,7 @@
             },
             "resourceGraphQueryRoleAssignmentId": {
               "type": "string",
-              "value": "[subscriptionResourceId('Microsoft.Authorization/roleAssignments', guid(subscription().id, parameters('collectorPrincipalId'), subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('resourceGraphQueryRoleDefinitionGuid'))))]"
+              "value": "[resourceId('Microsoft.Authorization/roleAssignments', guid(resourceGroup().id, parameters('collectorPrincipalId'), resourceId('Microsoft.Authorization/roleDefinitions', variables('resourceGraphQueryRoleDefinitionGuid'))))]"
             }
           }
         }
@@ -4411,10 +4411,10 @@
               "identityProofAppRoleValue": "[reference(subscriptionResourceId('Microsoft.Resources/deployments', 'monitoring-identity-proof-authority'), '2025-04-01').outputs.identityProofAppRoleValue.value]",
               "identityProofAppRoleAssignmentId": "[reference(subscriptionResourceId('Microsoft.Resources/deployments', 'monitoring-identity-proof-authority'), '2025-04-01').outputs.identityProofAppRoleAssignmentId.value]",
               "identityProofAssignedPrincipalId": "[reference(subscriptionResourceId('Microsoft.Resources/deployments', 'monitoring-identity-proof-authority'), '2025-04-01').outputs.identityProofAssignedPrincipalId.value]",
-              "resourceGraphQueryRoleDefinitionId": "[reference(subscriptionResourceId('Microsoft.Resources/deployments', 'resource-graph-query-reader-assignment'), '2025-04-01').outputs.resourceGraphQueryRoleDefinitionId.value]",
-              "resourceGraphQueryRoleName": "[reference(subscriptionResourceId('Microsoft.Resources/deployments', 'resource-graph-query-reader-assignment'), '2025-04-01').outputs.resourceGraphQueryRoleName.value]",
-              "resourceGraphQueryScopeId": "[reference(subscriptionResourceId('Microsoft.Resources/deployments', 'resource-graph-query-reader-assignment'), '2025-04-01').outputs.resourceGraphQueryScopeId.value]",
-              "resourceGraphQueryAllowedOperations": "[reference(subscriptionResourceId('Microsoft.Resources/deployments', 'resource-graph-query-reader-assignment'), '2025-04-01').outputs.resourceGraphQueryAllowedOperations.value]",
+              "resourceGraphQueryRoleDefinitionId": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'resource-graph-query-reader-assignment'), '2025-04-01').outputs.resourceGraphQueryRoleDefinitionId.value]",
+              "resourceGraphQueryRoleName": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'resource-graph-query-reader-assignment'), '2025-04-01').outputs.resourceGraphQueryRoleName.value]",
+              "resourceGraphQueryScopeId": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'resource-graph-query-reader-assignment'), '2025-04-01').outputs.resourceGraphQueryScopeId.value]",
+              "resourceGraphQueryAllowedOperations": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'resource-graph-query-reader-assignment'), '2025-04-01').outputs.resourceGraphQueryAllowedOperations.value]",
               "resourceHealthRoleDefinitionId": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments'), '2025-04-01').outputs.resourceHealthRoleDefinitionId.value]",
               "resourceHealthRoleName": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments'), '2025-04-01').outputs.resourceHealthRoleName.value]",
               "resourceHealthScopeIds": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments'), '2025-04-01').outputs.resourceHealthScopeIds.value]",
@@ -4667,7 +4667,7 @@
         "[subscriptionResourceId('Microsoft.Resources/deployments', 'monitoring-storage-readback-reader')]",
         "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-storage-readback-reader-assignment')]",
         "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('networkWatcherResourceGroupName')), 'Microsoft.Resources/deployments', 'network-watcher-monitoring-evidence-reader-assignment')]",
-        "[subscriptionResourceId('Microsoft.Resources/deployments', 'resource-graph-query-reader-assignment')]",
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'resource-graph-query-reader-assignment')]",
         "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments')]"
       ]
     }

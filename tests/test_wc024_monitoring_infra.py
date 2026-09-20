@@ -667,11 +667,19 @@ def test_wc024_rbac_is_collector_only_and_narrow() -> None:
     assert "Microsoft.ResourceHealth/availabilityStatuses/read" not in (
         RESOURCE_GRAPH_QUERY_RBAC
     )
-    assert "scope: subscription()" in RESOURCE_GRAPH_QUERY_RBAC
-    assert "subscription().id" in RESOURCE_GRAPH_QUERY_RBAC
+    assert "targetScope = 'resourceGroup'" in RESOURCE_GRAPH_QUERY_RBAC
+    assert "scope: resourceGroup()" in RESOURCE_GRAPH_QUERY_RBAC
+    assert "resourceGroup().id" in RESOURCE_GRAPH_QUERY_RBAC
+    assert "subscription().id" not in RESOURCE_GRAPH_QUERY_RBAC
     assert "*/read" not in RESOURCE_GRAPH_QUERY_RBAC
     assert "Microsoft.Compute/virtualMachines/read" not in RESOURCE_GRAPH_QUERY_RBAC
     assert "resource-graph-query-reader-assignment" in MAIN
+    query_assignment = MAIN.split(
+        "module resourceGraphQueryReaderAssignment",
+        maxsplit=1,
+    )[1].split("module workloadEvidenceReaderAssignments", maxsplit=1)[0]
+    assert "scope: resourceGroup(workloadResourceGroupName)" in query_assignment
+    assert "scope: subscription()" not in query_assignment
     assert "dataActions: []" in WORKLOAD_READER_RBAC
     assert "expectedSignalReaderActions" in WORKLOAD_READER_RBAC
     assert "unexpectedSignalReaderActions" in WORKLOAD_READER_RBAC

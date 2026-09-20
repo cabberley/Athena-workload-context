@@ -707,6 +707,7 @@ def test_resource_health_client_reads_documented_healthresources_transition() ->
     assert "HealthResources" in body["query"]
     assert "previousAvailabilityState" in body["query"]
     assert PRODUCTION_WEB_ID.casefold() in body["query"]
+    assert UNAPPROVED_PEER_VM_ID.casefold() not in body["query"]
 
 
 def test_resource_health_client_rejects_unapproved_peer_row() -> None:

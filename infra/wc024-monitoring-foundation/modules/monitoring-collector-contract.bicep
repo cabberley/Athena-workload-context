@@ -102,7 +102,7 @@ param resourceGraphQueryRoleDefinitionId string
 @description('Exact custom role name for Azure Resource Graph query submission.')
 param resourceGraphQueryRoleName string
 
-@description('Exact subscription scope at which the Resource Graph query operation is authorized.')
+@description('Exact approved workload resource-group scope at which the Resource Graph query operation is authorized.')
 param resourceGraphQueryScopeId string
 
 @description('Exact Azure Resource Graph query operation allowlist.')

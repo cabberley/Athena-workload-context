@@ -4779,13 +4779,11 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
                 raise ValueError("Resource Health assignments must match the exact approved VMs")
         if self.schema_version == MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION:
             expected_resource_graph_query_role_definition_id = (
-                f"/subscriptions/{monitoring_subscription}/providers/"
+                f"{workload_resource_group_root}/providers/"
                 "Microsoft.Authorization/roleDefinitions/"
                 f"{_RESOURCE_GRAPH_QUERY_ROLE_DEFINITION_GUID}"
             )
-            expected_resource_graph_query_scope_id = (
-                f"/subscriptions/{monitoring_subscription}"
-            )
+            expected_resource_graph_query_scope_id = workload_resource_group_root
             if (
                 cast(str, self.resource_graph_query_role_definition_id).casefold()
                 != expected_resource_graph_query_role_definition_id.casefold()
@@ -4793,7 +4791,7 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
                 != expected_resource_graph_query_scope_id.casefold()
             ):
                 raise ValueError(
-                    "Resource Graph query role must use the exact subscription-scoped definition"
+                    "Resource Graph query role must use the exact workload-resource-group scope"
                 )
         if self.schema_version in {
             MONITORING_PREVIOUS_TRUST_HARDENED_COLLECTOR_CONTRACT_SCHEMA_VERSION,

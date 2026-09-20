@@ -2,6 +2,7 @@
 
 - **Status:** Proposed
 - **Date:** 2026-09-18
+- **Amended:** 2026-09-20
 
 ## Context
 
@@ -11,7 +12,8 @@ request and queries `HealthResources` rows whose type is
 `Microsoft.ResourceGraph/resources/read`, and granted it at each approved VM. That action permits
 submitting a Resource Graph query within a specified subscription, management group, or tenant
 scope; it does not grant the Resource Health provider read that makes availability-status rows
-visible. A VM-scoped assignment also does not authorize the subscription-scoped query operation.
+visible. A VM-scoped assignment is also narrower than the approved workload object group that the
+query is authorized to inspect.
 
 Microsoft documents two independent authorization semantics:
 
@@ -29,9 +31,10 @@ Use two exact custom roles and two non-overlapping assignment shapes:
 
 1. `Athena WC-028 Resource Graph Query Submitter` contains only
    `Microsoft.ResourceGraph/resources/read`. It is assignable and assigned only at the reviewed
-   subscription because the client sends that subscription in the Resource Graph request body.
-   This role grants no `*/read`, `Microsoft.Compute/virtualMachines/read`, Resource Health action,
-   data action, or write action.
+   workload resource group. The REST body retains the exact subscription allowlist, while the KQL
+   retains the exact approved VM-ID allowlist; neither requires a generic subscription read
+   assignment. This role grants no `*/read`, `Microsoft.Compute/virtualMachines/read`, Resource
+   Health action, data action, or write action.
 2. `Athena WC-028 VM Resource Health Reader` contains only the canonical
    `Microsoft.ResourceHealth/availabilityStatuses/read` action. It remains assigned directly at
    each of the 11 approved VM resource IDs and nowhere at resource-group, subscription,
@@ -44,7 +47,8 @@ both action fingerprints, both grants, and both full role definitions. Contract 
 v4 remain parseable only as historical evidence and cannot execute current production acquisition.
 
 The signed inventory verifier and publication template reject a missing or altered query action, a
-missing or altered availability action, a query assignment outside the exact subscription, a
+missing or altered availability action, a query assignment outside the exact workload resource
+group, a
 Resource Health assignment outside the exact approved VM set, an unreferenced role, an extra
 grant, or a deny assignment that removes either required action. The bounded query still includes
 only approved VM IDs, and the client rejects any returned peer or otherwise unapproved VM row.
@@ -58,8 +62,9 @@ limit. Oversized evidence fails before the verifier runs.
 
 - Production Resource Health acquisition has both permissions Azure evaluates and no longer
   fails solely because the provider read is absent.
-- Subscription scope is used only for the Resource Graph query operation; it does not grant
-  generic subscription read or VM read.
+- The Resource Graph operation is authorized at the workload resource group even though the REST
+  request body names the containing subscription; no generic subscription read or VM read is
+  granted.
 - Availability-status visibility remains resource-scoped, so a peer VM that is not in the
   approved set is not authorized and cannot become trusted evidence.
 - Existing identity separation, group and ancestor expansion, inherited deny evaluation, active
@@ -74,8 +79,11 @@ limit. Oversized evidence fails before the verifier runs.
   violates least privilege.
 - **Grant both actions in one subscription-scoped role:** rejected because the Resource Health
   action would expose availability status for every supported resource in the subscription.
-- **Assign the query action only at each VM:** rejected because the Resource Graph operation is
-  submitted against the subscription scope.
+- **Assign the query action only at each VM:** rejected because the approved query authorization
+  boundary is the workload resource group, while VM visibility is separately controlled by the
+  Resource Health assignments.
+- **Assign the query action at the subscription:** rejected because the selected provider contract
+  does not require that broader assignment and the workload resource group is sufficient.
 - **Rely only on KQL filtering:** rejected because query text is defense in depth, not an
   authorization boundary.
 
@@ -83,10 +91,10 @@ limit. Oversized evidence fails before the verifier runs.
 
 - Build `main.bicep` and `publish-monitoring-contract.bicep`, then compare the checked-in
   `main.json` with a fresh Bicep build.
-- Verify the query role has exactly one subscription assignment and exactly one action.
+- Verify the query role has exactly one workload-resource-group assignment and exactly one action.
 - Verify the Resource Health role has exactly 11 direct VM assignments and exactly one action.
 - Validate v10/v5 contracts and reject missing permissions, wrong role fingerprints, subscription-
-  scoped Resource Health, resource-group-scoped query authorization, extra grants, and an
+  scoped Resource Health, subscription- or VM-scoped query authorization, extra grants, and an
   unapproved peer VM scope.
 - Run the production client test that injects an unapproved peer row and requires a fail-closed
   result before evidence can be committed.

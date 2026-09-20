@@ -161,10 +161,10 @@ PREVIOUS_PERMISSION_ATTESTED_RESOURCE_HEALTH_OPERATIONS = (
     "Microsoft.ResourceGraph/resources/read",
 )
 RESOURCE_GRAPH_QUERY_ROLE_DEFINITION_ID = (
-    f"/subscriptions/{SUBSCRIPTION_ID}/providers/Microsoft.Authorization/"
+    f"{WORKLOAD_RESOURCE_GROUP_ROOT}/providers/Microsoft.Authorization/"
     "roleDefinitions/5687977f-aa06-5699-8e18-1a54a074b532"
 )
-RESOURCE_GRAPH_QUERY_SCOPE_ID = f"/subscriptions/{SUBSCRIPTION_ID}"
+RESOURCE_GRAPH_QUERY_SCOPE_ID = WORKLOAD_RESOURCE_GROUP_ROOT
 RESOURCE_GRAPH_QUERY_OPERATIONS = ("Microsoft.ResourceGraph/resources/read",)
 RESOURCE_HEALTH_OPERATIONS = ("Microsoft.ResourceHealth/availabilityStatuses/read",)
 PREVIOUS_RESOURCE_LOG_OPERATIONS = (
@@ -2457,10 +2457,13 @@ def test_acquisition_collector_contract_authorizes_receipt_handoff() -> None:
         RESOURCE_GRAPH_QUERY_ROLE_DEFINITION_ID
     )
     assert contract.resource_graph_query_role_name == RESOURCE_GRAPH_QUERY_ROLE_NAME
-    assert contract.resource_graph_query_scope_id == RESOURCE_GRAPH_QUERY_SCOPE_ID
+    assert contract.resource_graph_query_scope_id == RESOURCE_GRAPH_QUERY_SCOPE_ID.casefold()
     assert contract.resource_graph_query_allowed_operations == RESOURCE_GRAPH_QUERY_OPERATIONS
     assert contract.resource_health_scope_ids == SIGNAL_READ_SCOPE_IDS
     assert contract.resource_health_allowed_operations == RESOURCE_HEALTH_OPERATIONS
+    assert "Microsoft.ResourceHealth/availabilityStatuses/current/read" not in (
+        contract.allowed_read_operations
+    )
     assert contract.workspace_access_control_mode == "workspaceAndResourceContext"
     assert contract.workspace_resource_context_access_enabled is True
     assert contract.workspace_sku_name == "PerGB2018"
@@ -2976,7 +2979,7 @@ def test_legacy_v9_trust_hardened_contract_remains_readable() -> None:
         ("identityProofRequiredRole", None),
         ("identityProofMaximumLifetimeSeconds", None),
         ("resourceGraphQueryRoleDefinitionId", READER_ROLE_DEFINITION_ID),
-        ("resourceGraphQueryScopeId", WORKLOAD_RESOURCE_GROUP_ROOT),
+        ("resourceGraphQueryScopeId", f"/subscriptions/{SUBSCRIPTION_ID}"),
         (
             "resourceGraphQueryAllowedOperations",
             ("Microsoft.ResourceHealth/availabilityStatuses/read",),
@@ -3035,7 +3038,12 @@ def test_acquisition_contract_rejects_missing_or_incorrect_permission_policy(
         (
             RESOURCE_GRAPH_QUERY_ROLE_DEFINITION_ID,
             RESOURCE_GRAPH_QUERY_ROLE_NAME,
-            (WORKLOAD_RESOURCE_GROUP_ROOT,),
+            (f"/subscriptions/{SUBSCRIPTION_ID}",),
+        ),
+        (
+            RESOURCE_GRAPH_QUERY_ROLE_DEFINITION_ID,
+            RESOURCE_GRAPH_QUERY_ROLE_NAME,
+            (SIGNAL_READ_SCOPE_IDS[0],),
         ),
         (
             RESOURCE_HEALTH_ROLE_DEFINITION_ID,
@@ -3044,7 +3052,7 @@ def test_acquisition_contract_rejects_missing_or_incorrect_permission_policy(
         ),
     ),
 )
-def test_effective_rbac_rejects_broadened_resource_health_authorization_scopes(
+def test_effective_rbac_rejects_inexact_resource_health_authorization_scopes(
     role_definition_id: str,
     role_definition_name: str,
     assignment_scope_ids: tuple[str, ...],

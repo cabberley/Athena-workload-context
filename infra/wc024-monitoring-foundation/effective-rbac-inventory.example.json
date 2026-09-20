@@ -119,19 +119,6 @@
       "assignedPrincipalId": "11111111-1111-1111-1111-111111111111",
       "assignedPrincipalType": "ServicePrincipal",
       "assignmentScopeIds": [
-        "/subscriptions/00000000-0000-0000-0000-000000000000"
-      ],
-      "effectivePrincipalId": "11111111-1111-1111-1111-111111111111",
-      "grantDigest": "sha256:a4e44ab273d327edd203cac6a9a0a4c5a181b3323e7382cbf0499b4d8c78d494",
-      "groupDerived": false,
-      "inheritance": "direct",
-      "roleDefinitionId": "/subscriptions/00000000-0000-0000-0000-000000000000/providers/microsoft.authorization/roledefinitions/5687977f-aa06-5699-8e18-1a54a074b532",
-      "roleDefinitionName": "Athena WC-028 Resource Graph Query Submitter"
-    },
-    {
-      "assignedPrincipalId": "11111111-1111-1111-1111-111111111111",
-      "assignedPrincipalType": "ServicePrincipal",
-      "assignmentScopeIds": [
         "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/networkwatcherrg/providers/microsoft.network/networkwatchers/networkwatcher_australiaeast/flowlogs/athena-hackathon-vnet-rg-athena-demo-workload-flowlog",
         "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.insights/datacollectionendpoints/athena-hackathon-linux-dce",
         "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.insights/datacollectionrules/athena-hackathon-linux-dcr",
@@ -166,6 +153,19 @@
       "inheritance": "direct",
       "roleDefinitionId": "/subscriptions/00000000-0000-0000-0000-000000000000/providers/microsoft.authorization/roledefinitions/acdd72a7-3385-48ef-bd42-f606fba81ae7",
       "roleDefinitionName": "Reader"
+    },
+    {
+      "assignedPrincipalId": "11111111-1111-1111-1111-111111111111",
+      "assignedPrincipalType": "ServicePrincipal",
+      "assignmentScopeIds": [
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload"
+      ],
+      "effectivePrincipalId": "11111111-1111-1111-1111-111111111111",
+      "grantDigest": "sha256:c56c825e9d3c8245b83c724dce5fdb80155f7f0203fbceceee2ddbe72351afcc",
+      "groupDerived": false,
+      "inheritance": "direct",
+      "roleDefinitionId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.authorization/roledefinitions/5687977f-aa06-5699-8e18-1a54a074b532",
+      "roleDefinitionName": "Athena WC-028 Resource Graph Query Submitter"
     },
     {
       "assignedPrincipalId": "11111111-1111-1111-1111-111111111111",
@@ -351,13 +351,13 @@
   "firstPimScheduleInstanceRawPageDigests": [
     "sha256:8959f9366f36fe82895ee188994b77fe18ec6cf00b06532747ed2462fb817320"
   ],
-  "firstRawSnapshotDigest": "sha256:2472994f593d53fec0d8f08721e3a9e0189ccd2e2de4377b5469984236846db6",
+  "firstRawSnapshotDigest": "sha256:2e59ca094f3834693fb935b45d74d8847e9cd2d1da6f892bac258f621a10918a",
   "firstReadCompletedAt": "2026-09-10T01:54:00Z",
   "firstRoleDefinitionRawPageDigests": [
-    "sha256:55f2b7876c25f65985c85e03d46ac856bdb7bfbb6712f6bce59b26be0064572f"
+    "sha256:9b08b1ce948dc2c7a96f9c74cc24bc616f0c30a5bd23a2781829267af47a55b4"
   ],
   "groupMembershipCollectionComplete": true,
-  "inventoryDigest": "sha256:61073fbe2c3da3d637b6aada2310e140e05b06d0912a726e3c76b8246d8eab16",
+  "inventoryDigest": "sha256:f299d601bb3601c963d5ab52c642fd1c4285ba020a4ff164c6ec7c5ccd2ecac2",
   "managementGroupAncestry": [
     "/providers/microsoft.management/managementgroups/00000000-0000-0000-0000-000000000003"
   ],
@@ -657,18 +657,6 @@
       "roleDefinitionName": "Athena WC016 Approved Signal Reader synthetic00000"
     },
     {
-      "actions": [
-        "microsoft.resourcegraph/resources/read"
-      ],
-      "dataActions": [],
-      "definitionDigest": "sha256:c3fc971e845b236c96f2122720f6d8d06df4651eaac7948f695023b834ee2ae0",
-      "notActions": [],
-      "notDataActions": [],
-      "rawDefinitionDigest": "sha256:2b8a8486f1cf81159259e12ab52b26a0d0ed2810fe4d0db35c487b8c9029b73f",
-      "roleDefinitionId": "/subscriptions/00000000-0000-0000-0000-000000000000/providers/microsoft.authorization/roledefinitions/5687977f-aa06-5699-8e18-1a54a074b532",
-      "roleDefinitionName": "Athena WC-028 Resource Graph Query Submitter"
-    },
-    {
       "actions": [],
       "dataActions": [
         "microsoft.storage/storageaccounts/blobservices/containers/blobs/add/action",
@@ -731,6 +719,18 @@
       "rawDefinitionDigest": "sha256:475b2bb9ce8794d5fcf6c58efef477a6e33fe62f5b4bdd573d0c4d24c50bdc98",
       "roleDefinitionId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.authorization/roledefinitions/0790d6f2-9553-5b63-84ac-56596b7e4072",
       "roleDefinitionName": "Athena WC-028 VM Resource Health Reader"
+    },
+    {
+      "actions": [
+        "microsoft.resourcegraph/resources/read"
+      ],
+      "dataActions": [],
+      "definitionDigest": "sha256:5e2778a573285fdd51997fd59409b28e9d2b6498c20b51ca9c09983d2960e25f",
+      "notActions": [],
+      "notDataActions": [],
+      "rawDefinitionDigest": "sha256:5058b1ded0886090dac151e9adc08e799a038ff9a3317384fbd69bbe6794e619",
+      "roleDefinitionId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.authorization/roledefinitions/5687977f-aa06-5699-8e18-1a54a074b532",
+      "roleDefinitionName": "Athena WC-028 Resource Graph Query Submitter"
     },
     {
       "actions": [
@@ -807,10 +807,10 @@
   "secondPimScheduleInstanceRawPageDigests": [
     "sha256:8959f9366f36fe82895ee188994b77fe18ec6cf00b06532747ed2462fb817320"
   ],
-  "secondRawSnapshotDigest": "sha256:2472994f593d53fec0d8f08721e3a9e0189ccd2e2de4377b5469984236846db6",
+  "secondRawSnapshotDigest": "sha256:2e59ca094f3834693fb935b45d74d8847e9cd2d1da6f892bac258f621a10918a",
   "secondReadCompletedAt": "2026-09-10T01:55:00Z",
   "secondRoleDefinitionRawPageDigests": [
-    "sha256:55f2b7876c25f65985c85e03d46ac856bdb7bfbb6712f6bce59b26be0064572f"
+    "sha256:9b08b1ce948dc2c7a96f9c74cc24bc616f0c30a5bd23a2781829267af47a55b4"
   ],
   "signalReaderRoleActions": [
     "microsoft.compute/virtualmachines/instanceview/read",

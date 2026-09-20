@@ -2473,13 +2473,8 @@ class AzureActivityLogAcquisitionClient(_AzureAcquisitionClientBase):
         if type(request) is not ActivityLogQueryRequest:
             raise TypeError("Azure Activity Log requires an exact query request")
         self._require_request_contract(request)
-        query_scope_id = cast(str, self._reviewed_contract.resource_graph_query_scope_id)
-        subscription_id = _arm_subscription_id(query_scope_id)
-        if query_scope_id != f"/subscriptions/{subscription_id}":
-            raise MonitoringAcquisitionError(
-                "Resource Health query scope is not the exact reviewed subscription"
-            )
         workload_scope = self._reviewed_contract.workload_resource_group_id
+        subscription_id = _arm_subscription_id(workload_scope)
         if any(
             _arm_subscription_id(resource_id) != subscription_id
             or not _resource_is_within(resource_id, workload_scope)
@@ -2824,7 +2819,16 @@ class AzureResourceHealthAcquisitionClient(_AzureAcquisitionClientBase):
             raise MonitoringAcquisitionError(
                 "Resource Health request escaped the exact reviewed VM scopes"
             )
-        subscription_id = _arm_subscription_id(self._reviewed_contract.workload_resource_group_id)
+        workload_scope = self._reviewed_contract.workload_resource_group_id.casefold().rstrip("/")
+        query_scope = cast(
+            str,
+            self._reviewed_contract.resource_graph_query_scope_id,
+        ).casefold().rstrip("/")
+        if query_scope != workload_scope:
+            raise MonitoringAcquisitionError(
+                "Resource Health query authorization escaped the reviewed workload scope"
+            )
+        subscription_id = _arm_subscription_id(query_scope)
         query_text = _resource_health_query(request)
         if len(query_text.encode("utf-8")) > 32 * 1024:
             raise MonitoringAcquisitionError(

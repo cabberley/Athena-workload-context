@@ -192,7 +192,8 @@ Resource Health acquisition has two deliberately separate grants. Record and com
 accepting the phase-one handoff:
 
 - `Athena WC-028 Resource Graph Query Submitter` is assigned directly once at
-  `/subscriptions/<subscription-id>` and its full role definition contains only
+  `/subscriptions/<subscription-id>/resourceGroups/rg-athena-demo-workload` and its full role
+  definition contains only
   `Microsoft.ResourceGraph/resources/read`;
 - `Athena WC-028 VM Resource Health Reader` is assigned directly at each of the 11 reviewed VM
   resource IDs and its full role definition contains only
@@ -201,8 +202,8 @@ accepting the phase-one handoff:
   the Resource Health role has no Resource Graph, generic VM, wildcard read, data, or write action;
   and
 - no Resource Health assignment exists at resource-group, subscription, management-group, or
-  tenant scope, and no Resource Graph query assignment exists only below the subscription query
-  scope.
+  tenant scope, and no Resource Graph query assignment exists at subscription, management-group,
+  tenant, or individual-VM scope.
 
 Fail the gate if either role, action, or assignment shape is absent or broader. Under the collector
 identity, execute the reviewed `HealthResources` query with one approved VM and one clearly

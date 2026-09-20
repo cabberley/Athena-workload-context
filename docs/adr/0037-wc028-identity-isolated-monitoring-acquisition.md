@@ -2,7 +2,7 @@
 
 - **Status:** Proposed
 - **Date:** 2026-09-13
-- **Amended:** 2026-09-18
+- **Amended:** 2026-09-20
 
 ## Context
 
@@ -174,9 +174,10 @@ The coordinator:
   observations, coverage, and incident selection therefore remain one governed unit. Supporting
   Activity Log controls without their own required coverage are not executed.
 - provisions two non-overlapping custom roles for the `HealthResources` path. The subscription-
-  scoped query role contains only `Microsoft.ResourceGraph/resources/read`, which authorizes the
-  Resource Graph request against the one reviewed subscription but grants no generic resource
-  read. The VM-scoped Resource Health role contains only the canonical
+  query role contains only `Microsoft.ResourceGraph/resources/read`, is assigned at the reviewed
+  workload resource group, and grants no generic resource read. The REST request still carries
+  the exact subscription allowlist and the KQL still carries the exact approved VM-ID allowlist.
+  The VM-scoped Resource Health role contains only the canonical
   `Microsoft.ResourceHealth/availabilityStatuses/read` action and is assigned independently at
   each exact approved VM. Azure Resource Graph therefore returns only availability-status rows
   for resources on which that second permission is effective; an unapproved peer VM remains
@@ -279,7 +280,7 @@ ambiguous incident transitions fail before the persistence transaction is entere
   support for WC-024 v2 and legacy WC-028 v3-v9 contracts. Production verification requires the
   full reviewed v10 contract, permission-attested resource-context logs, effective RBAC inventory
   v5, separate attestor identity, exact conditioned Blob persistence, storage readback, identity
-  proof, a subscription-scoped Resource Graph query grant, and per-VM Resource Health
+  proof, a workload-resource-group-scoped Resource Graph query grant, and per-VM Resource Health
   availability grants.
 - Legacy acquisition-authority v1-v5 documents remain readable, but only v6 authorities can execute
   production acquisition. Production receipt verification requires receipt v6, verifies its
@@ -357,12 +358,13 @@ ambiguous incident transitions fail before the persistence transaction is entere
 - Log request v3 tests bind current and prior windows, collector execution time, `_ResourceId`,
   exact authority coverage, the permissions response, and the `Prefer` header without module
   globals.
-- IaC and contract tests require the exact subscription-scoped Resource Graph query role with only
+- IaC and contract tests require the exact workload-resource-group-scoped Resource Graph query
+  role with only
   `Microsoft.ResourceGraph/resources/read`, the exact Resource Health role with only
   `Microsoft.ResourceHealth/availabilityStatuses/read`, and all 11 approved VM scopes while
   proving Reader and generic VM read were not broadened. Effective-inventory tests reject either
-  omitted permission, a query grant below the subscription request scope, and a peer VM replacing
-  or extending the approved VM set. Production client tests use the documented `HealthResources`
+  omitted permission, a subscription- or VM-scoped query grant, and a peer VM replacing or
+  extending the approved VM set. Production client tests use the documented `HealthResources`
   transition shape, reject an unapproved returned row, and no longer inject an unsupported
   `previousAvailabilityState` into the current-status endpoint.
 - Receipt signatures and deployed identity/authority bindings are reverified in the production

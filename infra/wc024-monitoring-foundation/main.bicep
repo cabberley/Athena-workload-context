@@ -570,7 +570,7 @@ module monitoringEvidenceReaderAssignments 'modules/monitoring-evidence-reader-r
 
 module resourceGraphQueryReaderAssignment 'modules/resource-graph-query-reader-rbac.bicep' = {
   name: 'resource-graph-query-reader-assignment'
-  scope: subscription()
+  scope: resourceGroup(workloadResourceGroupName)
   params: {
     collectorPrincipalId: monitoringEvidenceSeams.outputs.collectorIdentityPrincipalId
   }

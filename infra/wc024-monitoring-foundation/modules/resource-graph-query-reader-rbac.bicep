@@ -1,4 +1,4 @@
-targetScope = 'subscription'
+targetScope = 'resourceGroup'
 
 @description('Principal ID of the only identity permitted to submit the reviewed Resource Graph query.')
 param collectorPrincipalId string
@@ -12,7 +12,7 @@ resource resourceGraphQueryRoleDefinition 'Microsoft.Authorization/roleDefinitio
   name: resourceGraphQueryRoleDefinitionGuid
   properties: {
     roleName: 'Athena WC-028 Resource Graph Query Submitter'
-    description: 'Submit Azure Resource Graph queries only within this subscription. Resource visibility remains independently limited by exact resource-provider read assignments.'
+    description: 'Submit Azure Resource Graph queries for the approved workload resource group. Resource visibility remains independently limited by exact resource-provider read assignments.'
     type: 'CustomRole'
     permissions: [
       {
@@ -23,14 +23,14 @@ resource resourceGraphQueryRoleDefinition 'Microsoft.Authorization/roleDefinitio
       }
     ]
     assignableScopes: [
-      subscription().id
+      resourceGroup().id
     ]
   }
 }
 
 resource collectorResourceGraphQueryReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(subscription().id, collectorPrincipalId, resourceGraphQueryRoleDefinition.id)
-  scope: subscription()
+  name: guid(resourceGroup().id, collectorPrincipalId, resourceGraphQueryRoleDefinition.id)
+  scope: resourceGroup()
   properties: {
     principalId: collectorPrincipalId
     principalType: 'ServicePrincipal'
@@ -40,6 +40,6 @@ resource collectorResourceGraphQueryReader 'Microsoft.Authorization/roleAssignme
 
 output resourceGraphQueryRoleDefinitionId string = resourceGraphQueryRoleDefinition.id
 output resourceGraphQueryRoleName string = resourceGraphQueryRoleDefinition.properties.roleName
-output resourceGraphQueryScopeId string = subscription().id
+output resourceGraphQueryScopeId string = resourceGroup().id
 output resourceGraphQueryAllowedOperations array = resourceGraphQueryAllowedOperations
 output resourceGraphQueryRoleAssignmentId string = collectorResourceGraphQueryReader.id
