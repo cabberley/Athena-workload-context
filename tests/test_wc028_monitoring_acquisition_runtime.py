@@ -154,6 +154,8 @@ DIGEST_A = f"sha256:{'a' * 64}"
 DIGEST_B = f"sha256:{'b' * 64}"
 DIGEST_C = f"sha256:{'c' * 64}"
 CLEANUP_DIGEST = f"sha256:{'f' * 64}"
+# Syntax-only opaque fixture; it is not represented as an ARM guid() ground-truth vector.
+SYNTHETIC_OPAQUE_READBACK_BINDING_ID = "abababab-abab-abab-abab-abababababab"
 MONITORING_INTENT_ID = f"monitoring-intent-{'d' * 32}"
 EXECUTION_ID = f"wc028-execution-{'e' * 32}"
 
@@ -210,7 +212,7 @@ def _storage_readiness_payload() -> dict[str, object]:
             payload["immutabilityRetentionDays"],
         ),
     )
-    payload["readbackBindingId"] = runtime_module._arm_template_guid(readiness_preimage)
+    payload["readbackBindingId"] = SYNTHETIC_OPAQUE_READBACK_BINDING_ID
     payload["readinessDigest"] = sha256_hex(readiness_preimage.encode("utf-8"))
     return payload
 
@@ -247,9 +249,18 @@ def _refresh_storage_readiness(
             refreshed["immutabilityRetentionDays"],
         ),
     )
-    refreshed["readbackBindingId"] = runtime_module._arm_template_guid(readiness_preimage)
     refreshed["readinessDigest"] = sha256_hex(readiness_preimage.encode("utf-8"))
     return refreshed
+
+
+def test_runtime_does_not_reimplement_arm_guid_for_storage_readiness() -> None:
+    source = Path(runtime_module.__file__).read_text(encoding="utf-8")
+
+    assert "_arm_template_guid" not in source
+    assert "_ARM_TEMPLATE_GUID_NAMESPACE" not in source
+    assert "uuid5" not in source
+    assert "readbackBindingId does not bind" not in source
+    assert SYNTHETIC_OPAQUE_READBACK_BINDING_ID in json.dumps(_storage_readiness_payload())
 
 
 def _runtime_support_rbac_inventory(
@@ -853,7 +864,7 @@ def test_configuration_rejects_unprotected_monitoring_evidence_storage(
         Wc028MonitoringAcquisitionJobConfiguration.model_validate(payload)
 
 
-def test_configuration_rejects_storage_readiness_boundary_or_digest_substitution() -> None:
+def test_configuration_validates_storage_readiness_boundary_digest_and_opaque_binding() -> None:
     substituted_container = _configuration_payload()
     readiness = cast(
         dict[str, object],
@@ -879,14 +890,27 @@ def test_configuration_rejects_storage_readiness_boundary_or_digest_substitution
     with pytest.raises(ValidationError, match="readinessDigest"):
         Wc028MonitoringAcquisitionJobConfiguration.model_validate(substituted_digest)
 
-    substituted_binding = _configuration_payload()
+    nil_binding = _configuration_payload()
     readiness = cast(
         dict[str, object],
-        substituted_binding["monitoringEvidenceStorageReadiness"],
+        nil_binding["monitoringEvidenceStorageReadiness"],
     )
-    readiness["readbackBindingId"] = "abababab-abab-abab-abab-abababababab"
-    with pytest.raises(ValidationError, match="readbackBindingId"):
-        Wc028MonitoringAcquisitionJobConfiguration.model_validate(substituted_binding)
+    readiness["readbackBindingId"] = "00000000-0000-0000-0000-000000000000"
+    with pytest.raises(ValidationError, match="readback binding"):
+        Wc028MonitoringAcquisitionJobConfiguration.model_validate(nil_binding)
+
+    opaque_binding = _configuration_payload()
+    readiness = cast(
+        dict[str, object],
+        opaque_binding["monitoringEvidenceStorageReadiness"],
+    )
+    readiness["readbackBindingId"] = "cdcdcdcd-cdcd-cdcd-cdcd-cdcdcdcdcdcd"
+    _refresh_configuration_replay_key(opaque_binding)
+    validated = Wc028MonitoringAcquisitionJobConfiguration.model_validate(opaque_binding)
+    assert (
+        validated.monitoring_evidence_storage_readiness.readback_binding_id
+        == "cdcdcdcd-cdcd-cdcd-cdcd-cdcdcdcdcdcd"
+    )
 
 
 @pytest.mark.parametrize(

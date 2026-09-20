@@ -245,10 +245,6 @@ def test_upgrade_cleanup_targets_only_exact_legacy_collector_bindings() -> None:
     cleanup = (INFRA / "remove-obsolete-collector-rbac.ps1").read_text(encoding="utf-8")
 
     for expected in (
-        "athena-wc028-bounded-acquisition-reader",
-        "athena-wc028-change-evidence-create-only",
-        "athena-wc028-monitoring-intent-key-reader",
-        "athena-wc028-ip-flow-verify",
         "Microsoft.Network/networkWatchers/ipFlowVerify/action",
         "NetworkWatcherResourceId",
         "NetworkWatcherRG/NetworkWatcher_australiaeast",
@@ -265,6 +261,7 @@ def test_upgrade_cleanup_targets_only_exact_legacy_collector_bindings() -> None:
         "'role', 'assignment', 'list',",
         "'--assignee-object-id', $CollectorPrincipalId",
         "'--all'",
+        "'--fill-role-definition-name', 'true'",
         "'identity', 'show'",
         "'resource', 'show'",
         "'group', 'show'",
@@ -277,15 +274,15 @@ def test_upgrade_cleanup_targets_only_exact_legacy_collector_bindings() -> None:
         "Resolve-ReviewedTargetRoleAssignment",
         "Assert-ReviewedTargetRoleAssignmentsAbsent",
         "Get-CompleteCustomRoleDefinitionInventory",
-        "Get-CompleteCollectorRoleAssignmentInventory",
+        "Get-CompleteTargetRoleAssignmentInventory",
         "Get-ExactResourceGroupName",
         "Get-ResourceGroupScope",
         "Get-HistoricalNetworkWatcherResourceId",
         "$historicalRoleDefinitions",
         "$roleDefinitionGuid",
-        "$targetAssignments",
-        "complete-subscription-custom-role-enumeration",
-        "complete-subscription-descendant-principal-assignment-enumeration",
+        "$assignmentResolution",
+        "complete-known-scope-custom-role-enumeration",
+        "independent-complete-subscription-principal-assignment-enumeration",
         "roleDefinitionOutcomes",
         "roleAssignmentOutcomes",
         "armGuidGroundTruth",
@@ -310,22 +307,35 @@ def test_upgrade_cleanup_targets_only_exact_legacy_collector_bindings() -> None:
         "historicalIpFlowRoleDefinitionId",
         "historicalIpFlowRoleAssignmentId",
         "$matches",
+        "ExpectedDescription",
+        "ArmGuidPreimage",
+        "armGuidPreimage",
+        "armGuidUse",
     ):
         assert forbidden not in cleanup
 
-    assert "athena.wc028LegacyCollectorRbacCleanup.v4" in cleanup
-    assert cleanup.count("ArmGuidPreimage = @(") == 4
+    assert "athena.wc028LegacyCollectorRbacCleanup.v5" in cleanup
     assert cleanup.count("ExpectedRoleName = 'Athena WC028") == 4
-    assert "Get-CompleteCustomRoleDefinitionInventory -Phase 'pre-cleanup'" in cleanup
-    assert "Get-CompleteCustomRoleDefinitionInventory -Phase 'post-cleanup'" in cleanup
+    assert "'--scope', ([string]$Target.ExpectedAssignableScope)" in cleanup
     assert (
-        "Get-CompleteCollectorRoleAssignmentInventory `\n    -Phase 'pre-cleanup'" in cleanup
-    )
+        "Get-CompleteCustomRoleDefinitionInventory `\n        -Phase 'pre-cleanup' `\n"
+        "        -Target $historicalRole"
+    ) in cleanup
     assert (
-        "Get-CompleteCollectorRoleAssignmentInventory `\n    -Phase 'post-cleanup'" in cleanup
-    )
+        "Get-CompleteCustomRoleDefinitionInventory `\n        -Phase 'post-cleanup' `\n"
+        "        -Target $historicalRole"
+    ) in cleanup
+    assert (
+        "Get-CompleteTargetRoleAssignmentInventory `\n"
+        "        -Phase 'pre-cleanup' `\n        -Target $target"
+    ) in cleanup
+    assert (
+        "Get-CompleteTargetRoleAssignmentInventory `\n"
+        "        -Phase 'post-cleanup' `\n        -Target $target"
+    ) in cleanup
     assert "no name or GUID filter" in cleanup
-    assert "never locally hashed or trusted" in cleanup
+    assert "does not calculate, compare, record" in cleanup
+    assert "or trust locally reconstructed GUID values" in cleanup
     assert "[string]$networkWatcher.name -cne 'NetworkWatcher_australiaeast'" in cleanup
     assert "[string]$networkWatcher.properties.provisioningState -cne 'Succeeded'" in cleanup
     assert "[string]$workloadResourceGroup.name -cne $workloadResourceGroupName" in cleanup
@@ -388,6 +398,164 @@ if ($errors.Count -ne 0) {{
     assert parents["Get-ExactResourceGroupName"] == "<script>"
 
 
+def test_cleanup_inventory_queries_are_complete_scoped_and_independent() -> None:
+    shell = shutil.which("pwsh") or shutil.which("powershell")
+    if shell is None:
+        pytest.skip("PowerShell is required for executable cleanup tests")
+    cleanup_path = str(INFRA / "remove-obsolete-collector-rbac.ps1").replace("'", "''")
+    command = f"""
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+$tokens = $null
+$errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile(
+    '{cleanup_path}',
+    [ref]$tokens,
+    [ref]$errors
+)
+if ($errors.Count -ne 0) {{
+    throw ($errors -join [Environment]::NewLine)
+}}
+foreach ($functionName in @(
+    'Normalize-ResourceId',
+    'Get-CompleteCustomRoleDefinitionInventory',
+    'Get-CompleteTargetRoleAssignmentInventory'
+)) {{
+    $functionAst = $ast.Find(
+        {{
+            param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -eq $functionName
+        }},
+        $true
+    )
+    Invoke-Expression $functionAst.Extent.Text
+}}
+
+$SubscriptionId = '00000000-0000-0000-0000-000000000000'
+$CollectorPrincipalId = '22222222-2222-2222-2222-222222222222'
+$subscriptionScope = "/subscriptions/$SubscriptionId"
+$roleTargetA = [pscustomobject]@{{
+    Key = 'role-a'
+    ExpectedAssignableScope = "$subscriptionScope/resourceGroups/rg-a"
+}}
+$roleTargetB = [pscustomobject]@{{
+    Key = 'role-b'
+    ExpectedAssignableScope = "$subscriptionScope/resourceGroups/rg-b"
+}}
+$assignmentTarget = [pscustomobject]@{{
+    Key = 'assignment-a'
+    Scope = (
+        "$subscriptionScope/resourceGroups/rg-a/providers/" +
+        'Microsoft.KeyVault/vaults/synthetic-vault/keys/key-a'
+    )
+}}
+$script:azCalls = [System.Collections.Generic.List[object]]::new()
+function Invoke-AzJson {{
+    param([Parameter(Mandatory)][string[]]$AzArguments)
+    $script:azCalls.Add([pscustomobject]@{{ arguments = @($AzArguments) }})
+    return @()
+}}
+
+$roleA = Get-CompleteCustomRoleDefinitionInventory `
+    -Phase 'pre-cleanup' `
+    -Target $roleTargetA
+$roleB = Get-CompleteCustomRoleDefinitionInventory `
+    -Phase 'pre-cleanup' `
+    -Target $roleTargetB
+$assignmentPre = Get-CompleteTargetRoleAssignmentInventory `
+    -Phase 'pre-cleanup' `
+    -Target $assignmentTarget
+$assignmentPost = Get-CompleteTargetRoleAssignmentInventory `
+    -Phase 'post-cleanup' `
+    -Target $assignmentTarget
+
+[ordered]@{{
+    calls = @($script:azCalls)
+    roleA = $roleA
+    roleB = $roleB
+    assignmentPre = $assignmentPre
+    assignmentPost = $assignmentPost
+}} | ConvertTo-Json -Depth 8 -Compress
+"""
+    completed = subprocess.run(
+        [shell, "-NoProfile", "-NonInteractive", "-Command", command],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    result = json.loads(completed.stdout)
+
+    assert result["calls"] == [
+        {
+            "arguments": [
+                "role",
+                "definition",
+                "list",
+                "--custom-role-only",
+                "true",
+                "--scope",
+                (
+                    "/subscriptions/00000000-0000-0000-0000-000000000000/"
+                    "resourceGroups/rg-a"
+                ),
+                "--subscription",
+                "00000000-0000-0000-0000-000000000000",
+            ]
+        },
+        {
+            "arguments": [
+                "role",
+                "definition",
+                "list",
+                "--custom-role-only",
+                "true",
+                "--scope",
+                (
+                    "/subscriptions/00000000-0000-0000-0000-000000000000/"
+                    "resourceGroups/rg-b"
+                ),
+                "--subscription",
+                "00000000-0000-0000-0000-000000000000",
+            ]
+        },
+        {
+            "arguments": [
+                "role",
+                "assignment",
+                "list",
+                "--assignee-object-id",
+                "22222222-2222-2222-2222-222222222222",
+                "--all",
+                "--fill-role-definition-name",
+                "true",
+                "--subscription",
+                "00000000-0000-0000-0000-000000000000",
+            ]
+        },
+        {
+            "arguments": [
+                "role",
+                "assignment",
+                "list",
+                "--assignee-object-id",
+                "22222222-2222-2222-2222-222222222222",
+                "--all",
+                "--fill-role-definition-name",
+                "true",
+                "--subscription",
+                "00000000-0000-0000-0000-000000000000",
+            ]
+        },
+    ]
+    assert result["roleA"]["TargetKey"] == "role-a"
+    assert result["roleB"]["TargetKey"] == "role-b"
+    assert result["assignmentPre"]["Phase"] == "pre-cleanup"
+    assert result["assignmentPost"]["Phase"] == "post-cleanup"
+    assert result["assignmentPre"]["TargetKey"] == "assignment-a"
+    assert result["assignmentPost"]["TargetKey"] == "assignment-a"
+
+
 def test_cleanup_lookup_commands_match_installed_azure_cli_parser() -> None:
     azure_cli = shutil.which("az")
     if azure_cli is None:
@@ -427,6 +595,7 @@ def test_cleanup_lookup_commands_match_installed_azure_cli_parser() -> None:
     assert "--custom-role-only" in role_definition_help
     assert "--all" in role_assignment_help
     assert "--assignee-object-id" in role_assignment_help
+    assert "--fill-role-definition-name" in role_assignment_help
 
     for arguments in (
         (
@@ -453,6 +622,11 @@ def test_cleanup_lookup_commands_match_installed_azure_cli_parser() -> None:
             "list",
             "--custom-role-only",
             "true",
+            "--scope",
+            (
+                f"/subscriptions/{subscription_id}/"
+                "resourceGroups/rg-athena-demo-workload"
+            ),
             "--subscription",
             subscription_id,
         ),
@@ -463,6 +637,8 @@ def test_cleanup_lookup_commands_match_installed_azure_cli_parser() -> None:
             "--assignee-object-id",
             "22222222-2222-2222-2222-222222222222",
             "--all",
+            "--fill-role-definition-name",
+            "true",
             "--subscription",
             subscription_id,
         ),
@@ -596,7 +772,7 @@ def test_cleanup_rejects_malformed_or_cross_subscription_before_azure_cli(
     assert "az should not run" not in (completed.stdout + completed.stderr).casefold()
 
 
-def test_upgrade_cleanup_role_identity_fails_closed_for_guid_miss_duplicate_and_rename() -> None:
+def test_upgrade_cleanup_ignores_untrusted_id_miss_and_rejects_ambiguity() -> None:
     shell = shutil.which("pwsh") or shutil.which("powershell")
     if shell is None:
         pytest.skip("PowerShell is required for executable cleanup tests")
@@ -643,7 +819,7 @@ $actualRoleDefinitionId = (
     '/subscriptions/00000000-0000-0000-0000-000000000000/providers/' +
     'Microsoft.Authorization/roleDefinitions/bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'
 )
-$wrongDerivedRoleDefinitionId = $actualRoleDefinitionId.Replace(
+$untrustedGuessedRoleDefinitionId = $actualRoleDefinitionId.Replace(
     'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
     'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
 )
@@ -652,9 +828,9 @@ $assignableScope = (
     'resourceGroups/rg-synthetic'
 )
 $target = [pscustomobject]@{{
+    Key = 'synthetic-historical-reader'
     Name = 'synthetic historical reader'
     ExpectedRoleName = 'Athena WC028 Synthetic Historical Reader'
-    ExpectedDescription = 'Synthetic exact historical reader.'
     ExpectedAssignableScope = $assignableScope
     ExpectedActions = @('Microsoft.Test/widgets/read')
     ExpectedDataActions = @()
@@ -687,22 +863,23 @@ $exactRole = New-SyntheticRole `
     -RoleName $target.ExpectedRoleName `
     -Actions $target.ExpectedActions
 $completeInventory = [pscustomobject]@{{
-    QueryKind = 'complete-subscription-custom-role-enumeration'
-    Scope = $subscriptionScope
+    QueryKind = 'complete-known-scope-custom-role-enumeration'
+    TargetKey = $target.Key
+    Scope = $assignableScope
     Items = @($exactRole)
 }}
-$wrongGuidZeroMatches = @(
+$untrustedIdZeroMatches = @(
     $completeInventory.Items | Where-Object {{
         (Normalize-ResourceId -ResourceId ([string]$_.id)) -eq (
-            Normalize-ResourceId -ResourceId $wrongDerivedRoleDefinitionId
+            Normalize-ResourceId -ResourceId $untrustedGuessedRoleDefinitionId
         )
     }}
 ).Count -eq 0
 $resolved = Resolve-ReviewedHistoricalRoleDefinition `
     -Inventory $completeInventory `
     -Target $target
-$wrongGuidZeroMatchRecovered = (
-    $wrongGuidZeroMatches -and
+$untrustedIdMissDidNotHideRole = (
+    $untrustedIdZeroMatches -and
     [string]$resolved.Status -eq 'found' -and
     [string]$resolved.RoleDefinitionId -eq (
         Normalize-ResourceId -ResourceId $actualRoleDefinitionId
@@ -711,25 +888,27 @@ $wrongGuidZeroMatchRecovered = (
 
 $absent = Resolve-ReviewedHistoricalRoleDefinition `
     -Inventory ([pscustomobject]@{{
-        QueryKind = 'complete-subscription-custom-role-enumeration'
-        Scope = $subscriptionScope
+        QueryKind = 'complete-known-scope-custom-role-enumeration'
+        TargetKey = $target.Key
+        Scope = $assignableScope
         Items = @()
     }}) `
     -Target $target
 $completeZeroMatchProvedAbsent = (
     [string]$absent.Status -eq 'provedAbsent' -and
-    [string]$absent.DiscoveryProof -like 'complete subscription custom-role enumeration*'
+    [string]$absent.DiscoveryProof -like 'complete known-scope custom-role enumeration*'
 )
 $postCleanupAbsentProof = Assert-ReviewedHistoricalRoleDefinitionAbsent `
     -Inventory ([pscustomobject]@{{
-        QueryKind = 'complete-subscription-custom-role-enumeration'
-        Scope = $subscriptionScope
+        QueryKind = 'complete-known-scope-custom-role-enumeration'
+        TargetKey = $target.Key
+        Scope = $assignableScope
         Items = @()
     }}) `
     -Target $target `
     -PreviouslyResolvedRoleDefinitionId $null
 $initiallyAbsentPostcheckAccepted = (
-    $postCleanupAbsentProof -like 'complete subscription custom-role enumeration*'
+    $postCleanupAbsentProof -like 'complete known-scope custom-role enumeration*'
 )
 
 $duplicateRole = New-SyntheticRole `
@@ -743,8 +922,9 @@ $duplicateRejected = $false
 try {{
     Resolve-ReviewedHistoricalRoleDefinition `
         -Inventory ([pscustomobject]@{{
-            QueryKind = 'complete-subscription-custom-role-enumeration'
-            Scope = $subscriptionScope
+            QueryKind = 'complete-known-scope-custom-role-enumeration'
+            TargetKey = $target.Key
+            Scope = $assignableScope
             Items = @($exactRole, $duplicateRole)
         }}) `
         -Target $target | Out-Null
@@ -763,8 +943,9 @@ $renamedRejected = $false
 try {{
     Resolve-ReviewedHistoricalRoleDefinition `
         -Inventory ([pscustomobject]@{{
-            QueryKind = 'complete-subscription-custom-role-enumeration'
-            Scope = $subscriptionScope
+            QueryKind = 'complete-known-scope-custom-role-enumeration'
+            TargetKey = $target.Key
+            Scope = $assignableScope
             Items = @($renamedRole)
         }}) `
         -Target $target | Out-Null
@@ -783,13 +964,14 @@ $mismatchRejected = $false
 try {{
     Resolve-ReviewedHistoricalRoleDefinition `
         -Inventory ([pscustomobject]@{{
-            QueryKind = 'complete-subscription-custom-role-enumeration'
-            Scope = $subscriptionScope
+            QueryKind = 'complete-known-scope-custom-role-enumeration'
+            TargetKey = $target.Key
+            Scope = $assignableScope
             Items = @($mismatchedRole)
         }}) `
         -Target $target | Out-Null
 }} catch {{
-    $mismatchRejected = $_.Exception.Message -like '*unreviewed scope*'
+    $mismatchRejected = $_.Exception.Message -like '*unreviewed permissions*'
 }}
 if (-not $mismatchRejected) {{
     throw 'A same-name role with a mismatched body was accepted.'
@@ -815,7 +997,7 @@ if (-not $wrongWatcherRejected) {{
 }}
 
 [ordered]@{{
-    wrongGuidZeroMatchRecovered = $wrongGuidZeroMatchRecovered
+    untrustedIdMissDidNotHideRole = $untrustedIdMissDidNotHideRole
     completeZeroMatchProvedAbsent = $completeZeroMatchProvedAbsent
     initiallyAbsentPostcheckAccepted = $initiallyAbsentPostcheckAccepted
     duplicateRejected = $duplicateRejected
@@ -833,7 +1015,7 @@ if (-not $wrongWatcherRejected) {{
     )
 
     assert json.loads(completed.stdout) == {
-        "wrongGuidZeroMatchRecovered": True,
+        "untrustedIdMissDidNotHideRole": True,
         "completeZeroMatchProvedAbsent": True,
         "initiallyAbsentPostcheckAccepted": True,
         "duplicateRejected": True,
@@ -891,6 +1073,7 @@ $roleDefinitionId = (
     'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'
 )
 $target = [pscustomobject]@{{
+    Key = 'synthetic-key-reader'
     Name = 'synthetic collector key reader'
     Scope = $targetScope
     RoleDefinitionId = $roleDefinitionId
@@ -912,21 +1095,23 @@ $assignment = [pscustomobject]@{{
 function New-AssignmentInventory {{
     param([Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Items)
     return [pscustomobject]@{{
-        QueryKind = 'complete-subscription-descendant-principal-assignment-enumeration'
+        QueryKind = 'independent-complete-subscription-principal-assignment-enumeration'
+        TargetKey = $target.Key
         Scope = $subscriptionScope
+        RequestedTargetScope = $target.Scope
         PrincipalId = $CollectorPrincipalId
         Items = $Items
     }}
 }}
 
-$resolved = @(
-    Resolve-ReviewedTargetRoleAssignment `
-        -Inventory (New-AssignmentInventory -Items @($assignment)) `
-        -Target $target
-)
+$resolved = Resolve-ReviewedTargetRoleAssignment `
+    -Inventory (New-AssignmentInventory -Items @($assignment)) `
+    -Target $target
 $azureReturnedIdAccepted = (
-    $resolved.Count -eq 1 -and
-    [string]$resolved[0].id -eq [string]$assignment.id
+    [string]$resolved.Status -eq 'found' -and
+    [string]$resolved.RoleAssignmentId -eq (
+        Normalize-ResourceId -ResourceId ([string]$assignment.id)
+    )
 )
 
 $duplicateAssignment = $assignment.PSObject.Copy()
@@ -959,9 +1144,15 @@ if (-not $assignmentRemainsRejected) {{
 }}
 
 $emptyInventory = New-AssignmentInventory -Items @()
-Assert-ReviewedTargetRoleAssignmentsAbsent -Inventory $emptyInventory -Target $target
+$zeroMatchProof = Assert-ReviewedTargetRoleAssignmentsAbsent `
+    -Inventory $emptyInventory `
+    -Target $target
+$zeroMatchAbsentAccepted = (
+    $zeroMatchProof -like 'independent complete subscription assignment enumeration*'
+)
 
 $absentRoleTarget = [pscustomobject]@{{
+    Key = $target.Key
     Name = $target.Name
     Scope = $target.Scope
     RoleDefinitionId = $null
@@ -981,12 +1172,29 @@ if (-not $namedAssignmentAfterRoleAbsenceRejected) {{
     throw 'An assignment contradicted a complete role-definition absence proof.'
 }}
 
+$unresolvedAssignment = $assignment.PSObject.Copy()
+$unresolvedAssignment.roleDefinitionName = $null
+$unresolvedAssignmentRejected = $false
+try {{
+    Resolve-ReviewedTargetRoleAssignment `
+        -Inventory (New-AssignmentInventory -Items @($unresolvedAssignment)) `
+        -Target $absentRoleTarget | Out-Null
+}} catch {{
+    $unresolvedAssignmentRejected = (
+        $_.Exception.Message -like '*could not be resolved*'
+    )
+}}
+if (-not $unresolvedAssignmentRejected) {{
+    throw 'An unresolved assignment was accepted as proof that an absent role was unassigned.'
+}}
+
 [ordered]@{{
     azureReturnedIdAccepted = $azureReturnedIdAccepted
     duplicateRejected = $duplicateRejected
     assignmentRemainsRejected = $assignmentRemainsRejected
-    zeroMatchAbsentAccepted = $true
+    zeroMatchAbsentAccepted = $zeroMatchAbsentAccepted
     namedAssignmentAfterRoleAbsenceRejected = $namedAssignmentAfterRoleAbsenceRejected
+    unresolvedAssignmentRejected = $unresolvedAssignmentRejected
 }} | ConvertTo-Json -Compress
 """
     completed = subprocess.run(
@@ -1002,4 +1210,5 @@ if (-not $namedAssignmentAfterRoleAbsenceRejected) {{
         "assignmentRemainsRejected": True,
         "zeroMatchAbsentAccepted": True,
         "namedAssignmentAfterRoleAbsenceRejected": True,
+        "unresolvedAssignmentRejected": True,
     }

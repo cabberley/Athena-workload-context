@@ -11,7 +11,6 @@ from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any, Literal, Protocol, cast
 from urllib.parse import urlsplit
-from uuid import UUID, uuid5
 
 from azure.core.exceptions import AzureError
 from azure.servicebus.exceptions import ServiceBusError
@@ -136,7 +135,6 @@ _ZERO_DIGEST = f"sha256:{'0' * 64}"
 _NIL_GUID = "00000000-0000-0000-0000-000000000000"
 _ALL_PRINCIPALS_ID = _NIL_GUID
 _ZERO_EXECUTION_ID = f"wc028-execution-{'0' * 32}"
-_ARM_TEMPLATE_GUID_NAMESPACE = UUID("11fb06fb-712d-4ddd-98c7-e71bbd588830")
 _EXTERNAL_AZURE_FAILURES = (AzureError, ServiceBusError, OSError, TimeoutError)
 _ARM_GUID_PARENT_SEGMENTS = {
     "subscriptions",
@@ -342,14 +340,6 @@ def _monitoring_evidence_storage_readiness_preimage(
     )
 
 
-def _arm_template_guid(*values: str) -> str:
-    """Mirror ARM guid() only as a fail-closed storage-readiness consistency check."""
-
-    if not values or any(not value for value in values):
-        raise ValueError("ARM guid inputs must be non-empty")
-    return str(uuid5(_ARM_TEMPLATE_GUID_NAMESPACE, "-".join(values)))
-
-
 class MonitoringEvidenceStorageReadiness(_StrictRuntimeModel):
     """Reviewed WC-024 Blob versioning and container immutability readback."""
 
@@ -375,6 +365,10 @@ class MonitoringEvidenceStorageReadiness(_StrictRuntimeModel):
     readback_binding_id: str = Field(
         alias="readbackBindingId",
         pattern=_GUID_PATTERN.pattern,
+        description=(
+            "Opaque non-nil ARM-produced binding validated by deployment Bicep; runtime does not "
+            "reimplement ARM guid()."
+        ),
     )
     readiness_digest: str = Field(
         alias="readinessDigest",
@@ -430,8 +424,6 @@ class MonitoringEvidenceStorageReadiness(_StrictRuntimeModel):
             immutability_policy_state=self.immutability_policy_state,
             immutability_retention_days=self.immutability_retention_days,
         )
-        if self.readback_binding_id != _arm_template_guid(readiness_preimage):
-            raise ValueError("readbackBindingId does not bind live WC-024 storage protection")
         expected_digest = sha256_hex(readiness_preimage.encode("utf-8"))
         if self.readiness_digest != expected_digest:
             raise ValueError("readinessDigest does not bind WC-024 storage protection readback")

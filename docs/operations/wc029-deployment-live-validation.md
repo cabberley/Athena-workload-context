@@ -180,13 +180,16 @@ template. Perform these steps in order:
 2. Save the full cleanup JSON outside the repository and retain its `cleanupEvidenceDigest`.
 3. Re-query the collector's hierarchy-complete effective assignments, role definitions, deny
    assignments, transitive groups, and active PIM schedules. Stop unless all six legacy bindings
-   and all four deterministic obsolete custom role definitions, including the Network Watcher IP
-   Flow assignment and role, are absent. Discover each historical role only by its exact
-   original-ARM-`guid()` ID; a renamed role must still be validated and removed, while any changed
-   permission body or assignable scope blocks cleanup. The script must resolve the exact historical
-   Network Watcher with `az resource show --ids` and the canonical workload resource-group name with
-   `az group show --name`; returned ID, name, location, provisioning state, and subscription binding
-   must all match before mutation.
+   and all four obsolete custom role definitions, including the Network Watcher IP Flow assignment
+   and role, are absent. For each historical role, enumerate all custom roles available at its exact
+   known assignable scope without a name or GUID filter, then require one unique exact role name,
+   permission body, and assignable scope. Reject duplicate, renamed, or mismatched candidates.
+   Enumerate each assignment independently for the exact collector principal, then match the actual
+   returned role-definition ID and exact scope. Treat zero matches only as an explicit result of the
+   complete query, and use fresh per-target queries to prove post-delete absence. The script must
+   resolve the exact historical Network Watcher with `az resource show --ids` and the canonical
+   workload resource-group name with `az group show --name`; returned ID, name, location,
+   provisioning state, and subscription binding must all match before mutation.
 4. Produce a fresh collector contract and authority from the PR #99 revision that recognizes the
    conditioned known-name-read/add-only writer, binds the reviewed storage-protection contract and
    signed persistence replay preimage, and proves all management-group or tenant-root ancestor
@@ -204,8 +207,11 @@ template. Perform these steps in order:
    append-write flags are false. Embed the resulting non-zero readiness digest and ARM `guid()`
    readback binding in runtime configuration v4. The deployment must parse that same configuration
    and compare the live binding before releasing any role assignment or Job resource. The runtime
-   must also perform the PR #99-authorized fresh readback immediately before its first durable
-   create and reject any drift.
+   must not reimplement ARM `guid()` locally: no real deployment-derived vector is available, and
+   invented self-referential vectors are not acceptable evidence. Runtime treats the non-nil
+   binding as the deployment-validated value, independently recomputes the SHA-256 digest over the
+   exact readiness inputs, and performs the PR #99-authorized fresh readback immediately before its
+   first durable create.
 7. Run resource-group `validate` and `what-if` for
    `infra/wc028-monitoring-acquisition/main.bicep`. The only new assignments may be ACR pull and
    monitoring-intent key read for the distinct runtime-support identity plus the conditioned

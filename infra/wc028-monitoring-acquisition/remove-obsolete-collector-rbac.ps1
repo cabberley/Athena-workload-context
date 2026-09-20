@@ -177,7 +177,6 @@ function Test-ReviewedRoleDefinitionBody {
     $permissions = @($RoleDefinition.permissions)
     if (
         [string]$RoleDefinition.roleType -cne 'CustomRole' -or
-        [string]$RoleDefinition.description -cne [string]$Target.ExpectedDescription -or
         $permissions.Count -ne 1
     ) {
         return $false
@@ -260,29 +259,33 @@ function Get-CompleteCustomRoleDefinitionInventory {
     param(
         [Parameter(Mandatory)]
         [ValidateSet('pre-cleanup', 'post-cleanup')]
-        [string]$Phase
+        [string]$Phase,
+        [Parameter(Mandatory)][object]$Target
     )
 
     $items = @(
         Invoke-AzJson -AzArguments @(
             'role', 'definition', 'list',
             '--custom-role-only', 'true',
+            '--scope', ([string]$Target.ExpectedAssignableScope),
             '--subscription', $SubscriptionId
         )
     )
     return [pscustomobject]@{
         Phase = $Phase
-        QueryKind = 'complete-subscription-custom-role-enumeration'
-        Scope = "/subscriptions/$($SubscriptionId.ToLowerInvariant())"
+        QueryKind = 'complete-known-scope-custom-role-enumeration'
+        TargetKey = [string]$Target.Key
+        Scope = Normalize-ResourceId -ResourceId ([string]$Target.ExpectedAssignableScope)
         Items = $items
     }
 }
 
-function Get-CompleteCollectorRoleAssignmentInventory {
+function Get-CompleteTargetRoleAssignmentInventory {
     param(
         [Parameter(Mandatory)]
         [ValidateSet('pre-cleanup', 'post-cleanup')]
-        [string]$Phase
+        [string]$Phase,
+        [Parameter(Mandatory)][object]$Target
     )
 
     $items = @(
@@ -290,13 +293,16 @@ function Get-CompleteCollectorRoleAssignmentInventory {
             'role', 'assignment', 'list',
             '--assignee-object-id', $CollectorPrincipalId,
             '--all',
+            '--fill-role-definition-name', 'true',
             '--subscription', $SubscriptionId
         )
     )
     return [pscustomobject]@{
         Phase = $Phase
-        QueryKind = 'complete-subscription-descendant-principal-assignment-enumeration'
+        QueryKind = 'independent-complete-subscription-principal-assignment-enumeration'
+        TargetKey = [string]$Target.Key
         Scope = "/subscriptions/$($SubscriptionId.ToLowerInvariant())"
+        RequestedTargetScope = Normalize-ResourceId -ResourceId ([string]$Target.Scope)
         PrincipalId = $CollectorPrincipalId.ToLowerInvariant()
         Items = $items
     }
@@ -308,12 +314,14 @@ function Resolve-ReviewedHistoricalRoleDefinition {
         [Parameter(Mandatory)][object]$Target
     )
 
-    $subscriptionScope = "/subscriptions/$($SubscriptionId.ToLowerInvariant())"
     if (
-        [string]$Inventory.QueryKind -cne 'complete-subscription-custom-role-enumeration' -or
-        (Normalize-ResourceId -ResourceId ([string]$Inventory.Scope)) -cne $subscriptionScope
+        [string]$Inventory.QueryKind -cne 'complete-known-scope-custom-role-enumeration' -or
+        [string]$Inventory.TargetKey -cne [string]$Target.Key -or
+        (Normalize-ResourceId -ResourceId ([string]$Inventory.Scope)) -cne (
+            Normalize-ResourceId -ResourceId ([string]$Target.ExpectedAssignableScope)
+        )
     ) {
-        throw "$($Target.Name) was not resolved from a complete subscription custom-role query."
+        throw "$($Target.Name) was not resolved from its complete known-scope custom-role query."
     }
     $definitions = @($Inventory.Items)
     $roleNameCandidates = @(
@@ -340,7 +348,7 @@ function Resolve-ReviewedHistoricalRoleDefinition {
                 -Target $Target
         )
     ) {
-        throw "$($Target.Name) exact role name has an unreviewed scope, description, or permission body."
+        throw "$($Target.Name) exact role name has unreviewed permissions or assignable scopes."
     }
     $bodyCandidates = @(
         $definitions | Where-Object {
@@ -369,12 +377,12 @@ function Resolve-ReviewedHistoricalRoleDefinition {
             Status = 'found'
             RoleDefinition = $roleNameCandidates[0]
             RoleDefinitionId = $roleDefinitionId
-            DiscoveryProof = 'exact-name-description-scope-permissions-from-complete-enumeration'
+            DiscoveryProof = 'exact-name-permissions-assignable-scopes-from-complete-known-scope-query'
         }
     }
     if ($bodyCandidates.Count -eq 1) {
         throw (
-            "$($Target.Name) has the reviewed description, scope, and permissions under " +
+            "$($Target.Name) has the reviewed permissions and assignable scopes under " +
             "renamed role '$([string]$bodyCandidates[0].roleName)'; refusing destructive cleanup."
         )
     }
@@ -383,8 +391,8 @@ function Resolve-ReviewedHistoricalRoleDefinition {
         RoleDefinition = $null
         RoleDefinitionId = $null
         DiscoveryProof = (
-            'complete subscription custom-role enumeration contained neither the exact ' +
-            'historical name nor its exact reviewed description, scope, and permissions'
+            'complete known-scope custom-role enumeration contained neither the exact ' +
+            'historical name nor its exact reviewed permissions and assignable scopes'
         )
     }
 }
@@ -423,35 +431,62 @@ function Resolve-ReviewedTargetRoleAssignment {
         [Parameter(Mandatory)][object]$Target
     )
 
-    $subscriptionScope = "/subscriptions/$($SubscriptionId.ToLowerInvariant())"
     if (
         [string]$Inventory.QueryKind -cne (
-            'complete-subscription-descendant-principal-assignment-enumeration'
+            'independent-complete-subscription-principal-assignment-enumeration'
         ) -or
-        (Normalize-ResourceId -ResourceId ([string]$Inventory.Scope)) -cne $subscriptionScope -or
+        [string]$Inventory.TargetKey -cne [string]$Target.Key -or
+        (Normalize-ResourceId -ResourceId ([string]$Inventory.Scope)) -cne (
+            "/subscriptions/$($SubscriptionId.ToLowerInvariant())"
+        ) -or
+        (Normalize-ResourceId -ResourceId ([string]$Inventory.RequestedTargetScope)) -cne (
+            Normalize-ResourceId -ResourceId ([string]$Target.Scope)
+        ) -or
         [string]$Inventory.PrincipalId -cne $CollectorPrincipalId.ToLowerInvariant()
     ) {
-        throw "$($Target.Name) was not resolved from a complete collector assignment query."
+        throw "$($Target.Name) was not resolved from its independent complete assignment query."
     }
     $normalizedScope = Normalize-ResourceId -ResourceId ([string]$Target.Scope)
+    $scopePrincipalAssignments = @(
+        @($Inventory.Items) | Where-Object {
+            ([string]$_.principalId).ToLowerInvariant() -ceq (
+                $CollectorPrincipalId.ToLowerInvariant()
+            ) -and
+            (Normalize-ResourceId -ResourceId ([string]$_.scope)) -ceq $normalizedScope
+        }
+    )
     $candidateAssignments = @(
         if ($null -eq $Target.RoleDefinitionId) {
-            @($Inventory.Items) | Where-Object {
-                ([string]$_.principalId).ToLowerInvariant() -ceq (
-                    $CollectorPrincipalId.ToLowerInvariant()
-                ) -and
-                (Normalize-ResourceId -ResourceId ([string]$_.scope)) -ceq $normalizedScope -and
-                [string]$_.roleDefinitionName -ieq [string]$Target.RoleDefinitionName
+            $unresolvedRoleAssignments = @(
+                $scopePrincipalAssignments | Where-Object {
+                    [string]::IsNullOrEmpty([string]$_.roleDefinitionName)
+                }
+            )
+            if ($unresolvedRoleAssignments.Count -ne 0) {
+                throw (
+                    "$($Target.Name) cannot prove assignment absence because the exact scope " +
+                    'contains an assignment whose role definition name could not be resolved.'
+                )
             }
+            $caseInsensitiveNameCandidates = @(
+                $scopePrincipalAssignments | Where-Object {
+                    [string]$_.roleDefinitionName -ieq [string]$Target.RoleDefinitionName
+                }
+            )
+            $exactNameCandidates = @(
+                $caseInsensitiveNameCandidates | Where-Object {
+                    [string]$_.roleDefinitionName -ceq [string]$Target.RoleDefinitionName
+                }
+            )
+            if ($caseInsensitiveNameCandidates.Count -gt $exactNameCandidates.Count) {
+                throw "$($Target.Name) assignment reports a case-changed historical role name."
+            }
+            $exactNameCandidates
         } else {
             $normalizedRoleDefinitionId = Normalize-ResourceId -ResourceId (
                 [string]$Target.RoleDefinitionId
             )
-            @($Inventory.Items) | Where-Object {
-                ([string]$_.principalId).ToLowerInvariant() -ceq (
-                    $CollectorPrincipalId.ToLowerInvariant()
-                ) -and
-                (Normalize-ResourceId -ResourceId ([string]$_.scope)) -ceq $normalizedScope -and
+            $scopePrincipalAssignments | Where-Object {
                 (Normalize-ResourceId -ResourceId ([string]$_.roleDefinitionId)) -ceq (
                     $normalizedRoleDefinitionId
                 )
@@ -484,8 +519,25 @@ function Resolve-ReviewedTargetRoleAssignment {
         Get-RoleAssignmentGuid `
             -RoleAssignmentId ([string]$assignment.id) `
             -ExpectedScope ([string]$Target.Scope) | Out-Null
+        return [pscustomobject]@{
+            Status = 'found'
+            RoleAssignment = $assignment
+            RoleAssignmentId = Normalize-ResourceId -ResourceId ([string]$assignment.id)
+            DiscoveryProof = (
+                'actual returned roleDefinitionId, exact principal, and exact scope from an ' +
+                'independent complete assignment enumeration'
+            )
+        }
     }
-    return $candidateAssignments
+    return [pscustomobject]@{
+        Status = 'provedAbsent'
+        RoleAssignment = $null
+        RoleAssignmentId = $null
+        DiscoveryProof = (
+            'independent complete subscription assignment enumeration for the exact principal ' +
+            'contained no assignment with the trusted role identity and exact target scope'
+        )
+    }
 }
 
 function Assert-ReviewedTargetRoleAssignmentsAbsent {
@@ -494,12 +546,13 @@ function Assert-ReviewedTargetRoleAssignmentsAbsent {
         [Parameter(Mandatory)][object]$Target
     )
 
-    $remainingTargetAssignments = @(
-        Resolve-ReviewedTargetRoleAssignment -Inventory $Inventory -Target $Target
-    )
-    if ($remainingTargetAssignments.Count -ne 0) {
+    $remainingTargetAssignment = Resolve-ReviewedTargetRoleAssignment `
+        -Inventory $Inventory `
+        -Target $Target
+    if ([string]$remainingTargetAssignment.Status -cne 'provedAbsent') {
         throw "$($Target.Name) remains assigned after exact cleanup."
     }
+    return [string]$remainingTargetAssignment.DiscoveryProof
 }
 
 foreach ($resourceId in @(
@@ -588,10 +641,6 @@ $historicalRoleDefinitions = @(
         Key = 'bounded-acquisition-reader'
         Name = 'collector bounded acquisition reader'
         ExpectedRoleName = 'Athena WC028 Bounded Acquisition Reader'
-        ExpectedDescription = (
-            'Read only Activity Log events and Resource Graph change history for the one ' +
-            'approved workload resource group.'
-        )
         ExpectedAssignableScope = $workloadResourceGroupId
         ExpectedActions = @(
             'Microsoft.Insights/eventtypes/values/read'
@@ -599,31 +648,17 @@ $historicalRoleDefinitions = @(
             'Microsoft.Resources/changes/read'
         )
         ExpectedDataActions = @()
-        ArmGuidPreimage = @(
-            $subscriptionScope
-            'athena-wc028-bounded-acquisition-reader'
-            $workloadResourceGroupId
-        )
         AssignmentScope = $workloadResourceGroupId
     },
     [pscustomobject]@{
         Key = 'change-evidence-create-only-writer'
         Name = 'collector change-evidence writer'
         ExpectedRoleName = 'Athena WC028 Change Evidence Create-Only Writer'
-        ExpectedDescription = (
-            'Read one known Blob and create one conditionally named change-evidence Blob ' +
-            'without list or delete permissions.'
-        )
         ExpectedAssignableScope = $changeEvidenceResourceGroupId
         ExpectedActions = @()
         ExpectedDataActions = @(
             'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read'
             'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write'
-        )
-        ArmGuidPreimage = @(
-            $subscriptionScope
-            'athena-wc028-change-evidence-create-only'
-            (Normalize-ResourceId -ResourceId $ChangeEvidenceContainerResourceId)
         )
         AssignmentScope = $ChangeEvidenceContainerResourceId
     },
@@ -631,19 +666,10 @@ $historicalRoleDefinitions = @(
         Key = 'monitoring-intent-key-reader'
         Name = 'collector monitoring-intent key reader'
         ExpectedRoleName = 'Athena WC028 Monitoring Intent Key Reader'
-        ExpectedDescription = (
-            'Read only the public material and properties of the exact monitoring-intent ' +
-            'signing key.'
-        )
         ExpectedAssignableScope = $monitoringIntentKeyResourceGroupId
         ExpectedActions = @()
         ExpectedDataActions = @(
             'Microsoft.KeyVault/vaults/keys/read'
-        )
-        ArmGuidPreimage = @(
-            $subscriptionScope
-            'athena-wc028-monitoring-intent-key-reader'
-            (Normalize-ResourceId -ResourceId $MonitoringIntentSigningKeyResourceId)
         )
         AssignmentScope = $MonitoringIntentSigningKeyResourceId
     },
@@ -651,26 +677,20 @@ $historicalRoleDefinitions = @(
         Key = 'network-watcher-ip-flow-verifier'
         Name = 'collector Network Watcher IP Flow verifier'
         ExpectedRoleName = 'Athena WC028 IP Flow Verifier'
-        ExpectedDescription = (
-            'Run only the read-only IP Flow Verify diagnostic on the reviewed Network Watcher.'
-        )
         ExpectedAssignableScope = $networkWatcherResourceGroupId
         ExpectedActions = @(
             'Microsoft.Network/networkWatchers/ipFlowVerify/action'
         )
         ExpectedDataActions = @()
-        ArmGuidPreimage = @(
-            $subscriptionScope
-            'athena-wc028-ip-flow-verify'
-            $networkWatcherId
-        )
         AssignmentScope = $networkWatcherId
     }
 )
 
-$preCleanupRoleInventory = Get-CompleteCustomRoleDefinitionInventory -Phase 'pre-cleanup'
 $roleResolutionsByKey = @{}
 foreach ($historicalRole in $historicalRoleDefinitions) {
+    $preCleanupRoleInventory = Get-CompleteCustomRoleDefinitionInventory `
+        -Phase 'pre-cleanup' `
+        -Target $historicalRole
     $roleResolutionsByKey[$historicalRole.Key] = Resolve-ReviewedHistoricalRoleDefinition `
         -Inventory $preCleanupRoleInventory `
         -Target $historicalRole
@@ -715,28 +735,22 @@ foreach ($historicalRole in $historicalRoleDefinitions) {
     }
 }
 
-$preCleanupAssignmentInventory = Get-CompleteCollectorRoleAssignmentInventory `
-    -Phase 'pre-cleanup'
 $removedAssignmentIds = [System.Collections.Generic.List[string]]::new()
 $assignmentOutcomes = [System.Collections.Generic.List[object]]::new()
 foreach ($target in $targets) {
-    $targetAssignments = @(
-        Resolve-ReviewedTargetRoleAssignment `
-            -Inventory $preCleanupAssignmentInventory `
-            -Target $target
-    )
-    $status = 'provedAbsent'
-    $roleAssignmentId = $null
-    if ($targetAssignments.Count -eq 1) {
-        $roleAssignmentId = Normalize-ResourceId -ResourceId (
-            [string]$targetAssignments[0].id
-        )
+    $preCleanupAssignmentInventory = Get-CompleteTargetRoleAssignmentInventory `
+        -Phase 'pre-cleanup' `
+        -Target $target
+    $assignmentResolution = Resolve-ReviewedTargetRoleAssignment `
+        -Inventory $preCleanupAssignmentInventory `
+        -Target $target
+    if ([string]$assignmentResolution.Status -eq 'found') {
+        $roleAssignmentId = [string]$assignmentResolution.RoleAssignmentId
         Invoke-AzCommand -AzArguments @(
             'role', 'assignment', 'delete',
             '--ids', $roleAssignmentId
         )
         $removedAssignmentIds.Add($roleAssignmentId)
-        $status = 'foundAndRemoved'
     }
     $assignmentOutcomes.Add(
         [ordered]@{
@@ -749,20 +763,14 @@ foreach ($target in $targets) {
                 Normalize-ResourceId -ResourceId ([string]$target.RoleDefinitionId)
             }
             roleDiscoveryProof = [string]$target.RoleDiscoveryProof
-            initialResolution = $status
-            removedRoleAssignmentId = $roleAssignmentId
-            initialAbsenceProof = if ($status -eq 'provedAbsent') {
-                (
-                    'complete subscription-descendant assignment enumeration for the exact ' +
-                    'collector principal contained no exact target scope and trusted role identity'
-                )
+            initialResolution = if ([string]$assignmentResolution.Status -eq 'found') {
+                'foundAndRemoved'
             } else {
-                $null
+                'provedAbsent'
             }
-            postCleanupAbsenceProof = (
-                'fresh complete subscription-descendant assignment enumeration for the exact ' +
-                'collector principal contained no exact target scope and trusted role identity'
-            )
+            removedRoleAssignmentId = $assignmentResolution.RoleAssignmentId
+            initialDiscoveryProof = [string]$assignmentResolution.DiscoveryProof
+            postCleanupAbsenceProof = $null
         }
     )
 }
@@ -782,10 +790,12 @@ foreach ($historicalRole in $historicalRoleDefinitions) {
     }
 }
 
-$postCleanupRoleInventory = Get-CompleteCustomRoleDefinitionInventory -Phase 'post-cleanup'
 $roleDefinitionOutcomes = [System.Collections.Generic.List[object]]::new()
 foreach ($historicalRole in $historicalRoleDefinitions) {
     $resolution = $roleResolutionsByKey[$historicalRole.Key]
+    $postCleanupRoleInventory = Get-CompleteCustomRoleDefinitionInventory `
+        -Phase 'post-cleanup' `
+        -Target $historicalRole
     $postCleanupProof = Assert-ReviewedHistoricalRoleDefinitionAbsent `
         -Inventory $postCleanupRoleInventory `
         -Target $historicalRole `
@@ -794,14 +804,11 @@ foreach ($historicalRole in $historicalRoleDefinitions) {
         [ordered]@{
             target = $historicalRole.Name
             expectedRoleName = $historicalRole.ExpectedRoleName
-            expectedDescription = $historicalRole.ExpectedDescription
             expectedAssignableScope = (
                 Normalize-ResourceId -ResourceId $historicalRole.ExpectedAssignableScope
             )
             expectedActions = @($historicalRole.ExpectedActions | Sort-Object)
             expectedDataActions = @($historicalRole.ExpectedDataActions | Sort-Object)
-            armGuidPreimage = @($historicalRole.ArmGuidPreimage)
-            armGuidUse = 'recorded readiness evidence only; never locally hashed or trusted'
             trustedRoleDefinitionId = if ($null -eq $resolution.RoleDefinitionId) {
                 $null
             } else {
@@ -819,43 +826,48 @@ foreach ($historicalRole in $historicalRoleDefinitions) {
     )
 }
 
-$postCleanupAssignmentInventory = Get-CompleteCollectorRoleAssignmentInventory `
-    -Phase 'post-cleanup'
 foreach ($target in $targets) {
-    Assert-ReviewedTargetRoleAssignmentsAbsent `
+    $postCleanupAssignmentInventory = Get-CompleteTargetRoleAssignmentInventory `
+        -Phase 'post-cleanup' `
+        -Target $target
+    $postCleanupAssignmentProof = Assert-ReviewedTargetRoleAssignmentsAbsent `
         -Inventory $postCleanupAssignmentInventory `
         -Target $target
+    $assignmentOutcome = $assignmentOutcomes | Where-Object {
+        [string]$_.target -ceq [string]$target.Name
+    }
+    $assignmentOutcome.postCleanupAbsenceProof = $postCleanupAssignmentProof
 }
 
 $evidence = [ordered]@{
-    schemaVersion = 'athena.wc028LegacyCollectorRbacCleanup.v4'
+    schemaVersion = 'athena.wc028LegacyCollectorRbacCleanup.v5'
     subscriptionId = $SubscriptionId.ToLowerInvariant()
     collectorIdentityResourceId = (Normalize-ResourceId -ResourceId $CollectorIdentityResourceId)
     collectorPrincipalId = $CollectorPrincipalId.ToLowerInvariant()
     networkWatcherResourceId = (Normalize-ResourceId -ResourceId $networkWatcherId)
     enumerationContract = [ordered]@{
         customRoleDefinitions = (
-            'two independent complete subscription custom-role enumerations; no name or GUID filter'
+            'independent pre/post complete custom-role enumerations at each exact known ' +
+            'assignable scope; no name or GUID filter'
         )
         collectorRoleAssignments = (
-            'two independent complete subscription-descendant enumerations for the exact principal'
+            'independent pre/post complete subscription assignment enumerations per target for ' +
+            'the exact collector principal, then exact returned roleDefinitionId and scope matching'
         )
     }
     armGuidGroundTruth = [ordered]@{
         deploymentDerivedVectorAvailable = $false
         localComputationSecurityUse = 'none'
         note = (
-            'No reviewed deployment-derived ARM guid result is embedded. Historical preimages are ' +
-            'recorded for readiness only and cannot prove discovery, deletion, or absence.'
+            'No real deployment-derived ARM guid result was found in reviewed repository, ' +
+            'session, or read-only Azure evidence. Cleanup does not calculate, compare, record, ' +
+            'or trust locally reconstructed GUID values.'
         )
     }
     roleDefinitionOutcomes = @($roleDefinitionOutcomes)
     roleAssignmentOutcomes = @($assignmentOutcomes)
     removedRoleAssignmentIds = @($removedAssignmentIds | Sort-Object)
     removedRoleDefinitionIds = @($removedRoleDefinitionIds | Sort-Object)
-    postCleanupAssignmentAbsenceProof = (
-        'fresh complete subscription-descendant assignment enumeration for the exact principal'
-    )
 }
 $evidenceJson = $evidence | ConvertTo-Json -Depth 12 -Compress
 $digestBytes = [Text.Encoding]::UTF8.GetBytes($evidenceJson)

@@ -121,24 +121,28 @@ Before deploying this version over an existing WC-028 runtime, run
 change-evidence container, monitoring-evidence container, monitoring-intent key, exact historical
 Network Watcher, and exact collector resource/principal pair. The script deletes only the six exact
 legacy collector assignment targets, including Network Watcher IP Flow and the broad
-monitoring-evidence contributor assignment. Before mutation it enumerates every custom role
-definition available in the subscription without a name or GUID filter. Each historical custom role
-must resolve uniquely by its exact reviewed name, description, single assignable scope, and
-permissions. Duplicate, renamed, or body-mismatched candidates fail closed. A missing role is
-accepted only as a per-target absence proof from that complete enumeration.
+monitoring-evidence contributor assignment. Before mutation it runs a separate complete custom-role
+enumeration at each exact known historical assignable scope, without a name or GUID filter. Each
+historical custom role must resolve uniquely by its exact trusted role name, permissions, empty
+deny lists, and single assignable scope. Duplicate, renamed, or body-mismatched candidates fail
+closed. A missing role is accepted only as an explicit per-target absence proof from that complete
+known-scope enumeration.
 
-The script separately enumerates every subscription-descendant assignment for the exact collector
-principal. Each assignment target must either be found uniquely and deleted by its returned Azure
-resource ID or be proved absent in that complete query. The custom-role targets use the actual role
-definition IDs returned by the trusted role enumeration; the two built-in targets use their
-published fixed IDs. Fresh, independent complete role and assignment enumerations prove
-post-cleanup absence. The cleanup evidence records the resolution and absence proof for every
-target before emitting `cleanupEvidenceDigest`.
+For every assignment target, the script performs a separate complete subscription assignment
+enumeration for the exact collector principal. Found custom roles are matched using the actual
+`roleDefinitionId` returned by Azure together with the exact principal and target scope; the two
+built-in targets use their published fixed role IDs. Each assignment must be found uniquely and
+deleted by its returned Azure resource ID or be explicitly proved absent by that independent query.
+Fresh per-target role and assignment queries prove post-cleanup absence rather than reusing any
+pre-delete lookup. The cleanup evidence records the resolution and absence proof for every target
+before emitting `cleanupEvidenceDigest`.
 
-No deployment-derived ARM `guid()` result is embedded in this branch, so the cleanup script does
-not locally implement `guid()` and never treats a reconstructed ID miss as evidence of absence. It
-records the reviewed historical preimages only as readiness evidence. A renamed role with the exact
-historical body is surfaced for manual review rather than deleted automatically.
+No real deployment-derived ARM `guid()` result was found in the reviewed repository, session, or
+read-only Azure evidence. The earlier local UUIDv5/SHA-1 helper did not implement ARM's
+MD5/UUIDv3-style `guid()` behavior and has been removed. The cleanup script does not calculate role
+IDs, record invented GUID vectors, or treat a reconstructed-ID miss as evidence of absence. A
+renamed role with the exact historical permissions and assignable scope is surfaced for manual
+review rather than deleted automatically.
 
 The cleanup uses only supported exact lookups: `az resource show --ids` for the reviewed
 `NetworkWatcherRG/NetworkWatcher_australiaeast` resource and `az group show --name` for the
@@ -178,11 +182,11 @@ return the exact same validated contract immediately before any durable writer c
 deliberately wires a verifier that fails closed because current PR #99 has not yet published the
 required storage contract or narrow runtime read authorization.
 
-The runtime's local ARM `guid()` mirror remains only a defense-in-depth, fail-closed consistency
-check for that deployment-produced storage-readiness binding. The independently recomputed SHA-256
-readiness digest, exact resource IDs and protection values, Bicep validation, and fresh live
-readback remain authoritative; the local GUID mirror is not used for RBAC discovery, deletion, or
-absence claims.
+No local ARM `guid()` implementation remains. Runtime treats the non-nil readback binding as an
+opaque deployment-produced value already checked by the Bicep module's native `guid()` call. It
+independently recomputes the SHA-256 readiness digest from the exact resource IDs and protection
+values and requires a fresh live verifier result before durable creation. Neither RBAC cleanup nor
+runtime readiness relies on a locally reconstructed ARM GUID.
 
 It adds no built-in Reader, Contributor, Owner, Blob overwrite/delete/list, diagnostic-setting,
 alert-rule, or Connection Monitor mutation permission. Existing WC-024 grants continue to
