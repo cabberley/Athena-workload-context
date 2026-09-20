@@ -1,14 +1,21 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
-import math
+import os
 import re
+import stat
 import sys
-from collections.abc import Sequence
-from dataclasses import asdict, dataclass
+import uuid
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager, suppress
+from dataclasses import asdict, dataclass, field, replace
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, TextIO
+from urllib.parse import SplitResult, parse_qsl, unquote, urlsplit
 
 MAX_INPUT_BYTES = 8 * 1024 * 1024
 MAX_CHANGES = 5000
@@ -16,6 +23,22 @@ MAX_ASSIGNMENTS = 10000
 MAX_POLICY_ITEMS = 512
 MAX_JSON_DEPTH = 64
 MAX_JSON_NODES = 100000
+MAX_JSON_INTEGER_DIGITS = 1024
+MAX_JSON_DECIMAL_DIGITS = 1024
+MAX_JSON_DECIMAL_EXPONENT = 1024
+MAX_VIOLATIONS = 256
+MAX_RENDER_BYTES = 1024 * 1024
+MAX_SEPARATION_RULE_WORK = 100000
+MAX_DENY_EVALUATION_WORK = 500000
+MAX_RBAC_EXPANSION_WORK = 500000
+MAX_RBAC_EVIDENCE_CALLS = 4096
+MAX_PROPERTY_PATH_LENGTH = 4096
+MAX_PROPERTY_PATH_ITEMS = 50000
+MAX_PROPERTY_PATH_CHARACTERS = 4 * 1024 * 1024
+MAX_PROPERTY_LOOKUP_WORK = 500000
+MAX_RELEASE_LEDGER_RECORD_BYTES = 64 * 1024
+MAX_ATTESTATION_LIFETIME = timedelta(minutes=30)
+MAX_ATTESTATION_CLOCK_SKEW = timedelta(minutes=5)
 
 _BROAD_ROLES = frozenset(
     {
@@ -34,12 +57,18 @@ _ROLE_ID_TO_NAME = {
     "18d7d88d-d35e-4fb5-a5c3-7773c20a72d9": ("user access administrator"),
 }
 _BROAD_ROLE_IDS = frozenset(_ROLE_ID_TO_NAME)
+_ROLE_NAME_TO_ID = {role_name: role_id for role_id, role_name in _ROLE_ID_TO_NAME.items()}
+_GUID_PATTERN = (
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+    r"[0-9a-f]{4}-[0-9a-f]{12}"
+)
+_GUID = re.compile(rf"^{_GUID_PATTERN}$", re.IGNORECASE)
 _SUBSCRIPTION_SCOPE = re.compile(
-    r"^/subscriptions/[0-9a-f-]{36}$",
+    rf"^/subscriptions/{_GUID_PATTERN}$",
     re.IGNORECASE,
 )
 _RESOURCE_GROUP_SCOPE = re.compile(
-    r"^/subscriptions/[0-9a-f-]{36}/resourcegroups/[^/]+$",
+    rf"^/subscriptions/{_GUID_PATTERN}/resourcegroups/[^/]+$",
     re.IGNORECASE,
 )
 _MANAGEMENT_GROUP_SCOPE = re.compile(
@@ -49,8 +78,204 @@ _MANAGEMENT_GROUP_SCOPE = re.compile(
 _STORAGE_ACCOUNT_TYPE = "microsoft.storage/storageaccounts"
 _STORAGE_CONTAINER_TYPE = "microsoft.storage/storageaccounts/blobservices/containers"
 _KEY_VAULT_TYPE = "microsoft.keyvault/vaults"
+_KEY_VAULT_DEPLOYMENT_ACCESS_TARGETS = (
+    "properties.enabledfordeployment",
+    "properties.enabledfordiskencryption",
+    "properties.enabledfortemplatedeployment",
+)
 _CONTAINER_APP_TYPE = "microsoft.app/containerapps"
 _CONTAINER_ENVIRONMENT_TYPE = "microsoft.app/managedenvironments"
+_RESOURCE_ROOT_PATH = "<resource>"
+_MISSING_AFTER_VALUE = object()
+_NO_EXPLICIT_VALUE = object()
+_PROTECTED_OBJECT_PRESENT = object()
+_PROPERTY_OBSERVATION = "observation"
+_RESOURCE_ROOT_ALIASES = frozenset(
+    {
+        ".",
+        _RESOURCE_ROOT_PATH,
+        f"{_RESOURCE_ROOT_PATH}.",
+    }
+)
+_PROPERTY_NAME_PATTERN = r"[A-Za-z_$][A-Za-z0-9_$-]*"
+_PROPERTY_NAME = re.compile(rf"^{_PROPERTY_NAME_PATTERN}$")
+_PROPERTY_COMPONENT = re.compile(
+    rf"^(?P<name>{_PROPERTY_NAME_PATTERN})"
+    r"(?P<indexes>(?:\[(?:0|[1-9][0-9]*)\])*)$"
+)
+_PROPERTY_INDEX = re.compile(r"\[(0|[1-9][0-9]*)\]")
+_DEPLOYMENT_NAME = re.compile(r"^[A-Za-z0-9_.()-]{1,64}$")
+_ATTESTED_FILE_COMPONENT = re.compile(r"^[A-Za-z0-9_.()-]+$")
+_UNSUPPORTED_MUTATION_PREFIXES = (
+    "microsoft.authorization/",
+    "microsoft.graph/",
+    "microsoft.managedservices/",
+)
+_UNSUPPORTED_AUTHORIZATION_RESOURCE_TYPES = frozenset(
+    {
+        "microsoft.keyvault/vaults/accesspolicies",
+        "microsoft.managedidentity/userassignedidentities/federatedidentitycredentials",
+        "microsoft.resources/deploymentstacks",
+        "microsoft.storage/storageaccounts/localusers",
+    }
+)
+_UNCONDITIONALLY_BLOCKED_DELETE_TYPES = frozenset(
+    {
+        "microsoft.resources/deploymentstacks",
+        "microsoft.storage/storageaccounts/localusers",
+    }
+)
+_UNSUPPORTED_IDENTITY_CREDENTIAL_TYPE_SEGMENTS = frozenset(
+    {
+        "approleassignedto",
+        "approleassignments",
+        "delegatedpermissiongrants",
+        "federatedidentitycredentials",
+        "oauth2permissiongrants",
+    }
+)
+_UNSUPPORTED_IMPERATIVE_TYPES = frozenset(
+    {
+        "microsoft.resources/deploymentscripts",
+    }
+)
+_MANIFEST_SCHEMA_VERSION = "athena.wc029PreflightManifest.v1"
+_ARM_ROLE_ASSIGNMENTS_API_VERSION = "2022-04-01"
+_ARM_DENY_ASSIGNMENTS_API_VERSION = "2022-04-01"
+_ARM_AUTHORIZATION_QUERY_KEYS = frozenset(
+    {
+        "$filter",
+        "$skipToken",
+        "api-version",
+    }
+)
+_ALL_PRINCIPALS_ID = "00000000-0000-0000-0000-000000000000"
+_DENY_ASSIGNMENT_COLLECTION_TYPES = frozenset(
+    {
+        "subscription-inventory",
+        "target-and-ancestors",
+    }
+)
+_DENY_PRINCIPAL_TYPES = frozenset(
+    {
+        "group",
+        "serviceprincipal",
+        "systemdefined",
+        "user",
+    }
+)
+_GRAPH_MEMBERSHIP_QUERY_KEYS = frozenset(
+    {
+        "$skiptoken",
+    }
+)
+_PAGED_NEXT_LINK_KEY_CASEFOLDS = frozenset(
+    {
+        "@odata.nextlink",
+        "nextlink",
+        "odata.nextlink",
+    }
+)
+_GRAPH_MEMBERSHIP_METHODS = frozenset(
+    {
+        "getmembergroups",
+        "transitivememberof",
+    }
+)
+_GRAPH_DIRECTORY_PRINCIPAL_TYPES = {
+    "#microsoft.graph.group": "group",
+    "#microsoft.graph.serviceprincipal": "serviceprincipal",
+    "#microsoft.graph.user": "user",
+}
+_MANIFEST_BINDING_NAMES = frozenset(
+    {
+        "allowChangeIdsDigest",
+        "deploymentDigest",
+        "parametersDigest",
+        "policyDigest",
+        "rbacEvidenceDigest",
+        "templateDigest",
+        "whatIfDigest",
+        "whatIfRequestDigest",
+    }
+)
+_MANIFEST_FIELD_NAMES = frozenset(
+    {
+        "bindings",
+        "collectedat",
+        "collectionrunid",
+        "deploymentexecutionid",
+        "deploymenttarget",
+        "expiresat",
+        "schemaversion",
+    }
+)
+_NON_EFFECTIVE_RESOURCE_METADATA_ROOTS = frozenset(
+    {
+        "apiversion",
+        "etag",
+        "id",
+        "name",
+        "resourceid",
+        "systemdata",
+        "type",
+    }
+)
+_PARTIAL_SNAPSHOT_FLAT_OBJECT_ROOTS = frozenset(
+    {
+        "systemdata",
+        "tags",
+    }
+)
+_PROTECTED_PROPERTY_SCHEMAS: dict[str, tuple[tuple[str, str], ...]] = {
+    _STORAGE_ACCOUNT_TYPE: (
+        ("properties", "object"),
+        ("properties.allowsharedkeyaccess", "boolean"),
+        ("properties.allowblobpublicaccess", "boolean"),
+        ("properties.publicnetworkaccess", "string"),
+        ("properties.networkacls", "object"),
+        ("properties.networkacls.defaultaction", "string"),
+    ),
+    _STORAGE_CONTAINER_TYPE: (
+        ("properties", "object"),
+        ("properties.publicaccess", "string"),
+    ),
+    _KEY_VAULT_TYPE: (
+        ("properties", "object"),
+        ("properties.accesspolicies", "array"),
+        ("properties.enablerbacauthorization", "boolean"),
+        ("properties.enabledfordeployment", "boolean"),
+        ("properties.enabledfordiskencryption", "boolean"),
+        ("properties.enabledfortemplatedeployment", "boolean"),
+        ("properties.publicnetworkaccess", "string"),
+        ("properties.networkacls", "object"),
+        ("properties.networkacls.defaultaction", "string"),
+    ),
+    _CONTAINER_APP_TYPE: (
+        ("properties", "object"),
+        ("properties.configuration", "object"),
+        ("properties.configuration.ingress", "object"),
+        ("properties.configuration.ingress.external", "boolean"),
+        ("properties.publicnetworkaccess", "string"),
+    ),
+    _CONTAINER_ENVIRONMENT_TYPE: (
+        ("properties", "object"),
+        ("properties.publicnetworkaccess", "string"),
+        ("properties.vnetconfiguration", "object"),
+        ("properties.vnetconfiguration.internal", "boolean"),
+    ),
+}
+_PROTECTED_PROPERTY_TYPE_ERRORS = {
+    "properties.allowsharedkeyaccess": "allowSharedKeyAccess must be boolean",
+    "properties.allowblobpublicaccess": "allowBlobPublicAccess must be boolean",
+    "properties.configuration.ingress.external": (
+        "Container Apps ingress.external must be boolean"
+    ),
+    "properties.vnetconfiguration.internal": (
+        "Container Apps vnetConfiguration.internal must be boolean"
+    ),
+    "properties.publicaccess": "publicAccess must be an exact trimmed ASCII token",
+}
 
 
 class PreflightInputError(ValueError):
@@ -64,32 +289,358 @@ class PreflightViolation:
     detail: str
 
 
+@dataclass(slots=True)
+class _ViolationAccumulator:
+    values: list[PreflightViolation] = field(default_factory=list)
+    seen: set[PreflightViolation] = field(default_factory=set)
+
+    def add(self, violation: PreflightViolation) -> bool:
+        _strict_utf8_bytes(violation.code, field_name="violation code")
+        _strict_utf8_bytes(violation.subject, field_name="violation subject")
+        _strict_utf8_bytes(violation.detail, field_name="violation detail")
+        if violation in self.seen:
+            return False
+        if len(self.values) >= MAX_VIOLATIONS:
+            raise PreflightInputError(f"violation count exceeds {MAX_VIOLATIONS}")
+        self.seen.add(violation)
+        self.values.append(violation)
+        return True
+
+    def finalize(self) -> tuple[PreflightViolation, ...]:
+        return tuple(self.values)
+
+
+@dataclass(frozen=True, slots=True)
+class DeploymentTarget:
+    tenant_id: str
+    subscription_id: str
+    resource_group_scopes: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _WhatIfResourceRow:
+    value: dict[str, Any]
+    resource_id: str
+    canonical_resource_id: str
+
+
+@dataclass(slots=True)
+class _PropertyPathBudget:
+    items: int = 0
+    characters: int = 0
+    lookup_work: int = 0
+
+    def charge(self, path: str) -> None:
+        if len(path) > MAX_PROPERTY_PATH_LENGTH:
+            raise PreflightInputError(
+                f"property path exceeds {MAX_PROPERTY_PATH_LENGTH} characters"
+            )
+        self.items += 1
+        self.characters += len(path)
+        if self.items > MAX_PROPERTY_PATH_ITEMS or self.characters > MAX_PROPERTY_PATH_CHARACTERS:
+            raise PreflightInputError("property path generation exceeds its aggregate work budget")
+
+    def charge_lookup(self, work: int) -> None:
+        self.lookup_work += work
+        if self.lookup_work > MAX_PROPERTY_LOOKUP_WORK:
+            raise PreflightInputError("property snapshot lookup exceeds its aggregate work budget")
+
+
+@dataclass(frozen=True, slots=True)
+class AttestationManifest:
+    collection_run_id: str
+    deployment_execution_id: str
+    deployment_target: DeploymentTarget
+    collected_at: datetime
+    expires_at: datetime
+    bindings: dict[str, str]
+    digest: str
+
+
+def _finalize_violations(
+    values: Sequence[PreflightViolation],
+) -> tuple[PreflightViolation, ...]:
+    accumulator = _ViolationAccumulator()
+    for violation in values:
+        accumulator.add(violation)
+    return accumulator.finalize()
+
+
 @dataclass(frozen=True, slots=True)
 class BroadAssignmentAllowance:
     principal_id: str
+    effective_principal_id: str
+    principal_type: str
     role_name: str
+    role_definition_id: str
     scope: str
+    condition: str | None
+    condition_version: str | None
+    role_name_supplied: bool
+    effective_principal_id_supplied: bool = field(compare=False)
+    principal_type_supplied: bool = field(compare=False)
+    assigned_principal_fields_supplied: bool = field(compare=False)
+
+
+@dataclass(frozen=True, slots=True)
+class RbacAssignment:
+    principal_id: str
+    effective_principal_id: str
+    principal_type: str
+    role_name: str
+    role_definition_id: str
+    scope: str
+    condition: str | None
+    condition_version: str | None
+    role_name_supplied: bool
+    effective_principal_id_supplied: bool = field(compare=False)
+    principal_type_supplied: bool = field(compare=False)
+    assigned_principal_fields_supplied: bool = field(compare=False)
+    arm_assignment_id: str | None = field(default=None, compare=False)
+    arm_identity_digest: str | None = field(default=None, compare=False)
+
+
+@dataclass(frozen=True, slots=True)
+class _TypedPrincipalClaim:
+    principal_id: str
+    principal_type: str
+
+
+@dataclass(frozen=True, slots=True)
+class DenyAssignment:
+    assignment_id: str
+    scope: str
+    do_not_apply_to_child_scopes: bool
+    principals: tuple[_TypedPrincipalClaim, ...]
+    excluded_principals: tuple[_TypedPrincipalClaim, ...]
+    condition: str | None
+    condition_version: str | None
+
+    @property
+    def principal_ids(self) -> frozenset[str]:
+        return frozenset(principal.principal_id for principal in self.principals)
+
+    @property
+    def excluded_principal_ids(self) -> frozenset[str]:
+        return frozenset(principal.principal_id for principal in self.excluded_principals)
+
+
+@dataclass(slots=True)
+class _PrincipalTypeRegistry:
+    principal_types: dict[str, str] = field(default_factory=dict)
+
+    def register(
+        self,
+        principal_id: str,
+        principal_type: str,
+        *,
+        field_name: str,
+    ) -> None:
+        if principal_id == _ALL_PRINCIPALS_ID and principal_type != "systemdefined":
+            raise PreflightInputError(
+                f"{field_name} must not use the All Principals zero GUID as a workload identity"
+            )
+        previous_type = self.principal_types.get(principal_id)
+        if previous_type is not None and previous_type != principal_type:
+            raise PreflightInputError(
+                f"{field_name} conflicts with the tenant-wide principal type "
+                f"{previous_type} for {principal_id}"
+            )
+        self.principal_types[principal_id] = principal_type
+
+
+@dataclass(slots=True)
+class _ArmRoleAssignmentRegistry:
+    identity_digests_by_id: dict[str, str] = field(default_factory=dict)
+
+    def register(
+        self,
+        arm_assignment_id: str,
+        arm_identity_digest: str,
+    ) -> None:
+        previous_digest = self.identity_digests_by_id.get(arm_assignment_id)
+        if previous_digest is not None and previous_digest != arm_identity_digest:
+            raise PreflightInputError(
+                "ARM role-assignment ID is associated with conflicting canonical assignment bodies"
+            )
+        self.identity_digests_by_id[arm_assignment_id] = arm_identity_digest
+
+
+@dataclass(frozen=True, slots=True)
+class RbacCollection:
+    tenant_id: str
+    subscription_id: str
+    subscription_scope: str
+    resource_group_scope: str
+    management_group_ancestry: tuple[str, ...]
+    effective_principal_ids: frozenset[str]
 
 
 @dataclass(frozen=True, slots=True)
 class SeparationRule:
     principal_id: str
     forbidden_role_names: frozenset[str]
+    forbidden_role_ids: frozenset[str]
     forbidden_scope_prefixes: tuple[str, ...]
+
+
+@dataclass(slots=True)
+class _SeparationRuleWorkBudget:
+    work: int = 0
+
+    def charge(self, amount: int = 1) -> None:
+        self.work += amount
+        if self.work > MAX_SEPARATION_RULE_WORK:
+            raise PreflightInputError(
+                "identity-separation rule evaluation exceeds its deterministic work budget"
+            )
+
+
+@dataclass(slots=True)
+class _DenyEvaluationWorkBudget:
+    work: int = 0
+
+    def charge(self, amount: int = 1) -> None:
+        if type(amount) is not int or amount < 0:
+            raise ValueError("deny evaluation work charge must be a non-negative integer")
+        if amount > MAX_DENY_EVALUATION_WORK - self.work:
+            raise PreflightInputError(
+                "deny-assignment evaluation exceeds its deterministic work budget"
+            )
+        self.work += amount
+
+
+@dataclass(slots=True)
+class _RbacExpansionBudget:
+    work: int = 0
+    calls: int = 0
+
+    def charge_work(self, amount: int = 1) -> None:
+        if type(amount) is not int or amount < 0:
+            raise ValueError("RBAC expansion work charge must be a non-negative integer")
+        if amount > MAX_RBAC_EXPANSION_WORK - self.work:
+            raise PreflightInputError("Graph/RBAC expansion exceeds its deterministic work budget")
+        self.work += amount
+
+    def charge_calls(self, amount: int = 1) -> None:
+        if type(amount) is not int or amount < 0:
+            raise ValueError("RBAC evidence call charge must be a non-negative integer")
+        if amount > MAX_RBAC_EVIDENCE_CALLS - self.calls:
+            raise PreflightInputError(
+                "Graph/RBAC evidence exceeds its deterministic call-count limit"
+            )
+        self.calls += amount
+
+
+@dataclass(frozen=True, slots=True)
+class _DenyScopeContext:
+    management_group_indexes: dict[str, int]
+    subscription_tokens: _ScopeTokens
+
+
+@dataclass(slots=True)
+class _ScopeTrieNode:
+    terminal: bool = False
+    has_terminal_descendant: bool = False
+    children: dict[str, _ScopeTrieNode] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class _DenyAccessScopeIndex:
+    scope_trie: _ScopeTrieNode
+    minimum_management_group_index: int | None
+    maximum_management_group_index: int | None
+    has_management_group_access: bool
+    has_subscription_access: bool
 
 
 @dataclass(frozen=True, slots=True)
 class RbacPolicy:
     allowed_broad_assignments: frozenset[BroadAssignmentAllowance]
     separation_rules: tuple[SeparationRule, ...]
+    expected_principal_ids: frozenset[str]
+    approved_assignments: frozenset[RbacAssignment]
+    legacy_expected_assignments: frozenset[RbacAssignment]
+    target: RbacCollection | None
+    approved_assignments_supplied: bool = field(compare=False)
+    legacy_expected_assignments_supplied: bool = field(compare=False)
+
+
+type PreflightKind = Literal["rbac", "what-if"]
+type PreflightOutputFormat = Literal["json", "text"]
+type _UtcClock = Callable[[], datetime]
+type PropertyPathToken = str | int
+type _ScopeTokens = tuple[str, ...]
+type _CanonicalPaginationRequestIdentity = tuple[
+    str,
+    str,
+    str,
+    tuple[tuple[str, str], ...],
+]
 
 
 def _normalized(value: str) -> str:
     return value.strip().casefold()
 
 
+def _strict_utf8_bytes(value: str, *, field_name: str) -> bytes:
+    try:
+        return value.encode("utf-8", errors="strict")
+    except UnicodeEncodeError as exc:
+        raise PreflightInputError(f"{field_name} must be strict UTF-8") from exc
+
+
+def _require_exact_ascii_token(
+    value: object,
+    *,
+    field_name: str,
+    maximum_length: int = 4096,
+) -> str:
+    if (
+        type(value) is not str
+        or not value
+        or value != value.strip()
+        or len(value) > maximum_length
+        or not value.isascii()
+        or not value.isprintable()
+    ):
+        raise PreflightInputError(f"{field_name} must be an exact trimmed ASCII token")
+    return value
+
+
+def _normalized_ascii_token(
+    value: object,
+    *,
+    field_name: str,
+    maximum_length: int = 4096,
+) -> str:
+    return _require_exact_ascii_token(
+        value,
+        field_name=field_name,
+        maximum_length=maximum_length,
+    ).lower()
+
+
+def _optional_normalized_ascii_token(
+    value: object,
+    *,
+    field_name: str,
+    maximum_length: int = 64,
+) -> str:
+    if value is None:
+        return ""
+    return _normalized_ascii_token(
+        value,
+        field_name=field_name,
+        maximum_length=maximum_length,
+    )
+
+
 def _resource_type(resource_id: str) -> str:
-    segments = [segment for segment in resource_id.strip("/").casefold().split("/") if segment]
+    canonical_resource_id = _canonical_scope(resource_id)
+    segments = [segment for segment in canonical_resource_id.strip("/").split("/") if segment]
+    if len(segments) == 4 and segments[0] == "subscriptions" and segments[2] == "resourcegroups":
+        return "microsoft.resources/resourcegroups"
     if len(segments) >= 5 and segments[0] == "subscriptions":
         initial_provider_index = 4 if segments[2] == "resourcegroups" else 2
     elif segments and segments[0] == "providers":
@@ -120,29 +671,812 @@ def _resource_type(resource_id: str) -> str:
     return "/".join((namespace, *type_segments))
 
 
+def _is_unsupported_authorization_or_imperative_type(resource_type: str) -> bool:
+    type_segments = frozenset(resource_type.split("/"))
+    return (
+        resource_type.startswith(_UNSUPPORTED_MUTATION_PREFIXES)
+        or any(
+            resource_type == authorization_type
+            or resource_type.startswith(authorization_type + "/")
+            for authorization_type in _UNSUPPORTED_AUTHORIZATION_RESOURCE_TYPES
+        )
+        or bool(type_segments & _UNSUPPORTED_IDENTITY_CREDENTIAL_TYPE_SEGMENTS)
+        or any(
+            resource_type == imperative_type or resource_type.startswith(imperative_type + "/")
+            for imperative_type in _UNSUPPORTED_IMPERATIVE_TYPES
+        )
+    )
+
+
 def _reject_json_constant(value: str) -> None:
     raise PreflightInputError(f"invalid JSON constant: {value}")
 
 
+def _parse_json_integer(value: str) -> int:
+    digits = value.removeprefix("-")
+    if len(digits) > MAX_JSON_INTEGER_DIGITS:
+        raise PreflightInputError(f"JSON integer exceeds {MAX_JSON_INTEGER_DIGITS} digits")
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise PreflightInputError("JSON integer is invalid") from exc
+
+
+def _parse_json_decimal(value: str) -> Decimal:
+    digits = sum(character.isdigit() for character in value)
+    try:
+        parsed = Decimal(value)
+    except InvalidOperation as exc:
+        raise PreflightInputError("JSON decimal is invalid") from exc
+    exponent = parsed.as_tuple().exponent
+    if (
+        digits > MAX_JSON_DECIMAL_DIGITS
+        or not parsed.is_finite()
+        or not isinstance(exponent, int)
+        or abs(exponent) > MAX_JSON_DECIMAL_EXPONENT
+    ):
+        raise PreflightInputError("JSON decimal exceeds its precision or exponent bound")
+    return parsed
+
+
+def _reject_ambiguous_object_pairs(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    casefolded_keys: set[str] = set()
+    for key, value in pairs:
+        if key in result:
+            raise PreflightInputError("JSON object contains a duplicate key")
+        casefolded = key.casefold()
+        if casefolded in casefolded_keys:
+            raise PreflightInputError("JSON object contains a case-insensitive key collision")
+        if key.lower() != casefolded:
+            raise PreflightInputError("JSON object key has ambiguous Unicode case folding")
+        if _contains_non_ascii_case_alias(key):
+            raise PreflightInputError("JSON object key contains a non-ASCII case alias")
+        result[key] = value
+        casefolded_keys.add(casefolded)
+    return result
+
+
 def _canonical_role_key(value: str) -> str:
-    normalized = _normalized(value).rsplit("/", 1)[-1]
+    normalized = _normalized_ascii_token(
+        value,
+        field_name="roleDefinitionName",
+    ).rsplit("/", 1)[-1]
     return _ROLE_ID_TO_NAME.get(normalized, normalized)
 
 
+def _contains_non_ascii_case_alias(value: str) -> bool:
+    return any(
+        not character.isascii() and (character.lower().isascii() or character.casefold().isascii())
+        for character in value
+    )
+
+
+def _canonical_role_id(value: str) -> str:
+    stripped = value.strip()
+    if not stripped.isascii():
+        raise PreflightInputError("roleDefinitionId contains non-ASCII characters")
+    normalized = stripped.lower()
+    if "/" not in normalized:
+        if _GUID.fullmatch(normalized) is None:
+            raise PreflightInputError("roleDefinitionId must end in a role GUID")
+        return normalized
+    canonical = _canonical_scope(stripped)
+    segments = canonical.strip("/").split("/")
+    if (
+        len(segments) < 4
+        or segments[-4] != "providers"
+        or segments[-3] != "microsoft.authorization"
+        or segments[-2] != "roledefinitions"
+        or _GUID.fullmatch(segments[-1]) is None
+    ):
+        raise PreflightInputError(
+            "roleDefinitionId must identify a Microsoft.Authorization role definition"
+        )
+    return segments[-1]
+
+
+def _property_path_tokens(value: str) -> tuple[PropertyPathToken, ...]:
+    if len(value) > MAX_PROPERTY_PATH_LENGTH:
+        raise PreflightInputError(f"property path exceeds {MAX_PROPERTY_PATH_LENGTH} characters")
+    normalized = value.lower()
+    if normalized != value.casefold():
+        raise PreflightInputError("property path has ambiguous Unicode case folding")
+    if _contains_non_ascii_case_alias(value):
+        raise PreflightInputError("property path contains a non-ASCII case alias")
+    if value in _RESOURCE_ROOT_ALIASES:
+        return ()
+    if not value.isascii():
+        raise PreflightInputError("property path must use ASCII")
+    prefix = f"{_RESOURCE_ROOT_PATH}."
+    if normalized.startswith(_RESOURCE_ROOT_PATH):
+        if not value.startswith(prefix):
+            raise PreflightInputError("property path has an unsupported resource-root suffix")
+        normalized = normalized.removeprefix(prefix)
+    if not normalized:
+        raise PreflightInputError("property path is empty")
+    tokens: list[PropertyPathToken] = []
+    for component in normalized.split("."):
+        match = _PROPERTY_COMPONENT.fullmatch(component)
+        if match is None:
+            raise PreflightInputError(
+                "property path must use dotted ASCII names and canonical numeric indexes"
+            )
+        tokens.append(match.group("name"))
+        tokens.extend(
+            int(index.group(1)) for index in _PROPERTY_INDEX.finditer(match.group("indexes"))
+        )
+    return tuple(tokens)
+
+
+def _format_property_path(tokens: Sequence[PropertyPathToken]) -> str:
+    if not tokens:
+        return _RESOURCE_ROOT_PATH
+    components: list[str] = []
+    for token in tokens:
+        if isinstance(token, str):
+            components.append(token)
+        elif not components:
+            raise PreflightInputError("property path cannot start with an array index")
+        else:
+            components[-1] += f"[{token}]"
+    path = ".".join(components)
+    if len(path) > MAX_PROPERTY_PATH_LENGTH:
+        raise PreflightInputError(f"property path exceeds {MAX_PROPERTY_PATH_LENGTH} characters")
+    return path
+
+
 def _canonical_property_path(value: str) -> str:
-    normalized = value.casefold()
-    prefix = "<resource>."
-    return normalized.removeprefix(prefix) if normalized.startswith(prefix) else normalized
+    return _format_property_path(_property_path_tokens(value))
+
+
+def _accumulated_property_path(
+    parent_path: str,
+    own_path: str,
+    *,
+    budget: _PropertyPathBudget,
+) -> str:
+    if parent_path:
+        if len(parent_path) + len(own_path) + 1 > MAX_PROPERTY_PATH_LENGTH:
+            raise PreflightInputError(
+                f"property path exceeds {MAX_PROPERTY_PATH_LENGTH} characters"
+            )
+        raw_path = f"{parent_path}.{own_path}"
+    else:
+        raw_path = own_path
+    canonical_path = _canonical_property_path(raw_path)
+    budget.charge(canonical_path)
+    return canonical_path
+
+
+def _property_path_contains(ancestor: str, descendant: str) -> bool:
+    ancestor_tokens = _property_path_tokens(ancestor)
+    descendant_tokens = _property_path_tokens(descendant)
+    return descendant_tokens[: len(ancestor_tokens)] == ancestor_tokens
+
+
+def _canonical_scope(value: str) -> str:
+    stripped = value.strip()
+    if not stripped.isascii():
+        raise PreflightInputError("scope contains non-ASCII characters")
+    normalized = stripped.lower()
+    canonical = normalized.rstrip("/") or "/"
+    if (
+        not canonical.startswith("/")
+        or "//" in canonical
+        or any(character in canonical for character in ("\\", "?", "#", "%"))
+    ):
+        raise PreflightInputError("scope must be a canonical ARM scope")
+    if canonical == "/":
+        return canonical
+    segments = canonical[1:].split("/")
+    if any(
+        not segment or segment in {".", ".."} or segment != segment.strip() for segment in segments
+    ):
+        raise PreflightInputError("scope must be a canonical ARM scope")
+    if segments[0] == "subscriptions":
+        if len(segments) < 2 or _GUID.fullmatch(segments[1]) is None:
+            raise PreflightInputError("scope must contain a valid subscription ID")
+        if len(segments) == 2:
+            return canonical
+        if segments[2] == "resourcegroups":
+            if len(segments) < 4:
+                raise PreflightInputError("resource-group scope is incomplete")
+            if len(segments) == 4:
+                return canonical
+            provider_index = 4
+        elif segments[2] == "providers":
+            provider_index = 2
+        else:
+            raise PreflightInputError("scope has an unsupported subscription boundary")
+    elif segments[0] == "providers":
+        provider_index = 0
+    else:
+        raise PreflightInputError("scope has an unsupported ARM boundary")
+    index = provider_index
+    while index < len(segments):
+        if segments[index] != "providers" or index + 3 >= len(segments):
+            raise PreflightInputError("scope has an incomplete provider boundary")
+        index += 2
+        resource_pairs = 0
+        while index < len(segments) and segments[index] != "providers":
+            if index + 1 >= len(segments) or segments[index + 1] == "providers":
+                raise PreflightInputError("scope has an incomplete resource boundary")
+            resource_pairs += 1
+            index += 2
+        if resource_pairs == 0:
+            raise PreflightInputError("scope has an incomplete provider boundary")
+    return canonical
+
+
+def _canonical_guid(value: object, *, field_name: str) -> str:
+    guid = _normalized(
+        _require_string(
+            value,
+            field_name=field_name,
+            maximum_length=64,
+        )
+    )
+    if _GUID.fullmatch(guid) is None:
+        raise PreflightInputError(f"{field_name} must be a GUID")
+    return guid
+
+
+def _canonical_workload_principal_id(value: object, *, field_name: str) -> str:
+    principal_id = _canonical_guid(
+        value,
+        field_name=field_name,
+    )
+    if principal_id == _ALL_PRINCIPALS_ID:
+        raise PreflightInputError(
+            f"{field_name} must not use the All Principals zero GUID as a workload identity"
+        )
+    return principal_id
+
+
+def _normalized_workload_principal_id(value: object, *, field_name: str) -> str:
+    principal_id = _normalized(
+        _require_string(
+            value,
+            field_name=field_name,
+        )
+    )
+    if principal_id == _ALL_PRINCIPALS_ID:
+        raise PreflightInputError(
+            f"{field_name} must not use the All Principals zero GUID as a workload identity"
+        )
+    return principal_id
+
+
+def _length_prefixed(tag: bytes, payload: bytes) -> bytes:
+    return tag + str(len(payload)).encode("ascii") + b":" + payload
+
+
+def _canonical_json_bytes(value: object) -> bytes:
+    if value is None:
+        return b"n;"
+    if type(value) is bool:
+        return b"b1;" if value else b"b0;"
+    if type(value) is int:
+        return b"i" + str(value).encode("ascii") + b";"
+    if isinstance(value, Decimal):
+        if not value.is_finite():
+            raise PreflightInputError("JSON decimal must be finite")
+        decimal_tuple = value.as_tuple()
+        if not isinstance(decimal_tuple.exponent, int):
+            raise PreflightInputError("JSON decimal exponent is invalid")
+        digits = "".join(str(digit) for digit in decimal_tuple.digits) or "0"
+        payload = f"{decimal_tuple.sign}:{decimal_tuple.exponent}:{digits}".encode("ascii")
+        return _length_prefixed(b"d", payload)
+    if type(value) is str:
+        return _length_prefixed(
+            b"s",
+            _strict_utf8_bytes(value, field_name="canonical JSON string"),
+        )
+    if isinstance(value, list):
+        payload = b"".join(_canonical_json_bytes(item) for item in value)
+        return b"l" + str(len(value)).encode("ascii") + b":" + payload
+    if isinstance(value, dict) and all(type(key) is str for key in value):
+        payload = b"".join(
+            _canonical_json_bytes(key) + _canonical_json_bytes(value[key]) for key in sorted(value)
+        )
+        return b"o" + str(len(value)).encode("ascii") + b":" + payload
+    raise PreflightInputError("canonical JSON contains an unsupported value")
+
+
+def _canonical_json_digest(value: object) -> str:
+    serialized = _canonical_json_bytes(value)
+    return "sha256:" + hashlib.sha256(serialized).hexdigest()
+
+
+def _canonical_sha256_digest(
+    value: object,
+    *,
+    field_name: str,
+) -> str:
+    digest = _normalized(
+        _require_string(
+            value,
+            field_name=field_name,
+            maximum_length=71,
+        )
+    )
+    if re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
+        raise PreflightInputError(f"{field_name} must be a sha256 digest")
+    return digest
+
+
+def _parse_utc_timestamp(
+    value: object,
+    *,
+    field_name: str,
+) -> datetime:
+    timestamp = _require_string(
+        value,
+        field_name=field_name,
+        maximum_length=64,
+    )
+    try:
+        parsed = datetime.fromisoformat(
+            timestamp.removesuffix("Z") + ("+00:00" if timestamp.endswith("Z") else "")
+        )
+    except ValueError as exc:
+        raise PreflightInputError(f"{field_name} must be an ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
+        raise PreflightInputError(f"{field_name} must use UTC")
+    return parsed.astimezone(UTC)
+
+
+def _current_utc(now: datetime | None) -> datetime:
+    if now is None:
+        return datetime.now(UTC)
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise PreflightInputError("current time must be timezone-aware")
+    return now.astimezone(UTC)
+
+
+def _system_utc_clock() -> datetime:
+    return datetime.now(UTC)
+
+
+def _fixed_utc_clock(now: datetime) -> _UtcClock:
+    fixed_now = _current_utc(now)
+
+    def read() -> datetime:
+        return fixed_now
+
+    return read
+
+
+def _validate_attestation_window(
+    *,
+    collected_at: datetime,
+    expires_at: datetime,
+    now: datetime,
+) -> None:
+    if expires_at <= collected_at or expires_at - collected_at > MAX_ATTESTATION_LIFETIME:
+        raise PreflightInputError("attestation validity window is invalid or too long")
+    if collected_at - now > MAX_ATTESTATION_CLOCK_SKEW:
+        raise PreflightInputError("attestation collectedAt is in the future")
+    if now >= expires_at:
+        raise PreflightInputError("attestation has expired")
+
+
+def _parse_deployment_target(value: object) -> DeploymentTarget:
+    target = _mapping(
+        value,
+        field_name="manifest deploymentTarget",
+    )
+    if {key.casefold() for key in target} != {
+        "resourcegroupids",
+        "subscriptionid",
+        "tenantid",
+    }:
+        raise PreflightInputError("manifest deploymentTarget has an invalid envelope")
+    tenant_id = _canonical_guid(
+        _get_case_insensitive(target, "tenantId"),
+        field_name="manifest deploymentTarget tenantId",
+    )
+    subscription_id = _canonical_guid(
+        _get_case_insensitive(target, "subscriptionId"),
+        field_name="manifest deploymentTarget subscriptionId",
+    )
+    resource_group_scopes: set[str] = set()
+    for raw_scope in _sequence(
+        _get_case_insensitive(target, "resourceGroupIds"),
+        field_name="manifest deploymentTarget resourceGroupIds",
+        maximum_items=MAX_POLICY_ITEMS,
+    ):
+        scope = _canonical_scope(
+            _require_string(
+                raw_scope,
+                field_name="manifest deploymentTarget resourceGroupId",
+            )
+        )
+        if (
+            _RESOURCE_GROUP_SCOPE.fullmatch(scope) is None
+            or _resource_group_subscription_id(scope) != subscription_id
+        ):
+            raise PreflightInputError(
+                "manifest deploymentTarget resourceGroupIds must belong to subscriptionId"
+            )
+        if scope in resource_group_scopes:
+            raise PreflightInputError(
+                "manifest deploymentTarget contains a duplicate resourceGroupId"
+            )
+        resource_group_scopes.add(scope)
+    if not resource_group_scopes:
+        raise PreflightInputError("manifest deploymentTarget resourceGroupIds must not be empty")
+    return DeploymentTarget(
+        tenant_id=tenant_id,
+        subscription_id=subscription_id,
+        resource_group_scopes=tuple(sorted(resource_group_scopes)),
+    )
+
+
+def _deployment_target_payload(target: DeploymentTarget) -> dict[str, object]:
+    return {
+        "tenantId": target.tenant_id,
+        "subscriptionId": target.subscription_id,
+        "resourceGroupIds": list(target.resource_group_scopes),
+    }
+
+
+def _parse_attestation_manifest(
+    value: object,
+    *,
+    expected_collection_run_id: str,
+    expected_deployment_execution_id: str,
+    expected_manifest_digest: str,
+    now: datetime,
+) -> AttestationManifest:
+    manifest = _mapping(
+        value,
+        field_name="attestation manifest",
+    )
+    if {key.casefold() for key in manifest} != _MANIFEST_FIELD_NAMES:
+        raise PreflightInputError("attestation manifest has an invalid envelope")
+    if (
+        _require_exact_ascii_token(
+            _get_case_insensitive(manifest, "schemaVersion"),
+            field_name="manifest schemaVersion",
+            maximum_length=64,
+        )
+        != _MANIFEST_SCHEMA_VERSION
+    ):
+        raise PreflightInputError("attestation manifest schemaVersion is unsupported")
+    collection_run_id = _canonical_guid(
+        _get_case_insensitive(manifest, "collectionRunId"),
+        field_name="manifest collectionRunId",
+    )
+    if collection_run_id != _canonical_guid(
+        expected_collection_run_id,
+        field_name="expected collectionRunId",
+    ):
+        raise PreflightInputError("manifest collectionRunId does not match the reviewed run")
+    deployment_execution_id = _canonical_guid(
+        _get_case_insensitive(manifest, "deploymentExecutionId"),
+        field_name="manifest deploymentExecutionId",
+    )
+    if deployment_execution_id != _canonical_guid(
+        expected_deployment_execution_id,
+        field_name="expected deploymentExecutionId",
+    ):
+        raise PreflightInputError(
+            "manifest deploymentExecutionId does not match the immutable deployment execution"
+        )
+    deployment_target = _parse_deployment_target(
+        _get_case_insensitive(manifest, "deploymentTarget")
+    )
+    collected_at = _parse_utc_timestamp(
+        _get_case_insensitive(manifest, "collectedAt"),
+        field_name="manifest collectedAt",
+    )
+    expires_at = _parse_utc_timestamp(
+        _get_case_insensitive(manifest, "expiresAt"),
+        field_name="manifest expiresAt",
+    )
+    _validate_attestation_window(
+        collected_at=collected_at,
+        expires_at=expires_at,
+        now=now,
+    )
+    digest = _canonical_json_digest(manifest)
+    if digest != _canonical_sha256_digest(
+        expected_manifest_digest,
+        field_name="reviewed attestation manifest digest",
+    ):
+        raise PreflightInputError("attestation manifest digest does not match the reviewed digest")
+    bindings = _mapping(
+        _get_case_insensitive(manifest, "bindings"),
+        field_name="manifest bindings",
+    )
+    if set(bindings) != _MANIFEST_BINDING_NAMES:
+        raise PreflightInputError("attestation manifest bindings are incomplete")
+    normalized_bindings = {
+        binding_name: _canonical_sha256_digest(
+            _get_case_insensitive(bindings, binding_name),
+            field_name=f"manifest {binding_name}",
+        )
+        for binding_name in _MANIFEST_BINDING_NAMES
+    }
+    return AttestationManifest(
+        collection_run_id=collection_run_id,
+        deployment_execution_id=deployment_execution_id,
+        deployment_target=deployment_target,
+        collected_at=collected_at,
+        expires_at=expires_at,
+        bindings=normalized_bindings,
+        digest=digest,
+    )
+
+
+def _validate_artifact_attestation(
+    value: object,
+    *,
+    artifact_kind: PreflightKind,
+    manifest: AttestationManifest,
+    expected_binding_names: frozenset[str],
+) -> None:
+    attestation = _mapping(
+        value,
+        field_name=f"{artifact_kind} attestation",
+    )
+    if (
+        _normalized_ascii_token(
+            _get_case_insensitive(attestation, "artifactKind"),
+            field_name="attestation artifactKind",
+            maximum_length=32,
+        )
+        != artifact_kind
+    ):
+        raise PreflightInputError("attestation artifactKind does not match the check")
+    if (
+        _canonical_guid(
+            _get_case_insensitive(attestation, "collectionRunId"),
+            field_name="attestation collectionRunId",
+        )
+        != manifest.collection_run_id
+        or _parse_utc_timestamp(
+            _get_case_insensitive(attestation, "collectedAt"),
+            field_name="attestation collectedAt",
+        )
+        != manifest.collected_at
+        or _parse_utc_timestamp(
+            _get_case_insensitive(attestation, "expiresAt"),
+            field_name="attestation expiresAt",
+        )
+        != manifest.expires_at
+        or _canonical_guid(
+            _get_case_insensitive(attestation, "deploymentExecutionId"),
+            field_name="attestation deploymentExecutionId",
+        )
+        != manifest.deployment_execution_id
+    ):
+        raise PreflightInputError("artifact attestation does not match the reviewed manifest")
+    if (
+        _canonical_sha256_digest(
+            _get_case_insensitive(attestation, "manifestDigest"),
+            field_name="attestation manifestDigest",
+        )
+        != manifest.digest
+    ):
+        raise PreflightInputError("artifact attestation manifestDigest does not match")
+    bindings = _mapping(
+        _get_case_insensitive(attestation, "bindings"),
+        field_name="attestation bindings",
+    )
+    if set(bindings) != expected_binding_names:
+        raise PreflightInputError("artifact attestation bindings do not match the manifest subset")
+    for binding_name in expected_binding_names:
+        if (
+            _canonical_sha256_digest(
+                _get_case_insensitive(bindings, binding_name),
+                field_name=f"attestation {binding_name}",
+            )
+            != manifest.bindings[binding_name]
+        ):
+            raise PreflightInputError(f"attestation {binding_name} does not match the manifest")
+
+
+def _canonical_management_group_scope(
+    value: object,
+    *,
+    field_name: str,
+) -> str:
+    scope = _canonical_scope(
+        _require_string(
+            value,
+            field_name=field_name,
+        )
+    )
+    if _MANAGEMENT_GROUP_SCOPE.fullmatch(scope) is None:
+        raise PreflightInputError(f"{field_name} must be a management-group scope")
+    return scope
+
+
+def _require_http_success(value: object, *, field_name: str) -> None:
+    if type(value) is not int:
+        raise PreflightInputError(f"{field_name} statusCode must be an integer")
+    if value != 200:
+        raise PreflightInputError(f"{field_name} returned HTTP {value}")
+
+
+def _resource_group_subscription_id(scope: str) -> str:
+    segments = scope.strip("/").split("/")
+    if len(segments) != 4 or segments[0] != "subscriptions" or segments[2] != "resourcegroups":
+        raise PreflightInputError("resourceGroupId must be a resource-group scope")
+    return segments[1]
+
+
+def _allow_change_binding(
+    values: frozenset[str],
+) -> tuple[frozenset[str], str]:
+    records: list[dict[str, str]] = []
+    canonical_values: set[str] = set()
+    for value in values:
+        raw_value = _require_string(
+            value,
+            field_name="allow-change resource ID",
+        )
+        if not raw_value.isascii():
+            raise PreflightInputError("allow-change resource ID contains non-ASCII characters")
+        canonical_value = _canonical_scope(raw_value)
+        records.append(
+            {
+                "canonical": canonical_value,
+                "raw": raw_value,
+            }
+        )
+        canonical_values.add(canonical_value)
+    records.sort(key=lambda item: (item["raw"], item["canonical"]))
+    return (
+        frozenset(canonical_values),
+        _canonical_json_digest({"allowChangeIds": records}),
+    )
 
 
 def _scope_contains(ancestor: str, descendant: str) -> bool:
-    normalized_ancestor = ancestor.rstrip("/") or "/"
-    normalized_descendant = descendant.rstrip("/") or "/"
-    return (
-        normalized_ancestor == "/"
-        or normalized_descendant == normalized_ancestor
-        or normalized_descendant.startswith(normalized_ancestor + "/")
+    return ancestor == "/" or descendant == ancestor or descendant.startswith(ancestor + "/")
+
+
+def _validate_deployment_resource_id(
+    resource_id: str,
+    *,
+    deployment_target: DeploymentTarget,
+    field_name: str,
+) -> str:
+    canonical_resource_id = _canonical_scope(resource_id)
+    subscription_prefix = f"/subscriptions/{deployment_target.subscription_id}/"
+    if not canonical_resource_id.startswith(subscription_prefix):
+        raise PreflightInputError(f"{field_name} is outside the reviewed deployment subscription")
+    if not any(
+        _scope_contains(resource_group_scope, canonical_resource_id)
+        for resource_group_scope in deployment_target.resource_group_scopes
+    ):
+        raise PreflightInputError(
+            f"{field_name} is outside the reviewed deployment resource-group boundary"
+        )
+    return canonical_resource_id
+
+
+def _validate_rbac_deployment_target(
+    collection: RbacCollection,
+    *,
+    deployment_target: DeploymentTarget,
+) -> None:
+    if (
+        collection.tenant_id != deployment_target.tenant_id
+        or collection.subscription_id != deployment_target.subscription_id
+        or collection.resource_group_scope not in deployment_target.resource_group_scopes
+    ):
+        raise PreflightInputError(
+            "RBAC evidence target does not match the reviewed manifest deploymentTarget"
+        )
+
+
+def _validate_what_if_snapshot_ids(
+    change: dict[str, Any],
+    *,
+    canonical_resource_id: str,
+    deployment_target: DeploymentTarget | None,
+) -> None:
+    for snapshot_name in ("before", "after"):
+        if not _has_case_insensitive(change, snapshot_name):
+            continue
+        snapshot = _get_case_insensitive(change, snapshot_name)
+        if not isinstance(snapshot, dict) or not any(
+            _has_case_insensitive(snapshot, field_name) for field_name in ("id", "name", "type")
+        ):
+            continue
+        _validate_resource_snapshot(
+            snapshot,
+            resource_id=canonical_resource_id,
+            field_name=f"{snapshot_name} snapshot",
+            deployment_target=deployment_target,
+        )
+
+
+def _minimal_scope_prefixes(
+    values: Sequence[str],
+    *,
+    budget: _SeparationRuleWorkBudget,
+) -> tuple[str, ...]:
+    scopes_with_segments: list[tuple[tuple[str, ...], str]] = []
+    for value in set(values):
+        segments = () if value == "/" else tuple(value.strip("/").split("/"))
+        budget.charge(1 + len(segments))
+        scopes_with_segments.append((segments, value))
+    scopes_with_segments.sort(key=lambda item: item[0])
+    minimal: list[str] = []
+    for _, value in scopes_with_segments:
+        if minimal:
+            budget.charge()
+            if _scope_contains(minimal[-1], value):
+                continue
+        minimal.append(value)
+    return tuple(minimal)
+
+
+def _separation_scope_matches(
+    assignment_scope: str,
+    forbidden_scope_prefix: str,
+    *,
+    collection: RbacCollection | None,
+) -> bool:
+    if _scope_contains(
+        assignment_scope,
+        forbidden_scope_prefix,
+    ) or _scope_contains(
+        forbidden_scope_prefix,
+        assignment_scope,
+    ):
+        return True
+    if collection is None:
+        return False
+    assignment_is_management_group = assignment_scope in collection.management_group_ancestry
+    forbidden_is_management_group = forbidden_scope_prefix in collection.management_group_ancestry
+    assignment_is_subscription_descendant = _scope_contains(
+        collection.subscription_scope,
+        assignment_scope,
     )
+    forbidden_is_subscription_descendant = _scope_contains(
+        collection.subscription_scope,
+        forbidden_scope_prefix,
+    )
+    return (
+        assignment_is_management_group
+        and (forbidden_is_management_group or forbidden_is_subscription_descendant)
+    ) or (
+        forbidden_is_management_group
+        and (assignment_is_management_group or assignment_is_subscription_descendant)
+    )
+
+
+def _allowance_matches(
+    allowance: BroadAssignmentAllowance,
+    assignment: BroadAssignmentAllowance,
+) -> bool:
+    return (
+        allowance.principal_id == assignment.principal_id
+        and allowance.effective_principal_id == assignment.effective_principal_id
+        and (not allowance.principal_type or allowance.principal_type == assignment.principal_type)
+        and allowance.role_name == assignment.role_name
+        and allowance.scope == assignment.scope
+        and allowance.condition == assignment.condition
+        and allowance.condition_version == assignment.condition_version
+        and (
+            not allowance.role_definition_id
+            or allowance.role_definition_id == assignment.role_definition_id
+        )
+    )
+
+
+def _has_case_insensitive(mapping: dict[str, Any], name: str) -> bool:
+    expected = name.lower()
+    return any(key.lower() == expected for key in mapping)
 
 
 def _require_string(
@@ -151,7 +1485,12 @@ def _require_string(
     field_name: str,
     maximum_length: int = 4096,
 ) -> str:
-    if type(value) is not str or not value.strip() or len(value) > maximum_length:
+    if (
+        type(value) is not str
+        or not value.strip()
+        or len(value) > maximum_length
+        or not value.isprintable()
+    ):
         raise PreflightInputError(f"{field_name} must be a bounded string")
     return value.strip()
 
@@ -163,24 +1502,66 @@ def load_json_file(
 ) -> object:
     if type(maximum_bytes) is not int or maximum_bytes < 1:
         raise ValueError("maximum_bytes must be a positive integer")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOINHERIT", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
     try:
-        size = path.stat().st_size
+        descriptor = os.open(path, flags)
     except OSError as exc:
         raise PreflightInputError(f"cannot read {path}") from exc
-    if size < 1 or size > maximum_bytes:
+    try:
+        initial_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(initial_stat.st_mode):
+            raise PreflightInputError(f"cannot read {path}")
+        payload = bytearray()
+        while len(payload) <= maximum_bytes:
+            remaining = maximum_bytes + 1 - len(payload)
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            payload.extend(chunk)
+        final_stat = os.fstat(descriptor)
+    except PreflightInputError:
+        raise
+    except OSError as exc:
+        raise PreflightInputError(f"cannot read {path}") from exc
+    finally:
+        with suppress(OSError):
+            os.close(descriptor)
+    if len(payload) < 1 or len(payload) > maximum_bytes:
         raise PreflightInputError(f"{path} must contain between 1 and {maximum_bytes} bytes")
+    if (
+        initial_stat.st_dev != final_stat.st_dev
+        or initial_stat.st_ino != final_stat.st_ino
+        or initial_stat.st_size != final_stat.st_size
+        or initial_stat.st_mtime_ns != final_stat.st_mtime_ns
+        or initial_stat.st_ctime_ns != final_stat.st_ctime_ns
+        or final_stat.st_size != len(payload)
+    ):
+        raise PreflightInputError(f"{path} changed while being read")
     try:
         document = json.loads(
-            path.read_text(encoding="utf-8"),
+            payload.decode("utf-8", errors="strict"),
             parse_constant=_reject_json_constant,
+            parse_float=_parse_json_decimal,
+            parse_int=_parse_json_integer,
+            object_pairs_hook=_reject_ambiguous_object_pairs,
         )
         _validate_json_shape(document)
         return document
+    except PreflightInputError:
+        raise
     except (
         OSError,
         UnicodeDecodeError,
         json.JSONDecodeError,
         RecursionError,
+        ValueError,
     ) as exc:
         raise PreflightInputError(f"{path} is not valid UTF-8 JSON") from exc
 
@@ -194,17 +1575,29 @@ def _validate_json_shape(value: object) -> None:
         if depth > MAX_JSON_DEPTH or nodes > MAX_JSON_NODES:
             raise PreflightInputError("JSON structure exceeds depth or node bounds")
         if isinstance(item, dict):
-            if any(type(key) is not str or len(key) > 4096 for key in item):
-                raise PreflightInputError("JSON object keys are invalid")
+            for key in item:
+                if type(key) is not str or len(key) > 4096 or not key.isprintable():
+                    raise PreflightInputError("JSON object keys are invalid")
+                _strict_utf8_bytes(key, field_name="JSON object key")
+            lowered_keys = [key.lower() for key in item]
+            if any(key.lower() != key.casefold() for key in item):
+                raise PreflightInputError("JSON object key has ambiguous Unicode case folding")
+            if any(_contains_non_ascii_case_alias(key) for key in item):
+                raise PreflightInputError("JSON object key contains a non-ASCII case alias")
+            if len(lowered_keys) != len(set(lowered_keys)):
+                raise PreflightInputError("JSON object contains a case-insensitive key collision")
             stack.extend((child, depth + 1) for child in item.values())
         elif isinstance(item, list):
             stack.extend((child, depth + 1) for child in item)
         elif isinstance(item, str):
             if len(item) > MAX_INPUT_BYTES:
                 raise PreflightInputError("JSON string exceeds its bound")
-        elif isinstance(item, float):
-            if not math.isfinite(item):
+            _strict_utf8_bytes(item, field_name="JSON string")
+        elif isinstance(item, Decimal):
+            if not item.is_finite():
                 raise PreflightInputError("JSON contains a non-finite number")
+        elif isinstance(item, float):
+            raise PreflightInputError("JSON floating-point values must be parsed exactly")
         elif item is not None and not isinstance(item, (bool, int)):
             raise PreflightInputError("JSON contains an unsupported value")
 
@@ -229,34 +1622,344 @@ def _sequence(
 
 
 def _get_case_insensitive(mapping: dict[str, Any], name: str) -> object:
-    expected = name.casefold()
+    expected = name.lower()
     for key, value in mapping.items():
-        if key.casefold() == expected:
+        if key.lower() == expected:
             return value
     return None
 
 
-def _what_if_changes(document: object) -> list[object]:
-    _validate_json_shape(document)
-    root = _mapping(document, field_name="what-if document")
-    status = _normalized(
-        _require_string(
-            _get_case_insensitive(root, "status"),
-            field_name="status",
+def _budgeted_case_insensitive_lookup(
+    mapping: dict[str, Any],
+    name: str,
+    *,
+    budget: _PropertyPathBudget,
+) -> tuple[bool, object]:
+    budget.charge_lookup(len(mapping) + 1)
+    expected = name.lower()
+    for key, value in mapping.items():
+        if key.lower() == expected:
+            return True, value
+    return False, None
+
+
+def _require_literal_subscription_tenant(properties: dict[str, Any]) -> object:
+    tenant_keys = [key for key in properties if key.casefold() in {"tenant", "tenantid"}]
+    if tenant_keys != ["tenant"]:
+        raise PreflightInputError(
+            "ARM subscription properties must contain only the literal tenant key"
+        )
+    return properties["tenant"]
+
+
+def _require_exact_cli_token(
+    value: object,
+    *,
+    field_name: str,
+    maximum_length: int = 4096,
+) -> str:
+    if type(value) is not str or value != value.strip():
+        raise PreflightInputError(f"{field_name} must not contain surrounding whitespace")
+    return _require_string(
+        value,
+        field_name=field_name,
+        maximum_length=maximum_length,
+    )
+
+
+def _validate_attested_relative_file(
+    value: str,
+    *,
+    field_name: str,
+    suffix: str,
+) -> None:
+    normalized = value.replace("\\", "/")
+    if (
+        value.startswith("-")
+        or normalized.startswith("/")
+        or "://" in normalized
+        or ":" in normalized
+        or "?" in normalized
+        or "#" in normalized
+    ):
+        raise PreflightInputError(f"{field_name} is not a canonical relative file")
+    components = normalized.split("/")
+    if any(
+        component in {"", ".", ".."} or _ATTESTED_FILE_COMPONENT.fullmatch(component) is None
+        for component in components
+    ) or not components[-1].casefold().endswith(suffix):
+        raise PreflightInputError(f"{field_name} is not a canonical relative file")
+
+
+def _validate_what_if_request(
+    value: object,
+    *,
+    deployment_target: DeploymentTarget,
+) -> None:
+    request = _mapping(
+        value,
+        field_name="what-if request",
+    )
+    if {key.casefold() for key in request} != {"arguments", "command"}:
+        raise PreflightInputError("what-if request has an invalid envelope")
+    command = [
+        _require_exact_cli_token(
+            token,
+            field_name="what-if command token",
             maximum_length=64,
         )
+        for token in _sequence(
+            _get_case_insensitive(request, "command"),
+            field_name="what-if command",
+            maximum_items=4,
+        )
+    ]
+    if any(not token.isascii() for token in command):
+        raise PreflightInputError("what-if command tokens must use ASCII")
+    if len(command) != 4 or command[:2] != ["az", "deployment"] or command[3] != "what-if":
+        raise PreflightInputError("what-if command must use az deployment <scope> what-if")
+    deployment_scope = command[2]
+    if deployment_scope not in {"group", "sub"}:
+        raise PreflightInputError("what-if command scope is unsupported")
+
+    arguments = [
+        _require_exact_cli_token(
+            argument,
+            field_name="what-if command argument",
+            maximum_length=4096,
+        )
+        for argument in _sequence(
+            _get_case_insensitive(request, "arguments"),
+            field_name="what-if command arguments",
+            maximum_items=32,
+        )
+    ]
+    if any(not argument.isascii() for argument in arguments):
+        raise PreflightInputError("what-if command arguments must use ASCII")
+    allowed_options = {
+        "--location",
+        "--name",
+        "--no-prompt",
+        "--output",
+        "--parameters",
+        "--resource-group",
+        "--result-format",
+        "--subscription",
+        "--template-file",
+        "--validation-level",
+    }
+    switch_options = {"--no-pretty-print"}
+    parsed: dict[str, str] = {}
+    switches: set[str] = set()
+    index = 0
+    while index < len(arguments):
+        option = arguments[index]
+        if option in switch_options:
+            if option in switches:
+                raise PreflightInputError("what-if command contains a duplicate switch")
+            switches.add(option)
+            index += 1
+            continue
+        if (
+            option not in allowed_options
+            or "=" in option
+            or option in parsed
+            or index + 1 >= len(arguments)
+        ):
+            raise PreflightInputError(
+                "what-if command contains an unsupported, duplicate, or incomplete option"
+            )
+        option_value = arguments[index + 1]
+        if option_value.startswith("-"):
+            raise PreflightInputError("what-if command option is missing its value")
+        parsed[option] = option_value
+        index += 2
+    required_options = {
+        "--name",
+        "--output",
+        "--parameters",
+        "--result-format",
+        "--subscription",
+        "--validation-level",
+        "--no-prompt",
+        "--location" if deployment_scope == "sub" else "--resource-group",
+    }
+    parameters_value = parsed.get("--parameters", "")
+    json_parameters = parameters_value.startswith("@")
+    if json_parameters:
+        required_options.add("--template-file")
+    if set(parsed) != required_options or switches != {"--no-pretty-print"}:
+        raise PreflightInputError("what-if command options are incomplete or unsupported")
+    if parsed["--subscription"] != deployment_target.subscription_id:
+        raise PreflightInputError("what-if command uses the wrong subscription")
+    if parsed["--result-format"] != "FullResourcePayloads":
+        raise PreflightInputError("what-if command requires FullResourcePayloads")
+    if parsed["--validation-level"] != "Provider":
+        raise PreflightInputError("what-if command requires full Provider validation")
+    if parsed["--no-prompt"] != "true":
+        raise PreflightInputError("what-if command requires exact --no-prompt true")
+    if parsed["--output"] != "json":
+        raise PreflightInputError("what-if command output must be exact json")
+    if _DEPLOYMENT_NAME.fullmatch(parsed["--name"]) is None:
+        raise PreflightInputError("what-if command deployment name is invalid")
+    if json_parameters:
+        parameters_file = parameters_value[1:]
+        if len(parameters_value) == 1 or not parameters_value.casefold().endswith(".json"):
+            raise PreflightInputError(
+                "what-if JSON parameters require one @file and one template file"
+            )
+        _validate_attested_relative_file(
+            parameters_file,
+            field_name="what-if JSON parameters file",
+            suffix=".json",
+        )
+        _validate_attested_relative_file(
+            parsed["--template-file"],
+            field_name="what-if template file",
+            suffix=".bicep",
+        )
+    elif not parameters_value.casefold().endswith(".bicepparam") or "--template-file" in parsed:
+        raise PreflightInputError(
+            "what-if bicepparam mode requires one direct .bicepparam path without --template-file"
+        )
+    else:
+        _validate_attested_relative_file(
+            parameters_value,
+            field_name="what-if bicepparam file",
+            suffix=".bicepparam",
+        )
+    if deployment_scope == "sub":
+        if re.fullmatch(r"[a-z0-9-]+", parsed["--location"]) is None:
+            raise PreflightInputError("what-if command location is not canonical")
+    else:
+        reviewed_resource_groups = {
+            scope.rsplit("/", 1)[-1] for scope in deployment_target.resource_group_scopes
+        }
+        if parsed["--resource-group"] not in reviewed_resource_groups:
+            raise PreflightInputError("what-if command resource group is outside deploymentTarget")
+
+
+def _reject_nonempty_what_if_diagnostics(document: object) -> None:
+    stack: list[object] = [document]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, dict):
+            for key, child in item.items():
+                if key.casefold() in {"diagnostics", "validationdiagnostics"}:
+                    if child is None or (isinstance(child, (dict, list, str)) and len(child) == 0):
+                        continue
+                    raise PreflightInputError(
+                        "what-if diagnostics must be absent or empty for the release gate"
+                    )
+                stack.append(child)
+        elif isinstance(item, list):
+            stack.extend(item)
+
+
+def _what_if_changes(
+    document: object,
+) -> tuple[list[object], list[object]]:
+    _validate_json_shape(document)
+    _reject_nonempty_what_if_diagnostics(document)
+    root = _mapping(document, field_name="what-if document")
+    status = _normalized_ascii_token(
+        _get_case_insensitive(root, "status"),
+        field_name="status",
+        maximum_length=64,
     )
     error = _get_case_insensitive(root, "error")
     if status != "succeeded" or (error is not None and error != {}):
         raise PreflightInputError("what-if operation did not succeed")
     properties = _get_case_insensitive(root, "properties")
-    container = _mapping(properties, field_name="properties") if properties is not None else root
+    if properties is not None:
+        if _has_case_insensitive(root, "changes") or _has_case_insensitive(
+            root,
+            "potentialChanges",
+        ):
+            raise PreflightInputError("what-if document contains mixed result envelopes")
+        container = _mapping(properties, field_name="properties")
+    else:
+        container = root
     changes = _get_case_insensitive(container, "changes")
-    return _sequence(
-        changes,
-        field_name="changes",
-        maximum_items=MAX_CHANGES,
+    potential_changes = _get_case_insensitive(
+        container,
+        "potentialChanges",
     )
+    return (
+        _sequence(
+            changes,
+            field_name="changes",
+            maximum_items=MAX_CHANGES,
+        ),
+        (
+            []
+            if potential_changes is None
+            else _sequence(
+                potential_changes,
+                field_name="potentialChanges",
+                maximum_items=MAX_CHANGES,
+            )
+        ),
+    )
+
+
+def _canonical_what_if_resource_rows(
+    changes: Sequence[object],
+    potential_changes: Sequence[object],
+    *,
+    deployment_target: DeploymentTarget | None,
+) -> tuple[tuple[_WhatIfResourceRow, ...], tuple[_WhatIfResourceRow, ...]]:
+    seen_resource_ids: dict[str, str] = {}
+
+    def parse_rows(
+        values: Sequence[object],
+        *,
+        row_kind: str,
+        resource_id_field_name: str,
+    ) -> tuple[_WhatIfResourceRow, ...]:
+        rows: list[_WhatIfResourceRow] = []
+        for raw_value in values:
+            value = _mapping(raw_value, field_name=row_kind)
+            resource_id = _require_string(
+                _get_case_insensitive(value, "resourceId"),
+                field_name=resource_id_field_name,
+            )
+            canonical_resource_id = (
+                _canonical_scope(resource_id)
+                if deployment_target is None
+                else _validate_deployment_resource_id(
+                    resource_id,
+                    deployment_target=deployment_target,
+                    field_name=resource_id_field_name,
+                )
+            )
+            previous_kind = seen_resource_ids.get(canonical_resource_id)
+            if previous_kind is not None:
+                raise PreflightInputError(
+                    "what-if result contains duplicate canonical resourceId "
+                    f"across {previous_kind} and {row_kind}"
+                )
+            seen_resource_ids[canonical_resource_id] = row_kind
+            rows.append(
+                _WhatIfResourceRow(
+                    value=value,
+                    resource_id=resource_id,
+                    canonical_resource_id=canonical_resource_id,
+                )
+            )
+        return tuple(rows)
+
+    parsed_changes = parse_rows(
+        changes,
+        row_kind="change",
+        resource_id_field_name="resourceId",
+    )
+    parsed_potential_changes = parse_rows(
+        potential_changes,
+        row_kind="potential change",
+        resource_id_field_name="potential change resourceId",
+    )
+    return parsed_changes, parsed_potential_changes
 
 
 def _delta_entries(change: dict[str, Any]) -> list[dict[str, Any]]:
@@ -273,8 +1976,128 @@ def _delta_entries(change: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
+def _is_property_name(value: str) -> bool:
+    return (
+        value.isascii()
+        and value.lower() == value.casefold()
+        and not _contains_non_ascii_case_alias(value)
+        and _PROPERTY_NAME.fullmatch(value) is not None
+    )
+
+
+def _property_child_path(
+    parent: str,
+    key: str,
+    *,
+    budget: _PropertyPathBudget,
+) -> str | None:
+    if not _is_property_name(key):
+        return None
+    path = _format_property_path((*_property_path_tokens(parent), key.lower()))
+    budget.charge(path)
+    return path
+
+
+def _property_index_path(
+    parent: str,
+    index: int,
+    *,
+    budget: _PropertyPathBudget,
+) -> str:
+    path = _format_property_path((*_property_path_tokens(parent), index))
+    budget.charge(path)
+    return path
+
+
+def _json_values_equal(left: object, right: object) -> bool:
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict) and isinstance(right, dict):
+        return left.keys() == right.keys() and all(
+            _json_values_equal(left[key], right[key]) for key in left
+        )
+    if isinstance(left, list) and isinstance(right, list):
+        return len(left) == len(right) and all(
+            _json_values_equal(left_item, right_item)
+            for left_item, right_item in zip(left, right, strict=True)
+        )
+    return left == right
+
+
+def _derive_snapshot_delta(
+    before: object,
+    after: object,
+    *,
+    root: str = "<resource>",
+    budget: _PropertyPathBudget,
+) -> list[tuple[str, object, str]]:
+    values: list[tuple[str, object, str]] = []
+    stack: list[tuple[object, object, str]] = [(before, after, root)]
+    while stack:
+        old_value, new_value, path = stack.pop()
+        if _json_values_equal(old_value, new_value):
+            continue
+        if isinstance(old_value, dict) and isinstance(new_value, dict):
+            keys = sorted(set(old_value) | set(new_value))
+            for key in reversed(keys):
+                child_path = _property_child_path(
+                    path,
+                    key,
+                    budget=budget,
+                )
+                if child_path is None:
+                    budget.charge(path)
+                    values.append((path, new_value.get(key), "modify"))
+                    continue
+                if key not in new_value:
+                    values.append((child_path, None, "delete"))
+                elif key not in old_value:
+                    child = new_value[key]
+                    values.append((child_path, child, "create"))
+                    if isinstance(child, (dict, list)):
+                        values.extend(
+                            _flatten_after(
+                                child,
+                                root=child_path,
+                                budget=budget,
+                            )
+                        )
+                else:
+                    stack.append(
+                        (
+                            old_value[key],
+                            new_value[key],
+                            child_path,
+                        )
+                    )
+            continue
+        values.append((path, new_value, "modify"))
+        if isinstance(new_value, (dict, list)):
+            values.extend(
+                _flatten_after(
+                    new_value,
+                    root=path,
+                    budget=budget,
+                )
+            )
+    return values
+
+
+def _is_meaningful_delta_candidate(path: str, value: object) -> bool:
+    canonical = _canonical_property_path(path)
+    root = re.split(r"[.\[]", canonical, maxsplit=1)[0]
+    return root not in _NON_EFFECTIVE_RESOURCE_METADATA_ROOTS and not (
+        canonical == "<resource>" and isinstance(value, (dict, list))
+    )
+
+
 def _walk_delta(
     items: list[dict[str, Any]],
+    *,
+    budget: _PropertyPathBudget,
+    snapshot_index: _SnapshotPairIndex | None = None,
+    preserve_evidence_for: frozenset[str] = frozenset(),
+    protected_evidence: _ProtectedPropertyEvidence | None = None,
 ) -> list[tuple[str, object, str]]:
     values: list[tuple[str, object, str]] = []
     stack: list[tuple[dict[str, Any], str]] = [(item, "") for item in reversed(items)]
@@ -284,7 +2107,11 @@ def _walk_delta(
             _get_case_insensitive(item, "path"),
             field_name="delta path",
         )
-        path = ".".join(part for part in (parent_path, own_path) if part)
+        canonical_path = _accumulated_property_path(
+            parent_path,
+            own_path,
+            budget=budget,
+        )
         children = _get_case_insensitive(item, "children")
         raw_change_type = _get_case_insensitive(
             item,
@@ -293,12 +2120,10 @@ def _walk_delta(
         property_change_type = (
             "array"
             if raw_change_type is None and children is not None
-            else _normalized(
-                _require_string(
-                    raw_change_type,
-                    field_name="propertyChangeType",
-                    maximum_length=64,
-                )
+            else _normalized_ascii_token(
+                raw_change_type,
+                field_name="propertyChangeType",
+                maximum_length=64,
             )
         )
         if property_change_type not in {
@@ -310,20 +2135,51 @@ def _walk_delta(
             "remove",
         }:
             raise PreflightInputError("delta propertyChangeType is unsupported")
+        before_supplied = _has_case_insensitive(item, "before")
+        after_supplied = _has_case_insensitive(item, "after")
+        before = _get_case_insensitive(item, "before")
         after = _get_case_insensitive(item, "after")
+        preserve_observation = any(
+            _property_path_contains(canonical_path, target)
+            or _property_path_contains(target, canonical_path)
+            for target in preserve_evidence_for
+        )
+        if protected_evidence is not None:
+            protected_evidence.validate_path(canonical_path)
+        if (
+            canonical_path == _RESOURCE_ROOT_PATH
+            and property_change_type not in {"delete", "remove", "noeffect"}
+            and (not after_supplied or not isinstance(after, dict))
+        ):
+            raise PreflightInputError("resource-root delta after value must be an object")
         if (
             property_change_type not in {"delete", "remove", "noeffect"}
-            and after is None
+            and not after_supplied
             and children is None
         ):
+            if any(
+                canonical_path == target or _property_path_contains(target, canonical_path)
+                for target in preserve_evidence_for
+            ):
+                if protected_evidence is not None:
+                    protected_evidence.observe_delta(
+                        canonical_path,
+                        property_change_type=property_change_type,
+                        before_supplied=before_supplied,
+                        before=before,
+                        after_supplied=after_supplied,
+                        after=after,
+                    )
+                values.append(
+                    (
+                        canonical_path,
+                        _MISSING_AFTER_VALUE,
+                        property_change_type,
+                    )
+                )
+                continue
             raise PreflightInputError("delta item lacks inspectable after value or children")
-        values.append(
-            (
-                path,
-                after,
-                property_change_type,
-            )
-        )
+        child_items: list[dict[str, Any]] = []
         if children is not None:
             child_items = [
                 _mapping(child, field_name="delta child")
@@ -333,52 +2189,1759 @@ def _walk_delta(
                     maximum_items=MAX_CHANGES,
                 )
             ]
-            stack.extend((child, path) for child in reversed(child_items))
+            if not child_items:
+                raise PreflightInputError("delta item contains no inspectable children")
+        if property_change_type == "noeffect":
+            _validate_no_effect_entry(
+                item,
+                canonical_path=canonical_path,
+                snapshot_index=snapshot_index,
+                budget=budget,
+            )
+        if protected_evidence is not None:
+            protected_evidence.observe_delta(
+                canonical_path,
+                property_change_type=property_change_type,
+                before_supplied=before_supplied,
+                before=before,
+                after_supplied=after_supplied,
+                after=after,
+            )
+        if property_change_type in {"delete", "remove"}:
+            values.append(
+                (
+                    canonical_path,
+                    after,
+                    property_change_type,
+                )
+            )
+        elif property_change_type == "noeffect":
+            if preserve_observation:
+                values.append(
+                    (
+                        canonical_path,
+                        after,
+                        _PROPERTY_OBSERVATION,
+                    )
+                )
+        elif after_supplied:
+            if before_supplied:
+                if preserve_observation:
+                    values.append(
+                        (
+                            canonical_path,
+                            after,
+                            _PROPERTY_OBSERVATION,
+                        )
+                    )
+                values.extend(
+                    _derive_snapshot_delta(
+                        before,
+                        after,
+                        root=canonical_path,
+                        budget=budget,
+                    )
+                )
+            else:
+                values.append(
+                    (
+                        canonical_path,
+                        after,
+                        property_change_type,
+                    )
+                )
+                if isinstance(after, (dict, list)):
+                    values.extend(
+                        _flatten_after(
+                            after,
+                            root=canonical_path,
+                            budget=budget,
+                        )
+                    )
+        if child_items:
+            stack.extend((child, canonical_path) for child in reversed(child_items))
     return values
+
+
+@dataclass(frozen=True, slots=True)
+class _SnapshotPairIndex:
+    before: dict[str, object]
+    after: dict[str, object]
+
+
+def _build_snapshot_index(
+    snapshot: dict[str, Any],
+    *,
+    budget: _PropertyPathBudget,
+) -> dict[str, object]:
+    values: dict[str, object] = {}
+    stack: list[tuple[object, str]] = [(snapshot, _RESOURCE_ROOT_PATH)]
+    while stack:
+        item, path = stack.pop()
+        budget.charge_lookup(1)
+        values[path] = item
+        if isinstance(item, dict):
+            budget.charge_lookup(len(item))
+            lowered = {key.lower(): (key, child) for key, child in item.items()}
+            for key, child in reversed(list(lowered.values())):
+                child_path = _property_child_path(
+                    path,
+                    key,
+                    budget=budget,
+                )
+                if child_path is not None:
+                    stack.append((child, child_path))
+        elif isinstance(item, list):
+            budget.charge_lookup(len(item))
+            stack.extend(
+                (
+                    child,
+                    _property_index_path(
+                        path,
+                        index,
+                        budget=budget,
+                    ),
+                )
+                for index, child in reversed(list(enumerate(item)))
+            )
+    return values
+
+
+def _build_snapshot_pair_index(
+    before: dict[str, Any],
+    after: dict[str, Any],
+    *,
+    budget: _PropertyPathBudget,
+) -> _SnapshotPairIndex:
+    return _SnapshotPairIndex(
+        before=_build_snapshot_index(before, budget=budget),
+        after=_build_snapshot_index(after, budget=budget),
+    )
+
+
+def _snapshot_pair_values(
+    snapshot_index: _SnapshotPairIndex,
+    canonical_path: str,
+    *,
+    budget: _PropertyPathBudget,
+) -> tuple[bool, object, bool, object]:
+    budget.charge_lookup(len(_property_path_tokens(canonical_path)) + 2)
+    return (
+        canonical_path in snapshot_index.before,
+        snapshot_index.before.get(canonical_path),
+        canonical_path in snapshot_index.after,
+        snapshot_index.after.get(canonical_path),
+    )
+
+
+def _validate_no_effect_entry(
+    item: dict[str, Any],
+    *,
+    canonical_path: str,
+    snapshot_index: _SnapshotPairIndex | None,
+    budget: _PropertyPathBudget,
+) -> None:
+    if not _has_case_insensitive(item, "before") or not _has_case_insensitive(
+        item,
+        "after",
+    ):
+        raise PreflightInputError("NoEffect requires before and after evidence")
+    before = _get_case_insensitive(item, "before")
+    after = _get_case_insensitive(item, "after")
+    if not _json_values_equal(before, after):
+        raise PreflightInputError("NoEffect before and after values conflict")
+    if snapshot_index is None:
+        raise PreflightInputError("NoEffect requires complete resource snapshots")
+    before_exists, root_before, after_exists, root_after = _snapshot_pair_values(
+        snapshot_index,
+        canonical_path,
+        budget=budget,
+    )
+    if (
+        not before_exists
+        or not after_exists
+        or not _json_values_equal(root_before, root_after)
+        or not _json_values_equal(before, root_before)
+        or not _json_values_equal(after, root_after)
+    ):
+        raise PreflightInputError("NoEffect does not reconcile with resource snapshots")
+
+
+def _validate_resource_snapshot(
+    snapshot: dict[str, Any],
+    *,
+    resource_id: str,
+    field_name: str,
+    deployment_target: DeploymentTarget | None = None,
+) -> None:
+    raw_snapshot_id = _require_string(
+        _get_case_insensitive(snapshot, "id"),
+        field_name=f"{field_name} id",
+    )
+    snapshot_id = (
+        _canonical_scope(raw_snapshot_id)
+        if deployment_target is None
+        else _validate_deployment_resource_id(
+            raw_snapshot_id,
+            deployment_target=deployment_target,
+            field_name=f"{field_name} id",
+        )
+    )
+    canonical_resource_id = _canonical_scope(resource_id)
+    if snapshot_id != canonical_resource_id:
+        raise PreflightInputError(f"{field_name} id does not match resourceId")
+    snapshot_name = _require_exact_ascii_token(
+        _get_case_insensitive(snapshot, "name"),
+        field_name=f"{field_name} name",
+    )
+    if (
+        not snapshot_name.isascii()
+        or snapshot_name.lower() != canonical_resource_id.rsplit("/", 1)[-1]
+    ):
+        raise PreflightInputError(f"{field_name} name does not match resourceId")
+    snapshot_type = _require_exact_ascii_token(
+        _get_case_insensitive(snapshot, "type"),
+        field_name=f"{field_name} type",
+    )
+    if not snapshot_type.isascii() or snapshot_type.lower() != _resource_type(resource_id):
+        raise PreflightInputError(f"{field_name} type does not match resourceId")
+    _mapping(
+        _get_case_insensitive(snapshot, "properties"),
+        field_name=f"{field_name} properties",
+    )
+
+
+@dataclass(slots=True)
+class _ProtectedPathNode:
+    presence: bool | None = None
+    subtree_present: bool = False
+    child_kind: Literal["array", "object"] | None = None
+    explicit_value: object = _NO_EXPLICIT_VALUE
+    children: dict[PropertyPathToken, _ProtectedPathNode] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class _ProtectedPropertyEvidence:
+    resource_type: str
+    budget: _PropertyPathBudget
+    entries: tuple[tuple[str, tuple[PropertyPathToken, ...], str], ...]
+    values: dict[tuple[str, str], object] = field(default_factory=dict)
+    path_roots: dict[str, _ProtectedPathNode] = field(
+        default_factory=lambda: {
+            "before": _ProtectedPathNode(),
+            "after": _ProtectedPathNode(),
+        }
+    )
+    complete_snapshot_stages: set[str] = field(default_factory=set)
+    complete_snapshot_indexes: dict[str, dict[str, object]] = field(default_factory=dict)
+    complete_snapshot_paths: dict[str, set[str]] = field(
+        default_factory=lambda: {"before": set(), "after": set()}
+    )
+
+    @classmethod
+    def for_resource_type(
+        cls,
+        resource_type: str,
+        *,
+        budget: _PropertyPathBudget,
+    ) -> _ProtectedPropertyEvidence:
+        return cls(
+            resource_type=resource_type,
+            budget=budget,
+            entries=tuple(
+                (path, _property_path_tokens(path), value_kind)
+                for path, value_kind in _PROTECTED_PROPERTY_SCHEMAS.get(
+                    resource_type,
+                    (),
+                )
+            ),
+        )
+
+    def validate_path(self, canonical_path: str) -> None:
+        path_tokens = _property_path_tokens(canonical_path)
+        for schema_path, schema_tokens, value_kind in self.entries:
+            if (
+                len(path_tokens) <= len(schema_tokens)
+                or path_tokens[: len(schema_tokens)] != schema_tokens
+            ):
+                continue
+            next_token = path_tokens[len(schema_tokens)]
+            if (
+                value_kind == "object"
+                and isinstance(next_token, str)
+                or value_kind == "array"
+                and isinstance(next_token, int)
+            ):
+                continue
+            raise PreflightInputError(
+                f"delta path diverges from protected property schema at {schema_path}"
+            )
+
+    def observe_snapshot(
+        self,
+        stage: str,
+        snapshot: dict[str, Any],
+        *,
+        complete: bool,
+        snapshot_index: dict[str, object] | None = None,
+    ) -> None:
+        if complete:
+            self._validate_structure(
+                _RESOURCE_ROOT_PATH,
+                snapshot,
+            )
+            if snapshot_index is None:
+                raise PreflightInputError("complete protected snapshot requires an index")
+            self.complete_snapshot_stages.add(stage)
+            self.complete_snapshot_indexes[stage] = snapshot_index
+            for schema_path, _, value_kind in self.entries:
+                self.budget.charge_lookup(1)
+                if schema_path not in snapshot_index:
+                    continue
+                observed_value = snapshot_index[schema_path]
+                self._validate_value_kind(
+                    schema_path,
+                    observed_value,
+                    value_kind=value_kind,
+                )
+                self._record(
+                    stage,
+                    schema_path,
+                    observed_value,
+                    value_kind=value_kind,
+                    from_snapshot=True,
+                )
+        else:
+            self._observe_value(
+                stage,
+                _RESOURCE_ROOT_PATH,
+                snapshot,
+                from_snapshot=True,
+            )
+            self._register_partial_snapshot(
+                stage,
+                snapshot,
+            )
+
+    def observe_delta(
+        self,
+        canonical_path: str,
+        *,
+        property_change_type: str,
+        before_supplied: bool,
+        before: object,
+        after_supplied: bool,
+        after: object,
+    ) -> None:
+        self.validate_path(canonical_path)
+        protected_path = self._path_is_protected(canonical_path)
+        if protected_path and property_change_type == "create" and before_supplied:
+            raise PreflightInputError(
+                f"Create delta cannot supply before at protected path {canonical_path}"
+            )
+        if protected_path and property_change_type in {"delete", "remove"} and after_supplied:
+            raise PreflightInputError(
+                f"Delete/Remove delta cannot supply after at protected path {canonical_path}"
+            )
+        if before_supplied:
+            self._record_explicit_path_value(
+                "before",
+                canonical_path,
+                before,
+            )
+            self._observe_value(
+                "before",
+                canonical_path,
+                before,
+                from_snapshot=False,
+            )
+            self._reconcile_explicit_snapshot_value(
+                "before",
+                canonical_path,
+                before,
+            )
+        else:
+            self._reconcile_implicit_snapshot_presence(
+                "before",
+                canonical_path,
+                should_exist=property_change_type != "create",
+            )
+        if after_supplied:
+            self._record_explicit_path_value(
+                "after",
+                canonical_path,
+                after,
+            )
+            self._observe_value(
+                "after",
+                canonical_path,
+                after,
+                from_snapshot=False,
+            )
+            self._reconcile_explicit_snapshot_value(
+                "after",
+                canonical_path,
+                after,
+            )
+        else:
+            self._reconcile_implicit_snapshot_presence(
+                "after",
+                canonical_path,
+                should_exist=property_change_type not in {"delete", "remove"},
+            )
+
+    def _observe_value(
+        self,
+        stage: str,
+        canonical_path: str,
+        value: object,
+        *,
+        from_snapshot: bool,
+    ) -> None:
+        deferred_value_kind_paths = (
+            frozenset(_KEY_VAULT_DEPLOYMENT_ACCESS_TARGETS)
+            if (self.resource_type == _KEY_VAULT_TYPE and not from_snapshot and stage == "after")
+            else frozenset()
+        )
+        self._validate_structure(
+            canonical_path,
+            value,
+            deferred_value_kind_paths=deferred_value_kind_paths,
+        )
+        observation_tokens = _property_path_tokens(canonical_path)
+        for schema_path, schema_tokens, value_kind in self.entries:
+            if schema_tokens[: len(observation_tokens)] != observation_tokens:
+                continue
+            exists, observed_value = self._resolve_value(
+                value,
+                schema_tokens[len(observation_tokens) :],
+            )
+            if not exists:
+                if not from_snapshot:
+                    self._record(
+                        stage,
+                        schema_path,
+                        _MISSING_AFTER_VALUE,
+                        value_kind=value_kind,
+                        from_snapshot=False,
+                    )
+                continue
+            if not (
+                not from_snapshot
+                and stage == "after"
+                and schema_path in _KEY_VAULT_DEPLOYMENT_ACCESS_TARGETS
+            ):
+                self._validate_value_kind(
+                    schema_path,
+                    observed_value,
+                    value_kind=value_kind,
+                )
+            self._record(
+                stage,
+                schema_path,
+                observed_value,
+                value_kind=value_kind,
+                from_snapshot=from_snapshot,
+            )
+
+    def _validate_structure(
+        self,
+        canonical_path: str,
+        value: object,
+        *,
+        deferred_value_kind_paths: frozenset[str] = frozenset(),
+    ) -> None:
+        path_tokens = _property_path_tokens(canonical_path)
+        related_entries = tuple(
+            entry for entry in self.entries if entry[1][: len(path_tokens)] == path_tokens
+        )
+        if not related_entries:
+            return
+        stack = [(path_tokens, value, related_entries)]
+        while stack:
+            current_tokens, current_value, current_entries = stack.pop()
+            current_path = _format_property_path(current_tokens)
+            exact_kinds = {
+                value_kind
+                for _, schema_tokens, value_kind in current_entries
+                if schema_tokens == current_tokens
+            }
+            if exact_kinds and current_path not in deferred_value_kind_paths:
+                if len(exact_kinds) != 1:
+                    raise PreflightInputError(
+                        "protected property schema is internally inconsistent"
+                    )
+                self._validate_value_kind(
+                    current_path,
+                    current_value,
+                    value_kind=next(iter(exact_kinds)),
+                )
+
+            child_entries: dict[
+                PropertyPathToken,
+                list[tuple[str, tuple[PropertyPathToken, ...], str]],
+            ] = {}
+            for entry in current_entries:
+                schema_tokens = entry[1]
+                if len(schema_tokens) == len(current_tokens):
+                    continue
+                child_entries.setdefault(
+                    schema_tokens[len(current_tokens)],
+                    [],
+                ).append(entry)
+            if not child_entries:
+                continue
+
+            if all(isinstance(token, str) for token in child_entries):
+                if not isinstance(current_value, dict):
+                    raise PreflightInputError(
+                        f"protected property {current_path} must remain object-valued"
+                    )
+                self.budget.charge_lookup(len(current_value) + 1)
+                expected_children = frozenset(
+                    token for token in child_entries if isinstance(token, str)
+                )
+                for raw_key in current_value:
+                    if _is_property_name(raw_key):
+                        continue
+                    if current_tokens or self._malformed_key_targets_protected_child(
+                        raw_key,
+                        expected_children=expected_children,
+                    ):
+                        raise PreflightInputError(
+                            f"protected object {current_path} contains a malformed property alias"
+                        )
+                lowered = {key.lower(): child for key, child in current_value.items()}
+                for child_token, entries in child_entries.items():
+                    assert isinstance(child_token, str)
+                    if child_token not in lowered:
+                        continue
+                    stack.append(
+                        (
+                            (*current_tokens, child_token),
+                            lowered[child_token],
+                            tuple(entries),
+                        )
+                    )
+                continue
+
+            if all(isinstance(token, int) for token in child_entries):
+                if not isinstance(current_value, list):
+                    raise PreflightInputError(
+                        f"protected property {current_path} must remain array-valued"
+                    )
+                self.budget.charge_lookup(len(child_entries) + 1)
+                for child_token, entries in child_entries.items():
+                    assert isinstance(child_token, int)
+                    if child_token >= len(current_value):
+                        continue
+                    stack.append(
+                        (
+                            (*current_tokens, child_token),
+                            current_value[child_token],
+                            tuple(entries),
+                        )
+                    )
+                continue
+
+            raise PreflightInputError("protected property schema is internally inconsistent")
+
+    @staticmethod
+    def _malformed_key_targets_protected_child(
+        raw_key: str,
+        *,
+        expected_children: frozenset[str],
+    ) -> bool:
+        resource_prefix = f"{_RESOURCE_ROOT_PATH}."
+        candidates: set[str] = set()
+        for raw_candidate in (raw_key.lower(), raw_key.strip().lower()):
+            offset = 0
+            while offset < len(raw_candidate):
+                if raw_candidate.startswith(resource_prefix, offset):
+                    offset += len(resource_prefix)
+                    continue
+                if raw_candidate[offset] == ".":
+                    offset += 1
+                    continue
+                break
+            candidates.add(raw_candidate[offset:])
+        for candidate in candidates:
+            for expected_child in expected_children:
+                if candidate == expected_child:
+                    return True
+                if not candidate.startswith(expected_child):
+                    continue
+                suffix = candidate[len(expected_child) :]
+                if suffix and not (
+                    suffix[0].isascii() and (suffix[0].isalnum() or suffix[0] in "_$-")
+                ):
+                    return True
+        return False
+
+    def _record_explicit_path_value(
+        self,
+        stage: str,
+        canonical_path: str,
+        value: object,
+    ) -> None:
+        if not self._path_is_protected(canonical_path):
+            return
+        path_tokens = _property_path_tokens(canonical_path)
+        target_node = self._record_path_presence(
+            stage,
+            canonical_path,
+            present=True,
+        )
+        node = self.path_roots[stage]
+        for index, token in enumerate(path_tokens):
+            if node.explicit_value is not _NO_EXPLICIT_VALUE:
+                exists, ancestor_value = self._resolve_explicit_value(
+                    node.explicit_value,
+                    path_tokens[index:],
+                )
+                if not exists or not _json_values_equal(ancestor_value, value):
+                    raise PreflightInputError(
+                        f"protected path representations conflict at {canonical_path}"
+                    )
+            node = node.children[token]
+        if target_node.explicit_value is not _NO_EXPLICIT_VALUE and not _json_values_equal(
+            target_node.explicit_value,
+            value,
+        ):
+            raise PreflightInputError(
+                f"protected path representations conflict at {canonical_path}"
+            )
+        if target_node.child_kind is not None and not self._matches_container_kind(
+            value,
+            target_node.child_kind,
+        ):
+            raise PreflightInputError(
+                f"protected path container representations conflict at {canonical_path}"
+            )
+        self._validate_descendant_states(
+            target_node,
+            value,
+            canonical_path=canonical_path,
+        )
+        target_node.explicit_value = value
+
+    def _register_partial_snapshot(
+        self,
+        stage: str,
+        snapshot: dict[str, Any],
+    ) -> None:
+        if not self.entries:
+            return
+        root_children = frozenset(
+            schema_tokens[0]
+            for _, schema_tokens, _ in self.entries
+            if schema_tokens and isinstance(schema_tokens[0], str)
+        )
+        stack: list[tuple[object, str]] = [
+            (
+                snapshot,
+                _RESOURCE_ROOT_PATH,
+            )
+        ]
+        while stack:
+            value, canonical_path = stack.pop()
+            protected_path = self._path_is_protected(canonical_path)
+            if protected_path:
+                self._record_partial_snapshot_value(
+                    stage,
+                    canonical_path,
+                    value,
+                )
+            elif isinstance(value, (dict, list)):
+                path_tokens = _property_path_tokens(canonical_path)
+                if not (
+                    isinstance(value, dict)
+                    and len(path_tokens) == 1
+                    and path_tokens[0] in _PARTIAL_SNAPSHOT_FLAT_OBJECT_ROOTS
+                ):
+                    raise PreflightInputError(
+                        "partial snapshot contains an ignored or unknown "
+                        f"container at {canonical_path}"
+                    )
+            else:
+                continue
+            if not protected_path:
+                assert isinstance(value, dict)
+                self.budget.charge_lookup(len(value) + 1)
+                if any(isinstance(child, (dict, list)) for child in value.values()):
+                    raise PreflightInputError(
+                        "partial snapshot contains an ignored or unknown "
+                        f"descendant container below {canonical_path}"
+                    )
+                continue
+            if isinstance(value, dict):
+                for raw_key, child in reversed(list(value.items())):
+                    child_path = _property_child_path(
+                        canonical_path,
+                        raw_key,
+                        budget=self.budget,
+                    )
+                    if child_path is None:
+                        if canonical_path != _RESOURCE_ROOT_PATH or (
+                            self._malformed_key_targets_protected_child(
+                                raw_key,
+                                expected_children=root_children,
+                            )
+                        ):
+                            raise PreflightInputError(
+                                f"protected object {canonical_path} "
+                                "contains a malformed property alias"
+                            )
+                        if isinstance(child, (dict, list)):
+                            raise PreflightInputError(
+                                "partial snapshot contains an ignored or unknown "
+                                f"container below {_RESOURCE_ROOT_PATH}"
+                            )
+                        continue
+                    if self._path_is_protected(child_path) or isinstance(
+                        child,
+                        (dict, list),
+                    ):
+                        stack.append(
+                            (
+                                child,
+                                child_path,
+                            )
+                        )
+            elif isinstance(value, list):
+                stack.extend(
+                    (
+                        child,
+                        _property_index_path(
+                            canonical_path,
+                            index,
+                            budget=self.budget,
+                        ),
+                    )
+                    for index, child in reversed(list(enumerate(value)))
+                )
+
+    def _record_partial_snapshot_value(
+        self,
+        stage: str,
+        canonical_path: str,
+        value: object,
+    ) -> None:
+        node = self._record_path_presence(
+            stage,
+            canonical_path,
+            present=True,
+        )
+        if isinstance(value, (dict, list)):
+            child_kind: Literal["array", "object"] = (
+                "array" if isinstance(value, list) else "object"
+            )
+            if node.child_kind is not None and node.child_kind != child_kind:
+                raise PreflightInputError(
+                    f"protected path container representations conflict at {canonical_path}"
+                )
+            if node.explicit_value is not _NO_EXPLICIT_VALUE and not self._matches_container_kind(
+                node.explicit_value,
+                child_kind,
+            ):
+                raise PreflightInputError(
+                    f"protected path container representations conflict at {canonical_path}"
+                )
+            node.child_kind = child_kind
+            return
+        if node.child_kind is not None:
+            raise PreflightInputError(
+                f"protected path container representations conflict at {canonical_path}"
+            )
+        if node.explicit_value is not _NO_EXPLICIT_VALUE and not _json_values_equal(
+            node.explicit_value,
+            value,
+        ):
+            raise PreflightInputError(
+                f"protected path representations conflict at {canonical_path}"
+            )
+        node.explicit_value = value
+
+    def _record_path_presence(
+        self,
+        stage: str,
+        canonical_path: str,
+        *,
+        present: bool,
+    ) -> _ProtectedPathNode:
+        path_tokens = _property_path_tokens(canonical_path)
+        self.budget.charge_lookup(len(path_tokens) + 1)
+        node = self.path_roots[stage]
+        lineage = [node]
+        if present and node.presence is False:
+            raise PreflightInputError(
+                f"protected path presence representations conflict at {canonical_path}"
+            )
+        for token in path_tokens:
+            child_kind: Literal["array", "object"] = "object" if isinstance(token, str) else "array"
+            if node.child_kind is not None and node.child_kind != child_kind:
+                raise PreflightInputError(
+                    f"protected path container representations conflict at {canonical_path}"
+                )
+            if node.explicit_value is not _NO_EXPLICIT_VALUE and not self._matches_container_kind(
+                node.explicit_value,
+                child_kind,
+            ):
+                raise PreflightInputError(
+                    f"protected path container representations conflict at {canonical_path}"
+                )
+            node.child_kind = child_kind
+            node = node.children.setdefault(token, _ProtectedPathNode())
+            lineage.append(node)
+            if present and node.presence is False:
+                raise PreflightInputError(
+                    f"protected path presence representations conflict at {canonical_path}"
+                )
+        if present:
+            node.presence = True
+            for ancestor in lineage:
+                ancestor.subtree_present = True
+        else:
+            if node.subtree_present or node.presence is True:
+                raise PreflightInputError(
+                    f"protected path presence representations conflict at {canonical_path}"
+                )
+            node.presence = False
+        return node
+
+    @staticmethod
+    def _matches_container_kind(
+        value: object,
+        child_kind: Literal["array", "object"],
+    ) -> bool:
+        return isinstance(value, list if child_kind == "array" else dict)
+
+    def _validate_implicit_presence_against_explicit_values(
+        self,
+        stage: str,
+        canonical_path: str,
+        *,
+        should_exist: bool,
+    ) -> None:
+        path_tokens = _property_path_tokens(canonical_path)
+        node = self.path_roots[stage]
+        for index in range(len(path_tokens) + 1):
+            if node.explicit_value is not _NO_EXPLICIT_VALUE:
+                exists, _ = self._resolve_explicit_value(
+                    node.explicit_value,
+                    path_tokens[index:],
+                )
+                if exists != should_exist:
+                    raise PreflightInputError(
+                        f"protected path presence representations conflict at {canonical_path}"
+                    )
+            if index == len(path_tokens):
+                break
+            child = node.children.get(path_tokens[index])
+            if child is None:
+                break
+            node = child
+
+    def _validate_descendant_states(
+        self,
+        node: _ProtectedPathNode,
+        value: object,
+        *,
+        canonical_path: str,
+    ) -> None:
+        stack: list[tuple[_ProtectedPathNode, tuple[PropertyPathToken, ...]]] = [
+            (child, (token,)) for token, child in node.children.items()
+        ]
+        while stack:
+            descendant, relative_tokens = stack.pop()
+            self.budget.charge_lookup(1)
+            exists, resolved = self._resolve_explicit_value(
+                value,
+                relative_tokens,
+            )
+            if descendant.presence is not None and exists != descendant.presence:
+                raise PreflightInputError(
+                    f"protected path presence representations conflict below {canonical_path}"
+                )
+            if (
+                exists
+                and descendant.child_kind is not None
+                and not self._matches_container_kind(
+                    resolved,
+                    descendant.child_kind,
+                )
+            ):
+                raise PreflightInputError(
+                    f"protected path container representations conflict below {canonical_path}"
+                )
+            if descendant.explicit_value is not _NO_EXPLICIT_VALUE and (
+                not exists
+                or not _json_values_equal(
+                    resolved,
+                    descendant.explicit_value,
+                )
+            ):
+                raise PreflightInputError(
+                    f"protected path representations conflict below {canonical_path}"
+                )
+            stack.extend(
+                (child, (*relative_tokens, token)) for token, child in descendant.children.items()
+            )
+
+    def _resolve_explicit_value(
+        self,
+        value: object,
+        tokens: Sequence[PropertyPathToken],
+    ) -> tuple[bool, object]:
+        resolved = value
+        for token in tokens:
+            if isinstance(token, str):
+                if not isinstance(resolved, dict):
+                    return False, None
+                exists, child = _budgeted_case_insensitive_lookup(
+                    resolved,
+                    token,
+                    budget=self.budget,
+                )
+                if not exists:
+                    return False, None
+                resolved = child
+            elif not isinstance(resolved, list) or token >= len(resolved):
+                self.budget.charge_lookup(1)
+                return False, None
+            else:
+                self.budget.charge_lookup(1)
+                resolved = resolved[token]
+        return True, resolved
+
+    def _reconcile_explicit_snapshot_value(
+        self,
+        stage: str,
+        canonical_path: str,
+        value: object,
+    ) -> None:
+        if stage not in self.complete_snapshot_stages or not self._path_is_protected(
+            canonical_path
+        ):
+            return
+        self.budget.charge_lookup(len(_property_path_tokens(canonical_path)) + 2)
+        snapshot_index = self.complete_snapshot_indexes[stage]
+        exists = canonical_path in snapshot_index
+        snapshot_value = snapshot_index.get(canonical_path)
+        if not exists or not _json_values_equal(snapshot_value, value):
+            raise PreflightInputError(
+                f"delta and full snapshot conflict at protected path {canonical_path}"
+            )
+
+    def _reconcile_implicit_snapshot_presence(
+        self,
+        stage: str,
+        canonical_path: str,
+        *,
+        should_exist: bool,
+    ) -> None:
+        if not self._path_is_protected(canonical_path):
+            return
+        self._validate_implicit_presence_against_explicit_values(
+            stage,
+            canonical_path,
+            should_exist=should_exist,
+        )
+        self._record_path_presence(
+            stage,
+            canonical_path,
+            present=should_exist,
+        )
+        if stage not in self.complete_snapshot_stages:
+            return
+        self.budget.charge_lookup(len(_property_path_tokens(canonical_path)) + 2)
+        exists = canonical_path in self.complete_snapshot_indexes[stage]
+        if exists != should_exist:
+            raise PreflightInputError(
+                f"delta and full snapshot conflict at protected path {canonical_path}"
+            )
+
+    def _path_is_protected(self, canonical_path: str) -> bool:
+        path_tokens = _property_path_tokens(canonical_path)
+        return any(
+            path_tokens[: len(schema_tokens)] == schema_tokens
+            or schema_tokens[: len(path_tokens)] == path_tokens
+            for _, schema_tokens, _ in self.entries
+        )
+
+    def _resolve_value(
+        self,
+        value: object,
+        tokens: Sequence[PropertyPathToken],
+    ) -> tuple[bool, object]:
+        resolved = value
+        for token in tokens:
+            if isinstance(token, str):
+                if not isinstance(resolved, dict):
+                    return False, None
+                exists, child = _budgeted_case_insensitive_lookup(
+                    resolved,
+                    token,
+                    budget=self.budget,
+                )
+                if not exists:
+                    return False, None
+                resolved = child
+            elif not isinstance(resolved, list) or token >= len(resolved):
+                self.budget.charge_lookup(1)
+                return False, None
+            else:
+                self.budget.charge_lookup(1)
+                resolved = resolved[token]
+        return True, resolved
+
+    def _validate_value_kind(
+        self,
+        schema_path: str,
+        value: object,
+        *,
+        value_kind: str,
+    ) -> None:
+        valid = (
+            value_kind == "object"
+            and isinstance(value, dict)
+            or value_kind == "array"
+            and isinstance(value, list)
+            or value_kind == "boolean"
+            and type(value) is bool
+            or value_kind == "string"
+            and isinstance(value, str)
+        )
+        if not valid:
+            raise PreflightInputError(
+                _PROTECTED_PROPERTY_TYPE_ERRORS.get(
+                    schema_path,
+                    f"protected property {schema_path} must remain {value_kind}-valued",
+                )
+            )
+        if value_kind == "string":
+            self._validate_string_value(schema_path, value)
+
+    def _validate_string_value(
+        self,
+        schema_path: str,
+        value: object,
+    ) -> None:
+        assert isinstance(value, str)
+        field_name = (
+            "publicNetworkAccess"
+            if schema_path == "properties.publicnetworkaccess"
+            else ("publicAccess" if schema_path == "properties.publicaccess" else schema_path)
+        )
+        normalized = _normalized_ascii_token(
+            value,
+            field_name=field_name,
+            maximum_length=64,
+        )
+        if schema_path == "properties.publicnetworkaccess":
+            allowed_values = (
+                {"disabled", "enabled"}
+                if self.resource_type
+                in {
+                    _CONTAINER_APP_TYPE,
+                    _CONTAINER_ENVIRONMENT_TYPE,
+                }
+                else {"disabled", "enabled", "securedbyperimeter"}
+            )
+            if normalized not in allowed_values:
+                if self.resource_type in {
+                    _CONTAINER_APP_TYPE,
+                    _CONTAINER_ENVIRONMENT_TYPE,
+                }:
+                    raise PreflightInputError("Container Apps publicNetworkAccess is unsupported")
+                raise PreflightInputError(f"{schema_path} has an unsupported value")
+        elif schema_path == "properties.networkacls.defaultaction":
+            if normalized not in {"allow", "deny"}:
+                raise PreflightInputError(f"{schema_path} has an unsupported value")
+        elif schema_path == "properties.publicaccess" and normalized not in {
+            "blob",
+            "container",
+            "none",
+        }:
+            raise PreflightInputError("publicAccess has an unsupported value")
+
+    def _record(
+        self,
+        stage: str,
+        schema_path: str,
+        value: object,
+        *,
+        value_kind: str,
+        from_snapshot: bool,
+    ) -> None:
+        if from_snapshot:
+            self.complete_snapshot_paths[stage].add(schema_path)
+        elif stage in self.complete_snapshot_stages:
+            snapshot_has_value = schema_path in self.complete_snapshot_paths[stage]
+            delta_has_value = value is not _MISSING_AFTER_VALUE
+            if snapshot_has_value != delta_has_value:
+                raise PreflightInputError(
+                    f"delta and full snapshot conflict at protected property {schema_path}"
+                )
+        normalized_value = (
+            _PROTECTED_OBJECT_PRESENT
+            if value_kind == "object" and value is not _MISSING_AFTER_VALUE
+            else value
+        )
+        key = (stage, schema_path)
+        existing = self.values.get(key, _MISSING_AFTER_VALUE)
+        if key in self.values and not self._values_equal(existing, normalized_value):
+            raise PreflightInputError(
+                f"protected property representations conflict at {schema_path}"
+            )
+        self.values[key] = normalized_value
+
+    @staticmethod
+    def _values_equal(left: object, right: object) -> bool:
+        if (
+            left is _MISSING_AFTER_VALUE
+            or right is _MISSING_AFTER_VALUE
+            or left is _PROTECTED_OBJECT_PRESENT
+            or right is _PROTECTED_OBJECT_PRESENT
+        ):
+            return left is right
+        return _json_values_equal(left, right)
+
+
+def _validate_no_change(
+    resource_id: str,
+    change: dict[str, Any],
+    *,
+    budget: _PropertyPathBudget,
+) -> None:
+    if not _has_case_insensitive(
+        change,
+        "before",
+    ) or not _has_case_insensitive(change, "after"):
+        raise PreflightInputError("NoChange requires complete before and after snapshots")
+    before = _get_case_insensitive(change, "before")
+    after = _get_case_insensitive(change, "after")
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        raise PreflightInputError("NoChange before and after snapshots must be objects")
+    _validate_resource_snapshot(
+        before,
+        resource_id=resource_id,
+        field_name="NoChange before snapshot",
+    )
+    _validate_resource_snapshot(
+        after,
+        resource_id=resource_id,
+        field_name="NoChange after snapshot",
+    )
+    if not _json_values_equal(before, after):
+        raise PreflightInputError("NoChange before and after snapshots conflict")
+    snapshot_index = _build_snapshot_pair_index(
+        before,
+        after,
+        budget=budget,
+    )
+    protected_evidence = _ProtectedPropertyEvidence.for_resource_type(
+        _resource_type(resource_id),
+        budget=budget,
+    )
+    protected_evidence.observe_snapshot(
+        "before",
+        before,
+        complete=True,
+        snapshot_index=snapshot_index.before,
+    )
+    protected_evidence.observe_snapshot(
+        "after",
+        after,
+        complete=True,
+        snapshot_index=snapshot_index.after,
+    )
+    delta = _delta_entries(change)
+    stack: list[tuple[dict[str, Any], str]] = [(item, "") for item in reversed(delta)]
+    seen_paths: set[str] = set()
+    while stack:
+        item, parent_path = stack.pop()
+        own_path = _require_string(
+            _get_case_insensitive(item, "path"),
+            field_name="delta path",
+        )
+        canonical_path = _accumulated_property_path(
+            parent_path,
+            own_path,
+            budget=budget,
+        )
+        if canonical_path in seen_paths:
+            raise PreflightInputError("NoChange contains duplicate delta paths")
+        seen_paths.add(canonical_path)
+        children = _get_case_insensitive(item, "children")
+        raw_change_type = _get_case_insensitive(
+            item,
+            "propertyChangeType",
+        )
+        property_change_type = (
+            "array"
+            if raw_change_type is None and children is not None
+            else _normalized_ascii_token(
+                raw_change_type,
+                field_name="propertyChangeType",
+                maximum_length=64,
+            )
+        )
+        if property_change_type not in {"array", "noeffect"}:
+            raise PreflightInputError("NoChange contains a non-NoEffect property delta")
+        before_supplied = _has_case_insensitive(item, "before")
+        after_supplied = _has_case_insensitive(item, "after")
+        item_before = _get_case_insensitive(item, "before")
+        item_after = _get_case_insensitive(item, "after")
+        protected_evidence.validate_path(canonical_path)
+        if property_change_type == "noeffect":
+            _validate_no_effect_entry(
+                item,
+                canonical_path=canonical_path,
+                snapshot_index=snapshot_index,
+                budget=budget,
+            )
+        protected_evidence.observe_delta(
+            canonical_path,
+            property_change_type=property_change_type,
+            before_supplied=before_supplied,
+            before=item_before,
+            after_supplied=after_supplied,
+            after=item_after,
+        )
+        if (
+            canonical_path == _RESOURCE_ROOT_PATH
+            and property_change_type == "array"
+            and (not after_supplied or not isinstance(item_after, dict))
+        ):
+            raise PreflightInputError("resource-root delta after value must be an object")
+        if property_change_type == "array" and not after_supplied and children is None:
+            raise PreflightInputError("delta item lacks inspectable after value or children")
+        if property_change_type == "array" and (
+            before_supplied != after_supplied
+            or (
+                before_supplied
+                and not _json_values_equal(
+                    _get_case_insensitive(item, "before"),
+                    _get_case_insensitive(item, "after"),
+                )
+            )
+        ):
+            raise PreflightInputError("NoChange delta conflicts with its snapshots")
+        before_exists, snapshot_before, after_exists, snapshot_after = _snapshot_pair_values(
+            snapshot_index,
+            canonical_path,
+            budget=budget,
+        )
+        if (
+            not before_exists
+            or not after_exists
+            or not _json_values_equal(
+                snapshot_before,
+                snapshot_after,
+            )
+        ):
+            raise PreflightInputError("NoChange delta path is absent or inconsistent in snapshots")
+        if (
+            property_change_type == "array"
+            and before_supplied
+            and (
+                not _json_values_equal(
+                    _get_case_insensitive(item, "before"),
+                    snapshot_before,
+                )
+                or not _json_values_equal(
+                    _get_case_insensitive(item, "after"),
+                    snapshot_after,
+                )
+            )
+        ):
+            raise PreflightInputError("NoChange delta conflicts with root snapshots")
+        if children is not None:
+            child_items = [
+                _mapping(child, field_name="delta child")
+                for child in _sequence(
+                    children,
+                    field_name="delta children",
+                    maximum_items=MAX_CHANGES,
+                )
+            ]
+            if not child_items:
+                raise PreflightInputError("delta item contains no inspectable children")
+            stack.extend((child, canonical_path) for child in reversed(child_items))
+    _canonical_scope(resource_id)
 
 
 def _flatten_after(
     value: object,
+    *,
+    root: str = "<resource>",
+    budget: _PropertyPathBudget,
 ) -> list[tuple[str, object, str]]:
     values: list[tuple[str, object, str]] = []
-    stack: list[tuple[object, str]] = [(value, "<resource>")]
+    stack: list[tuple[object, str]] = [(value, root)]
     while stack:
         item, path = stack.pop()
         if isinstance(item, dict):
-            stack.extend((child, f"{path}.{key}") for key, child in reversed(list(item.items())))
+            for key, child in reversed(list(item.items())):
+                child_path = _property_child_path(
+                    path,
+                    key,
+                    budget=budget,
+                )
+                if child_path is not None:
+                    stack.append((child, child_path))
         elif isinstance(item, list):
             stack.extend(
-                (child, f"{path}[{index}]") for index, child in reversed(list(enumerate(item)))
+                (
+                    child,
+                    _property_index_path(
+                        path,
+                        index,
+                        budget=budget,
+                    ),
+                )
+                for index, child in reversed(list(enumerate(item)))
             )
         else:
             values.append((path, item, "set"))
     return values
 
 
-def _enabled(value: object) -> bool:
-    return value is True or (
-        isinstance(value, str) and value.strip().casefold() in {"allow", "enabled", "true"}
+def _has_complete_resource_snapshot_shape(value: object) -> bool:
+    return (
+        isinstance(value, dict)
+        and all(
+            _has_case_insensitive(value, field_name)
+            for field_name in ("id", "name", "type", "properties")
+        )
+        and isinstance(_get_case_insensitive(value, "properties"), dict)
     )
+
+
+def _snapshot_property_state(
+    value: object,
+    target: str,
+    *,
+    budget: _PropertyPathBudget,
+) -> tuple[bool, object]:
+    if not isinstance(value, dict):
+        return False, None
+    has_properties, properties = _budgeted_case_insensitive_lookup(
+        value,
+        "properties",
+        budget=budget,
+    )
+    if not has_properties:
+        return False, None
+    if not isinstance(properties, dict):
+        return False, None
+    field_name = target.rsplit(".", 1)[-1]
+    return _budgeted_case_insensitive_lookup(
+        properties,
+        field_name,
+        budget=budget,
+    )
+
+
+def _resolve_property_observation(
+    *,
+    observation_path: str,
+    observed_after: object,
+    target: str,
+    budget: _PropertyPathBudget,
+) -> tuple[bool, bool, object]:
+    path_tokens = _property_path_tokens(observation_path)
+    target_tokens = _property_path_tokens(target)
+    if path_tokens[: len(target_tokens)] == target_tokens and path_tokens != target_tokens:
+        return True, False, None
+    if target_tokens[: len(path_tokens)] != path_tokens:
+        return False, False, None
+    value = observed_after
+    for token in target_tokens[len(path_tokens) :]:
+        if isinstance(token, str):
+            if not isinstance(value, dict):
+                return True, False, None
+            exists, child = _budgeted_case_insensitive_lookup(
+                value,
+                token,
+                budget=budget,
+            )
+            if not exists:
+                return True, False, None
+            value = child
+        elif not isinstance(value, list) or token >= len(value):
+            budget.charge_lookup(1)
+            return True, False, None
+        else:
+            budget.charge_lookup(1)
+            value = value[token]
+    return True, True, value
+
+
+def _deployment_access_delta_evidence(
+    target: str,
+    declared_delta_candidates: Sequence[tuple[str, object, str]],
+    delta_observations: Sequence[tuple[str, object, str]],
+    budget: _PropertyPathBudget,
+) -> tuple[bool, bool, bool, bool]:
+    related: list[tuple[str, object, str]] = []
+    for raw_path, after, property_change_type in declared_delta_candidates:
+        path = _canonical_property_path(raw_path)
+        if _property_path_contains(path, target) or _property_path_contains(target, path):
+            related.append((path, after, property_change_type))
+    observations_related = False
+    observations_safe = True
+    for raw_path, after, _ in delta_observations:
+        path = _canonical_property_path(raw_path)
+        observation_related, observation_resolved, observed_value = _resolve_property_observation(
+            observation_path=path,
+            observed_after=after,
+            target=target,
+            budget=budget,
+        )
+        if not observation_related:
+            continue
+        observations_related = True
+        observations_safe = observations_safe and (
+            observation_resolved and type(observed_value) is bool and observed_value is False
+        )
+    if not related:
+        return False, False, observations_related, observations_safe
+    exact = [
+        (after, property_change_type)
+        for path, after, property_change_type in related
+        if path == target
+    ]
+    unsafe = (
+        any(
+            property_change_type in {"delete", "remove"}
+            or (path != target and _property_path_contains(target, path))
+            for path, _, property_change_type in related
+        )
+        or not exact
+        or any(
+            property_change_type in {"delete", "remove"}
+            or type(after) is not bool
+            or after is not False
+            for after, property_change_type in exact
+        )
+    )
+    return True, not unsafe, observations_related, observations_safe
+
+
+def _key_vault_deployment_access_is_unsafe(
+    *,
+    change_type: str,
+    declared_delta_candidates: Sequence[tuple[str, object, str]],
+    delta_observations: Sequence[tuple[str, object, str]],
+    before_payload_supplied: bool,
+    after_payload_supplied: bool,
+    before_payload: object,
+    after_payload: object,
+    complete_snapshots: bool,
+    budget: _PropertyPathBudget,
+) -> bool:
+    for target in _KEY_VAULT_DEPLOYMENT_ACCESS_TARGETS:
+        (
+            delta_touched,
+            delta_safe,
+            observations_related,
+            observations_safe,
+        ) = _deployment_access_delta_evidence(
+            target,
+            declared_delta_candidates,
+            delta_observations,
+            budget,
+        )
+        before_has_value, before_value = _snapshot_property_state(
+            before_payload,
+            target,
+            budget=budget,
+        )
+        after_has_value, after_value = _snapshot_property_state(
+            after_payload,
+            target,
+            budget=budget,
+        )
+        snapshot_mentions_target = before_has_value or after_has_value
+
+        if observations_related and not observations_safe:
+            return True
+        if complete_snapshots:
+            snapshot_changed = before_has_value != after_has_value or (
+                before_has_value
+                and not _json_values_equal(
+                    before_value,
+                    after_value,
+                )
+            )
+            if observations_related and (
+                not after_has_value or type(after_value) is not bool or after_value is not False
+            ):
+                return True
+            if delta_touched and (not delta_safe or not snapshot_changed):
+                return True
+            if snapshot_changed and (
+                not after_has_value or type(after_value) is not bool or after_value is not False
+            ):
+                return True
+            continue
+
+        if change_type == "create":
+            if before_payload_supplied and (
+                delta_touched or snapshot_mentions_target or observations_related
+            ):
+                return True
+            if (
+                after_payload_supplied
+                and (delta_touched or snapshot_mentions_target or observations_related)
+                and (
+                    not _has_complete_resource_snapshot_shape(after_payload)
+                    or not after_has_value
+                    or type(after_value) is not bool
+                    or after_value is not False
+                )
+            ):
+                return True
+            if delta_touched and not delta_safe:
+                return True
+            continue
+
+        if (before_payload_supplied or after_payload_supplied) and (
+            delta_touched or snapshot_mentions_target or observations_related
+        ):
+            return True
+        if delta_touched and not delta_safe:
+            return True
+    return False
 
 
 def _unsafe_property_violations(
     resource_id: str,
     change: dict[str, Any],
+    *,
+    budget: _PropertyPathBudget,
 ) -> tuple[PreflightViolation, ...]:
     resource_type = _resource_type(resource_id)
-    change_type = _normalized(
-        _require_string(
-            _get_case_insensitive(change, "changeType"),
-            field_name="changeType",
-            maximum_length=64,
-        )
+    change_type = _normalized_ascii_token(
+        _get_case_insensitive(change, "changeType"),
+        field_name="changeType",
+        maximum_length=64,
     )
     violations: list[PreflightViolation] = []
     delta = _delta_entries(change)
-    candidates = _walk_delta(delta) if delta else []
+    before_payload_supplied = _has_case_insensitive(change, "before")
+    after_payload_supplied = _has_case_insensitive(change, "after")
+    before_payload = _get_case_insensitive(change, "before")
     after_payload = _get_case_insensitive(change, "after")
+    protected_evidence = _ProtectedPropertyEvidence.for_resource_type(
+        resource_type,
+        budget=budget,
+    )
+    snapshot_delta_candidates: list[tuple[str, object, str]] = []
+    snapshot_index: _SnapshotPairIndex | None = None
+    complete_snapshots = (
+        change_type == "modify" and before_payload_supplied and after_payload_supplied
+    )
+    if complete_snapshots:
+        if not isinstance(before_payload, dict) or not isinstance(
+            after_payload,
+            dict,
+        ):
+            raise PreflightInputError("Modify before and after snapshots must both be objects")
+        _validate_resource_snapshot(
+            before_payload,
+            resource_id=resource_id,
+            field_name="Modify before snapshot",
+        )
+        _validate_resource_snapshot(
+            after_payload,
+            resource_id=resource_id,
+            field_name="Modify after snapshot",
+        )
+        snapshot_index = _build_snapshot_pair_index(
+            before_payload,
+            after_payload,
+            budget=budget,
+        )
+        protected_evidence.observe_snapshot(
+            "before",
+            before_payload,
+            complete=True,
+            snapshot_index=snapshot_index.before,
+        )
+        protected_evidence.observe_snapshot(
+            "after",
+            after_payload,
+            complete=True,
+            snapshot_index=snapshot_index.after,
+        )
+        snapshot_delta_candidates = _derive_snapshot_delta(
+            before_payload,
+            after_payload,
+            budget=budget,
+        )
+    else:
+        if isinstance(before_payload, dict):
+            before_complete = _has_complete_resource_snapshot_shape(before_payload)
+            protected_evidence.observe_snapshot(
+                "before",
+                before_payload,
+                complete=before_complete,
+                snapshot_index=(
+                    _build_snapshot_index(before_payload, budget=budget)
+                    if before_complete
+                    else None
+                ),
+            )
+        if isinstance(after_payload, dict):
+            after_complete = _has_complete_resource_snapshot_shape(after_payload)
+            protected_evidence.observe_snapshot(
+                "after",
+                after_payload,
+                complete=after_complete,
+                snapshot_index=(
+                    _build_snapshot_index(after_payload, budget=budget) if after_complete else None
+                ),
+            )
+    walked_delta_candidates = (
+        _walk_delta(
+            delta,
+            budget=budget,
+            snapshot_index=snapshot_index,
+            preserve_evidence_for=(
+                frozenset(_KEY_VAULT_DEPLOYMENT_ACCESS_TARGETS)
+                if resource_type == _KEY_VAULT_TYPE
+                else frozenset()
+            ),
+            protected_evidence=protected_evidence,
+        )
+        if delta
+        else []
+    )
+    delta_observations = [
+        candidate for candidate in walked_delta_candidates if candidate[2] == _PROPERTY_OBSERVATION
+    ]
+    declared_delta_candidates = [
+        candidate for candidate in walked_delta_candidates if candidate[2] != _PROPERTY_OBSERVATION
+    ]
+    effective_delta_candidates = (
+        snapshot_delta_candidates if complete_snapshots else declared_delta_candidates
+    )
+    if change_type == "modify" and not any(
+        _is_meaningful_delta_candidate(path, value) for path, value, _ in effective_delta_candidates
+    ):
+        violations.append(
+            PreflightViolation(
+                code="uninspectable-change",
+                subject=resource_id,
+                detail="Modify lacks a meaningful effective property delta",
+            )
+        )
+    delta_candidates = [
+        *declared_delta_candidates,
+        *snapshot_delta_candidates,
+    ]
+    candidates = list(delta_candidates)
     if isinstance(after_payload, (dict, list)):
-        candidates.extend(_flatten_after(after_payload))
+        candidates.extend(
+            _flatten_after(
+                after_payload,
+                budget=budget,
+            )
+        )
+    if resource_type == _KEY_VAULT_TYPE:
+        authorization_targets = (
+            "properties.accesspolicies",
+            "properties.enablerbacauthorization",
+        )
+        authorization_mutation = any(
+            _property_path_contains(
+                (path := _canonical_property_path(raw_path)),
+                target,
+            )
+            or _property_path_contains(
+                target,
+                path,
+            )
+            for raw_path, _, _ in delta_candidates
+            for target in authorization_targets
+        )
+        if not complete_snapshots:
+            for raw_payload in (before_payload, after_payload):
+                if not isinstance(raw_payload, dict):
+                    continue
+                raw_properties = _get_case_insensitive(raw_payload, "properties")
+                if isinstance(raw_properties, dict):
+                    authorization_mutation = authorization_mutation or any(
+                        _has_case_insensitive(raw_properties, field_name)
+                        for field_name in ("accessPolicies", "enableRbacAuthorization")
+                    )
+        elif complete_snapshots:
+            before_snapshot = _mapping(
+                before_payload,
+                field_name="Modify before snapshot",
+            )
+            after_snapshot = _mapping(
+                after_payload,
+                field_name="Modify after snapshot",
+            )
+            before_properties = _mapping(
+                _get_case_insensitive(before_snapshot, "properties"),
+                field_name="Modify before snapshot properties",
+            )
+            after_properties = _mapping(
+                _get_case_insensitive(after_snapshot, "properties"),
+                field_name="Modify after snapshot properties",
+            )
+            for field_name in ("accessPolicies", "enableRbacAuthorization"):
+                before_has_field = _has_case_insensitive(before_properties, field_name)
+                after_has_field = _has_case_insensitive(after_properties, field_name)
+                authorization_mutation = authorization_mutation or (
+                    before_has_field != after_has_field
+                    or (
+                        before_has_field
+                        and not _json_values_equal(
+                            _get_case_insensitive(before_properties, field_name),
+                            _get_case_insensitive(after_properties, field_name),
+                        )
+                    )
+                )
+        unsafe_deployment_access = _key_vault_deployment_access_is_unsafe(
+            change_type=change_type,
+            declared_delta_candidates=declared_delta_candidates,
+            delta_observations=delta_observations,
+            before_payload_supplied=before_payload_supplied,
+            after_payload_supplied=after_payload_supplied,
+            before_payload=before_payload,
+            after_payload=after_payload,
+            complete_snapshots=complete_snapshots,
+            budget=budget,
+        )
+        if authorization_mutation or unsafe_deployment_access:
+            violations.append(
+                PreflightViolation(
+                    code="authorization-change-unsupported",
+                    subject=resource_id,
+                    detail=(
+                        "Key Vault access-policy, RBAC-mode, or privileged deployment "
+                        "access mutations require a future separation-aware evaluator"
+                    ),
+                )
+            )
+    if change_type != "delete" and any(
+        property_change_type in {"delete", "remove"}
+        and _canonical_property_path(raw_path) == _RESOURCE_ROOT_PATH
+        for raw_path, _, property_change_type in delta_candidates
+    ):
+        violations.append(
+            PreflightViolation(
+                code="delete",
+                subject=resource_id,
+                detail=(f"resource-root deletion is never permitted under {change_type}"),
+            )
+        )
     if resource_type == _STORAGE_ACCOUNT_TYPE and change_type == "create":
         values_by_path = {_canonical_property_path(path): value for path, value, _ in candidates}
 
@@ -389,8 +3952,16 @@ def _unsafe_property_violations(
         if (
             shared_key is not False
             or public_blob_access is not False
-            or _normalized(str(public_network or "")) != "disabled"
-            or _normalized(str(default_action or "")) != "deny"
+            or _optional_normalized_ascii_token(
+                public_network,
+                field_name="publicNetworkAccess",
+            )
+            != "disabled"
+            or _optional_normalized_ascii_token(
+                default_action,
+                field_name="networkAcls.defaultAction",
+            )
+            != "deny"
         ):
             violations.append(
                 PreflightViolation(
@@ -408,8 +3979,16 @@ def _unsafe_property_violations(
         public_network = values_by_path.get("properties.publicnetworkaccess")
         default_action = values_by_path.get("properties.networkacls.defaultaction")
         if (
-            _normalized(str(public_network or "")) != "disabled"
-            or _normalized(str(default_action or "")) != "deny"
+            _optional_normalized_ascii_token(
+                public_network,
+                field_name="publicNetworkAccess",
+            )
+            != "disabled"
+            or _optional_normalized_ascii_token(
+                default_action,
+                field_name="networkAcls.defaultAction",
+            )
+            != "deny"
         ):
             violations.append(
                 PreflightViolation(
@@ -421,10 +4000,39 @@ def _unsafe_property_violations(
                     ),
                 )
             )
+    if resource_type == _CONTAINER_ENVIRONMENT_TYPE and change_type == "create":
+        values_by_path = {_canonical_property_path(path): value for path, value, _ in candidates}
+        public_network = values_by_path.get("properties.publicnetworkaccess")
+        internal = values_by_path.get("properties.vnetconfiguration.internal")
+        if (
+            not isinstance(public_network, str)
+            or _normalized_ascii_token(
+                public_network,
+                field_name="publicNetworkAccess",
+            )
+            != "disabled"
+            or internal is not True
+        ):
+            violations.append(
+                PreflightViolation(
+                    code="public-container-apps-exposure",
+                    subject=resource_id,
+                    detail=(
+                        "managed environment create must explicitly disable "
+                        "public network access and set internal to true"
+                    ),
+                )
+            )
     if resource_type == _STORAGE_CONTAINER_TYPE and change_type == "create":
         values_by_path = {_canonical_property_path(path): value for path, value, _ in candidates}
         public_access = values_by_path.get("properties.publicaccess")
-        if _normalized(str(public_access or "")) != "none":
+        if (
+            _optional_normalized_ascii_token(
+                public_access,
+                field_name="publicAccess",
+            )
+            != "none"
+        ):
             violations.append(
                 PreflightViolation(
                     code="storage-container-public-access",
@@ -434,7 +4042,7 @@ def _unsafe_property_violations(
             )
     if not candidates:
         if violations:
-            return tuple(violations)
+            return _finalize_violations(violations)
         return (
             PreflightViolation(
                 code="uninspectable-change",
@@ -442,104 +4050,406 @@ def _unsafe_property_violations(
                 detail=("change lacks FullResourcePayloads or inspectable delta"),
             ),
         )
-    for raw_path, after, property_change_type in candidates:
-        path = _canonical_property_path(raw_path)
-        removed = property_change_type in {"delete", "remove"}
-        if (resource_type in {_CONTAINER_APP_TYPE, _CONTAINER_ENVIRONMENT_TYPE}) and (
-            (
-                "ingress.external" in path
-                or "publicnetworkaccess" in path
-                or "vnetconfiguration.internal" in path
+
+    def delta_touches(target: str) -> bool:
+        return any(
+            _property_path_contains(
+                _canonical_property_path(raw_path),
+                target,
             )
-            and (
-                _enabled(after)
-                or removed
-                or ("vnetconfiguration.internal" in path and after is False)
+            for raw_path, _, _ in delta_candidates
+        )
+
+    def has_exact_evidence(target: str) -> bool:
+        return any(_canonical_property_path(raw_path) == target for raw_path, _, _ in candidates)
+
+    def ancestor_removed(target: str) -> bool:
+        return any(
+            property_change_type in {"delete", "remove"}
+            and (path := _canonical_property_path(raw_path)) != target
+            and _property_path_contains(path, target)
+            for raw_path, _, property_change_type in delta_candidates
+        )
+
+    if (
+        resource_type == _STORAGE_ACCOUNT_TYPE
+        and delta_touches("properties.allowsharedkeyaccess")
+        and (
+            ancestor_removed("properties.allowsharedkeyaccess")
+            or not has_exact_evidence("properties.allowsharedkeyaccess")
+        )
+    ):
+        violations.append(
+            PreflightViolation(
+                code="storage-shared-key-enabled",
+                subject=resource_id,
+                detail="ancestor change omits explicit shared-key protection",
             )
-        ):
+        )
+    if (
+        resource_type == _STORAGE_ACCOUNT_TYPE
+        and delta_touches("properties.allowblobpublicaccess")
+        and (
+            ancestor_removed("properties.allowblobpublicaccess")
+            or not has_exact_evidence("properties.allowblobpublicaccess")
+        )
+    ):
+        violations.append(
+            PreflightViolation(
+                code="storage-public-blob-access",
+                subject=resource_id,
+                detail="ancestor change omits explicit public-blob protection",
+            )
+        )
+    if (
+        resource_type == _STORAGE_CONTAINER_TYPE
+        and delta_touches("properties.publicaccess")
+        and (
+            ancestor_removed("properties.publicaccess")
+            or not has_exact_evidence("properties.publicaccess")
+        )
+    ):
+        violations.append(
+            PreflightViolation(
+                code="storage-container-public-access",
+                subject=resource_id,
+                detail="ancestor change omits explicit private-container protection",
+            )
+        )
+    if resource_type in {_STORAGE_ACCOUNT_TYPE, _KEY_VAULT_TYPE}:
+        network_acl_touched = any(
+            _property_path_contains(
+                (path := _canonical_property_path(raw_path)),
+                "properties.networkacls",
+            )
+            or _property_path_contains(
+                "properties.networkacls",
+                path,
+            )
+            for raw_path, _, _ in delta_candidates
+        )
+        if network_acl_touched:
+            protected_parent_removed = any(
+                _property_path_contains(
+                    (path := _canonical_property_path(raw_path)),
+                    "properties.networkacls",
+                )
+                and property_change_type in {"delete", "remove"}
+                for raw_path, _, property_change_type in delta_candidates
+            )
+            protected_values = {
+                "properties.publicnetworkaccess": "disabled",
+                "properties.networkacls.defaultaction": "deny",
+            }
+            explicit_unsafe = False
+            complete_safe = True
+            for protected_path, expected_value in protected_values.items():
+                matching = [
+                    (after, property_change_type)
+                    for raw_path, after, property_change_type in candidates
+                    if _canonical_property_path(raw_path) == protected_path
+                ]
+                safe_values = [
+                    after
+                    for after, property_change_type in matching
+                    if property_change_type not in {"delete", "remove"}
+                    and isinstance(after, str)
+                    and _normalized_ascii_token(
+                        after,
+                        field_name=protected_path,
+                    )
+                    == expected_value
+                ]
+                unsafe_values = [
+                    after
+                    for after, property_change_type in matching
+                    if property_change_type in {"delete", "remove"}
+                    or not isinstance(after, str)
+                    or _normalized_ascii_token(
+                        after,
+                        field_name=protected_path,
+                    )
+                    != expected_value
+                ]
+                complete_safe = complete_safe and bool(safe_values) and not unsafe_values
+                explicit_unsafe = explicit_unsafe or bool(unsafe_values)
+            if protected_parent_removed or (not explicit_unsafe and not complete_safe):
+                violations.append(
+                    PreflightViolation(
+                        code="public-data-plane-access",
+                        subject=resource_id,
+                        detail=(
+                            "network ACL protection was removed or lacks explicit "
+                            "publicNetworkAccess Disabled and defaultAction Deny"
+                        ),
+                    )
+                )
+    container_network_targets: tuple[str, ...] = ()
+    if resource_type == _CONTAINER_APP_TYPE:
+        container_network_targets = (
+            "properties.configuration.ingress.external",
+            "properties.publicnetworkaccess",
+        )
+    elif resource_type == _CONTAINER_ENVIRONMENT_TYPE:
+        container_network_targets = (
+            "properties.publicnetworkaccess",
+            "properties.vnetconfiguration.internal",
+        )
+    for target in container_network_targets:
+        related_delta = [
+            (raw_path, property_change_type)
+            for raw_path, _, property_change_type in delta_candidates
+            if _property_path_contains(
+                _canonical_property_path(raw_path),
+                target,
+            )
+        ]
+        exact_values = [
+            (after, property_change_type)
+            for raw_path, after, property_change_type in candidates
+            if _canonical_property_path(raw_path) == target
+        ]
+        parent_removed = any(
+            _canonical_property_path(raw_path) != target
+            and property_change_type in {"delete", "remove"}
+            for raw_path, property_change_type in related_delta
+        )
+        if parent_removed or (related_delta and not exact_values):
             violations.append(
                 PreflightViolation(
                     code="public-container-apps-exposure",
                     subject=resource_id,
-                    detail=f"unsafe public Container Apps setting at {path}",
+                    detail=f"network change lacks explicit safe value at {target}",
                 )
             )
-        if (
-            resource_type == _STORAGE_ACCOUNT_TYPE
-            and path == "properties.allowsharedkeyaccess"
-            and (_enabled(after) or removed)
-        ):
-            violations.append(
-                PreflightViolation(
-                    code="storage-shared-key-enabled",
-                    subject=resource_id,
-                    detail=f"shared-key access enabled at {path}",
+    for raw_path, after, property_change_type in candidates:
+        path = _canonical_property_path(raw_path)
+        removed = property_change_type in {"delete", "remove"}
+        if path in container_network_targets:
+            unsafe_container_network = removed
+            if not removed and path == "properties.configuration.ingress.external":
+                if type(after) is not bool:
+                    raise PreflightInputError("Container Apps ingress.external must be boolean")
+                unsafe_container_network = after
+            elif not removed and path == "properties.vnetconfiguration.internal":
+                if type(after) is not bool:
+                    raise PreflightInputError(
+                        "Container Apps vnetConfiguration.internal must be boolean"
+                    )
+                unsafe_container_network = not after
+            elif not removed and path == "properties.publicnetworkaccess":
+                public_network_access = _normalized_ascii_token(
+                    after,
+                    field_name="publicNetworkAccess",
+                    maximum_length=64,
                 )
-            )
-        if (
-            resource_type == _STORAGE_ACCOUNT_TYPE
-            and path == "properties.allowblobpublicaccess"
-            and (_enabled(after) or removed)
-        ):
-            violations.append(
-                PreflightViolation(
-                    code="storage-public-blob-access",
-                    subject=resource_id,
-                    detail=f"public blob access enabled at {path}",
+                if public_network_access not in {"disabled", "enabled"}:
+                    raise PreflightInputError("Container Apps publicNetworkAccess is unsupported")
+                unsafe_container_network = public_network_access != "disabled"
+            if unsafe_container_network:
+                violations.append(
+                    PreflightViolation(
+                        code="public-container-apps-exposure",
+                        subject=resource_id,
+                        detail=f"unsafe public Container Apps setting at {path}",
+                    )
                 )
-            )
-        if (
-            resource_type in {_STORAGE_ACCOUNT_TYPE, _KEY_VAULT_TYPE}
-            and path
-            in {
-                "properties.publicnetworkaccess",
-                "properties.networkacls.defaultaction",
-            }
-            and (_enabled(after) or removed)
-        ):
-            violations.append(
-                PreflightViolation(
-                    code="public-data-plane-access",
-                    subject=resource_id,
-                    detail=f"public data-plane access enabled at {path}",
+        if resource_type == _STORAGE_ACCOUNT_TYPE and path == "properties.allowsharedkeyaccess":
+            if not removed and type(after) is not bool:
+                raise PreflightInputError("allowSharedKeyAccess must be boolean")
+            if removed or after is True:
+                violations.append(
+                    PreflightViolation(
+                        code="storage-shared-key-enabled",
+                        subject=resource_id,
+                        detail=f"shared-key access enabled at {path}",
+                    )
                 )
-            )
-        if (
-            resource_type == _STORAGE_CONTAINER_TYPE
-            and path == "properties.publicaccess"
-            and (_normalized(str(after or "")) in {"blob", "container"} or removed)
-        ):
-            violations.append(
-                PreflightViolation(
-                    code="storage-container-public-access",
-                    subject=resource_id,
-                    detail=f"public container access enabled at {path}",
+        if resource_type == _STORAGE_ACCOUNT_TYPE and path == "properties.allowblobpublicaccess":
+            if not removed and type(after) is not bool:
+                raise PreflightInputError("allowBlobPublicAccess must be boolean")
+            if removed or after is True:
+                violations.append(
+                    PreflightViolation(
+                        code="storage-public-blob-access",
+                        subject=resource_id,
+                        detail=f"public blob access enabled at {path}",
+                    )
                 )
-            )
-    return tuple(violations)
+        if resource_type in {_STORAGE_ACCOUNT_TYPE, _KEY_VAULT_TYPE} and path in {
+            "properties.publicnetworkaccess",
+            "properties.networkacls.defaultaction",
+        }:
+            if removed:
+                unsafe_network_value = True
+            else:
+                value = _normalized_ascii_token(
+                    after,
+                    field_name=path,
+                    maximum_length=64,
+                )
+                allowed_values = (
+                    {"disabled", "enabled", "securedbyperimeter"}
+                    if path == "properties.publicnetworkaccess"
+                    else {"allow", "deny"}
+                )
+                if value not in allowed_values:
+                    raise PreflightInputError(f"{path} has an unsupported value")
+                unsafe_network_value = value != (
+                    "disabled" if path == "properties.publicnetworkaccess" else "deny"
+                )
+            if unsafe_network_value:
+                violations.append(
+                    PreflightViolation(
+                        code="public-data-plane-access",
+                        subject=resource_id,
+                        detail=f"unsafe public data-plane setting at {path}",
+                    )
+                )
+        if resource_type == _STORAGE_CONTAINER_TYPE and path == "properties.publicaccess":
+            if removed:
+                public_access = ""
+            else:
+                public_access = _normalized_ascii_token(
+                    after,
+                    field_name="publicAccess",
+                    maximum_length=64,
+                )
+                if public_access not in {"none", "blob", "container"}:
+                    raise PreflightInputError("publicAccess has an unsupported value")
+            if removed or public_access != "none":
+                violations.append(
+                    PreflightViolation(
+                        code="storage-container-public-access",
+                        subject=resource_id,
+                        detail=f"public container access enabled at {path}",
+                    )
+                )
+    return _finalize_violations(violations)
 
 
 def evaluate_what_if(
     document: object,
     *,
     allowed_change_ids: frozenset[str] = frozenset(),
+    require_attestation: bool = False,
+    expected_collection_run_id: str | None = None,
+    expected_deployment_execution_id: str | None = None,
+    attestation_manifest_digest: str | None = None,
+    deployment_digest: str | None = None,
+    template_digest: str | None = None,
+    parameters_digest: str | None = None,
+    now: datetime | None = None,
 ) -> tuple[PreflightViolation, ...]:
-    normalized_allowlist = frozenset(_normalized(value) for value in allowed_change_ids)
-    violations: list[PreflightViolation] = []
-    for raw_change in _what_if_changes(document):
-        change = _mapping(raw_change, field_name="change")
-        resource_id = _require_string(
-            _get_case_insensitive(change, "resourceId"),
-            field_name="resourceId",
+    _validate_json_shape(document)
+    normalized_allowlist, allow_change_ids_digest = _allow_change_binding(allowed_change_ids)
+    deployment_target: DeploymentTarget | None = None
+    if require_attestation:
+        if (
+            expected_collection_run_id is None
+            or expected_deployment_execution_id is None
+            or attestation_manifest_digest is None
+            or deployment_digest is None
+            or template_digest is None
+            or parameters_digest is None
+        ):
+            raise PreflightInputError("reviewed what-if attestation inputs are required")
+        root = _mapping(
+            document,
+            field_name="attested what-if artifact",
         )
-        change_type = _normalized(
-            _require_string(
-                _get_case_insensitive(change, "changeType"),
-                field_name="changeType",
-                maximum_length=64,
+        if {key.casefold() for key in root} != {
+            "attestation",
+            "manifest",
+            "whatif",
+            "whatifrequest",
+        }:
+            raise PreflightInputError("attested what-if artifact has an invalid envelope")
+        what_if_document = _get_case_insensitive(root, "whatIf")
+        what_if_request = _get_case_insensitive(root, "whatIfRequest")
+        manifest = _parse_attestation_manifest(
+            _get_case_insensitive(root, "manifest"),
+            expected_collection_run_id=expected_collection_run_id,
+            expected_deployment_execution_id=expected_deployment_execution_id,
+            expected_manifest_digest=attestation_manifest_digest,
+            now=_current_utc(now),
+        )
+        deployment_target = manifest.deployment_target
+        _validate_what_if_request(
+            what_if_request,
+            deployment_target=deployment_target,
+        )
+        for allowed_change_id in normalized_allowlist:
+            _validate_deployment_resource_id(
+                allowed_change_id,
+                deployment_target=deployment_target,
+                field_name="allow-change resource ID",
+            )
+        expected_bindings = {
+            "allowChangeIdsDigest": allow_change_ids_digest,
+            "deploymentDigest": _canonical_sha256_digest(
+                deployment_digest,
+                field_name="reviewed deployment digest",
+            ),
+            "parametersDigest": _canonical_sha256_digest(
+                parameters_digest,
+                field_name="reviewed parameters digest",
+            ),
+            "templateDigest": _canonical_sha256_digest(
+                template_digest,
+                field_name="reviewed template digest",
+            ),
+            "whatIfDigest": _canonical_json_digest(what_if_document),
+            "whatIfRequestDigest": _canonical_json_digest(what_if_request),
+        }
+        for binding_name, expected_digest in expected_bindings.items():
+            if manifest.bindings[binding_name] != expected_digest:
+                raise PreflightInputError(
+                    f"manifest {binding_name} does not match the reviewed input"
+                )
+        _validate_artifact_attestation(
+            _get_case_insensitive(root, "attestation"),
+            artifact_kind="what-if",
+            manifest=manifest,
+            expected_binding_names=frozenset(expected_bindings),
+        )
+        document = what_if_document
+    violations: list[PreflightViolation] = []
+    path_budget = _PropertyPathBudget()
+    changes, potential_changes = _what_if_changes(document)
+    canonical_changes, canonical_potential_changes = _canonical_what_if_resource_rows(
+        changes,
+        potential_changes,
+        deployment_target=deployment_target,
+    )
+    for row in canonical_potential_changes:
+        violations.append(
+            PreflightViolation(
+                code="unpredictable-change",
+                subject=row.resource_id,
+                detail="ARM what-if reported an unresolved potential change",
             )
         )
+    for row in canonical_changes:
+        change = row.value
+        resource_id = row.resource_id
+        canonical_resource_id = row.canonical_resource_id
+        _validate_what_if_snapshot_ids(
+            change,
+            canonical_resource_id=canonical_resource_id,
+            deployment_target=deployment_target,
+        )
+        change_type = _normalized_ascii_token(
+            _get_case_insensitive(change, "changeType"),
+            field_name="changeType",
+            maximum_length=64,
+        )
         if change_type == "nochange":
+            _validate_no_change(
+                resource_id,
+                change,
+                budget=path_budget,
+            )
             continue
         if change_type == "ignore":
             violations.append(
@@ -551,6 +4461,18 @@ def evaluate_what_if(
             )
             continue
         if change_type == "delete":
+            resource_type = _resource_type(canonical_resource_id)
+            if resource_type in _UNCONDITIONALLY_BLOCKED_DELETE_TYPES:
+                violations.append(
+                    PreflightViolation(
+                        code="authorization-change-unsupported",
+                        subject=resource_id,
+                        detail=(
+                            "planned deployment-stack or storage-local-user deletion "
+                            "requires downstream effect evaluation"
+                        ),
+                    )
+                )
             violations.append(
                 PreflightViolation(
                     code="delete",
@@ -577,7 +4499,20 @@ def evaluate_what_if(
                 )
             )
             continue
-        if _normalized(resource_id) not in normalized_allowlist:
+        resource_type = _resource_type(canonical_resource_id)
+        if _is_unsupported_authorization_or_imperative_type(resource_type):
+            violations.append(
+                PreflightViolation(
+                    code="authorization-change-unsupported",
+                    subject=resource_id,
+                    detail=(
+                        "planned authorization-affecting or imperative mutations require "
+                        "a future separation-aware evaluator"
+                    ),
+                )
+            )
+            continue
+        if canonical_resource_id not in normalized_allowlist:
             violations.append(
                 PreflightViolation(
                     code="unapproved-change",
@@ -585,15 +4520,370 @@ def evaluate_what_if(
                     detail=f"{change_type} is absent from the reviewed allowlist",
                 )
             )
-        violations.extend(_unsafe_property_violations(resource_id, change))
-    return tuple(violations)
+        violations.extend(
+            _unsafe_property_violations(
+                resource_id,
+                change,
+                budget=path_budget,
+            )
+        )
+    return _finalize_violations(violations)
 
 
-def _parse_policy(document: object | None) -> RbacPolicy:
+def _parse_rbac_assignment(
+    value: object,
+    *,
+    field_name: str,
+) -> RbacAssignment:
+    assignment = _mapping(value, field_name=field_name)
+    has_assigned_principal_id = _has_case_insensitive(
+        assignment,
+        "assignedPrincipalId",
+    )
+    has_assigned_principal_type = _has_case_insensitive(
+        assignment,
+        "assignedPrincipalType",
+    )
+    has_legacy_principal_id = _has_case_insensitive(
+        assignment,
+        "principalId",
+    )
+    has_legacy_principal_type = _has_case_insensitive(
+        assignment,
+        "principalType",
+    )
+    if has_assigned_principal_id or has_assigned_principal_type:
+        if (
+            not has_assigned_principal_id
+            or not has_assigned_principal_type
+            or has_legacy_principal_id
+            or has_legacy_principal_type
+        ):
+            raise PreflightInputError(
+                f"{field_name} must use one complete assigned-principal field set"
+            )
+        raw_principal_id = _get_case_insensitive(
+            assignment,
+            "assignedPrincipalId",
+        )
+        raw_principal_type = _get_case_insensitive(
+            assignment,
+            "assignedPrincipalType",
+        )
+        assigned_principal_fields_supplied = True
+    else:
+        raw_principal_id = _get_case_insensitive(
+            assignment,
+            "principalId",
+        )
+        raw_principal_type = _get_case_insensitive(
+            assignment,
+            "principalType",
+        )
+        assigned_principal_fields_supplied = False
+    principal_id = _normalized_workload_principal_id(
+        raw_principal_id,
+        field_name=("assignedPrincipalId" if assigned_principal_fields_supplied else "principalId"),
+    )
+    raw_effective_principal_id = _get_case_insensitive(
+        assignment,
+        "effectivePrincipalId",
+    )
+    effective_principal_id = (
+        principal_id
+        if raw_effective_principal_id is None
+        else _normalized_workload_principal_id(
+            raw_effective_principal_id,
+            field_name="effectivePrincipalId",
+        )
+    )
+    if raw_principal_type is None:
+        principal_type = ""
+    else:
+        principal_type_value = _require_exact_ascii_token(
+            raw_principal_type,
+            field_name=(
+                "assignedPrincipalType" if assigned_principal_fields_supplied else "principalType"
+            ),
+            maximum_length=64,
+        )
+        principal_type = principal_type_value.lower()
+    raw_role_name = _get_case_insensitive(
+        assignment,
+        "roleDefinitionName",
+    )
+    raw_role_id = _get_case_insensitive(
+        assignment,
+        "roleDefinitionId",
+    )
+    role_name = (
+        ""
+        if raw_role_name is None
+        else _canonical_role_key(
+            _require_exact_ascii_token(
+                raw_role_name,
+                field_name="roleDefinitionName",
+            )
+        )
+    )
+    role_id = (
+        ""
+        if raw_role_id is None
+        else _canonical_role_id(
+            _require_string(
+                raw_role_id,
+                field_name="roleDefinitionId",
+            )
+        )
+    )
+    mapped_role_id = _ROLE_ID_TO_NAME.get(role_id)
+    expected_role_id = _ROLE_NAME_TO_ID.get(role_name)
+    if (
+        role_name
+        and role_id
+        and (
+            (mapped_role_id is not None and role_name != mapped_role_id)
+            or (expected_role_id is not None and role_id != expected_role_id)
+        )
+    ):
+        raise PreflightInputError("roleDefinitionName and roleDefinitionId conflict")
+    canonical_role = role_name or mapped_role_id or role_id
+    if not canonical_role:
+        raise PreflightInputError("role assignment requires roleDefinitionName or roleDefinitionId")
+    raw_condition = _get_case_insensitive(assignment, "condition")
+    condition = (
+        None
+        if raw_condition is None
+        else _require_string(
+            raw_condition,
+            field_name="condition",
+        )
+    )
+    raw_condition_version = _get_case_insensitive(
+        assignment,
+        "conditionVersion",
+    )
+    condition_version = (
+        None
+        if raw_condition_version is None
+        else _require_exact_ascii_token(
+            raw_condition_version,
+            field_name="conditionVersion",
+            maximum_length=64,
+        )
+    )
+    if (condition is None) != (condition_version is None):
+        raise PreflightInputError("condition and conditionVersion must be supplied together")
+    return RbacAssignment(
+        principal_id=principal_id,
+        effective_principal_id=effective_principal_id,
+        principal_type=principal_type,
+        role_name=canonical_role,
+        role_definition_id=role_id,
+        scope=_canonical_scope(
+            _require_string(
+                _get_case_insensitive(assignment, "scope"),
+                field_name="scope",
+            )
+        ),
+        condition=condition,
+        condition_version=condition_version,
+        role_name_supplied=raw_role_name is not None,
+        effective_principal_id_supplied=raw_effective_principal_id is not None,
+        principal_type_supplied=raw_principal_type is not None,
+        assigned_principal_fields_supplied=(assigned_principal_fields_supplied),
+    )
+
+
+def _parse_management_group_chain(
+    value: object,
+    *,
+    field_name: str,
+) -> tuple[str, ...]:
+    chain: list[str] = []
+    seen: set[str] = set()
+    for item in _sequence(
+        value,
+        field_name=field_name,
+        maximum_items=MAX_POLICY_ITEMS,
+    ):
+        scope = _canonical_management_group_scope(
+            item,
+            field_name="management-group ancestor",
+        )
+        if scope in seen:
+            raise PreflightInputError(f"{field_name} contains a duplicate or cyclic ancestor")
+        seen.add(scope)
+        chain.append(scope)
+    if not chain:
+        raise PreflightInputError(f"{field_name} must not be empty")
+    return tuple(chain)
+
+
+def _parse_policy_target(
+    value: object,
+    *,
+    expected_principal_ids: frozenset[str],
+) -> RbacCollection:
+    target = _mapping(value, field_name="RBAC policy target")
+    tenant_id = _canonical_guid(
+        _get_case_insensitive(target, "tenantId"),
+        field_name="target tenantId",
+    )
+    subscription_id = _canonical_guid(
+        _get_case_insensitive(target, "subscriptionId"),
+        field_name="target subscriptionId",
+    )
+    subscription_scope = f"/subscriptions/{subscription_id}"
+    resource_group_scope = _canonical_scope(
+        _require_string(
+            _get_case_insensitive(target, "resourceGroupId"),
+            field_name="target resourceGroupId",
+        )
+    )
+    if (
+        _RESOURCE_GROUP_SCOPE.fullmatch(resource_group_scope) is None
+        or _resource_group_subscription_id(resource_group_scope) != subscription_id
+    ):
+        raise PreflightInputError("target resourceGroupId must belong to target subscriptionId")
+    ancestry = _parse_management_group_chain(
+        _get_case_insensitive(
+            target,
+            "approvedManagementGroupAncestry",
+        ),
+        field_name="approvedManagementGroupAncestry",
+    )
+    return RbacCollection(
+        tenant_id=tenant_id,
+        subscription_id=subscription_id,
+        subscription_scope=subscription_scope,
+        resource_group_scope=resource_group_scope,
+        management_group_ancestry=ancestry,
+        effective_principal_ids=expected_principal_ids,
+    )
+
+
+def _assignment_key(
+    assignment: RbacAssignment | BroadAssignmentAllowance,
+) -> tuple[
+    str,
+    str,
+    str,
+    str,
+    str,
+    str | None,
+    str | None,
+]:
+    return (
+        assignment.principal_id,
+        assignment.principal_type,
+        assignment.effective_principal_id,
+        assignment.role_definition_id,
+        assignment.scope,
+        assignment.condition,
+        assignment.condition_version,
+    )
+
+
+def _effective_rule_role_matchers(
+    rule: SeparationRule,
+) -> frozenset[str]:
+    matchers = {
+        (
+            f"id:{_ROLE_NAME_TO_ID[role_name]}"
+            if role_name in _ROLE_NAME_TO_ID
+            else f"name:{role_name}"
+        )
+        for role_name in rule.forbidden_role_names
+    }
+    matchers.update(f"id:{role_id}" for role_id in rule.forbidden_role_ids)
+    return frozenset(matchers)
+
+
+def _separation_rule_role_tokens(rule: SeparationRule) -> tuple[str, ...]:
+    return tuple(
+        [
+            *(f"name:{role_name}" for role_name in sorted(rule.forbidden_role_names)),
+            *(f"id:{role_id}" for role_id in sorted(rule.forbidden_role_ids)),
+        ]
+    )
+
+
+def _assignment_role_tokens(
+    *,
+    role_name: str,
+    role_definition_id: str,
+) -> tuple[str, ...]:
+    tokens = [f"name:{role_name}"]
+    if role_definition_id:
+        tokens.append(f"id:{role_definition_id}")
+    return tuple(dict.fromkeys(tokens))
+
+
+def _index_separation_rules(
+    rules: Sequence[SeparationRule],
+    *,
+    budget: _SeparationRuleWorkBudget,
+) -> dict[tuple[str, str], tuple[SeparationRule, ...]]:
+    mutable_index: dict[tuple[str, str], list[SeparationRule]] = {}
+    for rule in rules:
+        budget.charge(1 + len(rule.forbidden_scope_prefixes))
+        for role_token in _separation_rule_role_tokens(rule):
+            budget.charge()
+            mutable_index.setdefault(
+                (rule.principal_id, role_token),
+                [],
+            ).append(rule)
+    return {key: tuple(indexed_rules) for key, indexed_rules in mutable_index.items()}
+
+
+def _assignment_violates_separation(
+    *,
+    effective_principal_id: str,
+    role_name: str,
+    role_definition_id: str,
+    scope: str,
+    collection: RbacCollection | None,
+    rule_index: dict[tuple[str, str], tuple[SeparationRule, ...]],
+    budget: _SeparationRuleWorkBudget,
+) -> bool:
+    evaluated_rules: set[SeparationRule] = set()
+    for role_token in _assignment_role_tokens(
+        role_name=role_name,
+        role_definition_id=role_definition_id,
+    ):
+        budget.charge()
+        for rule in rule_index.get((effective_principal_id, role_token), ()):
+            budget.charge()
+            if rule in evaluated_rules:
+                continue
+            evaluated_rules.add(rule)
+            for prefix in rule.forbidden_scope_prefixes:
+                budget.charge()
+                if _separation_scope_matches(
+                    scope,
+                    prefix,
+                    collection=collection,
+                ):
+                    return True
+    return False
+
+
+def _parse_policy(
+    document: object | None,
+    *,
+    separation_budget: _SeparationRuleWorkBudget,
+) -> RbacPolicy:
     if document is None:
         return RbacPolicy(
             allowed_broad_assignments=frozenset(),
             separation_rules=(),
+            expected_principal_ids=frozenset(),
+            approved_assignments=frozenset(),
+            legacy_expected_assignments=frozenset(),
+            target=None,
+            approved_assignments_supplied=False,
+            legacy_expected_assignments_supplied=False,
         )
     _validate_json_shape(document)
     root = _mapping(document, field_name="RBAC policy")
@@ -608,40 +4898,38 @@ def _parse_policy(document: object | None) -> RbacPolicy:
             field_name="allowedBroadAssignments",
             maximum_items=MAX_POLICY_ITEMS,
         ):
-            item = _mapping(raw_item, field_name="broad assignment allowance")
-            role_value = _get_case_insensitive(
-                item,
-                "roleDefinitionId",
+            parsed_allowance = _parse_rbac_assignment(
+                raw_item,
+                field_name="broad assignment allowance",
             )
-            if role_value is None:
-                role_value = _get_case_insensitive(
-                    item,
-                    "roleDefinitionName",
-                )
-            allowances.add(
-                BroadAssignmentAllowance(
-                    principal_id=_normalized(
-                        _require_string(
-                            _get_case_insensitive(item, "principalId"),
-                            field_name="principalId",
-                        )
-                    ),
-                    role_name=_canonical_role_key(
-                        _require_string(
-                            role_value,
-                            field_name=("roleDefinitionName or roleDefinitionId"),
-                        )
-                    ),
-                    scope=_normalized(
-                        _require_string(
-                            _get_case_insensitive(item, "scope"),
-                            field_name="scope",
-                        )
-                    ),
-                )
+            allowance = BroadAssignmentAllowance(
+                principal_id=parsed_allowance.principal_id,
+                effective_principal_id=(parsed_allowance.effective_principal_id),
+                principal_type=parsed_allowance.principal_type,
+                role_name=parsed_allowance.role_name,
+                role_definition_id=parsed_allowance.role_definition_id,
+                scope=parsed_allowance.scope,
+                condition=parsed_allowance.condition,
+                condition_version=parsed_allowance.condition_version,
+                role_name_supplied=parsed_allowance.role_name_supplied,
+                effective_principal_id_supplied=(parsed_allowance.effective_principal_id_supplied),
+                principal_type_supplied=(parsed_allowance.principal_type_supplied),
+                assigned_principal_fields_supplied=(
+                    parsed_allowance.assigned_principal_fields_supplied
+                ),
             )
+            if allowance in allowances:
+                raise PreflightInputError("allowedBroadAssignments contains a duplicate assignment")
+            allowances.add(allowance)
     raw_rules = _get_case_insensitive(root, "separationRules")
     rules: list[SeparationRule] = []
+    rule_keys: set[
+        tuple[
+            str,
+            frozenset[str],
+            tuple[str, ...],
+        ]
+    ] = set()
     if raw_rules is not None:
         for raw_item in _sequence(
             raw_rules,
@@ -659,39 +4947,2646 @@ def _parse_policy(document: object | None) -> RbacPolicy:
                 field_name="forbiddenScopePrefixes",
                 maximum_items=MAX_POLICY_ITEMS,
             )
-            rules.append(
-                SeparationRule(
-                    principal_id=_normalized(
-                        _require_string(
-                            _get_case_insensitive(item, "principalId"),
-                            field_name="principalId",
-                        )
-                    ),
-                    forbidden_role_names=frozenset(
-                        _canonical_role_key(
-                            _require_string(
-                                role,
-                                field_name="forbidden role",
-                            )
-                        )
-                        for role in role_names
-                    ),
-                    forbidden_scope_prefixes=tuple(
-                        sorted(
-                            _normalized(
-                                _require_string(
-                                    prefix,
-                                    field_name="forbidden scope prefix",
-                                )
-                            )
-                            for prefix in scope_prefixes
-                        )
-                    ),
+            raw_role_ids = _get_case_insensitive(
+                item,
+                "forbiddenRoleDefinitionIds",
+            )
+            role_ids = (
+                []
+                if raw_role_ids is None
+                else _sequence(
+                    raw_role_ids,
+                    field_name="forbiddenRoleDefinitionIds",
+                    maximum_items=MAX_POLICY_ITEMS,
                 )
             )
+            if not role_names or not scope_prefixes:
+                raise PreflightInputError(
+                    "separation rule requires forbidden roles and scope prefixes"
+                )
+            separation_budget.charge(len(role_names) + len(role_ids) + len(scope_prefixes))
+            rule = SeparationRule(
+                principal_id=_normalized_workload_principal_id(
+                    _get_case_insensitive(item, "principalId"),
+                    field_name="principalId",
+                ),
+                forbidden_role_names=frozenset(
+                    _canonical_role_key(
+                        _require_exact_ascii_token(
+                            role,
+                            field_name="forbidden role",
+                        )
+                    )
+                    for role in role_names
+                ),
+                forbidden_role_ids=frozenset(
+                    _canonical_role_id(
+                        _require_string(
+                            role_id,
+                            field_name="forbidden roleDefinitionId",
+                        )
+                    )
+                    for role_id in role_ids
+                ),
+                forbidden_scope_prefixes=_minimal_scope_prefixes(
+                    [
+                        _canonical_scope(
+                            _require_string(
+                                prefix,
+                                field_name="forbidden scope prefix",
+                            )
+                        )
+                        for prefix in scope_prefixes
+                    ],
+                    budget=separation_budget,
+                ),
+            )
+            rule_key = (
+                rule.principal_id,
+                _effective_rule_role_matchers(rule),
+                rule.forbidden_scope_prefixes,
+            )
+            if rule_key in rule_keys:
+                raise PreflightInputError("separationRules contains an equivalent duplicate rule")
+            rule_keys.add(rule_key)
+            rules.append(rule)
+    raw_expected_principals = _get_case_insensitive(
+        root,
+        "expectedPrincipalIds",
+    )
+    expected_principal_ids: set[str] = set()
+    if raw_expected_principals is not None:
+        for raw_principal_id in _sequence(
+            raw_expected_principals,
+            field_name="expectedPrincipalIds",
+            maximum_items=MAX_POLICY_ITEMS,
+        ):
+            principal_id = _normalized_workload_principal_id(
+                raw_principal_id,
+                field_name="expected principalId",
+            )
+            if principal_id in expected_principal_ids:
+                raise PreflightInputError("expectedPrincipalIds contains a duplicate principalId")
+            expected_principal_ids.add(principal_id)
+    raw_approved_assignments = _get_case_insensitive(
+        root,
+        "approvedAssignments",
+    )
+    approved_assignments: set[RbacAssignment] = set()
+    approved_assignment_keys: set[
+        tuple[
+            str,
+            str,
+            str,
+            str,
+            str,
+            str | None,
+            str | None,
+        ]
+    ] = set()
+    if raw_approved_assignments is not None:
+        for raw_assignment in _sequence(
+            raw_approved_assignments,
+            field_name="approvedAssignments",
+            maximum_items=MAX_ASSIGNMENTS,
+        ):
+            approved_assignment = _parse_rbac_assignment(
+                raw_assignment,
+                field_name="approved assignment",
+            )
+            key = _assignment_key(approved_assignment)
+            if key in approved_assignment_keys:
+                raise PreflightInputError("approvedAssignments contains a duplicate assignment")
+            approved_assignment_keys.add(key)
+            approved_assignments.add(approved_assignment)
+    raw_expected_assignments = _get_case_insensitive(
+        root,
+        "expectedAssignments",
+    )
+    expected_assignments: set[RbacAssignment] = set()
+    if raw_expected_assignments is not None:
+        for raw_assignment in _sequence(
+            raw_expected_assignments,
+            field_name="expectedAssignments",
+            maximum_items=MAX_ASSIGNMENTS,
+        ):
+            expected_assignment = _parse_rbac_assignment(
+                raw_assignment,
+                field_name="expected assignment",
+            )
+            if expected_assignment in expected_assignments:
+                raise PreflightInputError("expectedAssignments contains a duplicate assignment")
+            expected_assignments.add(expected_assignment)
     return RbacPolicy(
         allowed_broad_assignments=frozenset(allowances),
         separation_rules=tuple(rules),
+        expected_principal_ids=frozenset(expected_principal_ids),
+        approved_assignments=frozenset(approved_assignments),
+        legacy_expected_assignments=frozenset(expected_assignments),
+        target=(
+            None
+            if _get_case_insensitive(root, "target") is None
+            else _parse_policy_target(
+                _get_case_insensitive(root, "target"),
+                expected_principal_ids=frozenset(expected_principal_ids),
+            )
+        ),
+        approved_assignments_supplied=raw_approved_assignments is not None,
+        legacy_expected_assignments_supplied=(raw_expected_assignments is not None),
+    )
+
+
+def _validate_guarded_assignment_binding(
+    assignment: RbacAssignment | BroadAssignmentAllowance,
+    *,
+    field_name: str,
+) -> None:
+    if not assignment.assigned_principal_fields_supplied:
+        raise PreflightInputError(
+            f"{field_name} requires assignedPrincipalId and assignedPrincipalType"
+        )
+    if not assignment.effective_principal_id_supplied:
+        raise PreflightInputError(f"{field_name} requires effectivePrincipalId")
+    if not assignment.principal_type_supplied:
+        raise PreflightInputError(f"{field_name} requires assignedPrincipalType")
+    if assignment.principal_type not in {"group", "serviceprincipal"}:
+        raise PreflightInputError(
+            f"{field_name} assignedPrincipalType must be Group or ServicePrincipal"
+        )
+    _canonical_workload_principal_id(
+        assignment.principal_id,
+        field_name=f"{field_name} assignedPrincipalId",
+    )
+    _canonical_workload_principal_id(
+        assignment.effective_principal_id,
+        field_name=f"{field_name} effectivePrincipalId",
+    )
+    if (
+        assignment.principal_type == "group"
+        and assignment.principal_id == assignment.effective_principal_id
+    ):
+        raise PreflightInputError(
+            f"{field_name} group assignment requires a distinct effectivePrincipalId"
+        )
+    if (
+        assignment.principal_type == "serviceprincipal"
+        and assignment.principal_id != assignment.effective_principal_id
+    ):
+        raise PreflightInputError(
+            f"{field_name} ServicePrincipal assignment must target the same effectivePrincipalId"
+        )
+
+
+def _split_url(value: str, *, field_name: str) -> SplitResult:
+    if not value.isascii() or not unquote(value).isascii():
+        raise PreflightInputError(f"{field_name} contains non-ASCII characters")
+    try:
+        return urlsplit(value)
+    except ValueError as exc:
+        raise PreflightInputError(f"{field_name} is not a valid URL") from exc
+
+
+def _parse_exact_query(
+    parts: SplitResult,
+    *,
+    field_name: str,
+    allowed_keys: frozenset[str],
+) -> dict[str, list[str]]:
+    try:
+        pairs = parse_qsl(
+            parts.query,
+            keep_blank_values=True,
+            strict_parsing=True,
+        )
+    except ValueError as exc:
+        raise PreflightInputError(f"{field_name} query is malformed") from exc
+    query: dict[str, list[str]] = {}
+    seen: set[str] = set()
+    for key, value in pairs:
+        folded_key = key.casefold()
+        if not key.isascii():
+            raise PreflightInputError(f"{field_name} query keys must use ASCII")
+        if folded_key in seen:
+            raise PreflightInputError(f"{field_name} query contains a duplicate decoded key")
+        if key not in allowed_keys:
+            raise PreflightInputError(f"{field_name} query key is not canonical for this endpoint")
+        if not value.isascii():
+            raise PreflightInputError(f"{field_name} query values must use ASCII")
+        seen.add(folded_key)
+        query[key] = [value]
+    return query
+
+
+def _register_canonical_pagination_request(
+    parts: SplitResult,
+    query: dict[str, list[str]],
+    *,
+    cursor_key: str,
+    field_name: str,
+    seen_request_identities: set[_CanonicalPaginationRequestIdentity],
+    seen_cursors: set[str],
+) -> None:
+    canonical_query = tuple(
+        sorted(
+            (
+                key.casefold(),
+                (
+                    " ".join(values[0].split()).casefold()
+                    if key.casefold() == "$filter"
+                    else values[0]
+                ),
+            )
+            for key, values in query.items()
+        )
+    )
+    identity = (
+        parts.scheme.casefold(),
+        parts.netloc.casefold(),
+        unquote(parts.path).casefold(),
+        canonical_query,
+    )
+    if identity in seen_request_identities:
+        raise PreflightInputError(f"{field_name} pagination contains a repeated canonical request")
+    seen_request_identities.add(identity)
+    cursor_values = query.get(cursor_key)
+    if cursor_values is None:
+        return
+    cursor = cursor_values[0]
+    if cursor in seen_cursors:
+        raise PreflightInputError(f"{field_name} pagination reuses a decoded cursor")
+    seen_cursors.add(cursor)
+
+
+def _require_exact_page_next_link(
+    page: dict[str, Any],
+    *,
+    expected_field: str,
+    field_name: str,
+) -> object:
+    matching_fields = [key for key in page if key.casefold() in _PAGED_NEXT_LINK_KEY_CASEFOLDS]
+    if matching_fields != [expected_field]:
+        raise PreflightInputError(
+            f"{field_name} must contain only the exact {expected_field} field"
+        )
+    return page[expected_field]
+
+
+def _require_exact_url_value(
+    value: object,
+    *,
+    field_name: str,
+) -> str:
+    url = _require_exact_cli_token(
+        value,
+        field_name=field_name,
+    )
+    if not url.isascii() or any(character.isspace() for character in url):
+        raise PreflightInputError(f"{field_name} must be an exact non-whitespace ASCII URL")
+    return url
+
+
+def _has_exact_nonempty_cursor(
+    query: dict[str, list[str]],
+    key: str,
+) -> bool:
+    values = query.get(key)
+    return (
+        values is not None
+        and len(values) == 1
+        and bool(values[0])
+        and values[0].isprintable()
+        and not any(character.isspace() for character in values[0])
+    )
+
+
+def _paged_values(
+    value: object,
+    *,
+    field_name: str,
+    next_link_field: str,
+    maximum_items: int,
+    allowed_host: str,
+    budget: _RbacExpansionBudget,
+) -> tuple[list[object], tuple[str, ...]]:
+    pages = _sequence(
+        value,
+        field_name=f"{field_name} pages",
+        maximum_items=MAX_POLICY_ITEMS,
+    )
+    if not pages:
+        raise PreflightInputError(f"{field_name} pages must not be empty")
+    budget.charge_calls(len(pages))
+    budget.charge_work(len(pages) * 2)
+    values: list[object] = []
+    expected_request_url: str | None = None
+    request_urls: list[str] = []
+    for index, raw_page in enumerate(pages):
+        page = _mapping(raw_page, field_name=f"{field_name} page")
+        request_url = _require_exact_url_value(
+            _get_case_insensitive(page, "requestUrl"),
+            field_name=f"{field_name} requestUrl",
+        )
+        parts = _split_url(
+            request_url,
+            field_name=f"{field_name} requestUrl",
+        )
+        if parts.scheme.casefold() != "https" or parts.netloc.casefold() != allowed_host:
+            raise PreflightInputError(f"{field_name} requestUrl must use https://{allowed_host}")
+        if index > 0 and expected_request_url != request_url:
+            raise PreflightInputError(f"{field_name} pagination has a nextLink gap")
+        request_urls.append(request_url)
+        _require_http_success(
+            _get_case_insensitive(page, "statusCode"),
+            field_name=f"{field_name} page",
+        )
+        page_values = _sequence(
+            _get_case_insensitive(page, "value"),
+            field_name=f"{field_name} page value",
+            maximum_items=maximum_items,
+        )
+        budget.charge_work(len(page_values))
+        if len(values) + len(page_values) > maximum_items:
+            raise PreflightInputError(f"{field_name} must contain at most {maximum_items} items")
+        values.extend(page_values)
+        raw_next_link = _require_exact_page_next_link(
+            page,
+            expected_field=next_link_field,
+            field_name=f"{field_name} page",
+        )
+        expected_request_url = (
+            None
+            if raw_next_link is None
+            else _require_exact_url_value(
+                raw_next_link,
+                field_name=f"{field_name} nextLink",
+            )
+        )
+        if index < len(pages) - 1 and expected_request_url is None:
+            raise PreflightInputError(f"{field_name} pagination ended before the supplied pages")
+    if expected_request_url is not None:
+        raise PreflightInputError(f"{field_name} pagination is incomplete")
+    return values, tuple(request_urls)
+
+
+def _parse_evidence_target(value: object) -> RbacCollection:
+    target = _mapping(value, field_name="RBAC evidence target")
+    tenant_id = _canonical_guid(
+        _get_case_insensitive(target, "tenantId"),
+        field_name="evidence target tenantId",
+    )
+    subscription_id = _canonical_guid(
+        _get_case_insensitive(target, "subscriptionId"),
+        field_name="evidence target subscriptionId",
+    )
+    subscription_scope = f"/subscriptions/{subscription_id}"
+    resource_group_scope = _canonical_scope(
+        _require_string(
+            _get_case_insensitive(target, "resourceGroupId"),
+            field_name="evidence target resourceGroupId",
+        )
+    )
+    if (
+        _RESOURCE_GROUP_SCOPE.fullmatch(resource_group_scope) is None
+        or _resource_group_subscription_id(resource_group_scope) != subscription_id
+    ):
+        raise PreflightInputError("evidence target resourceGroupId must belong to subscriptionId")
+    return RbacCollection(
+        tenant_id=tenant_id,
+        subscription_id=subscription_id,
+        subscription_scope=subscription_scope,
+        resource_group_scope=resource_group_scope,
+        management_group_ancestry=(),
+        effective_principal_ids=frozenset(),
+    )
+
+
+def _validate_arm_get_url(
+    value: object,
+    *,
+    expected_path: str,
+    expected_query: dict[str, str],
+    field_name: str,
+) -> None:
+    request_url = _require_string(
+        value,
+        field_name=field_name,
+    )
+    parts = _split_url(request_url, field_name=field_name)
+    if (
+        parts.scheme.casefold() != "https"
+        or parts.netloc.casefold() != "management.azure.com"
+        or unquote(parts.path).casefold() != expected_path.casefold()
+        or parts.fragment
+    ):
+        raise PreflightInputError(f"{field_name} is not canonical")
+    query = _parse_exact_query(
+        parts,
+        field_name=field_name,
+        allowed_keys=frozenset(expected_query),
+    )
+    expected = {key: [expected_value] for key, expected_value in expected_query.items()}
+    if query != expected:
+        raise PreflightInputError(f"{field_name} is not canonical")
+
+
+def _derive_management_group_ancestry(
+    value: object,
+    *,
+    target: RbacCollection,
+    budget: _RbacExpansionBudget,
+) -> tuple[str, ...]:
+    budget.charge_calls(3)
+    budget.charge_work(3)
+    hierarchy = _mapping(value, field_name="management-group hierarchy")
+    resource_graph = _mapping(
+        _get_case_insensitive(hierarchy, "resourceGraph"),
+        field_name="Resource Graph hierarchy evidence",
+    )
+    request = _mapping(
+        _get_case_insensitive(resource_graph, "request"),
+        field_name="Resource Graph hierarchy request",
+    )
+    if (
+        _canonical_guid(
+            _get_case_insensitive(request, "tenantId"),
+            field_name="Resource Graph request tenantId",
+        )
+        != target.tenant_id
+    ):
+        raise PreflightInputError("Resource Graph hierarchy request crosses tenants")
+    if (
+        _canonical_guid(
+            _get_case_insensitive(request, "subscriptionId"),
+            field_name="Resource Graph request subscriptionId",
+        )
+        != target.subscription_id
+    ):
+        raise PreflightInputError("Resource Graph hierarchy request targets another subscription")
+    query_text = _require_string(
+        _get_case_insensitive(request, "query"),
+        field_name="Resource Graph hierarchy query",
+    )
+    if "managementgroupancestorschain" not in query_text.casefold():
+        raise PreflightInputError(
+            "Resource Graph hierarchy query omits managementGroupAncestorsChain"
+        )
+    _require_http_success(
+        _get_case_insensitive(resource_graph, "statusCode"),
+        field_name="Resource Graph hierarchy evidence",
+    )
+    body = _mapping(
+        _get_case_insensitive(resource_graph, "body"),
+        field_name="Resource Graph hierarchy body",
+    )
+    if any(
+        key.casefold() in {"skiptoken", "$skiptoken"} and token is not None
+        for key, token in body.items()
+    ):
+        raise PreflightInputError("Resource Graph hierarchy evidence is paginated or incomplete")
+    result_truncated = _get_case_insensitive(
+        body,
+        "resultTruncated",
+    )
+    if not (
+        result_truncated is False or (type(result_truncated) is str and result_truncated == "false")
+    ):
+        raise PreflightInputError(
+            "Resource Graph hierarchy result must be explicitly non-truncated"
+        )
+    rows = _sequence(
+        _get_case_insensitive(body, "data"),
+        field_name="Resource Graph hierarchy data",
+        maximum_items=2,
+    )
+    count = _get_case_insensitive(body, "count")
+    total_records = _get_case_insensitive(body, "totalRecords")
+    if (
+        type(count) is not int
+        or type(total_records) is not int
+        or count != total_records
+        or count != len(rows)
+        or count != 1
+    ):
+        raise PreflightInputError(
+            "Resource Graph hierarchy count and totalRecords must match exactly one result row"
+        )
+    row = _mapping(
+        rows[0],
+        field_name="Resource Graph subscription row",
+    )
+    if (
+        _canonical_guid(
+            _get_case_insensitive(row, "tenantId"),
+            field_name="Resource Graph tenantId",
+        )
+        != target.tenant_id
+    ):
+        raise PreflightInputError("Resource Graph hierarchy evidence crosses tenants")
+    if (
+        _canonical_guid(
+            _get_case_insensitive(row, "subscriptionId"),
+            field_name="Resource Graph subscriptionId",
+        )
+        != target.subscription_id
+    ):
+        raise PreflightInputError("Resource Graph hierarchy evidence targets another subscription")
+    properties = _mapping(
+        _get_case_insensitive(row, "properties"),
+        field_name="Resource Graph subscription properties",
+    )
+    resource_graph_chain: list[str] = []
+    resource_graph_seen: set[str] = set()
+    raw_ancestors = _sequence(
+        _get_case_insensitive(
+            properties,
+            "managementGroupAncestorsChain",
+        ),
+        field_name="managementGroupAncestorsChain",
+        maximum_items=MAX_POLICY_ITEMS,
+    )
+    budget.charge_work(len(raw_ancestors))
+    for raw_ancestor in raw_ancestors:
+        ancestor = _mapping(
+            raw_ancestor,
+            field_name="Resource Graph management-group ancestor",
+        )
+        name = _require_string(
+            _get_case_insensitive(ancestor, "name"),
+            field_name="Resource Graph management-group name",
+            maximum_length=256,
+        )
+        scope = _canonical_management_group_scope(
+            (f"/providers/Microsoft.Management/managementGroups/{name}"),
+            field_name="Resource Graph management-group ancestor",
+        )
+        if scope in resource_graph_seen:
+            raise PreflightInputError("Resource Graph management-group ancestry is cyclic")
+        resource_graph_seen.add(scope)
+        resource_graph_chain.append(scope)
+    if not resource_graph_chain:
+        raise PreflightInputError("Resource Graph managementGroupAncestorsChain is missing")
+
+    arm = _mapping(
+        _get_case_insensitive(hierarchy, "arm"),
+        field_name="ARM hierarchy evidence",
+    )
+    subscription_artifact = _mapping(
+        _get_case_insensitive(arm, "subscription"),
+        field_name="ARM subscription hierarchy evidence",
+    )
+    _require_http_success(
+        _get_case_insensitive(subscription_artifact, "statusCode"),
+        field_name="ARM subscription hierarchy evidence",
+    )
+    subscription_body = _mapping(
+        _get_case_insensitive(subscription_artifact, "body"),
+        field_name="ARM subscription hierarchy body",
+    )
+    subscription_properties = _mapping(
+        _get_case_insensitive(subscription_body, "properties"),
+        field_name="ARM subscription hierarchy properties",
+    )
+    if (
+        _canonical_guid(
+            _require_literal_subscription_tenant(subscription_properties),
+            field_name="ARM subscription tenant",
+        )
+        != target.tenant_id
+    ):
+        raise PreflightInputError("ARM subscription hierarchy evidence crosses tenants")
+    parent = _mapping(
+        _get_case_insensitive(subscription_properties, "parent"),
+        field_name="ARM subscription hierarchy parent",
+    )
+    leaf_management_group = _canonical_management_group_scope(
+        _get_case_insensitive(parent, "id"),
+        field_name="ARM subscription parent id",
+    )
+    expected_subscription_id = f"{leaf_management_group}/subscriptions/{target.subscription_id}"
+    if (
+        _canonical_scope(
+            _require_string(
+                _get_case_insensitive(subscription_body, "id"),
+                field_name="ARM subscription association id",
+            )
+        )
+        != expected_subscription_id
+        or _normalized_ascii_token(
+            _get_case_insensitive(subscription_body, "type"),
+            field_name="ARM subscription association type",
+            maximum_length=128,
+        )
+        != "microsoft.management/managementgroups/subscriptions"
+        or _canonical_guid(
+            _get_case_insensitive(subscription_body, "name"),
+            field_name="ARM subscription association name",
+        )
+        != target.subscription_id
+    ):
+        raise PreflightInputError("ARM subscription hierarchy body is inconsistent")
+    _validate_arm_get_url(
+        _get_case_insensitive(subscription_artifact, "requestUrl"),
+        expected_path=expected_subscription_id,
+        expected_query={"api-version": "2020-05-01"},
+        field_name="ARM subscription hierarchy requestUrl",
+    )
+
+    resource_group_artifact = _mapping(
+        _get_case_insensitive(arm, "resourceGroup"),
+        field_name="ARM resource-group hierarchy evidence",
+    )
+    _require_http_success(
+        _get_case_insensitive(resource_group_artifact, "statusCode"),
+        field_name="ARM resource-group hierarchy evidence",
+    )
+    resource_group_body = _mapping(
+        _get_case_insensitive(resource_group_artifact, "body"),
+        field_name="ARM resource-group hierarchy body",
+    )
+    if (
+        _canonical_scope(
+            _require_string(
+                _get_case_insensitive(resource_group_body, "id"),
+                field_name="ARM resource-group id",
+            )
+        )
+        != target.resource_group_scope
+        or _normalized_ascii_token(
+            _get_case_insensitive(resource_group_body, "type"),
+            field_name="ARM resource-group type",
+            maximum_length=128,
+        )
+        != "microsoft.resources/resourcegroups"
+    ):
+        raise PreflightInputError("ARM resource-group hierarchy body is inconsistent")
+    _validate_arm_get_url(
+        _get_case_insensitive(resource_group_artifact, "requestUrl"),
+        expected_path=target.resource_group_scope,
+        expected_query={"api-version": "2021-04-01"},
+        field_name="ARM resource-group hierarchy requestUrl",
+    )
+
+    parent_by_management_group: dict[str, str | None] = {}
+    raw_management_groups = _sequence(
+        _get_case_insensitive(arm, "managementGroups"),
+        field_name="ARM managementGroups",
+        maximum_items=MAX_POLICY_ITEMS,
+    )
+    budget.charge_calls(len(raw_management_groups))
+    budget.charge_work(len(raw_management_groups) * 2)
+    for raw_artifact in raw_management_groups:
+        artifact = _mapping(
+            raw_artifact,
+            field_name="ARM management-group hierarchy evidence",
+        )
+        _require_http_success(
+            _get_case_insensitive(artifact, "statusCode"),
+            field_name="ARM management-group hierarchy evidence",
+        )
+        management_group = _mapping(
+            _get_case_insensitive(artifact, "body"),
+            field_name="ARM management-group hierarchy body",
+        )
+        management_group_id = _canonical_management_group_scope(
+            _get_case_insensitive(management_group, "id"),
+            field_name="ARM management-group id",
+        )
+        if (
+            _normalized_ascii_token(
+                _get_case_insensitive(management_group, "type"),
+                field_name="ARM management-group type",
+                maximum_length=128,
+            )
+            != "microsoft.management/managementgroups"
+        ):
+            raise PreflightInputError("ARM management-group hierarchy body has the wrong type")
+        properties = _mapping(
+            _get_case_insensitive(management_group, "properties"),
+            field_name="ARM management-group properties",
+        )
+        if (
+            _canonical_guid(
+                _get_case_insensitive(properties, "tenantId"),
+                field_name="ARM management-group tenantId",
+            )
+            != target.tenant_id
+        ):
+            raise PreflightInputError("ARM management-group hierarchy evidence crosses tenants")
+        details = _mapping(
+            _get_case_insensitive(properties, "details"),
+            field_name="ARM management-group details",
+        )
+        if not _has_case_insensitive(details, "parent"):
+            raise PreflightInputError("ARM management-group hierarchy omits details.parent")
+        raw_parent = _get_case_insensitive(details, "parent")
+        parent_id = (
+            None
+            if raw_parent is None
+            else _canonical_management_group_scope(
+                _get_case_insensitive(
+                    _mapping(
+                        raw_parent,
+                        field_name="ARM management-group parent",
+                    ),
+                    "id",
+                ),
+                field_name="ARM management-group parent id",
+            )
+        )
+        if management_group_id in parent_by_management_group:
+            raise PreflightInputError("ARM management-group hierarchy contains a duplicate node")
+        parent_by_management_group[management_group_id] = parent_id
+        _validate_arm_get_url(
+            _get_case_insensitive(artifact, "requestUrl"),
+            expected_path=management_group_id,
+            expected_query={
+                "api-version": "2020-05-01",
+                "$expand": "path",
+            },
+            field_name="ARM management-group hierarchy requestUrl",
+        )
+    if not parent_by_management_group:
+        raise PreflightInputError("ARM management-group hierarchy evidence is missing")
+
+    arm_chain: list[str] = []
+    seen: set[str] = set()
+    current: str | None = leaf_management_group
+    while current is not None:
+        if current in seen:
+            raise PreflightInputError("ARM management-group hierarchy is cyclic")
+        seen.add(current)
+        if current not in parent_by_management_group:
+            raise PreflightInputError("ARM management-group hierarchy omits an ancestor")
+        arm_chain.append(current)
+        current = parent_by_management_group[current]
+    if seen != set(parent_by_management_group):
+        raise PreflightInputError("ARM management-group hierarchy contains disconnected nodes")
+    if tuple(resource_graph_chain) != tuple(arm_chain):
+        raise PreflightInputError("Resource Graph and ARM management-group hierarchies disagree")
+    return tuple(arm_chain)
+
+
+def _validate_graph_urls(
+    request_urls: tuple[str, ...],
+    *,
+    effective_principal_id: str,
+    method: str,
+) -> None:
+    expected_path = f"/v1.0/serviceprincipals/{effective_principal_id}/{method}"
+    seen_request_identities: set[_CanonicalPaginationRequestIdentity] = set()
+    seen_cursors: set[str] = set()
+    for index, request_url in enumerate(request_urls):
+        parts = _split_url(
+            request_url,
+            field_name="Graph membership requestUrl",
+        )
+        path = unquote(parts.path).casefold()
+        if path != expected_path:
+            raise PreflightInputError(
+                "Graph membership requestUrl does not match the effective "
+                "service-principal object ID"
+            )
+        query = _parse_exact_query(
+            parts,
+            field_name="Graph membership requestUrl",
+            allowed_keys=_GRAPH_MEMBERSHIP_QUERY_KEYS,
+        )
+        if parts.fragment or (index == 0 and query):
+            raise PreflightInputError("initial Graph membership requestUrl must be unfiltered")
+        if index > 0 and (
+            set(query) != {"$skiptoken"} or not _has_exact_nonempty_cursor(query, "$skiptoken")
+        ):
+            raise PreflightInputError("Graph membership continuation URL is not canonical")
+        _register_canonical_pagination_request(
+            parts,
+            query,
+            cursor_key="$skiptoken",
+            field_name="Graph membership",
+            seen_request_identities=seen_request_identities,
+            seen_cursors=seen_cursors,
+        )
+
+
+def _parse_security_group_membership(
+    value: object,
+    *,
+    effective_principal_id: str,
+    target: RbacCollection,
+    principal_registry: _PrincipalTypeRegistry,
+    budget: _RbacExpansionBudget,
+) -> frozenset[str]:
+    membership = _mapping(value, field_name="Graph group-membership evidence")
+    if (
+        _canonical_guid(
+            _get_case_insensitive(membership, "tenantId"),
+            field_name="Graph group-membership tenantId",
+        )
+        != target.tenant_id
+    ):
+        raise PreflightInputError("Graph group-membership evidence crosses tenants")
+    raw_method = _require_exact_ascii_token(
+        _get_case_insensitive(membership, "method"),
+        field_name="Graph membership method",
+        maximum_length=64,
+    )
+    method = raw_method.lower()
+    if method not in _GRAPH_MEMBERSHIP_METHODS:
+        raise PreflightInputError("Graph membership method is unsupported")
+    values, request_urls = _paged_values(
+        _get_case_insensitive(membership, "pages"),
+        field_name="Graph group-membership evidence",
+        next_link_field="@odata.nextLink",
+        maximum_items=MAX_ASSIGNMENTS,
+        allowed_host="graph.microsoft.com",
+        budget=budget,
+    )
+    _validate_graph_urls(
+        request_urls,
+        effective_principal_id=effective_principal_id,
+        method=method,
+    )
+    groups: set[str] = set()
+    security_enabled_by_group_id: dict[str, bool] = {}
+
+    def register_group_claim(group_id: str, *, security_enabled: bool) -> None:
+        if group_id in security_enabled_by_group_id:
+            if security_enabled_by_group_id[group_id] != security_enabled:
+                raise PreflightInputError(
+                    "Graph group-membership evidence contains conflicting "
+                    "securityEnabled claims for a group"
+                )
+            raise PreflightInputError("Graph group-membership evidence contains a duplicate group")
+        security_enabled_by_group_id[group_id] = security_enabled
+        if security_enabled:
+            groups.add(group_id)
+
+    if method == "getmembergroups":
+        if _get_case_insensitive(membership, "securityEnabledOnly") is not True:
+            raise PreflightInputError("getMemberGroups evidence must set securityEnabledOnly true")
+        if len(request_urls) != 1:
+            raise PreflightInputError("getMemberGroups evidence must contain exactly one response")
+        for raw_group_id in values:
+            group_id = _canonical_workload_principal_id(
+                raw_group_id,
+                field_name="Graph security-group id",
+            )
+            principal_registry.register(
+                group_id,
+                "group",
+                field_name="Graph security-group id",
+            )
+            register_group_claim(
+                group_id,
+                security_enabled=True,
+            )
+    else:
+        for raw_item in values:
+            item = _mapping(
+                raw_item,
+                field_name="Graph transitiveMemberOf item",
+            )
+            object_type = _normalized_ascii_token(
+                _get_case_insensitive(item, "@odata.type"),
+                field_name="Graph transitiveMemberOf @odata.type",
+                maximum_length=128,
+            )
+            object_id = _canonical_workload_principal_id(
+                _get_case_insensitive(item, "id"),
+                field_name="Graph transitiveMemberOf id",
+            )
+            directory_principal_type = _GRAPH_DIRECTORY_PRINCIPAL_TYPES.get(object_type)
+            principal_registry.register(
+                object_id,
+                (
+                    directory_principal_type
+                    if directory_principal_type is not None
+                    else f"graph:{object_type.removeprefix('#microsoft.graph.')}"
+                ),
+                field_name="Graph transitiveMemberOf id",
+            )
+            if object_type != "#microsoft.graph.group":
+                continue
+            security_enabled = _get_case_insensitive(
+                item,
+                "securityEnabled",
+            )
+            if type(security_enabled) is not bool:
+                raise PreflightInputError("Graph group membership omits securityEnabled")
+            register_group_claim(
+                object_id,
+                security_enabled=security_enabled,
+            )
+    return frozenset(groups)
+
+
+def _parse_service_principal(
+    value: object,
+    *,
+    effective_principal_id: str,
+    target: RbacCollection,
+    principal_registry: _PrincipalTypeRegistry,
+    budget: _RbacExpansionBudget,
+) -> None:
+    budget.charge_calls()
+    budget.charge_work()
+    service_principal = _mapping(
+        value,
+        field_name="Graph service-principal evidence",
+    )
+    _require_http_success(
+        _get_case_insensitive(service_principal, "statusCode"),
+        field_name="Graph service-principal evidence",
+    )
+    if (
+        _canonical_guid(
+            _get_case_insensitive(service_principal, "tenantId"),
+            field_name="Graph service-principal tenantId",
+        )
+        != target.tenant_id
+    ):
+        raise PreflightInputError("Graph service-principal evidence crosses tenants")
+    object_id = _canonical_workload_principal_id(
+        _get_case_insensitive(service_principal, "id"),
+        field_name="Graph service-principal object id",
+    )
+    principal_registry.register(
+        effective_principal_id,
+        "serviceprincipal",
+        field_name="effectivePrincipalId",
+    )
+    principal_registry.register(
+        object_id,
+        "serviceprincipal",
+        field_name="Graph service-principal object id",
+    )
+    client_id = _canonical_workload_principal_id(
+        _get_case_insensitive(service_principal, "appId"),
+        field_name="Graph service-principal appId",
+    )
+    if object_id == client_id:
+        raise PreflightInputError("service-principal object ID and client ID must differ")
+    if effective_principal_id == client_id:
+        raise PreflightInputError("effectivePrincipalId is a client ID, not an object ID")
+    if effective_principal_id != object_id:
+        raise PreflightInputError(
+            "effectivePrincipalId does not match the service-principal object ID"
+        )
+
+
+def _validate_assigned_to_filter(
+    value: object,
+    *,
+    effective_principal_id: str,
+    field_name: str,
+) -> str:
+    filter_value = _require_string(
+        value,
+        field_name=field_name,
+    )
+    match = re.fullmatch(
+        rf"atScope\(\)\s+and\s+assignedTo\('({_GUID_PATTERN})'\)",
+        filter_value,
+        re.IGNORECASE,
+    )
+    if match is None:
+        raise PreflightInputError(f"{field_name} must use atScope() and assignedTo(object-id)")
+    if match.group(1).casefold() != effective_principal_id:
+        raise PreflightInputError(f"{field_name} uses a different principal")
+    return filter_value
+
+
+def _validate_arm_role_assignment_urls(
+    request_urls: tuple[str, ...],
+    *,
+    target: RbacCollection,
+    effective_principal_id: str,
+) -> None:
+    expected_path = (
+        target.resource_group_scope + "/providers/microsoft.authorization/roleassignments"
+    )
+    seen_request_identities: set[_CanonicalPaginationRequestIdentity] = set()
+    seen_cursors: set[str] = set()
+    for index, request_url in enumerate(request_urls):
+        parts = _split_url(
+            request_url,
+            field_name="ARM role-assignment requestUrl",
+        )
+        if unquote(parts.path).casefold() != expected_path:
+            raise PreflightInputError("ARM role-assignment requestUrl uses the wrong scope")
+        query = _parse_exact_query(
+            parts,
+            field_name="ARM role-assignment requestUrl",
+            allowed_keys=_ARM_AUTHORIZATION_QUERY_KEYS,
+        )
+        allowed_keys = {"api-version", "$filter"}
+        if index > 0:
+            allowed_keys.add("$skipToken")
+        if (
+            parts.fragment
+            or set(query) - allowed_keys
+            or query.get("api-version") != [_ARM_ROLE_ASSIGNMENTS_API_VERSION]
+            or len(query.get("$filter", [])) != 1
+            or (index == 0 and "$skipToken" in query)
+            or (
+                index > 0
+                and not _has_exact_nonempty_cursor(
+                    query,
+                    "$skipToken",
+                )
+            )
+        ):
+            raise PreflightInputError("ARM role-assignment requestUrl is not canonical")
+        _validate_assigned_to_filter(
+            query["$filter"][0],
+            effective_principal_id=effective_principal_id,
+            field_name="ARM role-assignment requestUrl filter",
+        )
+        _register_canonical_pagination_request(
+            parts,
+            query,
+            cursor_key="$skipToken",
+            field_name="ARM role-assignment",
+            seen_request_identities=seen_request_identities,
+            seen_cursors=seen_cursors,
+        )
+
+
+def _validate_principal_id_filter(
+    value: object,
+    *,
+    assigned_principal_id: str,
+    field_name: str,
+) -> str:
+    filter_value = _require_string(
+        value,
+        field_name=field_name,
+    )
+    match = re.fullmatch(
+        rf"principalId\s+eq\s+'({_GUID_PATTERN})'",
+        filter_value,
+        re.IGNORECASE,
+    )
+    if match is None:
+        raise PreflightInputError(f"{field_name} must use principalId eq assigned-object-id")
+    if match.group(1).casefold() != assigned_principal_id:
+        raise PreflightInputError(f"{field_name} uses a different assigned principal")
+    return filter_value
+
+
+def _validate_descendant_arm_urls(
+    request_urls: tuple[str, ...],
+    *,
+    target: RbacCollection,
+    assigned_principal_id: str,
+) -> None:
+    expected_path = target.subscription_scope + "/providers/microsoft.authorization/roleassignments"
+    seen_request_identities: set[_CanonicalPaginationRequestIdentity] = set()
+    seen_cursors: set[str] = set()
+    for index, request_url in enumerate(request_urls):
+        parts = _split_url(
+            request_url,
+            field_name="ARM descendant role-assignment requestUrl",
+        )
+        if unquote(parts.path).casefold() != expected_path:
+            raise PreflightInputError(
+                "ARM descendant role-assignment requestUrl uses the wrong subscription"
+            )
+        query = _parse_exact_query(
+            parts,
+            field_name="ARM descendant role-assignment requestUrl",
+            allowed_keys=_ARM_AUTHORIZATION_QUERY_KEYS,
+        )
+        allowed_keys = {"api-version", "$filter"}
+        if index > 0:
+            allowed_keys.add("$skipToken")
+        if (
+            parts.fragment
+            or set(query) - allowed_keys
+            or query.get("api-version") != [_ARM_ROLE_ASSIGNMENTS_API_VERSION]
+            or len(query.get("$filter", [])) != 1
+            or (index == 0 and "$skipToken" in query)
+            or (
+                index > 0
+                and not _has_exact_nonempty_cursor(
+                    query,
+                    "$skipToken",
+                )
+            )
+        ):
+            raise PreflightInputError("ARM descendant role-assignment requestUrl is not canonical")
+        _validate_principal_id_filter(
+            query["$filter"][0],
+            assigned_principal_id=assigned_principal_id,
+            field_name="ARM descendant requestUrl filter",
+        )
+        _register_canonical_pagination_request(
+            parts,
+            query,
+            cursor_key="$skipToken",
+            field_name="ARM descendant role-assignment",
+            seen_request_identities=seen_request_identities,
+            seen_cursors=seen_cursors,
+        )
+
+
+def _validate_arm_deny_assignment_urls(
+    request_urls: tuple[str, ...],
+    *,
+    target: RbacCollection,
+    collection_type: str,
+) -> None:
+    if collection_type == "target-and-ancestors":
+        expected_scope = target.resource_group_scope
+        expected_filter = "atScope()"
+    else:
+        if collection_type != "subscription-inventory":
+            raise PreflightInputError("deny-assignment collection type is unsupported")
+        expected_scope = target.subscription_scope
+        expected_filter = None
+    expected_path = expected_scope + "/providers/microsoft.authorization/denyassignments"
+    seen_request_identities: set[_CanonicalPaginationRequestIdentity] = set()
+    seen_cursors: set[str] = set()
+    for index, request_url in enumerate(request_urls):
+        parts = _split_url(
+            request_url,
+            field_name="ARM deny-assignment requestUrl",
+        )
+        if unquote(parts.path).casefold() != expected_path:
+            raise PreflightInputError("ARM deny-assignment requestUrl uses the wrong scope")
+        query = _parse_exact_query(
+            parts,
+            field_name="ARM deny-assignment requestUrl",
+            allowed_keys=_ARM_AUTHORIZATION_QUERY_KEYS,
+        )
+        expected_keys = {"api-version"}
+        if expected_filter is not None:
+            expected_keys.add("$filter")
+        if index > 0:
+            expected_keys.add("$skipToken")
+        if (
+            parts.fragment
+            or set(query) != expected_keys
+            or query.get("api-version") != [_ARM_DENY_ASSIGNMENTS_API_VERSION]
+            or (expected_filter is not None and query.get("$filter") != [expected_filter])
+            or (
+                index > 0
+                and not _has_exact_nonempty_cursor(
+                    query,
+                    "$skipToken",
+                )
+            )
+        ):
+            raise PreflightInputError("ARM deny-assignment requestUrl is not canonical")
+        _register_canonical_pagination_request(
+            parts,
+            query,
+            cursor_key="$skipToken",
+            field_name="ARM deny-assignment",
+            seen_request_identities=seen_request_identities,
+            seen_cursors=seen_cursors,
+        )
+
+
+def _parse_deny_principals(
+    value: object,
+    *,
+    field_name: str,
+    principal_registry: _PrincipalTypeRegistry,
+    budget: _DenyEvaluationWorkBudget,
+) -> tuple[_TypedPrincipalClaim, ...]:
+    principal_ids: set[str] = set()
+    principals: list[_TypedPrincipalClaim] = []
+    raw_principals = _sequence(
+        value,
+        field_name=field_name,
+        maximum_items=MAX_ASSIGNMENTS,
+    )
+    budget.charge(len(raw_principals))
+    for raw_principal in raw_principals:
+        principal = _mapping(
+            raw_principal,
+            field_name=f"{field_name} entry",
+        )
+        principal_id = _canonical_guid(
+            _get_case_insensitive(principal, "id"),
+            field_name=f"{field_name} id",
+        )
+        principal_type = _normalized_ascii_token(
+            _get_case_insensitive(principal, "type"),
+            field_name=f"{field_name} type",
+            maximum_length=64,
+        )
+        if principal_type not in _DENY_PRINCIPAL_TYPES:
+            raise PreflightInputError(f"{field_name} contains an unsupported principal type")
+        if (principal_id == _ALL_PRINCIPALS_ID) != (principal_type == "systemdefined"):
+            raise PreflightInputError(f"{field_name} uses an inconsistent All Principals identity")
+        if principal_id in principal_ids:
+            raise PreflightInputError(f"{field_name} contains a duplicate principal")
+        principal_registry.register(
+            principal_id,
+            principal_type,
+            field_name=f"{field_name} id",
+        )
+        principal_ids.add(principal_id)
+        principals.append(
+            _TypedPrincipalClaim(
+                principal_id=principal_id,
+                principal_type=principal_type,
+            )
+        )
+    return tuple(principals)
+
+
+def _parse_optional_deny_condition(
+    value: dict[str, Any],
+    *,
+    field_name: str,
+) -> tuple[str | None, str | None]:
+    raw_condition = _get_case_insensitive(value, "condition")
+    raw_condition_version = _get_case_insensitive(
+        value,
+        "conditionVersion",
+    )
+    if raw_condition is None:
+        if raw_condition_version is not None:
+            raise PreflightInputError(f"{field_name} conditionVersion requires condition")
+        return None, None
+    condition = _require_exact_cli_token(
+        raw_condition,
+        field_name=f"{field_name} condition",
+    )
+    condition_version = _require_exact_ascii_token(
+        raw_condition_version,
+        field_name=f"{field_name} conditionVersion",
+        maximum_length=32,
+    )
+    if condition_version != "2.0":
+        raise PreflightInputError(f"{field_name} conditionVersion must be exact 2.0")
+    return condition, condition_version
+
+
+def _validate_deny_permissions(
+    value: object,
+    *,
+    budget: _DenyEvaluationWorkBudget,
+) -> None:
+    permissions = _sequence(
+        value,
+        field_name="ARM deny-assignment permissions",
+        maximum_items=MAX_POLICY_ITEMS,
+    )
+    if not permissions:
+        raise PreflightInputError("ARM deny-assignment permissions must not be empty")
+    budget.charge(len(permissions))
+    has_denied_operation = False
+    for raw_permission in permissions:
+        permission = _mapping(
+            raw_permission,
+            field_name="ARM deny-assignment permission",
+        )
+        _parse_optional_deny_condition(
+            permission,
+            field_name="ARM deny-assignment permission",
+        )
+        permission_values: dict[str, list[object]] = {}
+        for field_name in ("actions", "notActions", "dataActions", "notDataActions"):
+            raw_values = _sequence(
+                _get_case_insensitive(permission, field_name),
+                field_name=f"ARM deny-assignment permission {field_name}",
+                maximum_items=MAX_POLICY_ITEMS,
+            )
+            budget.charge(len(raw_values))
+            for raw_value in raw_values:
+                value_text = _require_exact_cli_token(
+                    raw_value,
+                    field_name=f"ARM deny-assignment permission {field_name} value",
+                    maximum_length=512,
+                )
+                if not value_text.isascii():
+                    raise PreflightInputError(
+                        "ARM deny-assignment permission values must use ASCII"
+                    )
+            permission_values[field_name] = raw_values
+        has_denied_operation = has_denied_operation or bool(
+            permission_values["actions"] or permission_values["dataActions"]
+        )
+    if not has_denied_operation:
+        raise PreflightInputError(
+            "ARM deny-assignment permissions must deny at least one action or data action"
+        )
+
+
+def _parse_arm_deny_assignment(
+    value: object,
+    *,
+    collection: RbacCollection,
+    principal_registry: _PrincipalTypeRegistry,
+    budget: _DenyEvaluationWorkBudget,
+) -> DenyAssignment:
+    resource = _mapping(
+        value,
+        field_name="ARM deny-assignment resource",
+    )
+    resource_type = _normalized_ascii_token(
+        _get_case_insensitive(resource, "type"),
+        field_name="ARM deny-assignment type",
+        maximum_length=128,
+    )
+    if resource_type != "microsoft.authorization/denyassignments":
+        raise PreflightInputError("ARM deny-assignment resource has the wrong type")
+    assignment_id = _canonical_scope(
+        _require_string(
+            _get_case_insensitive(resource, "id"),
+            field_name="ARM deny-assignment id",
+        )
+    )
+    marker = "/providers/microsoft.authorization/denyassignments/"
+    marker_index = assignment_id.rfind(marker)
+    if marker_index < 0:
+        raise PreflightInputError("ARM deny-assignment id is malformed")
+    assignment_name = assignment_id[marker_index + len(marker) :]
+    if "/" in assignment_name or _GUID.fullmatch(assignment_name) is None:
+        raise PreflightInputError("ARM deny-assignment id must end in an assignment GUID")
+    id_scope = assignment_id[:marker_index] if marker_index > 0 else "/"
+    id_scope = _canonical_scope(id_scope)
+    properties = _mapping(
+        _get_case_insensitive(resource, "properties"),
+        field_name="ARM deny-assignment properties",
+    )
+    scope = _canonical_scope(
+        _require_string(
+            _get_case_insensitive(properties, "scope"),
+            field_name="ARM deny-assignment scope",
+        )
+    )
+    if scope != id_scope:
+        raise PreflightInputError("ARM deny-assignment id and properties.scope disagree")
+    if not _scope_is_within_reviewed_boundary(
+        scope,
+        collection=collection,
+    ):
+        raise PreflightInputError("ARM deny-assignment scope is outside the reviewed boundary")
+    do_not_apply = _get_case_insensitive(
+        properties,
+        "doNotApplyToChildScopes",
+    )
+    if type(do_not_apply) is not bool:
+        raise PreflightInputError("ARM deny-assignment doNotApplyToChildScopes must be boolean")
+    is_system_protected = _get_case_insensitive(
+        properties,
+        "isSystemProtected",
+    )
+    if type(is_system_protected) is not bool:
+        raise PreflightInputError("ARM deny-assignment isSystemProtected must be boolean")
+    principals = _parse_deny_principals(
+        _get_case_insensitive(properties, "principals"),
+        field_name="ARM deny-assignment principals",
+        principal_registry=principal_registry,
+        budget=budget,
+    )
+    if not principals:
+        raise PreflightInputError("ARM deny-assignment principals must not be empty")
+    excluded_principals = _parse_deny_principals(
+        _get_case_insensitive(properties, "excludePrincipals"),
+        field_name="ARM deny-assignment excludePrincipals",
+        principal_registry=principal_registry,
+        budget=budget,
+    )
+    principal_ids = frozenset(principal.principal_id for principal in principals)
+    excluded_principal_ids = frozenset(principal.principal_id for principal in excluded_principals)
+    if principal_ids & excluded_principal_ids:
+        raise PreflightInputError("ARM deny-assignment principals and exclusions must not overlap")
+    _validate_deny_permissions(
+        _get_case_insensitive(properties, "permissions"),
+        budget=budget,
+    )
+    condition, condition_version = _parse_optional_deny_condition(
+        properties,
+        field_name="ARM deny-assignment",
+    )
+    return DenyAssignment(
+        assignment_id=assignment_id,
+        scope=scope,
+        do_not_apply_to_child_scopes=do_not_apply,
+        principals=principals,
+        excluded_principals=excluded_principals,
+        condition=condition,
+        condition_version=condition_version,
+    )
+
+
+def _scope_tokens(scope: str) -> _ScopeTokens:
+    return () if scope == "/" else tuple(scope.strip("/").split("/"))
+
+
+def _build_deny_scope_context(
+    collection: RbacCollection,
+    *,
+    budget: _DenyEvaluationWorkBudget,
+) -> _DenyScopeContext:
+    budget.charge(len(collection.management_group_ancestry))
+    management_group_indexes: dict[str, int] = {}
+    for index, scope in enumerate(collection.management_group_ancestry):
+        management_group_indexes[scope] = index
+    subscription_tokens = _scope_tokens(collection.subscription_scope)
+    budget.charge(len(subscription_tokens) + 1)
+    return _DenyScopeContext(
+        management_group_indexes=management_group_indexes,
+        subscription_tokens=subscription_tokens,
+    )
+
+
+def _build_deny_access_scope_index(
+    access_scopes: frozenset[str],
+    *,
+    context: _DenyScopeContext,
+    budget: _DenyEvaluationWorkBudget,
+) -> _DenyAccessScopeIndex:
+    scope_trie = _ScopeTrieNode()
+    management_group_indexes: list[int] = []
+    has_subscription_access = False
+    budget.charge(len(access_scopes))
+    for scope in sorted(access_scopes):
+        tokens = _scope_tokens(scope)
+        budget.charge(len(tokens) + 1)
+        node = scope_trie
+        node.has_terminal_descendant = True
+        for token in tokens:
+            node = node.children.setdefault(
+                token,
+                _ScopeTrieNode(),
+            )
+            node.has_terminal_descendant = True
+        node.terminal = True
+        management_group_index = context.management_group_indexes.get(scope)
+        if management_group_index is not None:
+            management_group_indexes.append(management_group_index)
+        budget.charge()
+        has_subscription_access = has_subscription_access or (
+            tokens[: len(context.subscription_tokens)] == context.subscription_tokens
+        )
+    return _DenyAccessScopeIndex(
+        scope_trie=scope_trie,
+        minimum_management_group_index=(
+            min(management_group_indexes) if management_group_indexes else None
+        ),
+        maximum_management_group_index=(
+            max(management_group_indexes) if management_group_indexes else None
+        ),
+        has_management_group_access=bool(management_group_indexes),
+        has_subscription_access=has_subscription_access,
+    )
+
+
+def _deny_scope_might_invalidate_access(
+    deny: DenyAssignment,
+    *,
+    access_index: _DenyAccessScopeIndex,
+    context: _DenyScopeContext,
+    budget: _DenyEvaluationWorkBudget,
+) -> bool:
+    deny_tokens = _scope_tokens(deny.scope)
+    budget.charge(len(deny_tokens) + 2)
+    current_node = access_index.scope_trie
+    matched_node: _ScopeTrieNode | None = current_node
+    if current_node.terminal:
+        return True
+    for token in deny_tokens:
+        next_node = current_node.children.get(token)
+        if next_node is None:
+            matched_node = None
+            break
+        current_node = next_node
+        matched_node = current_node
+        if current_node.terminal:
+            return True
+    if (
+        not deny.do_not_apply_to_child_scopes
+        and matched_node is not None
+        and matched_node.has_terminal_descendant
+    ):
+        return True
+    deny_management_group_index = context.management_group_indexes.get(deny.scope)
+    if deny_management_group_index is not None:
+        budget.charge(3)
+        if (
+            access_index.maximum_management_group_index is not None
+            and deny_management_group_index < access_index.maximum_management_group_index
+        ):
+            return True
+        return not deny.do_not_apply_to_child_scopes and (
+            (
+                access_index.minimum_management_group_index is not None
+                and deny_management_group_index > access_index.minimum_management_group_index
+            )
+            or access_index.has_subscription_access
+        )
+    budget.charge(2)
+    return access_index.has_management_group_access and (
+        deny_tokens[: len(context.subscription_tokens)] == context.subscription_tokens
+    )
+
+
+def _deny_targets_effective_principal(
+    deny: DenyAssignment,
+    *,
+    relevant_principal_ids: frozenset[str],
+    budget: _DenyEvaluationWorkBudget,
+) -> bool:
+    budget.charge(len(deny.excluded_principals) + len(deny.principals))
+    for principal in deny.excluded_principals:
+        if principal.principal_id in relevant_principal_ids:
+            return False
+    for principal in deny.principals:
+        if (
+            principal.principal_id == _ALL_PRINCIPALS_ID
+            or principal.principal_id in relevant_principal_ids
+        ):
+            return True
+    return False
+
+
+def _parse_deny_assignment_evidence(
+    value: object,
+    *,
+    collection: RbacCollection,
+    principal_registry: _PrincipalTypeRegistry,
+    expansion_budget: _RbacExpansionBudget,
+    deny_budget: _DenyEvaluationWorkBudget,
+) -> tuple[DenyAssignment, ...]:
+    evidence = _mapping(
+        value,
+        field_name="principal denyAssignments",
+    )
+    method = _require_exact_ascii_token(
+        _get_case_insensitive(evidence, "method"),
+        field_name="deny-assignment collection method",
+        maximum_length=64,
+    )
+    if method != "arm":
+        raise PreflightInputError("deny-assignment evidence must use exact arm method")
+    collection_types: set[str] = set()
+    assignments_by_id: dict[str, tuple[str, DenyAssignment]] = {}
+    for raw_collection in _sequence(
+        _get_case_insensitive(evidence, "collections"),
+        field_name="ARM deny-assignment collections",
+        maximum_items=2,
+    ):
+        deny_collection = _mapping(
+            raw_collection,
+            field_name="ARM deny-assignment collection",
+        )
+        collection_type = _require_exact_ascii_token(
+            _get_case_insensitive(deny_collection, "collectionType"),
+            field_name="ARM deny-assignment collectionType",
+            maximum_length=64,
+        )
+        if (
+            collection_type not in _DENY_ASSIGNMENT_COLLECTION_TYPES
+            or collection_type in collection_types
+        ):
+            raise PreflightInputError(
+                "ARM deny-assignment collections must exactly cover target and subscription"
+            )
+        collection_types.add(collection_type)
+        api_version = _require_exact_ascii_token(
+            _get_case_insensitive(deny_collection, "apiVersion"),
+            field_name="ARM deny-assignment apiVersion",
+            maximum_length=64,
+        )
+        if api_version != _ARM_DENY_ASSIGNMENTS_API_VERSION:
+            raise PreflightInputError("ARM deny-assignment evidence requires apiVersion 2022-04-01")
+        expected_scope = (
+            collection.resource_group_scope
+            if collection_type == "target-and-ancestors"
+            else collection.subscription_scope
+        )
+        scope = _canonical_scope(
+            _require_string(
+                _get_case_insensitive(deny_collection, "scope"),
+                field_name="ARM deny-assignment collection scope",
+            )
+        )
+        if scope != expected_scope:
+            raise PreflightInputError("ARM deny-assignment evidence uses the wrong scope")
+        if collection_type == "target-and-ancestors":
+            if (
+                _require_exact_cli_token(
+                    _get_case_insensitive(deny_collection, "filter"),
+                    field_name="ARM deny-assignment filter",
+                    maximum_length=64,
+                )
+                != "atScope()"
+            ):
+                raise PreflightInputError(
+                    "ARM target deny-assignment evidence requires exact atScope() filter"
+                )
+        elif _has_case_insensitive(deny_collection, "filter"):
+            raise PreflightInputError(
+                "ARM subscription deny-assignment inventory must be unfiltered"
+            )
+        raw_assignments, request_urls = _paged_values(
+            _get_case_insensitive(deny_collection, "pages"),
+            field_name="ARM deny-assignment evidence",
+            next_link_field="nextLink",
+            maximum_items=MAX_ASSIGNMENTS,
+            allowed_host="management.azure.com",
+            budget=expansion_budget,
+        )
+        _validate_arm_deny_assignment_urls(
+            request_urls,
+            target=collection,
+            collection_type=collection_type,
+        )
+        collection_assignment_ids: set[str] = set()
+        deny_budget.charge(len(raw_assignments))
+        for raw_assignment in raw_assignments:
+            assignment = _parse_arm_deny_assignment(
+                raw_assignment,
+                collection=collection,
+                principal_registry=principal_registry,
+                budget=deny_budget,
+            )
+            if assignment.assignment_id in collection_assignment_ids:
+                raise PreflightInputError(
+                    "ARM deny-assignment collection contains a duplicate assignment"
+                )
+            collection_assignment_ids.add(assignment.assignment_id)
+            digest = _canonical_json_digest(raw_assignment)
+            previous = assignments_by_id.get(assignment.assignment_id)
+            if previous is not None and previous[0] != digest:
+                raise PreflightInputError(
+                    "ARM deny-assignment collections disagree on an assignment"
+                )
+            if previous is None and len(assignments_by_id) >= MAX_ASSIGNMENTS:
+                raise PreflightInputError(
+                    f"ARM deny assignments must contain at most {MAX_ASSIGNMENTS} items"
+                )
+            assignments_by_id[assignment.assignment_id] = (digest, assignment)
+    if collection_types != _DENY_ASSIGNMENT_COLLECTION_TYPES:
+        raise PreflightInputError(
+            "ARM deny-assignment collections must exactly cover target and subscription"
+        )
+    return tuple(assignment for _, assignment in assignments_by_id.values())
+
+
+def _validate_deny_assignments_for_principal(
+    assignments: tuple[DenyAssignment, ...],
+    *,
+    effective_principal_id: str,
+    security_group_ids: frozenset[str],
+    access_scopes: frozenset[str],
+    scope_context: _DenyScopeContext,
+    budget: _DenyEvaluationWorkBudget,
+) -> None:
+    budget.charge(len(security_group_ids) + len(assignments) + 1)
+    relevant_principal_ids = frozenset(
+        {
+            effective_principal_id,
+            *security_group_ids,
+        }
+    )
+    access_index = _build_deny_access_scope_index(
+        access_scopes,
+        context=scope_context,
+        budget=budget,
+    )
+    for deny in assignments:
+        if not _deny_targets_effective_principal(
+            deny,
+            relevant_principal_ids=relevant_principal_ids,
+            budget=budget,
+        ):
+            continue
+        if _deny_scope_might_invalidate_access(
+            deny,
+            access_index=access_index,
+            context=scope_context,
+            budget=budget,
+        ):
+            qualifier = " with a condition" if deny.condition is not None else ""
+            raise PreflightInputError(
+                "ARM deny assignment "
+                f"{deny.assignment_id}{qualifier} may invalidate approved access"
+            )
+
+
+def _canonical_arm_role_assignment_id(
+    value: object,
+    *,
+    field_name: str,
+) -> tuple[str, str]:
+    arm_assignment_id = _canonical_scope(
+        _require_string(
+            value,
+            field_name=f"{field_name} id",
+        )
+    )
+    marker = "/providers/microsoft.authorization/roleassignments/"
+    marker_index = arm_assignment_id.rfind(marker)
+    if marker_index < 0:
+        raise PreflightInputError(f"{field_name} id is malformed")
+    assignment_name = arm_assignment_id[marker_index + len(marker) :]
+    if "/" in assignment_name or _GUID.fullmatch(assignment_name) is None:
+        raise PreflightInputError(f"{field_name} id must end in an assignment GUID")
+    id_scope = arm_assignment_id[:marker_index] if marker_index > 0 else "/"
+    return arm_assignment_id, _canonical_scope(id_scope)
+
+
+def _bind_arm_assignment_identity(
+    assignment: RbacAssignment,
+    *,
+    arm_assignment_id: str,
+    assignment_registry: _ArmRoleAssignmentRegistry,
+) -> RbacAssignment:
+    arm_identity_digest = _canonical_json_digest(
+        {
+            "condition": assignment.condition,
+            "conditionVersion": assignment.condition_version,
+            "principalId": assignment.principal_id,
+            "principalType": assignment.principal_type,
+            "roleDefinitionId": assignment.role_definition_id,
+            "scope": assignment.scope,
+        }
+    )
+    assignment_registry.register(
+        arm_assignment_id,
+        arm_identity_digest,
+    )
+    return replace(
+        assignment,
+        arm_assignment_id=arm_assignment_id,
+        arm_identity_digest=arm_identity_digest,
+    )
+
+
+def _parse_arm_role_assignment(
+    value: object,
+    *,
+    effective_principal_id: str,
+    assignment_registry: _ArmRoleAssignmentRegistry,
+) -> RbacAssignment:
+    resource = _mapping(
+        value,
+        field_name="ARM role assignment",
+    )
+    resource_type = _normalized_ascii_token(
+        _get_case_insensitive(resource, "type"),
+        field_name="ARM role-assignment type",
+        maximum_length=128,
+    )
+    if resource_type != "microsoft.authorization/roleassignments":
+        raise PreflightInputError("ARM role-assignment resource has the wrong type")
+    arm_assignment_id, id_scope = _canonical_arm_role_assignment_id(
+        _get_case_insensitive(resource, "id"),
+        field_name="ARM role-assignment",
+    )
+    properties = _mapping(
+        _get_case_insensitive(resource, "properties"),
+        field_name="ARM role-assignment properties",
+    )
+    property_scope = _canonical_scope(
+        _require_string(
+            _get_case_insensitive(properties, "scope"),
+            field_name="ARM role-assignment scope",
+        )
+    )
+    if property_scope != id_scope:
+        raise PreflightInputError("ARM role-assignment id and properties.scope disagree")
+    normalized_assignment: dict[str, object] = {
+        "principalId": _get_case_insensitive(properties, "principalId"),
+        "principalType": _get_case_insensitive(
+            properties,
+            "principalType",
+        ),
+        "effectivePrincipalId": effective_principal_id,
+        "roleDefinitionId": _get_case_insensitive(
+            properties,
+            "roleDefinitionId",
+        ),
+        "scope": property_scope,
+    }
+    for field_name in (
+        "roleDefinitionName",
+        "condition",
+        "conditionVersion",
+    ):
+        if _has_case_insensitive(properties, field_name):
+            normalized_assignment[field_name] = _get_case_insensitive(
+                properties,
+                field_name,
+            )
+    parsed_assignment = _parse_rbac_assignment(
+        normalized_assignment,
+        field_name="ARM role assignment",
+    )
+    return _bind_arm_assignment_identity(
+        parsed_assignment,
+        arm_assignment_id=arm_assignment_id,
+        assignment_registry=assignment_registry,
+    )
+
+
+def _parse_cli_role_assignment(
+    value: object,
+    *,
+    field_name: str,
+    effective_principal_id: str,
+    assignment_registry: _ArmRoleAssignmentRegistry,
+) -> RbacAssignment:
+    raw_assignment = _mapping(
+        value,
+        field_name=field_name,
+    )
+    resource_type = _require_exact_ascii_token(
+        _get_case_insensitive(raw_assignment, "type"),
+        field_name=f"{field_name} type",
+        maximum_length=128,
+    )
+    if resource_type != "Microsoft.Authorization/roleAssignments":
+        raise PreflightInputError(f"{field_name} resource has the wrong type")
+    arm_assignment_id, id_scope = _canonical_arm_role_assignment_id(
+        _get_case_insensitive(raw_assignment, "id"),
+        field_name=field_name,
+    )
+    assignment = _parse_rbac_assignment(
+        raw_assignment,
+        field_name=field_name,
+    )
+    if assignment.scope != id_scope:
+        raise PreflightInputError(f"{field_name} id and scope disagree")
+    if (
+        assignment.effective_principal_id_supplied
+        and assignment.effective_principal_id != effective_principal_id
+    ):
+        raise PreflightInputError(
+            f"{field_name} effectivePrincipalId disagrees with its collection"
+        )
+    return _bind_arm_assignment_identity(
+        replace(
+            assignment,
+            effective_principal_id=effective_principal_id,
+            effective_principal_id_supplied=True,
+        ),
+        arm_assignment_id=arm_assignment_id,
+        assignment_registry=assignment_registry,
+    )
+
+
+def _validate_cli_arguments(
+    value: object,
+    *,
+    target: RbacCollection,
+    effective_principal_id: str,
+    include_descendants: bool = False,
+) -> None:
+    arguments = [
+        _require_exact_cli_token(
+            argument,
+            field_name="Azure CLI role-assignment argument",
+            maximum_length=4096,
+        )
+        for argument in _sequence(
+            value,
+            field_name="Azure CLI role-assignment arguments",
+            maximum_items=64,
+        )
+    ]
+    if any(not argument.isascii() for argument in arguments):
+        raise PreflightInputError("Azure CLI role collection arguments must use ASCII")
+    if any(argument.startswith("--") and "=" in argument for argument in arguments):
+        raise PreflightInputError("Azure CLI role collection does not allow equals-form arguments")
+    switch_flags = {"--include-groups", "--only-show-errors"}
+    if include_descendants:
+        switch_flags.add("--all")
+    else:
+        switch_flags.add("--include-inherited")
+    expected_values = {
+        "--subscription": target.subscription_id,
+        "--assignee-object-id": effective_principal_id,
+        "--output": "json",
+        "--fill-principal-name": "false",
+        "--fill-role-definition-name": "true",
+    }
+    if not include_descendants:
+        expected_values["--scope"] = target.resource_group_scope
+    required_flags = {
+        "--assignee-object-id",
+        "--include-groups",
+        "--output",
+        "--subscription",
+    }
+    if include_descendants:
+        required_flags.add("--all")
+    else:
+        required_flags.update({"--include-inherited", "--scope"})
+    seen: set[str] = set()
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument in seen:
+            raise PreflightInputError(f"Azure CLI role collection repeats {argument}")
+        if argument in switch_flags:
+            seen.add(argument)
+            index += 1
+            continue
+        if argument not in expected_values:
+            raise PreflightInputError(
+                f"Azure CLI role collection contains unsupported argument {arguments[index]}"
+            )
+        if index + 1 >= len(arguments):
+            raise PreflightInputError(f"Azure CLI role collection omits the value for {argument}")
+        seen.add(argument)
+        actual_value = arguments[index + 1]
+        if actual_value.startswith("-"):
+            raise PreflightInputError(f"Azure CLI role collection omits the value for {argument}")
+        if argument == "--scope":
+            actual_value = _canonical_scope(actual_value)
+        if actual_value != expected_values[argument]:
+            raise PreflightInputError(f"Azure CLI role collection uses the wrong {argument}")
+        index += 2
+    missing = sorted(required_flags - seen)
+    if missing:
+        raise PreflightInputError(
+            "Azure CLI role collection is missing required arguments: " + ", ".join(missing)
+        )
+
+
+def _validate_effective_assignment_principal(
+    assignment: RbacAssignment,
+    *,
+    effective_principal_id: str,
+    security_group_ids: frozenset[str],
+) -> None:
+    assigned_principal_id = _canonical_workload_principal_id(
+        assignment.principal_id,
+        field_name="assigned principal ID",
+    )
+    if assignment.principal_type == "serviceprincipal":
+        if assigned_principal_id != effective_principal_id:
+            raise PreflightInputError(
+                "direct ARM role assignment does not target the effective service principal"
+            )
+        return
+    if assignment.principal_type != "group":
+        raise PreflightInputError(
+            "effective role assignment principalType must be ServicePrincipal or Group"
+        )
+    if assigned_principal_id not in security_group_ids:
+        raise PreflightInputError("ARM group-derived assignment disagrees with Graph membership")
+
+
+def _register_assignment_principal_types(
+    assignment: RbacAssignment | BroadAssignmentAllowance,
+    *,
+    principal_registry: _PrincipalTypeRegistry,
+    field_name: str,
+) -> None:
+    effective_principal_id = _canonical_workload_principal_id(
+        assignment.effective_principal_id,
+        field_name=f"{field_name} effectivePrincipalId",
+    )
+    assigned_principal_id = _canonical_workload_principal_id(
+        assignment.principal_id,
+        field_name=f"{field_name} assignedPrincipalId",
+    )
+    principal_registry.register(
+        effective_principal_id,
+        "serviceprincipal",
+        field_name=f"{field_name} effectivePrincipalId",
+    )
+    principal_registry.register(
+        assigned_principal_id,
+        assignment.principal_type,
+        field_name=f"{field_name} assignedPrincipalId",
+    )
+
+
+def _scope_is_ancestor_or_target(
+    scope: str,
+    *,
+    collection: RbacCollection,
+) -> bool:
+    return (
+        scope
+        in {
+            "/",
+            collection.subscription_scope,
+            collection.resource_group_scope,
+        }
+        or scope in collection.management_group_ancestry
+    )
+
+
+def _scope_is_within_reviewed_boundary(
+    scope: str,
+    *,
+    collection: RbacCollection,
+) -> bool:
+    return (
+        scope == "/"
+        or scope in collection.management_group_ancestry
+        or _scope_contains(collection.subscription_scope, scope)
+    )
+
+
+def _parse_ancestor_role_assignments(
+    value: object,
+    *,
+    effective_principal_id: str,
+    security_group_ids: frozenset[str],
+    collection: RbacCollection,
+    principal_registry: _PrincipalTypeRegistry,
+    assignment_registry: _ArmRoleAssignmentRegistry,
+    budget: _RbacExpansionBudget,
+) -> list[RbacAssignment]:
+    evidence = _mapping(
+        value,
+        field_name="effective role-assignment evidence",
+    )
+    raw_method = _require_exact_ascii_token(
+        _get_case_insensitive(evidence, "method"),
+        field_name="role-assignment collection method",
+        maximum_length=64,
+    )
+    method = raw_method.lower()
+    assignments: list[RbacAssignment] = []
+    if method == "arm":
+        api_version = _require_exact_ascii_token(
+            _get_case_insensitive(evidence, "apiVersion"),
+            field_name="ARM role-assignment apiVersion",
+            maximum_length=64,
+        )
+        if api_version != _ARM_ROLE_ASSIGNMENTS_API_VERSION:
+            raise PreflightInputError("ARM role-assignment evidence requires apiVersion 2022-04-01")
+        scope = _canonical_scope(
+            _require_string(
+                _get_case_insensitive(evidence, "scope"),
+                field_name="ARM role-assignment request scope",
+            )
+        )
+        if scope != collection.resource_group_scope:
+            raise PreflightInputError("ARM role-assignment evidence uses the wrong target scope")
+        _validate_assigned_to_filter(
+            _get_case_insensitive(evidence, "filter"),
+            effective_principal_id=effective_principal_id,
+            field_name="ARM role-assignment filter",
+        )
+        raw_assignments, request_urls = _paged_values(
+            _get_case_insensitive(evidence, "pages"),
+            field_name="ARM role-assignment evidence",
+            next_link_field="nextLink",
+            maximum_items=MAX_ASSIGNMENTS,
+            allowed_host="management.azure.com",
+            budget=budget,
+        )
+        _validate_arm_role_assignment_urls(
+            request_urls,
+            target=collection,
+            effective_principal_id=effective_principal_id,
+        )
+        assignments = [
+            _parse_arm_role_assignment(
+                assignment,
+                effective_principal_id=effective_principal_id,
+                assignment_registry=assignment_registry,
+            )
+            for assignment in raw_assignments
+        ]
+    elif method == "azure-cli":
+        budget.charge_calls()
+        exit_code = _get_case_insensitive(evidence, "exitCode")
+        if type(exit_code) is not int or exit_code != 0:
+            raise PreflightInputError("Azure CLI role-assignment collection did not succeed")
+        _validate_cli_arguments(
+            _get_case_insensitive(evidence, "arguments"),
+            target=collection,
+            effective_principal_id=effective_principal_id,
+        )
+        raw_assignments = _sequence(
+            _get_case_insensitive(evidence, "value"),
+            field_name="Azure CLI role assignments",
+            maximum_items=MAX_ASSIGNMENTS,
+        )
+        budget.charge_work(len(raw_assignments))
+        for raw_assignment in raw_assignments:
+            assignments.append(
+                _parse_cli_role_assignment(
+                    raw_assignment,
+                    field_name="Azure CLI role assignment",
+                    effective_principal_id=effective_principal_id,
+                    assignment_registry=assignment_registry,
+                )
+            )
+    else:
+        raise PreflightInputError("role-assignment collection method must be arm or azure-cli")
+    unique_assignments: set[RbacAssignment] = set()
+    for assignment in assignments:
+        if not assignment.role_definition_id:
+            raise PreflightInputError("effective role assignment requires roleDefinitionId")
+        if not assignment.principal_type_supplied:
+            raise PreflightInputError("effective role assignment requires principalType")
+        _register_assignment_principal_types(
+            assignment,
+            principal_registry=principal_registry,
+            field_name="effective role assignment",
+        )
+        _validate_effective_assignment_principal(
+            assignment,
+            effective_principal_id=effective_principal_id,
+            security_group_ids=security_group_ids,
+        )
+        if not _scope_is_ancestor_or_target(
+            assignment.scope,
+            collection=collection,
+        ):
+            raise PreflightInputError(
+                "effective role assignment scope is outside the attested target ancestry"
+            )
+        if assignment in unique_assignments:
+            raise PreflightInputError(
+                "effective role-assignment evidence contains a duplicate assignment"
+            )
+        unique_assignments.add(assignment)
+    return assignments
+
+
+def _parse_descendant_role_assignments(
+    value: object,
+    *,
+    effective_principal_id: str,
+    security_group_ids: frozenset[str],
+    collection: RbacCollection,
+    principal_registry: _PrincipalTypeRegistry,
+    assignment_registry: _ArmRoleAssignmentRegistry,
+    budget: _RbacExpansionBudget,
+) -> list[RbacAssignment]:
+    evidence = _mapping(
+        value,
+        field_name="subscription-descendant role-assignment evidence",
+    )
+    raw_method = _require_exact_ascii_token(
+        _get_case_insensitive(evidence, "method"),
+        field_name="descendant role-assignment collection method",
+        maximum_length=64,
+    )
+    method = raw_method.lower()
+    assignments: list[RbacAssignment] = []
+    if method == "arm":
+        required_principal_ids = {
+            effective_principal_id,
+            *security_group_ids,
+        }
+        collected_principal_ids: set[str] = set()
+        raw_collections = _sequence(
+            _get_case_insensitive(evidence, "collections"),
+            field_name="ARM descendant role-assignment collections",
+            maximum_items=MAX_ASSIGNMENTS,
+        )
+        budget.charge_work(len(raw_collections))
+        for raw_collection in raw_collections:
+            descendant_collection = _mapping(
+                raw_collection,
+                field_name="ARM descendant role-assignment collection",
+            )
+            assigned_principal_id = _canonical_workload_principal_id(
+                _get_case_insensitive(
+                    descendant_collection,
+                    "assignedToPrincipalId",
+                ),
+                field_name="descendant assignedToPrincipalId",
+            )
+            if (
+                assigned_principal_id not in required_principal_ids
+                or assigned_principal_id in collected_principal_ids
+            ):
+                raise PreflightInputError(
+                    "ARM descendant collections do not exactly cover the "
+                    "effective principal and security groups"
+                )
+            collected_principal_ids.add(assigned_principal_id)
+            api_version = _require_exact_ascii_token(
+                _get_case_insensitive(
+                    descendant_collection,
+                    "apiVersion",
+                ),
+                field_name="ARM descendant apiVersion",
+                maximum_length=64,
+            )
+            if api_version != _ARM_ROLE_ASSIGNMENTS_API_VERSION:
+                raise PreflightInputError("ARM descendant evidence requires apiVersion 2022-04-01")
+            scope = _canonical_scope(
+                _require_string(
+                    _get_case_insensitive(
+                        descendant_collection,
+                        "scope",
+                    ),
+                    field_name="ARM descendant request scope",
+                )
+            )
+            if scope != collection.subscription_scope:
+                raise PreflightInputError("ARM descendant evidence uses the wrong subscription")
+            _validate_principal_id_filter(
+                _get_case_insensitive(
+                    descendant_collection,
+                    "filter",
+                ),
+                assigned_principal_id=assigned_principal_id,
+                field_name="ARM descendant role-assignment filter",
+            )
+            raw_assignments, request_urls = _paged_values(
+                _get_case_insensitive(
+                    descendant_collection,
+                    "pages",
+                ),
+                field_name="ARM descendant role-assignment evidence",
+                next_link_field="nextLink",
+                maximum_items=MAX_ASSIGNMENTS,
+                allowed_host="management.azure.com",
+                budget=budget,
+            )
+            _validate_descendant_arm_urls(
+                request_urls,
+                target=collection,
+                assigned_principal_id=assigned_principal_id,
+            )
+            for raw_assignment in raw_assignments:
+                assignment = _parse_arm_role_assignment(
+                    raw_assignment,
+                    effective_principal_id=effective_principal_id,
+                    assignment_registry=assignment_registry,
+                )
+                if assignment.principal_id != assigned_principal_id:
+                    raise PreflightInputError(
+                        "ARM descendant assignment does not match its principal collection"
+                    )
+                if assigned_principal_id == effective_principal_id:
+                    if assignment.principal_type != "serviceprincipal":
+                        raise PreflightInputError(
+                            "effective-principal descendant assignment must be ServicePrincipal"
+                        )
+                elif (
+                    assigned_principal_id not in security_group_ids
+                    or assignment.principal_type != "group"
+                ):
+                    raise PreflightInputError(
+                        "group descendant assignment disagrees with Graph membership"
+                    )
+                assignments.append(assignment)
+        if collected_principal_ids != required_principal_ids:
+            raise PreflightInputError(
+                "ARM descendant collections do not exactly cover the "
+                "effective principal and security groups"
+            )
+    elif method == "azure-cli":
+        budget.charge_calls()
+        exit_code = _get_case_insensitive(evidence, "exitCode")
+        if type(exit_code) is not int or exit_code != 0:
+            raise PreflightInputError("Azure CLI descendant role collection did not succeed")
+        _validate_cli_arguments(
+            _get_case_insensitive(evidence, "arguments"),
+            target=collection,
+            effective_principal_id=effective_principal_id,
+            include_descendants=True,
+        )
+        raw_assignments = _sequence(
+            _get_case_insensitive(evidence, "value"),
+            field_name="Azure CLI descendant role assignments",
+            maximum_items=MAX_ASSIGNMENTS,
+        )
+        budget.charge_work(len(raw_assignments))
+        for raw_assignment in raw_assignments:
+            assignments.append(
+                _parse_cli_role_assignment(
+                    raw_assignment,
+                    field_name="Azure CLI descendant role assignment",
+                    effective_principal_id=effective_principal_id,
+                    assignment_registry=assignment_registry,
+                )
+            )
+    else:
+        raise PreflightInputError(
+            "descendant role-assignment collection method must be arm or azure-cli"
+        )
+
+    unique_keys: set[
+        tuple[
+            str,
+            str,
+            str,
+            str,
+            str,
+            str | None,
+            str | None,
+        ]
+    ] = set()
+    for assignment in assignments:
+        if not assignment.role_definition_id:
+            raise PreflightInputError("descendant role assignment requires roleDefinitionId")
+        if not assignment.principal_type_supplied:
+            raise PreflightInputError("descendant role assignment requires principalType")
+        _register_assignment_principal_types(
+            assignment,
+            principal_registry=principal_registry,
+            field_name="descendant role assignment",
+        )
+        _validate_effective_assignment_principal(
+            assignment,
+            effective_principal_id=effective_principal_id,
+            security_group_ids=security_group_ids,
+        )
+        if not _scope_is_within_reviewed_boundary(
+            assignment.scope,
+            collection=collection,
+        ):
+            raise PreflightInputError("descendant role assignment is outside the reviewed boundary")
+        key = _assignment_key(assignment)
+        if key in unique_keys:
+            raise PreflightInputError(
+                "descendant role-assignment evidence contains a duplicate assignment"
+            )
+        unique_keys.add(key)
+    return assignments
+
+
+def _parse_rbac_evidence(
+    document: object,
+    *,
+    policy: RbacPolicy,
+    policy_document: object,
+    require_attestation: bool,
+    expected_collection_run_id: str | None,
+    expected_deployment_execution_id: str | None,
+    attestation_manifest_digest: str | None,
+    now: datetime | None,
+) -> tuple[list[RbacAssignment], RbacCollection]:
+    root = _mapping(document, field_name="guarded RBAC evidence")
+    manifest: AttestationManifest | None = None
+    if require_attestation:
+        if (
+            expected_collection_run_id is None
+            or expected_deployment_execution_id is None
+            or attestation_manifest_digest is None
+        ):
+            raise PreflightInputError(
+                "reviewed RBAC collectionRunId, deploymentExecutionId, "
+                "and manifest digest are required"
+            )
+        if {key.casefold() for key in root} != {
+            "attestation",
+            "hierarchy",
+            "manifest",
+            "principals",
+            "target",
+        }:
+            raise PreflightInputError("attested RBAC artifact has an invalid envelope")
+        manifest = _parse_attestation_manifest(
+            _get_case_insensitive(root, "manifest"),
+            expected_collection_run_id=expected_collection_run_id,
+            expected_deployment_execution_id=expected_deployment_execution_id,
+            expected_manifest_digest=attestation_manifest_digest,
+            now=_current_utc(now),
+        )
+        rbac_payload = {
+            key: item
+            for key, item in root.items()
+            if key.casefold() not in {"attestation", "manifest"}
+        }
+        expected_bindings = {
+            "policyDigest": _canonical_json_digest(policy_document),
+            "rbacEvidenceDigest": _canonical_json_digest(rbac_payload),
+        }
+        for binding_name, expected_digest in expected_bindings.items():
+            if manifest.bindings[binding_name] != expected_digest:
+                raise PreflightInputError(
+                    f"manifest {binding_name} does not match the reviewed input"
+                )
+        _validate_artifact_attestation(
+            _get_case_insensitive(root, "attestation"),
+            artifact_kind="rbac",
+            manifest=manifest,
+            expected_binding_names=frozenset(expected_bindings),
+        )
+    if any(
+        _has_case_insensitive(root, legacy_name)
+        for legacy_name in ("value", "queries", "collection")
+    ):
+        raise PreflightInputError(
+            "guarded RBAC evidence requires raw target, hierarchy, and principal artifacts"
+        )
+    expansion_budget = _RbacExpansionBudget()
+    target = _parse_evidence_target(_get_case_insensitive(root, "target"))
+    if manifest is not None:
+        _validate_rbac_deployment_target(
+            target,
+            deployment_target=manifest.deployment_target,
+        )
+    if policy.target is None:
+        raise PreflightInputError("RBAC policy requires a reviewed target")
+    if (
+        target.tenant_id != policy.target.tenant_id
+        or target.subscription_id != policy.target.subscription_id
+        or target.resource_group_scope != policy.target.resource_group_scope
+    ):
+        raise PreflightInputError("RBAC evidence target does not match the reviewed policy target")
+    ancestry = _derive_management_group_ancestry(
+        _get_case_insensitive(root, "hierarchy"),
+        target=target,
+        budget=expansion_budget,
+    )
+    if ancestry != policy.target.management_group_ancestry:
+        raise PreflightInputError("management-group hierarchy changed from the reviewed policy")
+    target = replace(
+        target,
+        management_group_ancestry=ancestry,
+    )
+    principal_registry = _PrincipalTypeRegistry()
+    principal_registry.register(
+        _ALL_PRINCIPALS_ID,
+        "systemdefined",
+        field_name="All Principals",
+    )
+    assignment_registry = _ArmRoleAssignmentRegistry()
+    deny_evaluation_budget = _DenyEvaluationWorkBudget()
+    deny_scope_context = _build_deny_scope_context(
+        target,
+        budget=deny_evaluation_budget,
+    )
+    approved_access_scopes: dict[str, set[str]] = {
+        principal_id: {target.resource_group_scope}
+        for principal_id in policy.expected_principal_ids
+    }
+    expansion_budget.charge_work(
+        len(policy.expected_principal_ids)
+        + len(policy.approved_assignments)
+        + len(policy.allowed_broad_assignments)
+    )
+    for expected_principal_id in policy.expected_principal_ids:
+        principal_registry.register(
+            _canonical_workload_principal_id(
+                expected_principal_id,
+                field_name="expectedPrincipalIds principal",
+            ),
+            "serviceprincipal",
+            field_name="expectedPrincipalIds principal",
+        )
+    for assignment in policy.approved_assignments:
+        _register_assignment_principal_types(
+            assignment,
+            principal_registry=principal_registry,
+            field_name="approvedAssignments",
+        )
+        approved_access_scopes.setdefault(
+            assignment.effective_principal_id,
+            {target.resource_group_scope},
+        ).add(assignment.scope)
+    for allowance in policy.allowed_broad_assignments:
+        _register_assignment_principal_types(
+            allowance,
+            principal_registry=principal_registry,
+            field_name="allowedBroadAssignments",
+        )
+    assignments: list[RbacAssignment] = []
+    effective_principal_ids: set[str] = set()
+    principal_contexts: list[tuple[str, frozenset[str]]] = []
+    deny_assignment_evidence_digest: str | None = None
+    deny_assignments: tuple[DenyAssignment, ...] | None = None
+    unique_assignment_keys: set[
+        tuple[
+            str,
+            str,
+            str,
+            str,
+            str,
+            str | None,
+            str | None,
+        ]
+    ] = set()
+    raw_principals = _sequence(
+        _get_case_insensitive(root, "principals"),
+        field_name="RBAC evidence principals",
+        maximum_items=MAX_POLICY_ITEMS,
+    )
+    expansion_budget.charge_work(len(raw_principals))
+    for raw_principal in raw_principals:
+        principal = _mapping(
+            raw_principal,
+            field_name="RBAC evidence principal",
+        )
+        effective_principal_id = _canonical_workload_principal_id(
+            _get_case_insensitive(principal, "effectivePrincipalId"),
+            field_name="effectivePrincipalId",
+        )
+        if effective_principal_id in effective_principal_ids:
+            raise PreflightInputError("RBAC evidence contains a duplicate effectivePrincipalId")
+        effective_principal_ids.add(effective_principal_id)
+        principal_registry.register(
+            effective_principal_id,
+            "serviceprincipal",
+            field_name="effectivePrincipalId",
+        )
+        _parse_service_principal(
+            _get_case_insensitive(principal, "servicePrincipal"),
+            effective_principal_id=effective_principal_id,
+            target=target,
+            principal_registry=principal_registry,
+            budget=expansion_budget,
+        )
+        security_group_ids = _parse_security_group_membership(
+            _get_case_insensitive(principal, "groupMembership"),
+            effective_principal_id=effective_principal_id,
+            target=target,
+            principal_registry=principal_registry,
+            budget=expansion_budget,
+        )
+        principal_contexts.append(
+            (
+                effective_principal_id,
+                security_group_ids,
+            )
+        )
+        deny_assignment_evidence = _get_case_insensitive(
+            principal,
+            "denyAssignments",
+        )
+        current_deny_assignment_digest = _canonical_json_digest(
+            deny_assignment_evidence,
+        )
+        if deny_assignment_evidence_digest is None:
+            deny_assignment_evidence_digest = current_deny_assignment_digest
+            deny_assignments = _parse_deny_assignment_evidence(
+                deny_assignment_evidence,
+                collection=target,
+                principal_registry=principal_registry,
+                expansion_budget=expansion_budget,
+                deny_budget=deny_evaluation_budget,
+            )
+        elif deny_assignment_evidence_digest != current_deny_assignment_digest:
+            raise PreflightInputError(
+                "RBAC principals disagree on complete deny-assignment evidence"
+            )
+        if deny_assignments is None:
+            raise PreflightInputError("complete deny-assignment evidence is missing")
+        role_assignment_evidence = _mapping(
+            _get_case_insensitive(principal, "roleAssignments"),
+            field_name="principal roleAssignments",
+        )
+        principal_assignments = [
+            *_parse_ancestor_role_assignments(
+                _get_case_insensitive(
+                    role_assignment_evidence,
+                    "ancestors",
+                ),
+                effective_principal_id=effective_principal_id,
+                security_group_ids=security_group_ids,
+                collection=target,
+                principal_registry=principal_registry,
+                assignment_registry=assignment_registry,
+                budget=expansion_budget,
+            ),
+            *_parse_descendant_role_assignments(
+                _get_case_insensitive(
+                    role_assignment_evidence,
+                    "descendants",
+                ),
+                effective_principal_id=effective_principal_id,
+                security_group_ids=security_group_ids,
+                collection=target,
+                principal_registry=principal_registry,
+                assignment_registry=assignment_registry,
+                budget=expansion_budget,
+            ),
+        ]
+        for assignment in principal_assignments:
+            key = _assignment_key(assignment)
+            if key in unique_assignment_keys:
+                continue
+            unique_assignment_keys.add(key)
+            assignments.append(assignment)
+    if not effective_principal_ids:
+        raise PreflightInputError("RBAC evidence principals must not be empty")
+    if deny_assignments is None:
+        raise PreflightInputError("complete deny-assignment evidence is missing")
+    for effective_principal_id, security_group_ids in principal_contexts:
+        _validate_deny_assignments_for_principal(
+            deny_assignments,
+            effective_principal_id=effective_principal_id,
+            security_group_ids=security_group_ids,
+            access_scopes=frozenset(
+                approved_access_scopes.get(
+                    effective_principal_id,
+                    {target.resource_group_scope},
+                )
+            ),
+            scope_context=deny_scope_context,
+            budget=deny_evaluation_budget,
+        )
+    return (
+        assignments,
+        replace(
+            target,
+            effective_principal_ids=frozenset(effective_principal_ids),
+        ),
     )
 
 
@@ -703,6 +7598,11 @@ def _role_assignments(document: object) -> list[object]:
             maximum_items=MAX_ASSIGNMENTS,
         )
     root = _mapping(document, field_name="role-assignment document")
+    for key, value in root.items():
+        if key.lower() in {"nextlink", "@odata.nextlink", "odata.nextlink"} and value is not None:
+            raise PreflightInputError(
+                "role-assignment evidence must not contain a continuation link"
+            )
     return _sequence(
         _get_case_insensitive(root, "value"),
         field_name="value",
@@ -714,62 +7614,175 @@ def evaluate_role_assignments(
     document: object,
     *,
     policy_document: object | None = None,
+    require_separation_rules: bool = False,
+    require_attestation: bool = False,
+    expected_collection_run_id: str | None = None,
+    expected_deployment_execution_id: str | None = None,
+    attestation_manifest_digest: str | None = None,
+    now: datetime | None = None,
 ) -> tuple[PreflightViolation, ...]:
     _validate_json_shape(document)
-    policy = _parse_policy(policy_document)
-    violations: list[PreflightViolation] = []
-    for raw_assignment in _role_assignments(document):
-        assignment = _mapping(
-            raw_assignment,
-            field_name="role assignment",
-        )
-        principal_id = _normalized(
-            _require_string(
-                _get_case_insensitive(assignment, "principalId"),
-                field_name="principalId",
-            )
-        )
-        raw_role_name = _get_case_insensitive(
-            assignment,
-            "roleDefinitionName",
-        )
-        raw_role_id = _get_case_insensitive(
-            assignment,
-            "roleDefinitionId",
-        )
-        role_name = (
-            ""
-            if raw_role_name is None
-            else _canonical_role_key(
-                _require_string(
-                    raw_role_name,
-                    field_name="roleDefinitionName",
-                )
-            )
-        )
-        role_id = (
-            ""
-            if raw_role_id is None
-            else _normalized(
-                _require_string(
-                    raw_role_id,
-                    field_name="roleDefinitionId",
-                )
-            ).rsplit("/", 1)[-1]
-        )
-        mapped_role_id = _ROLE_ID_TO_NAME.get(role_id)
-        if role_name and mapped_role_id is not None and role_name != mapped_role_id:
-            raise PreflightInputError("roleDefinitionName and roleDefinitionId conflict")
-        canonical_role = role_name or mapped_role_id or role_id
-        if not canonical_role:
+    separation_budget = _SeparationRuleWorkBudget()
+    policy = _parse_policy(
+        policy_document,
+        separation_budget=separation_budget,
+    )
+    collection = policy.target
+    if require_separation_rules:
+        if not policy.separation_rules:
+            raise PreflightInputError("RBAC policy requires at least one separation rule")
+        if not policy.expected_principal_ids:
+            raise PreflightInputError("RBAC policy requires expectedPrincipalIds")
+        if policy.legacy_expected_assignments_supplied:
             raise PreflightInputError(
-                "role assignment requires roleDefinitionName or roleDefinitionId"
+                "guarded RBAC policy must use approvedAssignments, not expectedAssignments"
             )
-        scope = _normalized(
-            _require_string(
-                _get_case_insensitive(assignment, "scope"),
-                field_name="scope",
+        if not policy.approved_assignments_supplied:
+            raise PreflightInputError("RBAC policy requires approvedAssignments")
+        if not policy.approved_assignments:
+            raise PreflightInputError("approvedAssignments must not be empty")
+        if policy.target is None:
+            raise PreflightInputError("RBAC policy requires a reviewed target")
+        for assignment in policy.approved_assignments:
+            if not assignment.role_definition_id:
+                raise PreflightInputError("approvedAssignments require roleDefinitionId")
+            if not assignment.role_name_supplied:
+                raise PreflightInputError("approvedAssignments require roleDefinitionName")
+            _validate_guarded_assignment_binding(
+                assignment,
+                field_name="approvedAssignments",
             )
+            _canonical_workload_principal_id(
+                assignment.principal_id,
+                field_name="approved assignedPrincipalId",
+            )
+            _canonical_workload_principal_id(
+                assignment.effective_principal_id,
+                field_name="approved effectivePrincipalId",
+            )
+            if not _scope_is_within_reviewed_boundary(
+                assignment.scope,
+                collection=policy.target,
+            ):
+                raise PreflightInputError(
+                    "approvedAssignments scope is outside the reviewed target ancestry"
+                )
+        for allowance in policy.allowed_broad_assignments:
+            if not allowance.role_definition_id:
+                raise PreflightInputError("allowedBroadAssignments require roleDefinitionId")
+            if not allowance.role_name_supplied:
+                raise PreflightInputError("allowedBroadAssignments require roleDefinitionName")
+            _validate_guarded_assignment_binding(
+                allowance,
+                field_name="allowedBroadAssignments",
+            )
+        rule_principal_ids = frozenset(rule.principal_id for rule in policy.separation_rules)
+        if rule_principal_ids != policy.expected_principal_ids:
+            raise PreflightInputError(
+                "separationRules principals must exactly match expectedPrincipalIds"
+            )
+        if any(not rule.forbidden_role_ids for rule in policy.separation_rules):
+            raise PreflightInputError("separation rule requires forbiddenRoleDefinitionIds")
+        allowance_principal_ids = frozenset(
+            allowance.effective_principal_id for allowance in policy.allowed_broad_assignments
+        )
+        if not allowance_principal_ids.issubset(policy.expected_principal_ids):
+            raise PreflightInputError(
+                "RBAC policy principals must be listed in expectedPrincipalIds"
+            )
+        approved_assignment_principal_ids = frozenset(
+            assignment.effective_principal_id for assignment in policy.approved_assignments
+        )
+        if approved_assignment_principal_ids != policy.expected_principal_ids:
+            raise PreflightInputError(
+                "approvedAssignments principals must exactly match expectedPrincipalIds"
+            )
+        approved_assignment_keys = {
+            _assignment_key(assignment) for assignment in policy.approved_assignments
+        }
+        approved_allowances = tuple(
+            BroadAssignmentAllowance(
+                principal_id=assignment.principal_id,
+                effective_principal_id=(assignment.effective_principal_id),
+                principal_type=assignment.principal_type,
+                role_name=assignment.role_name,
+                role_definition_id=assignment.role_definition_id,
+                scope=assignment.scope,
+                condition=assignment.condition,
+                condition_version=assignment.condition_version,
+                role_name_supplied=assignment.role_name_supplied,
+                effective_principal_id_supplied=(assignment.effective_principal_id_supplied),
+                principal_type_supplied=(assignment.principal_type_supplied),
+                assigned_principal_fields_supplied=(assignment.assigned_principal_fields_supplied),
+            )
+            for assignment in policy.approved_assignments
+        )
+        if not all(
+            any(_allowance_matches(allowance, approved) for approved in approved_allowances)
+            for allowance in policy.allowed_broad_assignments
+        ):
+            raise PreflightInputError(
+                "allowedBroadAssignments must be listed in approvedAssignments"
+            )
+        observed_assignments, collection = _parse_rbac_evidence(
+            document,
+            policy=policy,
+            policy_document=policy_document,
+            require_attestation=(require_attestation or require_separation_rules),
+            expected_collection_run_id=expected_collection_run_id,
+            expected_deployment_execution_id=expected_deployment_execution_id,
+            attestation_manifest_digest=attestation_manifest_digest,
+            now=now,
+        )
+        if not observed_assignments:
+            raise PreflightInputError("effective role-assignment evidence must not be empty")
+        if collection.effective_principal_ids != policy.expected_principal_ids:
+            raise PreflightInputError(
+                "RBAC evidence effectivePrincipalIds must exactly match expectedPrincipalIds"
+            )
+        observed_assignment_keys = {
+            _assignment_key(assignment) for assignment in observed_assignments
+        }
+        if observed_assignment_keys != approved_assignment_keys:
+            raise PreflightInputError(
+                "derived effective assignments do not exactly match approvedAssignments"
+            )
+        approved_by_key = {
+            _assignment_key(assignment): assignment for assignment in policy.approved_assignments
+        }
+        assignments = [
+            approved_by_key[_assignment_key(assignment)] for assignment in observed_assignments
+        ]
+    else:
+        assignments = []
+        unique_assignments: set[RbacAssignment] = set()
+        for raw_assignment in _role_assignments(document):
+            assignment = _parse_rbac_assignment(
+                raw_assignment,
+                field_name="role assignment",
+            )
+            if assignment in unique_assignments:
+                raise PreflightInputError(
+                    "role-assignment evidence contains a duplicate assignment"
+                )
+            unique_assignments.add(assignment)
+            assignments.append(assignment)
+
+    separation_rule_index = _index_separation_rules(
+        policy.separation_rules,
+        budget=separation_budget,
+    )
+    violations = _ViolationAccumulator()
+    for assignment in assignments:
+        assignment_principal_id = assignment.principal_id
+        effective_principal_id = assignment.effective_principal_id
+        canonical_role = assignment.role_name
+        role_id = assignment.role_definition_id
+        scope = assignment.scope
+        access_path = (
+            f"{canonical_role} via group {assignment_principal_id}"
+            if assignment.principal_type == "group"
+            else canonical_role
         )
         broad_scope = (
             scope == "/"
@@ -777,59 +7790,1551 @@ def evaluate_role_assignments(
             or _RESOURCE_GROUP_SCOPE.fullmatch(scope) is not None
             or _MANAGEMENT_GROUP_SCOPE.fullmatch(scope) is not None
         )
-        allowed = (
-            BroadAssignmentAllowance(
-                principal_id=principal_id,
-                role_name=canonical_role,
-                scope=scope,
+        allowed = any(
+            _allowance_matches(
+                allowance,
+                BroadAssignmentAllowance(
+                    principal_id=assignment_principal_id,
+                    effective_principal_id=effective_principal_id,
+                    principal_type=assignment.principal_type,
+                    role_name=canonical_role,
+                    role_definition_id=role_id,
+                    scope=scope,
+                    condition=assignment.condition,
+                    condition_version=assignment.condition_version,
+                    role_name_supplied=assignment.role_name_supplied,
+                    effective_principal_id_supplied=(assignment.effective_principal_id_supplied),
+                    principal_type_supplied=(assignment.principal_type_supplied),
+                    assigned_principal_fields_supplied=(
+                        assignment.assigned_principal_fields_supplied
+                    ),
+                ),
             )
-            in policy.allowed_broad_assignments
+            for allowance in policy.allowed_broad_assignments
         )
         if (
             (canonical_role in _BROAD_ROLES or role_id in _BROAD_ROLE_IDS)
             and broad_scope
             and not allowed
         ):
-            violations.append(
+            violations.add(
                 PreflightViolation(
                     code="broad-role-assignment",
-                    subject=principal_id,
-                    detail=(f"{canonical_role} at broad scope {scope}"),
+                    subject=effective_principal_id,
+                    detail=(f"{access_path} at broad scope {scope}"),
                 )
             )
-        for rule in policy.separation_rules:
-            if (
-                principal_id == rule.principal_id
-                and canonical_role in rule.forbidden_role_names
-                and any(
-                    _scope_contains(scope, prefix) or _scope_contains(prefix, scope)
-                    for prefix in rule.forbidden_scope_prefixes
+        if _assignment_violates_separation(
+            effective_principal_id=effective_principal_id,
+            role_name=canonical_role,
+            role_definition_id=role_id,
+            scope=scope,
+            collection=collection,
+            rule_index=separation_rule_index,
+            budget=separation_budget,
+        ):
+            violations.add(
+                PreflightViolation(
+                    code="identity-separation",
+                    subject=effective_principal_id,
+                    detail=(f"{access_path} is forbidden at scope {scope}"),
                 )
-            ):
-                violations.append(
-                    PreflightViolation(
-                        code="identity-separation",
-                        subject=principal_id,
-                        detail=(f"{canonical_role} is forbidden at scope {scope}"),
-                    )
-                )
-    return tuple(violations)
+            )
+    return violations.finalize()
 
 
-def _render_result(
+def render_preflight_json(
     *,
-    kind: str,
+    kind: PreflightKind,
     violations: tuple[PreflightViolation, ...],
 ) -> str:
-    return json.dumps(
-        {
-            "kind": kind,
-            "safe": not violations,
-            "violations": [asdict(item) for item in violations],
-        },
-        sort_keys=True,
-        separators=(",", ":"),
+    bounded_violations = _finalize_violations(violations)
+    ordered_violations = sorted(
+        bounded_violations,
+        key=lambda item: (item.code, item.subject.casefold(), item.detail),
     )
+    rendered = (
+        json.dumps(
+            {
+                "kind": kind,
+                "safe": not ordered_violations,
+                "violations": [asdict(item) for item in ordered_violations],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+    if len(_strict_utf8_bytes(rendered, field_name="rendered JSON output")) > MAX_RENDER_BYTES:
+        raise PreflightInputError(f"rendered output exceeds {MAX_RENDER_BYTES} bytes")
+    return rendered
+
+
+def render_preflight_text(
+    *,
+    kind: PreflightKind,
+    violations: tuple[PreflightViolation, ...],
+) -> str:
+    bounded_violations = _finalize_violations(violations)
+    ordered_violations = sorted(
+        bounded_violations,
+        key=lambda item: (item.code, item.subject.casefold(), item.detail),
+    )
+    lines = [
+        f"WC-029 preflight: {'SAFE' if not ordered_violations else 'BLOCKED'}",
+        f"Check: {kind}",
+        f"Blockers: {len(ordered_violations)}",
+    ]
+    lines.extend(
+        f"- {_escaped_text(item.code)}"
+        f" | {_escaped_text(item.subject)}"
+        f" | {_escaped_text(item.detail)}"
+        for item in ordered_violations
+    )
+    rendered = "\n".join(lines) + "\n"
+    if len(_strict_utf8_bytes(rendered, field_name="rendered text output")) > MAX_RENDER_BYTES:
+        raise PreflightInputError(f"rendered output exceeds {MAX_RENDER_BYTES} bytes")
+    return rendered
+
+
+def _escaped_text(value: str) -> str:
+    return json.dumps(value, ensure_ascii=True)[1:-1]
+
+
+def _is_link_or_reparse_point(path: Path, path_stat: os.stat_result) -> bool:
+    reparse_attribute = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    file_attributes = getattr(path_stat, "st_file_attributes", 0)
+    is_junction = getattr(os.path, "isjunction", None)
+    return (
+        stat.S_ISLNK(path_stat.st_mode)
+        or bool(file_attributes & reparse_attribute)
+        or (is_junction is not None and is_junction(path))
+    )
+
+
+def _validated_directory_without_links(path: Path, *, field_name: str) -> Path:
+    absolute_path = Path(os.path.abspath(os.fspath(path)))
+    current = Path(absolute_path.anchor)
+    try:
+        current_stat = os.lstat(current)
+    except OSError as exc:
+        raise PreflightInputError(f"{field_name} anchor is unavailable") from exc
+    if _is_link_or_reparse_point(current, current_stat):
+        raise PreflightInputError(
+            f"{field_name} must not contain a symlink, junction, or reparse point"
+        )
+    if not stat.S_ISDIR(current_stat.st_mode):
+        raise PreflightInputError(f"{field_name} anchor must be a directory")
+    components = absolute_path.parts[1:]
+    for component in components:
+        current /= component
+        try:
+            current_stat = os.lstat(current)
+        except OSError as exc:
+            raise PreflightInputError(f"{field_name} component is unavailable") from exc
+        if _is_link_or_reparse_point(current, current_stat):
+            raise PreflightInputError(
+                f"{field_name} must not contain a symlink, junction, or reparse point"
+            )
+        if not stat.S_ISDIR(current_stat.st_mode):
+            raise PreflightInputError(f"{field_name} components must be directories")
+    return absolute_path
+
+
+def _validated_release_ledger_paths(
+    ledger_path: Path,
+    trusted_root: Path,
+) -> tuple[Path, Path]:
+    root_candidate = Path(os.path.abspath(os.fspath(trusted_root)))
+    ledger_candidate = Path(os.path.abspath(os.fspath(ledger_path)))
+    root_key = os.path.normcase(os.fspath(root_candidate))
+    ledger_key = os.path.normcase(os.fspath(ledger_candidate))
+    try:
+        common = os.path.commonpath((root_key, ledger_key))
+    except ValueError as exc:
+        raise PreflightInputError(
+            "release ledger is outside the trusted release-ledger root"
+        ) from exc
+    if common != root_key or ledger_key == root_key:
+        raise PreflightInputError("release ledger must be beneath the trusted release-ledger root")
+    root = _validated_directory_without_links(
+        root_candidate,
+        field_name="trusted release-ledger root",
+    )
+    ledger = _validated_directory_without_links(
+        ledger_candidate,
+        field_name="release ledger",
+    )
+    return root, ledger
+
+
+def _secure_directory_handles_supported() -> bool:
+    return (
+        os.open in os.supports_dir_fd
+        and os.link in os.supports_dir_fd
+        and os.unlink in os.supports_dir_fd
+        and hasattr(os, "O_DIRECTORY")
+        and hasattr(os, "O_NOFOLLOW")
+    )
+
+
+def _normalized_windows_handle_path(path: str) -> str:
+    if path.startswith("\\\\?\\UNC\\"):
+        path = "\\\\" + path[8:]
+    elif path.startswith("\\\\?\\"):
+        path = path[4:]
+    return os.path.normcase(os.path.abspath(path))
+
+
+def _windows_handle_details(handle: int) -> tuple[str, bool]:
+    import ctypes
+    from ctypes import wintypes
+
+    class FileAttributeTagInfo(ctypes.Structure):
+        _fields_ = [
+            ("FileAttributes", wintypes.DWORD),
+            ("ReparseTag", wintypes.DWORD),
+        ]
+
+    kernel32 = vars(ctypes)["WinDLL"]("kernel32", use_last_error=True)
+    get_last_error = vars(ctypes)["get_last_error"]
+    information = FileAttributeTagInfo()
+    if not kernel32.GetFileInformationByHandleEx(
+        wintypes.HANDLE(handle),
+        9,
+        ctypes.byref(information),
+        ctypes.sizeof(information),
+    ):
+        raise OSError(get_last_error(), "GetFileInformationByHandleEx failed")
+    buffer = ctypes.create_unicode_buffer(32768)
+    length = kernel32.GetFinalPathNameByHandleW(
+        wintypes.HANDLE(handle),
+        buffer,
+        len(buffer),
+        0,
+    )
+    if length == 0 or length >= len(buffer):
+        raise OSError(get_last_error(), "GetFinalPathNameByHandleW failed")
+    return (
+        _normalized_windows_handle_path(buffer.value),
+        bool(information.FileAttributes & stat.FILE_ATTRIBUTE_REPARSE_POINT),
+    )
+
+
+def _open_windows_directory_handle(path: Path) -> tuple[int, str]:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = vars(ctypes)["WinDLL"]("kernel32", use_last_error=True)
+    get_last_error = vars(ctypes)["get_last_error"]
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    handle = kernel32.CreateFileW(
+        os.fspath(path),
+        0x00000001,
+        0x00000001 | 0x00000002 | 0x00000004,
+        None,
+        3,
+        0x02000000 | 0x00200000,
+        None,
+    )
+    invalid_handle = ctypes.c_void_p(-1).value
+    if handle == invalid_handle:
+        raise OSError(get_last_error(), "CreateFileW failed")
+    handle_value = int(handle)
+    try:
+        final_path, is_reparse = _windows_handle_details(handle_value)
+        if is_reparse:
+            raise PreflightInputError("release ledger directory handle resolves to a reparse point")
+        expected_path = os.path.normcase(os.path.abspath(os.fspath(path)))
+        if final_path != expected_path:
+            raise PreflightInputError("release ledger directory escaped the trusted path")
+        _validate_windows_local_ntfs_handle(
+            handle_value,
+            final_path=final_path,
+        )
+        return handle_value, final_path
+    except BaseException:
+        kernel32.CloseHandle(wintypes.HANDLE(handle_value))
+        raise
+
+
+def _close_windows_handle(handle: int) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = vars(ctypes)["WinDLL"]("kernel32", use_last_error=True)
+    get_last_error = vars(ctypes)["get_last_error"]
+    if not kernel32.CloseHandle(wintypes.HANDLE(handle)):
+        raise OSError(get_last_error(), "CloseHandle failed")
+
+
+def _validate_windows_file_descriptor(
+    file_descriptor: int,
+    *,
+    expected_directory: str,
+    name: str,
+) -> None:
+    import msvcrt
+
+    handle = vars(msvcrt)["get_osfhandle"](file_descriptor)
+    final_path, is_reparse = _windows_handle_details(handle)
+    if is_reparse:
+        raise PreflightInputError("release ledger record handle resolves to a reparse point")
+    expected_path = os.path.normcase(os.path.abspath(os.path.join(expected_directory, name)))
+    if final_path != expected_path:
+        raise PreflightInputError("release ledger record escaped the securely opened directory")
+
+
+def _validate_windows_local_ntfs_handle(
+    handle: int,
+    *,
+    final_path: str,
+) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = vars(ctypes)["WinDLL"]("kernel32", use_last_error=True)
+    get_last_error = vars(ctypes)["get_last_error"]
+    kernel32.GetVolumeInformationByHandleW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+        ctypes.POINTER(wintypes.DWORD),
+        ctypes.POINTER(wintypes.DWORD),
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+    ]
+    kernel32.GetVolumeInformationByHandleW.restype = wintypes.BOOL
+    file_system_name = ctypes.create_unicode_buffer(32)
+    if not kernel32.GetVolumeInformationByHandleW(
+        wintypes.HANDLE(handle),
+        None,
+        0,
+        None,
+        None,
+        None,
+        file_system_name,
+        len(file_system_name),
+    ):
+        raise OSError(get_last_error(), "GetVolumeInformationByHandleW failed")
+    kernel32.GetVolumePathNameW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+    ]
+    kernel32.GetVolumePathNameW.restype = wintypes.BOOL
+    volume_path = ctypes.create_unicode_buffer(32768)
+    if not kernel32.GetVolumePathNameW(
+        final_path,
+        volume_path,
+        len(volume_path),
+    ):
+        raise OSError(get_last_error(), "GetVolumePathNameW failed")
+    kernel32.GetDriveTypeW.argtypes = [wintypes.LPCWSTR]
+    kernel32.GetDriveTypeW.restype = wintypes.UINT
+    if (
+        file_system_name.value.casefold() != "ntfs"
+        or kernel32.GetDriveTypeW(volume_path.value) != 3
+    ):
+        raise PreflightInputError("Windows release ledger requires a local fixed NTFS volume")
+
+
+def _open_windows_write_through_file(
+    path: Path,
+    *,
+    create_new: bool,
+    delete_access: bool,
+) -> int:
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    kernel32 = vars(ctypes)["WinDLL"]("kernel32", use_last_error=True)
+    get_last_error = vars(ctypes)["get_last_error"]
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    desired_access = 0x80000000 | 0x40000000
+    if delete_access:
+        desired_access |= 0x00010000
+    handle = kernel32.CreateFileW(
+        os.fspath(path),
+        desired_access,
+        0x00000001 | 0x00000002 | 0x00000004,
+        None,
+        1 if create_new else 3,
+        0x00000080 | 0x00200000 | 0x80000000,
+        None,
+    )
+    invalid_handle = ctypes.c_void_p(-1).value
+    if handle == invalid_handle:
+        error = get_last_error()
+        if create_new and error in {80, 183}:
+            raise FileExistsError(error, "release ledger record already exists", path)
+        raise OSError(error, "CreateFileW failed", path)
+    handle_value = int(handle)
+    try:
+        return int(
+            vars(msvcrt)["open_osfhandle"](
+                handle_value,
+                os.O_RDWR | getattr(os, "O_BINARY", 0),
+            )
+        )
+    except BaseException:
+        kernel32.CloseHandle(wintypes.HANDLE(handle_value))
+        raise
+
+
+def _windows_file_identity(file_descriptor: int) -> tuple[int, int]:
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    class ByHandleFileInformation(ctypes.Structure):
+        _fields_ = [
+            ("FileAttributes", wintypes.DWORD),
+            ("CreationTime", wintypes.FILETIME),
+            ("LastAccessTime", wintypes.FILETIME),
+            ("LastWriteTime", wintypes.FILETIME),
+            ("VolumeSerialNumber", wintypes.DWORD),
+            ("FileSizeHigh", wintypes.DWORD),
+            ("FileSizeLow", wintypes.DWORD),
+            ("NumberOfLinks", wintypes.DWORD),
+            ("FileIndexHigh", wintypes.DWORD),
+            ("FileIndexLow", wintypes.DWORD),
+        ]
+
+    kernel32 = vars(ctypes)["WinDLL"]("kernel32", use_last_error=True)
+    get_last_error = vars(ctypes)["get_last_error"]
+    kernel32.GetFileInformationByHandle.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(ByHandleFileInformation),
+    ]
+    kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
+    handle = vars(msvcrt)["get_osfhandle"](file_descriptor)
+    information = ByHandleFileInformation()
+    if not kernel32.GetFileInformationByHandle(
+        wintypes.HANDLE(handle),
+        ctypes.byref(information),
+    ):
+        raise OSError(get_last_error(), "GetFileInformationByHandle failed")
+    return (
+        int(information.VolumeSerialNumber),
+        (int(information.FileIndexHigh) << 32) | int(information.FileIndexLow),
+    )
+
+
+def _windows_rename_file_no_replace_write_through(
+    file_descriptor: int,
+    target: Path,
+) -> None:
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    target_name = os.fspath(target)
+
+    class FileRenameInfo(ctypes.Structure):
+        _fields_ = [
+            ("ReplaceIfExists", wintypes.BOOLEAN),
+            ("RootDirectory", wintypes.HANDLE),
+            ("FileNameLength", wintypes.DWORD),
+            ("FileName", wintypes.WCHAR * (len(target_name) + 1)),
+        ]
+
+    kernel32 = vars(ctypes)["WinDLL"]("kernel32", use_last_error=True)
+    get_last_error = vars(ctypes)["get_last_error"]
+    kernel32.SetFileInformationByHandle.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    ]
+    kernel32.SetFileInformationByHandle.restype = wintypes.BOOL
+    information = FileRenameInfo()
+    information.ReplaceIfExists = False
+    information.RootDirectory = None
+    information.FileNameLength = len(target_name.encode("utf-16-le"))
+    information.FileName = target_name
+    handle = vars(msvcrt)["get_osfhandle"](file_descriptor)
+    if not kernel32.SetFileInformationByHandle(
+        wintypes.HANDLE(handle),
+        3,
+        ctypes.byref(information),
+        ctypes.sizeof(information),
+    ):
+        error = get_last_error()
+        if error in {80, 183}:
+            raise FileExistsError(error, "release ledger record already exists", target)
+        raise OSError(error, "SetFileInformationByHandle FileRenameInfo failed", target)
+
+
+def _acquire_windows_file_lock(file_descriptor: int) -> Any:
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    class Overlapped(ctypes.Structure):
+        _fields_ = [
+            ("Internal", ctypes.c_size_t),
+            ("InternalHigh", ctypes.c_size_t),
+            ("Offset", wintypes.DWORD),
+            ("OffsetHigh", wintypes.DWORD),
+            ("hEvent", wintypes.HANDLE),
+        ]
+
+    kernel32 = vars(ctypes)["WinDLL"]("kernel32", use_last_error=True)
+    get_last_error = vars(ctypes)["get_last_error"]
+    handle = vars(msvcrt)["get_osfhandle"](file_descriptor)
+    overlapped = Overlapped()
+    lockfile_exclusive_lock = 0x00000002
+    if not kernel32.LockFileEx(
+        wintypes.HANDLE(handle),
+        lockfile_exclusive_lock,
+        0,
+        1,
+        0,
+        ctypes.byref(overlapped),
+    ):
+        raise OSError(get_last_error(), "LockFileEx failed")
+    return overlapped
+
+
+def _release_windows_file_lock(
+    file_descriptor: int,
+    overlapped: Any,
+) -> None:
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    kernel32 = vars(ctypes)["WinDLL"]("kernel32", use_last_error=True)
+    get_last_error = vars(ctypes)["get_last_error"]
+    handle = vars(msvcrt)["get_osfhandle"](file_descriptor)
+    if not kernel32.UnlockFileEx(
+        wintypes.HANDLE(handle),
+        0,
+        1,
+        0,
+        ctypes.byref(overlapped),
+    ):
+        raise OSError(get_last_error(), "UnlockFileEx failed")
+
+
+class _SecureLedgerDirectory:
+    def __init__(self, ledger_path: Path, trusted_root: Path) -> None:
+        self._requested_ledger_path = ledger_path
+        self._requested_trusted_root = trusted_root
+        self._ledger_path: Path | None = None
+        self._trusted_root: Path | None = None
+        self._directory_fd: int | None = None
+        self._windows_directory_handle: int | None = None
+        self._windows_final_path: str | None = None
+        self._lock_fd: int | None = None
+
+    def __enter__(self) -> _SecureLedgerDirectory:
+        trusted_root, ledger_path = _validated_release_ledger_paths(
+            self._requested_ledger_path,
+            self._requested_trusted_root,
+        )
+        self._trusted_root = trusted_root
+        self._ledger_path = ledger_path
+        if _secure_directory_handles_supported():
+            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            if hasattr(os, "O_CLOEXEC"):
+                flags |= os.O_CLOEXEC
+            current_fd = os.open(trusted_root.anchor, flags)
+            try:
+                relative_components = [
+                    *trusted_root.parts[1:],
+                    *Path(os.path.relpath(ledger_path, trusted_root)).parts,
+                ]
+                for component in relative_components:
+                    next_fd = os.open(
+                        component,
+                        flags,
+                        dir_fd=current_fd,
+                    )
+                    os.close(current_fd)
+                    current_fd = next_fd
+            except BaseException:
+                os.close(current_fd)
+                raise
+            self._directory_fd = current_fd
+        elif os.name == "nt":
+            (
+                self._windows_directory_handle,
+                self._windows_final_path,
+            ) = _open_windows_directory_handle(ledger_path)
+        else:
+            raise PreflightInputError("secure release-ledger directory operations are unsupported")
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: object,
+    ) -> None:
+        if self._directory_fd is not None:
+            os.close(self._directory_fd)
+            self._directory_fd = None
+        if self._windows_directory_handle is not None:
+            _close_windows_handle(self._windows_directory_handle)
+            self._windows_directory_handle = None
+            self._windows_final_path = None
+
+    def _fallback_file_path(self, name: str, *, require_existing: bool) -> Path:
+        trusted_root, ledger_path = _validated_release_ledger_paths(
+            self._requested_ledger_path,
+            self._requested_trusted_root,
+        )
+        self._trusted_root = trusted_root
+        self._ledger_path = ledger_path
+        file_path = ledger_path / name
+        if require_existing:
+            try:
+                file_stat = os.lstat(file_path)
+            except OSError as exc:
+                raise PreflightInputError("release ledger record is unavailable") from exc
+            if _is_link_or_reparse_point(file_path, file_stat):
+                raise PreflightInputError(
+                    "release ledger record must not be a symlink or reparse point"
+                )
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise PreflightInputError("release ledger record must be a regular file")
+        return file_path
+
+    def _verify_file_descriptor(self, file_descriptor: int, name: str) -> None:
+        if os.name != "nt":
+            return
+        if self._windows_final_path is None:
+            raise PreflightInputError("release ledger Windows directory handle is unavailable")
+        _validate_windows_file_descriptor(
+            file_descriptor,
+            expected_directory=self._windows_final_path,
+            name=name,
+        )
+
+    @staticmethod
+    def _lock_state_bytes(pending_record: str | None) -> bytes:
+        return _strict_utf8_bytes(
+            json.dumps(
+                {
+                    "pendingRecord": pending_record,
+                    "schemaVersion": "athena.wc029LedgerTransaction.v1",
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            )
+            + "\n",
+            field_name="release ledger transaction state",
+        )
+
+    def _write_lock_state(self, pending_record: str | None) -> None:
+        if self._lock_fd is None:
+            raise PreflightInputError("release ledger transaction lock is unavailable")
+        rendered = self._lock_state_bytes(pending_record)
+        os.lseek(self._lock_fd, 0, os.SEEK_SET)
+        os.ftruncate(self._lock_fd, 0)
+        offset = 0
+        while offset < len(rendered):
+            written = os.write(
+                self._lock_fd,
+                rendered[offset:],
+            )
+            if written <= 0:
+                raise OSError("release ledger transaction write did not make progress")
+            offset += written
+        os.fsync(self._lock_fd)
+
+    def _read_lock_state(self) -> str | None:
+        if self._lock_fd is None:
+            raise PreflightInputError("release ledger transaction lock is unavailable")
+        os.lseek(self._lock_fd, 0, os.SEEK_SET)
+        content = os.read(
+            self._lock_fd,
+            4097,
+        )
+        if not content:
+            self._write_lock_state(None)
+            return None
+        if len(content) > 4096:
+            raise PreflightInputError("release ledger transaction state exceeds its bound")
+        try:
+            document = json.loads(
+                content.decode("utf-8"),
+                parse_constant=_reject_json_constant,
+                parse_float=_parse_json_decimal,
+                parse_int=_parse_json_integer,
+                object_pairs_hook=_reject_ambiguous_object_pairs,
+            )
+        except (
+            UnicodeError,
+            json.JSONDecodeError,
+            RecursionError,
+            ValueError,
+        ) as exc:
+            raise PreflightInputError("release ledger transaction state is not valid JSON") from exc
+        state = _mapping(
+            document,
+            field_name="release ledger transaction state",
+        )
+        if {key.casefold() for key in state} != {
+            "pendingrecord",
+            "schemaversion",
+        }:
+            raise PreflightInputError("release ledger transaction state is malformed")
+        if _get_case_insensitive(state, "schemaVersion") != "athena.wc029LedgerTransaction.v1":
+            raise PreflightInputError("release ledger transaction state has the wrong schema")
+        pending_record = _get_case_insensitive(state, "pendingRecord")
+        if pending_record is None:
+            return None
+        pending_name = _require_exact_ascii_token(
+            pending_record,
+            field_name="release ledger pending record",
+            maximum_length=255,
+        )
+        if Path(pending_name).name != pending_name:
+            raise PreflightInputError("release ledger pending record name is invalid")
+        return pending_name
+
+    def _begin_record_publication(self, name: str) -> bool:
+        if self._lock_fd is None:
+            return False
+        if self._record_exists(name):
+            raise FileExistsError(name)
+        if self._read_lock_state() is not None:
+            raise PreflightInputError(
+                "release ledger contains an incomplete publication transaction"
+            )
+        self._write_lock_state(name)
+        return True
+
+    def _complete_record_publication(self, name: str) -> None:
+        if self._lock_fd is None:
+            return
+        if self._read_lock_state() != name:
+            raise PreflightInputError("release ledger transaction state changed unexpectedly")
+        self._write_lock_state(None)
+
+    def _record_exists(self, name: str) -> bool:
+        try:
+            if self._directory_fd is None:
+                os.lstat(
+                    self._fallback_file_path(
+                        name,
+                        require_existing=False,
+                    )
+                )
+            else:
+                os.stat(
+                    name,
+                    dir_fd=self._directory_fd,
+                    follow_symlinks=False,
+                )
+        except FileNotFoundError:
+            return False
+        return True
+
+    def _ensure_windows_lock_file(self, lock_name: str) -> None:
+        if self._record_exists(lock_name):
+            return
+        staging_name = f".wc029-lock-{uuid.uuid4().hex}.tmp"
+        file_descriptor: int | None = None
+        staging_stat: os.stat_result | None = None
+        staging_identity: tuple[int, int] | None = None
+        published = False
+        try:
+            file_descriptor = self._open_windows_write_through_record(
+                staging_name,
+                create_new=True,
+                delete_access=True,
+            )
+            rendered = self._lock_state_bytes(None)
+            staging_stat = os.fstat(file_descriptor)
+            if not stat.S_ISREG(staging_stat.st_mode):
+                raise PreflightInputError("release ledger lock staging file must be regular")
+            staging_identity = _windows_file_identity(file_descriptor)
+            offset = 0
+            while offset < len(rendered):
+                written = os.write(
+                    file_descriptor,
+                    rendered[offset:],
+                )
+                if written <= 0:
+                    raise OSError("release ledger lock write did not make progress")
+                offset += written
+            os.fsync(file_descriptor)
+            try:
+                self._publish_staged_record(
+                    staging_name,
+                    lock_name,
+                    staging_file_descriptor=file_descriptor,
+                )
+                published = True
+            except FileExistsError:
+                return
+            os.close(file_descriptor)
+            file_descriptor = None
+            self._verify_published_record(
+                lock_name,
+                staging_stat=staging_stat,
+                expected_content=rendered,
+                windows_identity=staging_identity,
+            )
+        except BaseException:
+            if published and staging_stat is not None:
+                self._rollback_published_record(
+                    lock_name,
+                    staging_stat=staging_stat,
+                    windows_identity=staging_identity,
+                )
+            raise
+        finally:
+            if file_descriptor is not None:
+                os.close(file_descriptor)
+            with suppress(
+                OSError,
+                PreflightInputError,
+            ):
+                self._unlink_record(staging_name)
+
+    @contextmanager
+    def exclusive_lock(self) -> Iterator[None]:
+        lock_name = ".wc029-ledger.lock"
+        if os.name == "nt":
+            self._ensure_windows_lock_file(lock_name)
+        flags = os.O_RDWR | getattr(os, "O_BINARY", 0)
+        if os.name != "nt":
+            flags |= os.O_CREAT
+        if hasattr(os, "O_NONBLOCK"):
+            flags |= os.O_NONBLOCK
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        file_descriptor = self._open_record(
+            lock_name,
+            flags,
+            require_existing=False,
+        )
+        windows_lock: Any = None
+        posix_locked = False
+        try:
+            self._verify_file_descriptor(file_descriptor, lock_name)
+            if not stat.S_ISREG(os.fstat(file_descriptor).st_mode):
+                raise PreflightInputError("release ledger lock must be a regular file")
+            if os.name == "nt":
+                windows_lock = _acquire_windows_file_lock(file_descriptor)
+            else:
+                import fcntl
+
+                vars(fcntl)["flock"](
+                    file_descriptor,
+                    vars(fcntl)["LOCK_EX"],
+                )
+                posix_locked = True
+            self._lock_fd = file_descriptor
+            pending_record = self._read_lock_state()
+            if pending_record is not None:
+                raise PreflightInputError(
+                    "release ledger contains an incomplete publication transaction"
+                )
+            if self._directory_fd is not None:
+                self._sync_directory()
+            yield
+        finally:
+            try:
+                self._lock_fd = None
+                if windows_lock is not None:
+                    _release_windows_file_lock(
+                        file_descriptor,
+                        windows_lock,
+                    )
+                elif posix_locked:
+                    import fcntl
+
+                    vars(fcntl)["flock"](
+                        file_descriptor,
+                        vars(fcntl)["LOCK_UN"],
+                    )
+            finally:
+                os.close(file_descriptor)
+
+    def _open_record(
+        self,
+        name: str,
+        flags: int,
+        *,
+        mode: int = 0o600,
+        require_existing: bool,
+    ) -> int:
+        if self._directory_fd is None:
+            return os.open(
+                self._fallback_file_path(
+                    name,
+                    require_existing=require_existing,
+                ),
+                flags,
+                mode,
+            )
+        return os.open(
+            name,
+            flags,
+            mode,
+            dir_fd=self._directory_fd,
+        )
+
+    def _open_windows_write_through_record(
+        self,
+        name: str,
+        *,
+        create_new: bool,
+        delete_access: bool,
+    ) -> int:
+        if os.name != "nt" or self._directory_fd is not None:
+            raise PreflightInputError(
+                "Windows write-through release-ledger operations are unsupported"
+            )
+        file_descriptor = _open_windows_write_through_file(
+            self._fallback_file_path(
+                name,
+                require_existing=not create_new,
+            ),
+            create_new=create_new,
+            delete_access=delete_access,
+        )
+        try:
+            self._verify_file_descriptor(file_descriptor, name)
+            return file_descriptor
+        except BaseException:
+            os.close(file_descriptor)
+            raise
+
+    def _unlink_record(self, name: str) -> None:
+        if self._directory_fd is None:
+            os.unlink(
+                self._fallback_file_path(
+                    name,
+                    require_existing=False,
+                )
+            )
+            return
+        os.unlink(
+            name,
+            dir_fd=self._directory_fd,
+        )
+
+    def _publish_staged_record(
+        self,
+        staging_name: str,
+        final_name: str,
+        *,
+        staging_file_descriptor: int | None = None,
+    ) -> None:
+        try:
+            if self._directory_fd is None:
+                if os.name == "nt":
+                    if staging_file_descriptor is None:
+                        raise PreflightInputError(
+                            "Windows write-through ledger staging handle is unavailable"
+                        )
+                    _windows_rename_file_no_replace_write_through(
+                        staging_file_descriptor,
+                        self._fallback_file_path(
+                            final_name,
+                            require_existing=False,
+                        ),
+                    )
+                    return
+                os.link(
+                    self._fallback_file_path(
+                        staging_name,
+                        require_existing=True,
+                    ),
+                    self._fallback_file_path(
+                        final_name,
+                        require_existing=False,
+                    ),
+                    follow_symlinks=False,
+                )
+                return
+            os.link(
+                staging_name,
+                final_name,
+                src_dir_fd=self._directory_fd,
+                dst_dir_fd=self._directory_fd,
+                follow_symlinks=False,
+            )
+        except (AttributeError, NotImplementedError, TypeError) as exc:
+            raise PreflightInputError(
+                "safe no-overwrite ledger publication is unsupported"
+            ) from exc
+
+    def _sync_directory(self) -> None:
+        if self._directory_fd is None:
+            raise PreflightInputError(
+                "safe release-ledger directory synchronization is unsupported"
+            )
+        try:
+            os.fsync(self._directory_fd)
+        except OSError as exc:
+            raise PreflightInputError("release ledger directory could not be synchronized") from exc
+
+    @staticmethod
+    def _sync_published_record(
+        file_descriptor: int,
+    ) -> None:
+        try:
+            os.fsync(file_descriptor)
+        except OSError as exc:
+            raise PreflightInputError(
+                "release ledger published record could not be synchronized"
+            ) from exc
+
+    def _verify_published_record(
+        self,
+        name: str,
+        *,
+        staging_stat: os.stat_result,
+        expected_content: bytes,
+        windows_identity: tuple[int, int] | None,
+    ) -> None:
+        flags = os.O_RDWR if os.name == "nt" else os.O_RDONLY
+        if hasattr(os, "O_NONBLOCK"):
+            flags |= os.O_NONBLOCK
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        flags |= getattr(os, "O_BINARY", 0)
+        file_descriptor = (
+            self._open_windows_write_through_record(
+                name,
+                create_new=False,
+                delete_access=False,
+            )
+            if os.name == "nt"
+            else self._open_record(
+                name,
+                flags,
+                require_existing=True,
+            )
+        )
+        try:
+            self._verify_file_descriptor(file_descriptor, name)
+            published_stat = os.fstat(file_descriptor)
+            same_record = (
+                windows_identity is not None
+                and _windows_file_identity(file_descriptor) == windows_identity
+                if os.name == "nt"
+                else os.path.samestat(staging_stat, published_stat)
+            )
+            if not stat.S_ISREG(published_stat.st_mode) or not same_record:
+                raise PreflightInputError(
+                    "release ledger publication did not preserve the staged record"
+                )
+            os.lseek(file_descriptor, 0, os.SEEK_SET)
+            content = bytearray()
+            while len(content) <= len(expected_content):
+                chunk = os.read(
+                    file_descriptor,
+                    len(expected_content) + 1 - len(content),
+                )
+                if not chunk:
+                    break
+                content.extend(chunk)
+            if bytes(content) != expected_content:
+                raise PreflightInputError(
+                    "release ledger publication did not preserve the staged bytes"
+                )
+            self._sync_published_record(file_descriptor)
+        finally:
+            os.close(file_descriptor)
+
+    def _rollback_published_record(
+        self,
+        name: str,
+        *,
+        staging_stat: os.stat_result,
+        windows_identity: tuple[int, int] | None,
+    ) -> None:
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+        if hasattr(os, "O_NONBLOCK"):
+            flags |= os.O_NONBLOCK
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        file_descriptor: int | None = None
+        try:
+            file_descriptor = self._open_record(
+                name,
+                flags,
+                require_existing=True,
+            )
+            self._verify_file_descriptor(file_descriptor, name)
+            same_record = (
+                windows_identity is not None
+                and _windows_file_identity(file_descriptor) == windows_identity
+                if os.name == "nt"
+                else os.path.samestat(staging_stat, os.fstat(file_descriptor))
+            )
+            if not same_record:
+                return
+        except OSError, PreflightInputError:
+            return
+        finally:
+            if file_descriptor is not None:
+                os.close(file_descriptor)
+        with suppress(
+            OSError,
+            PreflightInputError,
+        ):
+            self._unlink_record(name)
+            if os.name != "nt":
+                self._sync_directory()
+
+    def create_json(self, name: str, payload: dict[str, object]) -> None:
+        if Path(name).name != name:
+            raise PreflightInputError("release ledger record name is invalid")
+        rendered = _strict_utf8_bytes(
+            json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            )
+            + "\n",
+            field_name="release ledger record",
+        )
+        if len(rendered) > MAX_RELEASE_LEDGER_RECORD_BYTES:
+            raise PreflightInputError("release ledger record exceeds its byte bound")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        flags |= getattr(os, "O_BINARY", 0)
+        staging_name = ""
+        file_descriptor: int | None = None
+        for _ in range(8):
+            staging_name = f".wc029-{uuid.uuid4().hex}.tmp"
+            try:
+                file_descriptor = (
+                    self._open_windows_write_through_record(
+                        staging_name,
+                        create_new=True,
+                        delete_access=True,
+                    )
+                    if os.name == "nt"
+                    else self._open_record(
+                        staging_name,
+                        flags,
+                        require_existing=False,
+                    )
+                )
+                break
+            except FileExistsError:
+                continue
+        if file_descriptor is None:
+            raise PreflightInputError("release ledger staging name could not be allocated")
+        journaled = False
+        published = False
+        staging_stat: os.stat_result | None = None
+        staging_identity: tuple[int, int] | None = None
+        try:
+            journaled = self._begin_record_publication(name)
+            self._verify_file_descriptor(file_descriptor, staging_name)
+            staging_stat = os.fstat(file_descriptor)
+            if not stat.S_ISREG(staging_stat.st_mode):
+                raise PreflightInputError("release ledger staging record must be a regular file")
+            if os.name == "nt":
+                staging_identity = _windows_file_identity(file_descriptor)
+            offset = 0
+            while offset < len(rendered):
+                written = os.write(
+                    file_descriptor,
+                    rendered[offset:],
+                )
+                if written <= 0:
+                    raise OSError("release ledger staging write did not make progress")
+                offset += written
+            os.fsync(file_descriptor)
+            self._publish_staged_record(
+                staging_name,
+                name,
+                staging_file_descriptor=file_descriptor,
+            )
+            published = True
+            if os.name == "nt":
+                os.close(file_descriptor)
+                file_descriptor = None
+            self._verify_published_record(
+                name,
+                staging_stat=staging_stat,
+                expected_content=rendered,
+                windows_identity=staging_identity,
+            )
+            if os.name != "nt":
+                self._sync_directory()
+            self._complete_record_publication(name)
+        except BaseException:
+            if published and staging_stat is not None:
+                self._rollback_published_record(
+                    name,
+                    staging_stat=staging_stat,
+                    windows_identity=staging_identity,
+                )
+            elif journaled:
+                self._complete_record_publication(name)
+            raise
+        finally:
+            if file_descriptor is not None:
+                os.close(file_descriptor)
+            with suppress(
+                OSError,
+                PreflightInputError,
+            ):
+                self._unlink_record(staging_name)
+
+    def read_json(self, name: str) -> object:
+        if Path(name).name != name:
+            raise PreflightInputError("release ledger record name is invalid")
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NONBLOCK"):
+            flags |= os.O_NONBLOCK
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        flags |= getattr(os, "O_BINARY", 0)
+        file_descriptor: int | None = None
+        try:
+            try:
+                if self._directory_fd is None:
+                    file_descriptor = os.open(
+                        self._fallback_file_path(name, require_existing=True),
+                        flags,
+                    )
+                else:
+                    file_descriptor = os.open(
+                        name,
+                        flags,
+                        dir_fd=self._directory_fd,
+                    )
+            except PreflightInputError:
+                raise
+            except OSError as exc:
+                raise PreflightInputError("release ledger record is unavailable") from exc
+            self._verify_file_descriptor(file_descriptor, name)
+            if not stat.S_ISREG(os.fstat(file_descriptor).st_mode):
+                raise PreflightInputError("release ledger record must be a regular file")
+            content_bytes = bytearray()
+            while len(content_bytes) <= MAX_RELEASE_LEDGER_RECORD_BYTES:
+                chunk = os.read(
+                    file_descriptor,
+                    min(
+                        64 * 1024,
+                        MAX_RELEASE_LEDGER_RECORD_BYTES + 1 - len(content_bytes),
+                    ),
+                )
+                if not chunk:
+                    break
+                content_bytes.extend(chunk)
+            os.close(file_descriptor)
+            file_descriptor = None
+            if not 1 <= len(content_bytes) <= MAX_RELEASE_LEDGER_RECORD_BYTES:
+                raise PreflightInputError("release ledger record exceeds its byte bound")
+            content = bytes(content_bytes).decode("utf-8")
+            document = json.loads(
+                content,
+                parse_constant=_reject_json_constant,
+                parse_float=_parse_json_decimal,
+                parse_int=_parse_json_integer,
+                object_pairs_hook=_reject_ambiguous_object_pairs,
+            )
+            _validate_json_shape(document)
+            return document
+        except PreflightInputError:
+            raise
+        except (
+            OSError,
+            UnicodeError,
+            json.JSONDecodeError,
+            RecursionError,
+            ValueError,
+        ) as exc:
+            raise PreflightInputError("release ledger record is not valid JSON") from exc
+        finally:
+            if file_descriptor is not None:
+                os.close(file_descriptor)
+
+
+def _validate_release_ledger_directory(
+    ledger_path: Path,
+    trusted_root: Path,
+) -> None:
+    _validated_release_ledger_paths(ledger_path, trusted_root)
+
+
+def _consume_release_ledger(
+    *,
+    ledger_path: Path,
+    trusted_root: Path,
+    manifest: AttestationManifest,
+    kind: PreflightKind,
+    rendered: str,
+    safe: bool,
+    clock: _UtcClock,
+) -> None:
+    collection_binding: dict[str, object] = {
+        "schemaVersion": "athena.wc029CollectionBinding.v1",
+        "collectionRunId": manifest.collection_run_id,
+        "deploymentExecutionId": manifest.deployment_execution_id,
+        "deploymentTarget": _deployment_target_payload(manifest.deployment_target),
+        "manifestDigest": manifest.digest,
+    }
+    binding: dict[str, object] = {
+        "schemaVersion": "athena.wc029ReleaseBinding.v1",
+        "collectionRunId": manifest.collection_run_id,
+        "deploymentExecutionId": manifest.deployment_execution_id,
+        "deploymentTarget": _deployment_target_payload(manifest.deployment_target),
+        "manifestDigest": manifest.digest,
+    }
+    consumption: dict[str, object] = {
+        **binding,
+        "schemaVersion": "athena.wc029ReleaseConsumption.v1",
+        "artifactKind": kind,
+        "resultDigest": "sha256:"
+        + hashlib.sha256(
+            _strict_utf8_bytes(rendered, field_name="rendered preflight output")
+        ).hexdigest(),
+        "safe": safe,
+    }
+    try:
+        with (
+            _SecureLedgerDirectory(ledger_path, trusted_root) as secure_ledger,
+            secure_ledger.exclusive_lock(),
+        ):
+            # Evaluation and lock acquisition may outlive the reviewed evidence window.
+            _validate_attestation_window(
+                collected_at=manifest.collected_at,
+                expires_at=manifest.expires_at,
+                now=_current_utc(clock()),
+            )
+            for name, payload, mismatch_message, create_message in (
+                (
+                    f"{manifest.collection_run_id}.collection.json",
+                    collection_binding,
+                    "release ledger collectionRunId is already bound to another "
+                    "deployment execution or manifest",
+                    "release ledger collection binding could not be created",
+                ),
+                (
+                    f"{manifest.deployment_execution_id}.binding.json",
+                    binding,
+                    "release ledger deployment binding does not match this manifest",
+                    "release ledger binding could not be created",
+                ),
+            ):
+                try:
+                    secure_ledger.create_json(name, payload)
+                except FileExistsError:
+                    existing = secure_ledger.read_json(
+                        name,
+                    )
+                    if not _json_values_equal(existing, payload):
+                        raise PreflightInputError(mismatch_message) from None
+                except OSError as exc:
+                    raise PreflightInputError(create_message) from exc
+            try:
+                consumption_name = f"{manifest.deployment_execution_id}.{kind}.consumed.json"
+                secure_ledger.create_json(
+                    consumption_name,
+                    consumption,
+                )
+            except FileExistsError:
+                existing = secure_ledger.read_json(
+                    consumption_name,
+                )
+                if not _json_values_equal(existing, consumption):
+                    raise PreflightInputError(
+                        "release ledger consumption record does not match this result"
+                    ) from None
+                raise PreflightInputError(
+                    f"release ledger already consumed {kind} for this deployment execution"
+                ) from None
+            except OSError as exc:
+                raise PreflightInputError(
+                    "release ledger consumption could not be recorded"
+                ) from exc
+    except OSError as exc:
+        raise PreflightInputError("release ledger directory could not be opened securely") from exc
+
+
+def run_preflight_check(
+    *,
+    kind: PreflightKind,
+    input_path: Path,
+    output_format: PreflightOutputFormat,
+    stdout: TextIO,
+    stderr: TextIO,
+    allowed_change_ids: frozenset[str] = frozenset(),
+    policy_path: Path | None = None,
+    require_rbac_policy: bool = False,
+    require_attestation: bool = False,
+    expected_collection_run_id: str | None = None,
+    expected_deployment_execution_id: str | None = None,
+    attestation_manifest_digest: str | None = None,
+    deployment_digest: str | None = None,
+    template_digest: str | None = None,
+    parameters_digest: str | None = None,
+    release_ledger_path: Path | None = None,
+    trusted_release_ledger_root: Path | None = None,
+    now: datetime | None = None,
+    clock: _UtcClock | None = None,
+) -> int:
+    """Run one offline preflight check without adding policy or Azure I/O."""
+
+    try:
+        document = load_json_file(input_path)
+        validation_clock: _UtcClock | None = None
+        validation_now = now
+        if require_attestation:
+            if now is not None and clock is not None:
+                raise ValueError("now and clock cannot both be supplied")
+            validation_clock = (
+                clock
+                if clock is not None
+                else (_system_utc_clock if now is None else _fixed_utc_clock(now))
+            )
+            validation_now = _current_utc(validation_clock())
+            if (
+                expected_collection_run_id is None
+                or expected_deployment_execution_id is None
+                or attestation_manifest_digest is None
+                or release_ledger_path is None
+                or trusted_release_ledger_root is None
+            ):
+                raise PreflightInputError(
+                    "reviewed deployment execution, manifest, and release ledger are required"
+                )
+            _validate_release_ledger_directory(
+                release_ledger_path,
+                trusted_release_ledger_root,
+            )
+        if kind == "what-if":
+            violations = evaluate_what_if(
+                document,
+                allowed_change_ids=allowed_change_ids,
+                require_attestation=require_attestation,
+                expected_collection_run_id=(expected_collection_run_id),
+                expected_deployment_execution_id=(expected_deployment_execution_id),
+                attestation_manifest_digest=(attestation_manifest_digest),
+                deployment_digest=deployment_digest,
+                template_digest=template_digest,
+                parameters_digest=parameters_digest,
+                now=validation_now,
+            )
+        elif kind == "rbac":
+            if require_rbac_policy and policy_path is None:
+                raise PreflightInputError("reviewed RBAC policy is required")
+            policy_document = (
+                None
+                if policy_path is None
+                else load_json_file(policy_path, maximum_bytes=1024 * 1024)
+            )
+            violations = evaluate_role_assignments(
+                document,
+                policy_document=policy_document,
+                require_separation_rules=require_rbac_policy,
+                require_attestation=require_attestation,
+                expected_collection_run_id=(expected_collection_run_id),
+                expected_deployment_execution_id=(expected_deployment_execution_id),
+                attestation_manifest_digest=(attestation_manifest_digest),
+                now=validation_now,
+            )
+        else:
+            raise ValueError(f"unsupported preflight kind: {kind}")
+        if output_format == "json":
+            rendered = render_preflight_json(
+                kind=kind,
+                violations=violations,
+            )
+        elif output_format == "text":
+            rendered = render_preflight_text(
+                kind=kind,
+                violations=violations,
+            )
+        else:
+            raise ValueError(f"unsupported output format: {output_format}")
+        if require_attestation:
+            assert expected_collection_run_id is not None
+            assert expected_deployment_execution_id is not None
+            assert attestation_manifest_digest is not None
+            assert release_ledger_path is not None
+            assert trusted_release_ledger_root is not None
+            assert validation_clock is not None
+            artifact_root = _mapping(
+                document,
+                field_name=f"attested {kind} artifact",
+            )
+            reviewed_manifest = _parse_attestation_manifest(
+                _get_case_insensitive(artifact_root, "manifest"),
+                expected_collection_run_id=expected_collection_run_id,
+                expected_deployment_execution_id=expected_deployment_execution_id,
+                expected_manifest_digest=attestation_manifest_digest,
+                now=_current_utc(validation_now),
+            )
+            _consume_release_ledger(
+                ledger_path=release_ledger_path,
+                trusted_root=trusted_release_ledger_root,
+                manifest=reviewed_manifest,
+                kind=kind,
+                rendered=rendered,
+                safe=not violations,
+                clock=validation_clock,
+            )
+    except PreflightInputError as exc:
+        if output_format == "json":
+            stderr.write(
+                json.dumps(
+                    {
+                        "error": str(exc),
+                        "kind": kind,
+                        "safe": False,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
+        elif output_format == "text":
+            stderr.write(f"WC-029 preflight {kind} failed: {_escaped_text(str(exc))}\n")
+        else:
+            raise ValueError(f"unsupported output format: {output_format}") from None
+        return 3
+
+    stdout.write(rendered)
+    return 0 if not violations else 2
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -845,43 +9350,40 @@ def _parser() -> argparse.ArgumentParser:
         default=[],
         metavar="RESOURCE_ID",
     )
+    what_if.add_argument(
+        "--format",
+        choices=("json", "text"),
+        default="json",
+    )
     rbac = subparsers.add_parser("rbac")
     rbac.add_argument("input", type=Path)
     rbac.add_argument("--policy", type=Path)
+    rbac.add_argument(
+        "--format",
+        choices=("json", "text"),
+        default="json",
+    )
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    stdout: TextIO | None = None,
+    stderr: TextIO | None = None,
+) -> int:
     args = _parser().parse_args(argv)
-    try:
-        document = load_json_file(args.input)
-        if args.command == "what-if":
-            violations = evaluate_what_if(
-                document,
-                allowed_change_ids=frozenset(args.allow_change),
-            )
-        else:
-            policy = (
-                None
-                if args.policy is None
-                else load_json_file(args.policy, maximum_bytes=1024 * 1024)
-            )
-            violations = evaluate_role_assignments(
-                document,
-                policy_document=policy,
-            )
-    except PreflightInputError as exc:
-        print(
-            json.dumps(
-                {"safe": False, "error": str(exc)},
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
-            file=sys.stderr,
-        )
-        return 3
-    print(_render_result(kind=args.command, violations=violations))
-    return 0 if not violations else 2
+    output = stdout if stdout is not None else sys.stdout
+    errors = stderr if stderr is not None else sys.stderr
+    return run_preflight_check(
+        kind=args.command,
+        input_path=args.input,
+        allowed_change_ids=frozenset(args.allow_change if args.command == "what-if" else ()),
+        policy_path=args.policy if args.command == "rbac" else None,
+        output_format=args.format,
+        stdout=output,
+        stderr=errors,
+    )
 
 
 if __name__ == "__main__":
