@@ -195,6 +195,27 @@ def _publisher_image_pull_evidence() -> tuple[
             "roleAssignmentScheduleInstancesComplete": True,
             "siblingRegistriesChecked": True,
             "acrEscalationPathsChecked": True,
+            "completeness": {
+                "classicRoleAssignments": True,
+                "pimRoleAssignmentScheduleInstances": True,
+                "transitiveGroups": True,
+                "siblingRegistries": True,
+                "acrEscalationPaths": True,
+                "exactAssignmentReadbacks": True,
+                "paginationBudgets": True,
+            },
+            "paginationBudgets": {
+                "tenantHierarchyMaxPages": 64,
+                "governedSubscriptionMaxCount": 4096,
+                "graphMembershipMaxPagesPerObject": 16,
+                "transitiveGroupMaxCountPerPrincipal": 4096,
+                "classicRoleAssignmentMaxPagesPerQuery": 64,
+                "classicRoleAssignmentMaxApiCalls": 16_384,
+                "classicRoleAssignmentMaxItems": 65_536,
+                "roleAssignmentScheduleMaxPagesPerQuery": 64,
+                "roleAssignmentScheduleMaxApiCalls": 16_384,
+                "roleAssignmentScheduleMaxInstances": 65_536,
+            },
             "evidenceDigest": "sha256:" + "d" * 64,
             "expectedAssignmentIds": assignment_ids,
             "principalIds": principal_ids,
@@ -285,6 +306,7 @@ def _evaluate_publisher_image_pull_evidence(
         "wc027PublisherImagePullIdentity!.properties.principalId",
         "wc027ParsedEffectiveAcrAccess.schemaVersion == "
         "'athena.wc027AcrEffectiveAccessEvidence.v1'",
+        "length(items(wc027ParsedEffectiveAcrAccess)) == 27",
         "wc027ParsedEffectiveAcrAccess.expectedAssignmentCount == 3",
         "wc027ParsedEffectiveAcrAccess.pullCapableAssignmentCount == 3",
         "wc027ParsedEffectiveAcrAccess.roleDefinitionsResolved == true",
@@ -296,6 +318,58 @@ def _evaluate_publisher_image_pull_evidence(
         "wc027ParsedEffectiveAcrAccess.roleAssignmentScheduleInstancesComplete == true",
         "wc027ParsedEffectiveAcrAccess.siblingRegistriesChecked == true",
         "wc027ParsedEffectiveAcrAccess.acrEscalationPathsChecked == true",
+        "length(items(wc027ParsedEffectiveAcrAccess.completeness)) == 7",
+        "wc027ParsedEffectiveAcrAccess.completeness.classicRoleAssignments == true",
+        (
+            "wc027ParsedEffectiveAcrAccess.completeness."
+            "pimRoleAssignmentScheduleInstances == true"
+        ),
+        "wc027ParsedEffectiveAcrAccess.completeness.transitiveGroups == true",
+        "wc027ParsedEffectiveAcrAccess.completeness.siblingRegistries == true",
+        "wc027ParsedEffectiveAcrAccess.completeness.acrEscalationPaths == true",
+        "wc027ParsedEffectiveAcrAccess.completeness.exactAssignmentReadbacks == true",
+        "wc027ParsedEffectiveAcrAccess.completeness.paginationBudgets == true",
+        "length(items(wc027ParsedEffectiveAcrAccess.paginationBudgets)) == 10",
+        (
+            "wc027ParsedEffectiveAcrAccess.paginationBudgets."
+            "tenantHierarchyMaxPages == 64"
+        ),
+        (
+            "wc027ParsedEffectiveAcrAccess.paginationBudgets."
+            "governedSubscriptionMaxCount == 4096"
+        ),
+        (
+            "wc027ParsedEffectiveAcrAccess.paginationBudgets."
+            "graphMembershipMaxPagesPerObject == 16"
+        ),
+        (
+            "wc027ParsedEffectiveAcrAccess.paginationBudgets."
+            "transitiveGroupMaxCountPerPrincipal == 4096"
+        ),
+        (
+            "wc027ParsedEffectiveAcrAccess.paginationBudgets."
+            "classicRoleAssignmentMaxPagesPerQuery == 64"
+        ),
+        (
+            "wc027ParsedEffectiveAcrAccess.paginationBudgets."
+            "classicRoleAssignmentMaxApiCalls == 16384"
+        ),
+        (
+            "wc027ParsedEffectiveAcrAccess.paginationBudgets."
+            "classicRoleAssignmentMaxItems == 65536"
+        ),
+        (
+            "wc027ParsedEffectiveAcrAccess.paginationBudgets."
+            "roleAssignmentScheduleMaxPagesPerQuery == 64"
+        ),
+        (
+            "wc027ParsedEffectiveAcrAccess.paginationBudgets."
+            "roleAssignmentScheduleMaxApiCalls == 16384"
+        ),
+        (
+            "wc027ParsedEffectiveAcrAccess.paginationBudgets."
+            "roleAssignmentScheduleMaxInstances == 65536"
+        ),
         "wc027ParsedEffectiveAcrAccess.tenantSubscriptionHierarchyComplete == true",
         "wc027EffectiveAcrEvidenceFresh",
         "wc027EffectiveAcrEvidenceDigestValid",
@@ -312,6 +386,10 @@ def _evaluate_publisher_image_pull_evidence(
         "wc027ReviewedRequestProducerAcrAssignmentValid",
         "wc027ReviewedFeedProducerAcrAssignmentValid",
         "wc027ReviewedPublisherAcrAssignmentValid",
+        "length(items(wc027ReviewedRequestProducerAcrAssignment)) == 9",
+        "length(items(wc027ReviewedFeedProducerAcrAssignment)) == 9",
+        "length(items(wc027ReviewedPublisherAcrAssignment)) == 9",
+        "wc027EffectiveAcrSummarySetsValid",
         "empty(wc027ParsedEffectiveAcrAccess.extraPullCapableAssignmentIds)",
         "wc027ParsedPublisherImagePullEvidence.attempts >= 1",
         "wc027ParsedPublisherImagePullEvidence.maxAttempts <= 20",
@@ -321,8 +399,91 @@ def _evaluate_publisher_image_pull_evidence(
     effective_access = evidence.get("effectiveAccess")
     if not isinstance(effective_access, dict):
         return False
+    if set(effective_access) != {
+        "schemaVersion",
+        "verified",
+        "tenantId",
+        "tenantSubscriptionHierarchyComplete",
+        "governedSubscriptionIds",
+        "anonymousPullEnabled",
+        "expectedAssignmentCount",
+        "pullCapableAssignmentCount",
+        "roleDefinitionsResolved",
+        "exactAssignmentReadbacksComplete",
+        "directAssignmentsComplete",
+        "inheritedAssignmentsComplete",
+        "transitiveGroupsComplete",
+        "directMembershipTraversalComplete",
+        "convergedMembershipReadbacks",
+        "roleAssignmentScheduleInstancesComplete",
+        "siblingRegistriesChecked",
+        "acrEscalationPathsChecked",
+        "completeness",
+        "paginationBudgets",
+        "expectedAssignmentIds",
+        "principalIds",
+        "registryResourceIds",
+        "reviewedAssignments",
+        "extraPullCapableAssignmentIds",
+        "evidenceDigest",
+        "verifiedAt",
+    }:
+        return False
+    completeness = effective_access.get("completeness")
+    pagination_budgets = effective_access.get("paginationBudgets")
+    if not isinstance(completeness, dict) or not isinstance(
+        pagination_budgets,
+        dict,
+    ):
+        return False
     reviewed_assignments = effective_access.get("reviewedAssignments")
     if not isinstance(reviewed_assignments, list):
+        return False
+    if any(
+        not isinstance(item, dict)
+        or set(item)
+        != {
+            "label",
+            "principalId",
+            "assignmentResourceId",
+            "registryResourceId",
+            "repositoryName",
+            "roleAssignmentMode",
+            "roleDefinitionId",
+            "conditionVersion",
+            "condition",
+        }
+        for item in reviewed_assignments
+    ):
+        return False
+
+    def exact_string_set(value: object, expected: set[str]) -> bool:
+        if not isinstance(value, list) or any(
+            not isinstance(item, str) or not item for item in value
+        ):
+            return False
+        normalized = [item.casefold() for item in value]
+        return len(normalized) == len(set(normalized)) and set(normalized) == {
+            item.casefold() for item in expected
+        }
+
+    if not (
+        exact_string_set(
+            effective_access.get("expectedAssignmentIds"),
+            {
+                str(item["assignmentResourceId"])
+                for item in reviewed_assignments
+            },
+        )
+        and exact_string_set(
+            effective_access.get("principalIds"),
+            {str(item["principalId"]) for item in reviewed_assignments},
+        )
+        and exact_string_set(
+            effective_access.get("registryResourceIds"),
+            {str(item["registryResourceId"]) for item in reviewed_assignments},
+        )
+    ):
         return False
     publisher_assignments = [
         item
@@ -451,6 +612,29 @@ def _evaluate_publisher_image_pull_evidence(
         and effective_access.get("roleAssignmentScheduleInstancesComplete") is True
         and effective_access.get("siblingRegistriesChecked") is True
         and effective_access.get("acrEscalationPathsChecked") is True
+        and completeness
+        == {
+            "classicRoleAssignments": True,
+            "pimRoleAssignmentScheduleInstances": True,
+            "transitiveGroups": True,
+            "siblingRegistries": True,
+            "acrEscalationPaths": True,
+            "exactAssignmentReadbacks": True,
+            "paginationBudgets": True,
+        }
+        and pagination_budgets
+        == {
+            "tenantHierarchyMaxPages": 64,
+            "governedSubscriptionMaxCount": 4096,
+            "graphMembershipMaxPagesPerObject": 16,
+            "transitiveGroupMaxCountPerPrincipal": 4096,
+            "classicRoleAssignmentMaxPagesPerQuery": 64,
+            "classicRoleAssignmentMaxApiCalls": 16_384,
+            "classicRoleAssignmentMaxItems": 65_536,
+            "roleAssignmentScheduleMaxPagesPerQuery": 64,
+            "roleAssignmentScheduleMaxApiCalls": 16_384,
+            "roleAssignmentScheduleMaxInstances": 65_536,
+        }
         and str(effective_access.get("evidenceDigest", "")).startswith(
             "sha256:"
         )
@@ -816,6 +1000,7 @@ def test_pr103_readiness_requires_pr102_effective_acr_assignment_scan() -> None:
     for expected in (
         "wc027ParsedPublisherImagePullEvidence.effectiveAccess",
         "athena.wc027AcrEffectiveAccessEvidence.v1",
+        "length(items(wc027ParsedEffectiveAcrAccess)) == 27",
         "wc027ParsedEffectiveAcrAccess.anonymousPullEnabled == false",
         "wc027ParsedEffectiveAcrAccess.roleDefinitionsResolved == true",
         "wc027ParsedEffectiveAcrAccess.exactAssignmentReadbacksComplete == true",
@@ -827,12 +1012,62 @@ def test_pr103_readiness_requires_pr102_effective_acr_assignment_scan() -> None:
         "wc027ParsedEffectiveAcrAccess.convergedMembershipReadbacks == true",
         "wc027ParsedEffectiveAcrAccess.roleAssignmentScheduleInstancesComplete == true",
         "wc027ParsedEffectiveAcrAccess.acrEscalationPathsChecked == true",
+        "length(items(wc027ParsedEffectiveAcrAccess.completeness)) == 7",
+        "wc027ParsedEffectiveAcrAccess.completeness.classicRoleAssignments == true",
+        "wc027ParsedEffectiveAcrAccess.completeness.pimRoleAssignmentScheduleInstances == true",
+        "wc027ParsedEffectiveAcrAccess.completeness.transitiveGroups == true",
+        "wc027ParsedEffectiveAcrAccess.completeness.siblingRegistries == true",
+        "wc027ParsedEffectiveAcrAccess.completeness.acrEscalationPaths == true",
+        "wc027ParsedEffectiveAcrAccess.completeness.exactAssignmentReadbacks == true",
+        "wc027ParsedEffectiveAcrAccess.completeness.paginationBudgets == true",
+        "length(items(wc027ParsedEffectiveAcrAccess.paginationBudgets)) == 10",
+        "wc027ParsedEffectiveAcrAccess.paginationBudgets.tenantHierarchyMaxPages == 64",
+        (
+            "wc027ParsedEffectiveAcrAccess.paginationBudgets."
+            "governedSubscriptionMaxCount == 4096"
+        ),
+        (
+            "wc027ParsedEffectiveAcrAccess.paginationBudgets."
+            "graphMembershipMaxPagesPerObject == 16"
+        ),
+        (
+            "wc027ParsedEffectiveAcrAccess.paginationBudgets."
+            "transitiveGroupMaxCountPerPrincipal == 4096"
+        ),
+        (
+            "wc027ParsedEffectiveAcrAccess.paginationBudgets."
+            "classicRoleAssignmentMaxPagesPerQuery == 64"
+        ),
+        (
+            "wc027ParsedEffectiveAcrAccess.paginationBudgets."
+            "classicRoleAssignmentMaxApiCalls == 16384"
+        ),
+        (
+            "wc027ParsedEffectiveAcrAccess.paginationBudgets."
+            "classicRoleAssignmentMaxItems == 65536"
+        ),
+        (
+            "wc027ParsedEffectiveAcrAccess.paginationBudgets."
+            "roleAssignmentScheduleMaxPagesPerQuery == 64"
+        ),
+        (
+            "wc027ParsedEffectiveAcrAccess.paginationBudgets."
+            "roleAssignmentScheduleMaxApiCalls == 16384"
+        ),
+        (
+            "wc027ParsedEffectiveAcrAccess.paginationBudgets."
+            "roleAssignmentScheduleMaxInstances == 65536"
+        ),
         "param wc027ReadinessEvaluationTimeUtc string = utcNow(",
         "dateTimeToEpoch(wc027ReadinessEvaluationTimeUtc)",
         "wc027EffectiveAcrEvidenceFresh",
         "wc027EffectiveAcrEvidenceDigestValid",
         "wc027ReviewedRequestProducerAcrAssignmentValid",
         "wc027ReviewedFeedProducerAcrAssignmentValid",
+        "length(items(wc027ReviewedRequestProducerAcrAssignment)) == 9",
+        "length(items(wc027ReviewedFeedProducerAcrAssignment)) == 9",
+        "length(items(wc027ReviewedPublisherAcrAssignment)) == 9",
+        "wc027EffectiveAcrSummarySetsValid",
         "empty(wc027ParsedEffectiveAcrAccess.extraPullCapableAssignmentIds)",
         "param wc027RequestProducerImagePullBindingJson string = ''",
         "param wc027EnrichmentFeedProducerImagePullBindingJson string = ''",
@@ -871,6 +1106,10 @@ def test_publisher_digest_pull_readiness_is_bounded_and_activation_gated() -> No
         "[int] $DelaySeconds = 30",
         "function Get-RegistryReadback",
         "function Get-ManagedIdentityReadback",
+        "function Assert-ExactJsonObjectProperties",
+        "function Assert-ExactStringSet",
+        "function Test-JsonBoolean",
+        "function Test-JsonInteger",
         "az resource show",
         "--subscription $SubscriptionId",
         "--api-version '2025-04-01'",
@@ -886,6 +1125,15 @@ def test_publisher_digest_pull_readiness_is_bounded_and_activation_gated() -> No
         "convergedMembershipReadbacks",
         "roleAssignmentScheduleInstancesComplete",
         "acrEscalationPathsChecked",
+        "classicRoleAssignments",
+        "pimRoleAssignmentScheduleInstances",
+        "paginationBudgets",
+        "classicRoleAssignmentMaxPagesPerQuery",
+        "classicRoleAssignmentMaxApiCalls",
+        "classicRoleAssignmentMaxItems",
+        "roleAssignmentScheduleMaxPagesPerQuery",
+        "roleAssignmentScheduleMaxApiCalls",
+        "roleAssignmentScheduleMaxInstances",
         "evidenceDigest",
         "verify_wc027_acr_effective_access.py",
         "--expected-assignments-json $ExpectedPullAssignmentsJson",
@@ -956,12 +1204,89 @@ def test_publisher_digest_pull_readiness_is_bounded_and_activation_gated() -> No
 
 
 @pytest.mark.parametrize(
-    ("anonymous_pull_enabled", "should_succeed"),
-    ((False, True), (True, False)),
+    (
+        "anonymous_pull_enabled",
+        "classic_flag_name",
+        "classic_assignments_complete",
+        "classic_assignment_max_calls_literal",
+        "request_summary_assignment_id",
+        "should_succeed",
+        "expected_error",
+    ),
+    (
+        (
+            False,
+            "classicRoleAssignments",
+            True,
+            "16384",
+            "request-assignment",
+            True,
+            None,
+        ),
+        (
+            True,
+            "classicRoleAssignments",
+            True,
+            "16384",
+            "request-assignment",
+            False,
+            "anonymousPullEnabled must be explicitly false",
+        ),
+        (
+            False,
+            "classicRoleAssignments",
+            False,
+            "16384",
+            "request-assignment",
+            False,
+            "Effective ACR assignment evidence is invalid or incomplete",
+        ),
+        (
+            False,
+            "classicRoleAssignments",
+            True,
+            "0",
+            "request-assignment",
+            False,
+            "Effective ACR assignment evidence is invalid or incomplete",
+        ),
+        (
+            False,
+            "ClassicRoleAssignments",
+            True,
+            "16384",
+            "request-assignment",
+            False,
+            "noncanonical property names",
+        ),
+        (
+            False,
+            "classicRoleAssignments",
+            True,
+            "'16384'",
+            "request-assignment",
+            False,
+            "Effective ACR assignment evidence is invalid or incomplete",
+        ),
+        (
+            False,
+            "classicRoleAssignments",
+            True,
+            "16384",
+            "unrelated-assignment",
+            False,
+            "does not match its reviewed assignment values",
+        ),
+    ),
 )
-def test_digest_pull_probe_requires_live_anonymous_pull_disabled(
+def test_digest_pull_probe_validates_live_and_effective_access_contract(
     anonymous_pull_enabled: bool,
+    classic_flag_name: str,
+    classic_assignments_complete: bool,
+    classic_assignment_max_calls_literal: str,
+    request_summary_assignment_id: str,
     should_succeed: bool,
+    expected_error: str | None,
 ) -> None:
     pwsh = shutil.which("pwsh")
     if pwsh is None:
@@ -1042,9 +1367,38 @@ function global:python {
         roleAssignmentScheduleInstancesComplete = $true
         siblingRegistriesChecked = $true
         acrEscalationPathsChecked = $true
+        completeness = [ordered]@{
+            __CLASSIC_FLAG_NAME__ = __CLASSIC_COMPLETE__
+            pimRoleAssignmentScheduleInstances = $true
+            transitiveGroups = $true
+            siblingRegistries = $true
+            acrEscalationPaths = $true
+            exactAssignmentReadbacks = $true
+            paginationBudgets = $true
+        }
+        paginationBudgets = [ordered]@{
+            tenantHierarchyMaxPages = 64
+            governedSubscriptionMaxCount = 4096
+            graphMembershipMaxPagesPerObject = 16
+            transitiveGroupMaxCountPerPrincipal = 4096
+            classicRoleAssignmentMaxPagesPerQuery = 64
+            classicRoleAssignmentMaxApiCalls = __CLASSIC_MAX_CALLS__
+            classicRoleAssignmentMaxItems = 65536
+            roleAssignmentScheduleMaxPagesPerQuery = 64
+            roleAssignmentScheduleMaxApiCalls = 16384
+            roleAssignmentScheduleMaxInstances = 65536
+        }
         evidenceDigest = 'sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd'
-        expectedAssignmentIds = @('assignment-1', 'assignment-2', 'assignment-3')
-        principalIds = @('principal-1', 'principal-2', 'principal-3')
+        expectedAssignmentIds = @(
+            '__REQUEST_SUMMARY_ASSIGNMENT_ID__'
+            'feed-assignment'
+            '__ASSIGNMENT_ID__'
+        )
+        principalIds = @(
+            '22222222-2222-4222-8222-222222222222'
+            '33333333-3333-4333-8333-333333333333'
+            '44444444-4444-4444-8444-444444444444'
+        )
         registryResourceIds = @('__REGISTRY_ID__')
         reviewedAssignments = @(
             [ordered]@{
@@ -1109,6 +1463,18 @@ function global:python {
     ).replace(
         "__ANONYMOUS__", "$true" if anonymous_pull_enabled else "$false"
     ).replace(
+        "__CLASSIC_COMPLETE__",
+        "$true" if classic_assignments_complete else "$false",
+    ).replace(
+        "__CLASSIC_FLAG_NAME__",
+        classic_flag_name,
+    ).replace(
+        "__CLASSIC_MAX_CALLS__",
+        classic_assignment_max_calls_literal,
+    ).replace(
+        "__REQUEST_SUMMARY_ASSIGNMENT_ID__",
+        request_summary_assignment_id,
+    ).replace(
         "__ASSIGNMENT_ID__", assignment_id
     ).replace(
         "__SCRIPT__", str(DIGEST_PULL_READINESS).replace("'", "''")
@@ -1143,7 +1509,8 @@ function global:python {
         assert evidence["effectiveAccess"]["verified"] is True
         assert evidence["success"] is True
     else:
-        assert "anonymousPullEnabled must be explicitly false" in combined
+        assert expected_error is not None
+        assert expected_error in combined
 
 
 def test_publisher_digest_pull_evidence_evaluates_ready() -> None:
@@ -1235,6 +1602,31 @@ def test_legacy_digest_pull_evidence_uses_null_repository_conditions() -> None:
         "effective-convergence",
         "effective-schedules",
         "effective-escalation",
+        "effective-completeness-classic",
+        "effective-completeness-pim",
+        "effective-completeness-groups",
+        "effective-completeness-siblings",
+        "effective-completeness-escalation",
+        "effective-completeness-readbacks",
+        "effective-completeness-budgets",
+        "effective-budget-tenant-pages",
+        "effective-budget-subscriptions",
+        "effective-budget-graph-pages",
+        "effective-budget-groups",
+        "effective-budget-classic-pages",
+        "effective-budget-classic-calls",
+        "effective-budget-classic-items",
+        "effective-budget-pim-pages",
+        "effective-budget-pim-calls",
+        "effective-budget-pim-items",
+        "effective-extra-field",
+        "effective-reviewed-extra-field",
+        "effective-summary-assignments",
+        "effective-summary-principals",
+        "effective-summary-registries",
+        "effective-completeness-case",
+        "effective-budget-string",
+        "effective-budget-extra-field",
         "effective-hierarchy",
         "effective-stale",
         "effective-count",
@@ -1319,14 +1711,77 @@ def test_publisher_digest_pull_evidence_rejects_drift(mutation: str) -> None:
             ["unexpected-assignment"],
         ),
     }
-    if mutation in effective_mutations:
+    effective_completeness_mutations = {
+        "effective-completeness-classic": "classicRoleAssignments",
+        "effective-completeness-pim": "pimRoleAssignmentScheduleInstances",
+        "effective-completeness-groups": "transitiveGroups",
+        "effective-completeness-siblings": "siblingRegistries",
+        "effective-completeness-escalation": "acrEscalationPaths",
+        "effective-completeness-readbacks": "exactAssignmentReadbacks",
+        "effective-completeness-budgets": "paginationBudgets",
+    }
+    effective_budget_mutations = {
+        "effective-budget-tenant-pages": "tenantHierarchyMaxPages",
+        "effective-budget-subscriptions": "governedSubscriptionMaxCount",
+        "effective-budget-graph-pages": "graphMembershipMaxPagesPerObject",
+        "effective-budget-groups": "transitiveGroupMaxCountPerPrincipal",
+        "effective-budget-classic-pages": "classicRoleAssignmentMaxPagesPerQuery",
+        "effective-budget-classic-calls": "classicRoleAssignmentMaxApiCalls",
+        "effective-budget-classic-items": "classicRoleAssignmentMaxItems",
+        "effective-budget-pim-pages": "roleAssignmentScheduleMaxPagesPerQuery",
+        "effective-budget-pim-calls": "roleAssignmentScheduleMaxApiCalls",
+        "effective-budget-pim-items": "roleAssignmentScheduleMaxInstances",
+    }
+    effective_access = selected["effectiveAccess"]
+    assert isinstance(effective_access, dict)
+    if mutation == "effective-extra-field":
+        effective_access["unexpected"] = True
+    elif mutation == "effective-reviewed-extra-field":
+        reviewed_assignments = effective_access["reviewedAssignments"]
+        assert isinstance(reviewed_assignments, list)
+        reviewed_assignment = reviewed_assignments[0]
+        assert isinstance(reviewed_assignment, dict)
+        reviewed_assignment["unexpected"] = True
+    elif mutation == "effective-summary-assignments":
+        effective_access["expectedAssignmentIds"] = [
+            "synthetic-unrelated-assignment-1",
+            "synthetic-unrelated-assignment-2",
+            "synthetic-unrelated-assignment-3",
+        ]
+    elif mutation == "effective-summary-principals":
+        effective_access["principalIds"] = [
+            "55555555-5555-4555-8555-555555555555",
+            "66666666-6666-4666-8666-666666666666",
+            "77777777-7777-4777-8777-777777777777",
+        ]
+    elif mutation == "effective-summary-registries":
+        effective_access["registryResourceIds"] = ["/synthetic/registry"]
+    elif mutation == "effective-completeness-case":
+        completeness = effective_access["completeness"]
+        assert isinstance(completeness, dict)
+        completeness["ClassicRoleAssignments"] = completeness.pop(
+            "classicRoleAssignments"
+        )
+    elif mutation == "effective-budget-string":
+        pagination_budgets = effective_access["paginationBudgets"]
+        assert isinstance(pagination_budgets, dict)
+        pagination_budgets["classicRoleAssignmentMaxApiCalls"] = "16384"
+    elif mutation == "effective-budget-extra-field":
+        pagination_budgets = effective_access["paginationBudgets"]
+        assert isinstance(pagination_budgets, dict)
+        pagination_budgets["unexpected"] = 1
+    elif mutation in effective_mutations:
         key, value = effective_mutations[mutation]
-        effective_access = selected["effectiveAccess"]
-        assert isinstance(effective_access, dict)
         effective_access[key] = value
+    elif mutation in effective_completeness_mutations:
+        completeness = effective_access["completeness"]
+        assert isinstance(completeness, dict)
+        completeness[effective_completeness_mutations[mutation]] = False
+    elif mutation in effective_budget_mutations:
+        pagination_budgets = effective_access["paginationBudgets"]
+        assert isinstance(pagination_budgets, dict)
+        pagination_budgets[effective_budget_mutations[mutation]] = 0
     elif mutation.startswith("effective-reviewed-"):
-        effective_access = selected["effectiveAccess"]
-        assert isinstance(effective_access, dict)
         reviewed_assignments = effective_access["reviewedAssignments"]
         assert isinstance(reviewed_assignments, list)
         publisher_assignment = next(

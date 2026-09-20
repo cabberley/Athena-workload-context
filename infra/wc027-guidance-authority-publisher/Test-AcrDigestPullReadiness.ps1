@@ -215,6 +215,115 @@ $effectiveAccessVerifier = Join-Path (
     $repoRoot
 ) 'scripts\verify_wc027_acr_effective_access.py'
 
+function Assert-ExactJsonObjectProperties {
+    param(
+        [Parameter(Mandatory)]
+        [object] $Value,
+
+        [Parameter(Mandatory)]
+        [string[]] $ExpectedNames,
+
+        [Parameter(Mandatory)]
+        [string] $Field
+    )
+
+    if ($null -eq $Value -or $Value -isnot [pscustomobject]) {
+        throw "$Field must be one JSON object."
+    }
+    $actualNames = @($Value.PSObject.Properties.Name)
+    if (
+        $actualNames.Count -ne $ExpectedNames.Count -or
+        @($ExpectedNames | Where-Object { -not ($actualNames -ccontains $_) }).Count -ne 0 -or
+        @($actualNames | Where-Object { -not ($ExpectedNames -ccontains $_) }).Count -ne 0
+    ) {
+        throw "$Field has missing, unknown, or noncanonical property names."
+    }
+}
+
+function Test-JsonBoolean {
+    param(
+        [object] $Value,
+        [bool] $Expected
+    )
+
+    return $Value -is [bool] -and $Value -eq $Expected
+}
+
+function Test-JsonInteger {
+    param(
+        [object] $Value,
+        [long] $Expected
+    )
+
+    return (
+        ($Value -is [int] -or $Value -is [long]) -and
+        [long] $Value -eq $Expected
+    )
+}
+
+function ConvertTo-CanonicalStringSet {
+    param(
+        [Parameter(Mandatory)]
+        [object[]] $Values,
+
+        [Parameter(Mandatory)]
+        [string] $Field,
+
+        [switch] $AllowDuplicateInput
+    )
+
+    $normalized = @(
+        foreach ($value in @($Values)) {
+            if (
+                $value -isnot [string] -or
+                [string]::IsNullOrWhiteSpace($value)
+            ) {
+                throw "$Field must contain only non-empty strings."
+            }
+            $value.ToLowerInvariant()
+        }
+    )
+    $unique = @($normalized | Sort-Object -Unique)
+    if (-not $AllowDuplicateInput -and $unique.Count -ne $normalized.Count) {
+        throw "$Field must not contain duplicates."
+    }
+    return $unique
+}
+
+function Assert-ExactStringSet {
+    param(
+        [Parameter(Mandatory)]
+        [object[]] $Actual,
+
+        [Parameter(Mandatory)]
+        [object[]] $Expected,
+
+        [Parameter(Mandatory)]
+        [string] $Field
+    )
+
+    $actualSet = @(
+        ConvertTo-CanonicalStringSet -Values $Actual -Field $Field
+    )
+    $expectedSet = @(
+        ConvertTo-CanonicalStringSet `
+            -Values $Expected `
+            -Field "$Field expected values" `
+            -AllowDuplicateInput
+    )
+    if (
+        $actualSet.Count -ne $expectedSet.Count -or
+        @(
+            Compare-Object `
+                -ReferenceObject $expectedSet `
+                -DifferenceObject $actualSet `
+                -CaseSensitive
+        ).Count -ne 0
+    ) {
+        throw "$Field does not match its reviewed assignment values."
+    }
+}
+
 function Get-EffectiveAccessEvidence {
     $json = & python `
         $effectiveAccessVerifier `
@@ -227,29 +336,208 @@ function Get-EffectiveAccessEvidence {
         throw 'Effective ACR assignment verification failed.'
     }
     $evidence = $json | ConvertFrom-Json
+    $completeness = $evidence.completeness
+    $paginationBudgets = $evidence.paginationBudgets
+    Assert-ExactJsonObjectProperties `
+        -Value $evidence `
+        -Field 'Effective ACR assignment evidence' `
+        -ExpectedNames @(
+            'schemaVersion'
+            'verified'
+            'tenantId'
+            'tenantSubscriptionHierarchyComplete'
+            'governedSubscriptionIds'
+            'anonymousPullEnabled'
+            'expectedAssignmentCount'
+            'pullCapableAssignmentCount'
+            'roleDefinitionsResolved'
+            'exactAssignmentReadbacksComplete'
+            'directAssignmentsComplete'
+            'inheritedAssignmentsComplete'
+            'transitiveGroupsComplete'
+            'directMembershipTraversalComplete'
+            'convergedMembershipReadbacks'
+            'roleAssignmentScheduleInstancesComplete'
+            'siblingRegistriesChecked'
+            'acrEscalationPathsChecked'
+            'completeness'
+            'paginationBudgets'
+            'expectedAssignmentIds'
+            'principalIds'
+            'registryResourceIds'
+            'reviewedAssignments'
+            'extraPullCapableAssignmentIds'
+            'evidenceDigest'
+            'verifiedAt'
+        )
+    Assert-ExactJsonObjectProperties `
+        -Value $completeness `
+        -Field 'Effective ACR completeness' `
+        -ExpectedNames @(
+            'classicRoleAssignments'
+            'pimRoleAssignmentScheduleInstances'
+            'transitiveGroups'
+            'siblingRegistries'
+            'acrEscalationPaths'
+            'exactAssignmentReadbacks'
+            'paginationBudgets'
+        )
+    Assert-ExactJsonObjectProperties `
+        -Value $paginationBudgets `
+        -Field 'Effective ACR pagination budgets' `
+        -ExpectedNames @(
+            'tenantHierarchyMaxPages'
+            'governedSubscriptionMaxCount'
+            'graphMembershipMaxPagesPerObject'
+            'transitiveGroupMaxCountPerPrincipal'
+            'classicRoleAssignmentMaxPagesPerQuery'
+            'classicRoleAssignmentMaxApiCalls'
+            'classicRoleAssignmentMaxItems'
+            'roleAssignmentScheduleMaxPagesPerQuery'
+            'roleAssignmentScheduleMaxApiCalls'
+            'roleAssignmentScheduleMaxInstances'
+        )
+    $reviewedAssignments = @($evidence.reviewedAssignments)
+    foreach ($reviewedAssignment in $reviewedAssignments) {
+        Assert-ExactJsonObjectProperties `
+            -Value $reviewedAssignment `
+            -Field 'Effective ACR reviewed assignment' `
+            -ExpectedNames @(
+                'label'
+                'principalId'
+                'assignmentResourceId'
+                'registryResourceId'
+                'repositoryName'
+                'roleAssignmentMode'
+                'roleDefinitionId'
+                'conditionVersion'
+                'condition'
+            )
+    }
+    Assert-ExactStringSet `
+        -Actual @($evidence.expectedAssignmentIds) `
+        -Expected @($reviewedAssignments | ForEach-Object { $_.assignmentResourceId }) `
+        -Field 'Effective ACR expected assignment IDs'
+    Assert-ExactStringSet `
+        -Actual @($evidence.principalIds) `
+        -Expected @($reviewedAssignments | ForEach-Object { $_.principalId }) `
+        -Field 'Effective ACR principal IDs'
+    Assert-ExactStringSet `
+        -Actual @($evidence.registryResourceIds) `
+        -Expected @($reviewedAssignments | ForEach-Object { $_.registryResourceId }) `
+        -Field 'Effective ACR registry resource IDs'
     if (
         $evidence.schemaVersion -cne
         'athena.wc027AcrEffectiveAccessEvidence.v1' -or
-        $evidence.verified -ne $true -or
-        $evidence.tenantSubscriptionHierarchyComplete -ne $true -or
+        -not (Test-JsonBoolean -Value $evidence.verified -Expected $true) -or
+        -not (
+            Test-JsonBoolean `
+                -Value $evidence.tenantSubscriptionHierarchyComplete `
+                -Expected $true
+        ) -or
         @($evidence.governedSubscriptionIds).Count -lt 1 -or
-        $evidence.anonymousPullEnabled -ne $false -or
-        $evidence.expectedAssignmentCount -ne 3 -or
-        $evidence.pullCapableAssignmentCount -ne 3 -or
-        $evidence.roleDefinitionsResolved -ne $true -or
-        $evidence.exactAssignmentReadbacksComplete -ne $true -or
-        $evidence.directAssignmentsComplete -ne $true -or
-        $evidence.inheritedAssignmentsComplete -ne $true -or
-        $evidence.transitiveGroupsComplete -ne $true -or
-        $evidence.directMembershipTraversalComplete -ne $true -or
-        $evidence.convergedMembershipReadbacks -ne $true -or
-        $evidence.roleAssignmentScheduleInstancesComplete -ne $true -or
-        $evidence.siblingRegistriesChecked -ne $true -or
-        $evidence.acrEscalationPathsChecked -ne $true -or
+        -not (
+            Test-JsonBoolean `
+                -Value $evidence.anonymousPullEnabled `
+                -Expected $false
+        ) -or
+        -not (Test-JsonInteger -Value $evidence.expectedAssignmentCount -Expected 3) -or
+        -not (Test-JsonInteger -Value $evidence.pullCapableAssignmentCount -Expected 3) -or
+        -not (Test-JsonBoolean -Value $evidence.roleDefinitionsResolved -Expected $true) -or
+        -not (
+            Test-JsonBoolean `
+                -Value $evidence.exactAssignmentReadbacksComplete `
+                -Expected $true
+        ) -or
+        -not (Test-JsonBoolean -Value $evidence.directAssignmentsComplete -Expected $true) -or
+        -not (Test-JsonBoolean -Value $evidence.inheritedAssignmentsComplete -Expected $true) -or
+        -not (Test-JsonBoolean -Value $evidence.transitiveGroupsComplete -Expected $true) -or
+        -not (
+            Test-JsonBoolean `
+                -Value $evidence.directMembershipTraversalComplete `
+                -Expected $true
+        ) -or
+        -not (
+            Test-JsonBoolean `
+                -Value $evidence.convergedMembershipReadbacks `
+                -Expected $true
+        ) -or
+        -not (
+            Test-JsonBoolean `
+                -Value $evidence.roleAssignmentScheduleInstancesComplete `
+                -Expected $true
+        ) -or
+        -not (Test-JsonBoolean -Value $evidence.siblingRegistriesChecked -Expected $true) -or
+        -not (Test-JsonBoolean -Value $evidence.acrEscalationPathsChecked -Expected $true) -or
+        -not (Test-JsonBoolean -Value $completeness.classicRoleAssignments -Expected $true) -or
+        -not (
+            Test-JsonBoolean `
+                -Value $completeness.pimRoleAssignmentScheduleInstances `
+                -Expected $true
+        ) -or
+        -not (Test-JsonBoolean -Value $completeness.transitiveGroups -Expected $true) -or
+        -not (Test-JsonBoolean -Value $completeness.siblingRegistries -Expected $true) -or
+        -not (Test-JsonBoolean -Value $completeness.acrEscalationPaths -Expected $true) -or
+        -not (
+            Test-JsonBoolean `
+                -Value $completeness.exactAssignmentReadbacks `
+                -Expected $true
+        ) -or
+        -not (Test-JsonBoolean -Value $completeness.paginationBudgets -Expected $true) -or
+        -not (
+            Test-JsonInteger `
+                -Value $paginationBudgets.tenantHierarchyMaxPages `
+                -Expected 64
+        ) -or
+        -not (
+            Test-JsonInteger `
+                -Value $paginationBudgets.governedSubscriptionMaxCount `
+                -Expected 4096
+        ) -or
+        -not (
+            Test-JsonInteger `
+                -Value $paginationBudgets.graphMembershipMaxPagesPerObject `
+                -Expected 16
+        ) -or
+        -not (
+            Test-JsonInteger `
+                -Value $paginationBudgets.transitiveGroupMaxCountPerPrincipal `
+                -Expected 4096
+        ) -or
+        -not (
+            Test-JsonInteger `
+                -Value $paginationBudgets.classicRoleAssignmentMaxPagesPerQuery `
+                -Expected 64
+        ) -or
+        -not (
+            Test-JsonInteger `
+                -Value $paginationBudgets.classicRoleAssignmentMaxApiCalls `
+                -Expected 16384
+        ) -or
+        -not (
+            Test-JsonInteger `
+                -Value $paginationBudgets.classicRoleAssignmentMaxItems `
+                -Expected 65536
+        ) -or
+        -not (
+            Test-JsonInteger `
+                -Value $paginationBudgets.roleAssignmentScheduleMaxPagesPerQuery `
+                -Expected 64
+        ) -or
+        -not (
+            Test-JsonInteger `
+                -Value $paginationBudgets.roleAssignmentScheduleMaxApiCalls `
+                -Expected 16384
+        ) -or
+        -not (
+            Test-JsonInteger `
+                -Value $paginationBudgets.roleAssignmentScheduleMaxInstances `
+                -Expected 65536
+        ) -or
         @($evidence.expectedAssignmentIds).Count -ne 3 -or
         @($evidence.principalIds).Count -ne 3 -or
         @($evidence.registryResourceIds).Count -lt 1 -or
-        @($evidence.reviewedAssignments).Count -ne 3 -or
+        $reviewedAssignments.Count -ne 3 -or
         @($evidence.extraPullCapableAssignmentIds).Count -ne 0 -or
         [string]::IsNullOrWhiteSpace([string] $evidence.tenantId) -or
         [string]::IsNullOrWhiteSpace([string] $evidence.evidenceDigest) -or

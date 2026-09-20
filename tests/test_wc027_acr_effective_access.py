@@ -10,6 +10,8 @@ import pytest
 import scripts.verify_wc027_acr_effective_access as acr_verifier
 from scripts.verify_wc027_acr_effective_access import (
     ABAC_ROLE_ASSIGNMENT_MODE,
+    ACR_ESCALATION_ACTIONS,
+    ACR_ESCALATION_DATA_ACTIONS,
     ACR_PULL_ROLE_ID,
     ACR_QUARANTINE_READ_ACTION,
     ACR_QUARANTINED_ARTIFACTS_READ_ACTION,
@@ -59,6 +61,32 @@ SCHEDULE_INSTANCE_GUIDS = (
 REPOSITORY_READER_ROLE_DEFINITION_ID = (
     f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
     f"Microsoft.Authorization/roleDefinitions/{ACR_REPOSITORY_READER_ROLE_ID}"
+)
+EXPECTED_ESCALATION_ACTIONS = (
+    "Microsoft.Authorization/elevateAccess/action",
+    "Microsoft.Authorization/roleAssignments/write",
+    "Microsoft.Authorization/roleAssignmentScheduleRequests/write",
+    "Microsoft.Authorization/roleEligibilityScheduleRequests/write",
+    "Microsoft.Authorization/roleEligibilityScheduleRequests/whenApprovalRequired/write",
+    "Microsoft.Authorization/roleManagementPolicies/write",
+    "Microsoft.Authorization/roleManagementPolicies/approvalRule/action",
+    "Microsoft.Authorization/roleDefinitions/write",
+    "Microsoft.ContainerRegistry/registries/write",
+    "Microsoft.ContainerRegistry/registries/listCredentials/action",
+    "Microsoft.ContainerRegistry/registries/regenerateCredential/action",
+    "Microsoft.ContainerRegistry/registries/generateCredentials/action",
+    "Microsoft.ContainerRegistry/registries/tokens/write",
+    "Microsoft.ContainerRegistry/registries/scopeMaps/write",
+    "Microsoft.ContainerRegistry/registries/quarantine/write",
+    "Microsoft.ContainerRegistry/registries/scheduleRun/action",
+    "Microsoft.ContainerRegistry/registries/tasks/listDetails/action",
+    "Microsoft.ContainerRegistry/registries/tasks/write",
+    "Microsoft.ContainerRegistry/registries/taskruns/listDetails/action",
+    "Microsoft.ContainerRegistry/registries/taskruns/write",
+    "Microsoft.ContainerRegistry/registries/updatePolicies/write",
+)
+EXPECTED_ESCALATION_DATA_ACTIONS = (
+    "Microsoft.ContainerRegistry/registries/quarantinedArtifacts/write",
 )
 
 
@@ -132,6 +160,20 @@ def _assignment(
     }
 
 
+def _classic_role_assignment_resource(
+    assignment: dict[str, object],
+) -> dict[str, object]:
+    assignment_id = str(assignment["id"])
+    return {
+        "id": assignment_id,
+        "name": assignment_id.rsplit("/", 1)[-1],
+        "type": "Microsoft.Authorization/roleAssignments",
+        "properties": {
+            key: value for key, value in assignment.items() if key != "id"
+        },
+    }
+
+
 class StubAzure:
     def __init__(self) -> None:
         expected = _expected_assignments()
@@ -144,6 +186,10 @@ class StubAzure:
         self.inherited: dict[str, object] = {item.principal_id: [] for item in expected}
         self.cross_subscription_direct: dict[str, object] = {}
         self.cross_subscription_inherited: dict[str, object] = {}
+        self.classic_pages: dict[
+            tuple[str, str],
+            list[dict[str, object]],
+        ] = {}
         self.group_pages: dict[str, list[dict[str, object]]] = {
             item.principal_id: [{"value": []}] for item in expected
         }
@@ -191,18 +237,6 @@ class StubAzure:
                     "anonymousPullEnabled": self.anonymous_pull_enabled,
                 },
             }
-        if command_tuple[1:4] == ("role", "assignment", "list"):
-            principal_id = command_tuple[command_tuple.index("--assignee-object-id") + 1]
-            subscription_id = command_tuple[command_tuple.index("--subscription") + 1]
-            if subscription_id == SUBSCRIPTION_ID:
-                source = self.inherited if "--include-inherited" in command_tuple else self.direct
-            else:
-                source = (
-                    self.cross_subscription_inherited
-                    if "--include-inherited" in command_tuple
-                    else self.cross_subscription_direct
-                )
-            return deepcopy(source.get(principal_id, []))
         if command_tuple[1] == "rest":
             url = command_tuple[command_tuple.index("--url") + 1]
             if url.startswith("https://graph.microsoft.com/"):
@@ -220,6 +254,41 @@ class StubAzure:
                 )
                 if page_marker in url:
                     page_index = int(url.rsplit(page_marker, 1)[1]) - 1
+                return deepcopy(pages[page_index])
+            if "/roleAssignments?" in url:
+                parsed = urlparse(url)
+                query = parse_qs(parsed.query)
+                assignment_filter = query["$filter"][0]
+                prefix = "principalId eq '"
+                assert assignment_filter.startswith(prefix)
+                assert assignment_filter.endswith("'")
+                principal_id = assignment_filter[len(prefix) : -1]
+                subscription_id = parsed.path.split("/subscriptions/", 1)[1].split("/", 1)[0]
+                pages = self.classic_pages.get((subscription_id, principal_id))
+                if pages is None:
+                    if subscription_id == SUBSCRIPTION_ID:
+                        direct_source = self.direct
+                        inherited_source = self.inherited
+                    else:
+                        direct_source = self.cross_subscription_direct
+                        inherited_source = self.cross_subscription_inherited
+                    direct = direct_source.get(principal_id, [])
+                    inherited = inherited_source.get(principal_id, [])
+                    if not isinstance(direct, list):
+                        return {"value": deepcopy(direct), "nextLink": None}
+                    if not isinstance(inherited, list):
+                        return {"value": deepcopy(inherited), "nextLink": None}
+                    return {
+                        "value": [
+                            _classic_role_assignment_resource(assignment)
+                            for assignment in [*direct, *inherited]
+                        ],
+                        "nextLink": None,
+                    }
+                page_index = 0
+                continuation = query.get("$skiptoken")
+                if continuation is not None:
+                    page_index = int(continuation[0].removeprefix("page")) - 1
                 return deepcopy(pages[page_index])
             if "/roleAssignmentScheduleInstances?" in url:
                 parsed = urlparse(url)
@@ -268,13 +337,14 @@ def _extra_assignment(
     *,
     principal_id: str,
     role_definition_id: str,
+    principal_type: str = "ServicePrincipal",
     assignment_guid: str = "88888888-8888-4888-8888-888888888888",
     scope: str = SIBLING_REGISTRY_ID,
 ) -> dict[str, object]:
     return {
         "id": (f"{scope}/providers/Microsoft.Authorization/roleAssignments/{assignment_guid}"),
         "principalId": principal_id,
-        "principalType": "ServicePrincipal",
+        "principalType": principal_type,
         "roleDefinitionId": role_definition_id,
         "scope": scope,
         "conditionVersion": None,
@@ -335,6 +405,15 @@ def _schedule_next_link(principal_id: str, page_number: int) -> str:
     )
 
 
+def _classic_next_link(principal_id: str, page_number: int) -> str:
+    return (
+        f"https://management.azure.com/subscriptions/{SUBSCRIPTION_ID}/providers/"
+        "Microsoft.Authorization/roleAssignments?"
+        f"api-version=2022-04-01&%24filter=principalId%20eq%20%27{principal_id}%27"
+        f"&%24skiptoken=page{page_number}"
+    )
+
+
 def test_effective_access_accepts_only_the_three_exact_direct_assignments() -> None:
     stub = StubAzure()
 
@@ -352,6 +431,27 @@ def test_effective_access_accepts_only_the_three_exact_direct_assignments() -> N
     assert evidence["convergedMembershipReadbacks"] is True
     assert evidence["roleAssignmentScheduleInstancesComplete"] is True
     assert evidence["acrEscalationPathsChecked"] is True
+    assert evidence["completeness"] == {
+        "classicRoleAssignments": True,
+        "pimRoleAssignmentScheduleInstances": True,
+        "transitiveGroups": True,
+        "siblingRegistries": True,
+        "acrEscalationPaths": True,
+        "exactAssignmentReadbacks": True,
+        "paginationBudgets": True,
+    }
+    assert evidence["paginationBudgets"] == {
+        "tenantHierarchyMaxPages": 64,
+        "governedSubscriptionMaxCount": 4096,
+        "graphMembershipMaxPagesPerObject": 16,
+        "transitiveGroupMaxCountPerPrincipal": 4096,
+        "classicRoleAssignmentMaxPagesPerQuery": 64,
+        "classicRoleAssignmentMaxApiCalls": 16_384,
+        "classicRoleAssignmentMaxItems": 65_536,
+        "roleAssignmentScheduleMaxPagesPerQuery": 64,
+        "roleAssignmentScheduleMaxApiCalls": 16_384,
+        "roleAssignmentScheduleMaxInstances": 65_536,
+    }
     assert str(evidence["evidenceDigest"]).startswith("sha256:")
     assert evidence["extraPullCapableAssignmentIds"] == []
     reviewed = evidence["reviewedAssignments"]
@@ -361,7 +461,11 @@ def test_effective_access_accepts_only_the_three_exact_direct_assignments() -> N
     assert all(
         item["condition"] == _repository_condition(item["repositoryName"]) for item in reviewed
     )
-    assert sum(command[1:4] == ("role", "assignment", "list") for command in stub.commands) == 6
+    assert sum(
+        command[1] == "rest"
+        and "/roleAssignments?" in command[command.index("--url") + 1]
+        for command in stub.commands
+    ) == 3
     assert sum(
         command[1] == "rest"
         and "/roleAssignmentScheduleInstances?" in command[command.index("--url") + 1]
@@ -680,6 +784,83 @@ def test_effective_access_rejects_root_scope_escalation_paths(
         _verify(stub)
 
 
+def test_effective_access_escalation_action_contract_is_complete() -> None:
+    assert set(ACR_ESCALATION_ACTIONS) == set(EXPECTED_ESCALATION_ACTIONS)
+    assert set(ACR_ESCALATION_DATA_ACTIONS) == set(
+        EXPECTED_ESCALATION_DATA_ACTIONS
+    )
+
+
+@pytest.mark.parametrize("action", EXPECTED_ESCALATION_ACTIONS)
+def test_effective_access_rejects_every_control_plane_escalation_action(
+    action: str,
+) -> None:
+    stub = StubAzure()
+    is_authorization_action = action.startswith("Microsoft.Authorization/")
+    role_definition_id = (
+        "/providers/Microsoft.Authorization/roleDefinitions/"
+        "95959595-9595-4595-8595-959595959595"
+        if is_authorization_action
+        else (
+            f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+            "Microsoft.Authorization/roleDefinitions/"
+            "95959595-9595-4595-8595-959595959595"
+        )
+    )
+    scope = "/" if is_authorization_action else SIBLING_REGISTRY_ID
+    scope_prefix = "" if scope == "/" else scope
+    stub.roles[role_definition_id.casefold()] = _role_definition(
+        role_definition_id,
+        _permission(actions=(action,)),
+    )
+    inherited = stub.inherited[PRINCIPAL_IDS[0]]
+    assert isinstance(inherited, list)
+    inherited.append(
+        {
+            "id": (
+                f"{scope_prefix}/providers/Microsoft.Authorization/roleAssignments/"
+                "94949494-9494-4494-8494-949494949494"
+            ),
+            "principalId": PRINCIPAL_IDS[0],
+            "principalType": "ServicePrincipal",
+            "roleDefinitionId": role_definition_id,
+            "scope": scope,
+            "conditionVersion": None,
+            "condition": None,
+        }
+    )
+
+    with pytest.raises(EffectiveAccessError, match="unreviewed direct"):
+        _verify(stub)
+
+
+@pytest.mark.parametrize("action", EXPECTED_ESCALATION_DATA_ACTIONS)
+def test_effective_access_rejects_every_data_plane_escalation_action(
+    action: str,
+) -> None:
+    stub = StubAzure()
+    role_definition_id = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+        "Microsoft.Authorization/roleDefinitions/"
+        "96969696-9696-4696-8696-969696969696"
+    )
+    stub.roles[role_definition_id.casefold()] = _role_definition(
+        role_definition_id,
+        _permission(data_actions=(action,)),
+    )
+    direct = stub.direct[PRINCIPAL_IDS[0]]
+    assert isinstance(direct, list)
+    direct.append(
+        _extra_assignment(
+            principal_id=PRINCIPAL_IDS[0],
+            role_definition_id=role_definition_id,
+        )
+    )
+
+    with pytest.raises(EffectiveAccessError, match="unreviewed direct"):
+        _verify(stub)
+
+
 def test_effective_access_rejects_inherited_pull_assignment() -> None:
     stub = StubAzure()
     role_definition_id = (
@@ -728,6 +909,7 @@ def test_effective_access_rejects_transitive_group_pull_assignment() -> None:
     stub.direct[group_id] = [
         _extra_assignment(
             principal_id=group_id,
+            principal_type="Group",
             role_definition_id=role_definition_id,
         )
     ]
@@ -1044,6 +1226,9 @@ def test_effective_access_rejects_quarantine_pull_paths(
     )
     assignment = _extra_assignment(
         principal_id=assignment_principal_id,
+        principal_type=(
+            "Group" if assignment_source == "transitive-group" else "ServicePrincipal"
+        ),
         role_definition_id=role_definition_id,
     )
     if assignment_source == "direct":
@@ -1140,6 +1325,7 @@ def test_effective_access_rejects_cross_component_expected_repository() -> None:
                 "Microsoft.ContainerRegistry/registries/repositories/content/read",
                 "Microsoft.ContainerRegistry/registries/quarantine/read",
                 "Microsoft.ContainerRegistry/registries/quarantinedArtifacts/read",
+                "Microsoft.Authorization/elevateAccess/action",
                 "Microsoft.Authorization/roleAssignments/write",
                 "Microsoft.Authorization/roleAssignmentScheduleRequests/write",
                 "Microsoft.Authorization/roleEligibilityScheduleRequests/write",
@@ -1156,6 +1342,13 @@ def test_effective_access_rejects_cross_component_expected_repository() -> None:
                 "Microsoft.ContainerRegistry/registries/generateCredentials/action",
                 "Microsoft.ContainerRegistry/registries/tokens/write",
                 "Microsoft.ContainerRegistry/registries/scopeMaps/write",
+                "Microsoft.ContainerRegistry/registries/quarantine/write",
+                "Microsoft.ContainerRegistry/registries/scheduleRun/action",
+                "Microsoft.ContainerRegistry/registries/tasks/listDetails/action",
+                "Microsoft.ContainerRegistry/registries/tasks/write",
+                "Microsoft.ContainerRegistry/registries/taskruns/listDetails/action",
+                "Microsoft.ContainerRegistry/registries/taskruns/write",
+                "Microsoft.ContainerRegistry/registries/updatePolicies/write",
             ),
         ),
         _permission(
@@ -1165,6 +1358,7 @@ def test_effective_access_rejects_cross_component_expected_repository() -> None:
                 "Microsoft.ContainerRegistry/registries/repositories/content/read",
                 "Microsoft.ContainerRegistry/registries/quarantine/read",
                 "Microsoft.ContainerRegistry/registries/quarantinedArtifacts/read",
+                "Microsoft.ContainerRegistry/registries/quarantinedArtifacts/write",
             ),
         ),
     ),
@@ -1229,7 +1423,7 @@ def test_effective_access_rejects_expected_assignment_profile_drift(
 
     with pytest.raises(
         EffectiveAccessError,
-        match="not exact|exact registry|principal type",
+        match="not exact|exact registry|principal type|canonical for its scope",
     ):
         _verify(stub)
 
@@ -1303,6 +1497,81 @@ def test_effective_access_rejects_noncanonical_registry_resource_id(
             subscription_id=SUBSCRIPTION_ID,
             run_json=stub,
         )
+
+
+def test_effective_access_follows_classic_role_assignment_pagination() -> None:
+    stub = StubAzure()
+    expected = _expected_assignments()[0]
+    stub.classic_pages[(SUBSCRIPTION_ID, expected.principal_id)] = [
+        {
+            "value": [],
+            "nextLink": _classic_next_link(expected.principal_id, 2),
+        },
+        {
+            "value": [
+                _classic_role_assignment_resource(_assignment(expected))
+            ],
+            "nextLink": None,
+        },
+    ]
+
+    assert _verify(stub)["verified"] is True
+
+
+def test_effective_access_rejects_untrusted_classic_assignment_continuation() -> None:
+    stub = StubAzure()
+    stub.classic_pages[(SUBSCRIPTION_ID, PRINCIPAL_IDS[0])] = [
+        {
+            "value": [],
+            "nextLink": (
+                "https://evil.example/subscriptions/"
+                f"{SUBSCRIPTION_ID}/providers/Microsoft.Authorization/roleAssignments?"
+                "api-version=2022-04-01&"
+                f"%24filter=principalId%20eq%20%27{PRINCIPAL_IDS[0]}%27&"
+                "%24skiptoken=page2"
+            ),
+        }
+    ]
+
+    with pytest.raises(
+        EffectiveAccessError,
+        match="classic role-assignment continuation is invalid",
+    ):
+        _verify(stub)
+
+
+def test_effective_access_rejects_classic_pagination_over_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stub = StubAzure()
+    expected = _expected_assignments()[0]
+    stub.classic_pages[(SUBSCRIPTION_ID, expected.principal_id)] = [
+        {
+            "value": [
+                _classic_role_assignment_resource(_assignment(expected))
+            ],
+            "nextLink": _classic_next_link(expected.principal_id, 2),
+        }
+    ]
+    monkeypatch.setattr(acr_verifier, "MAX_CLASSIC_ROLE_ASSIGNMENT_PAGES", 1)
+
+    with pytest.raises(
+        EffectiveAccessError,
+        match="classic role-assignment pagination exceeded its bound",
+    ):
+        _verify(stub)
+
+
+def test_effective_access_accepts_terminal_pages_at_exact_page_limits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stub = StubAzure()
+    monkeypatch.setattr(acr_verifier, "MAX_TENANT_HIERARCHY_PAGES", 1)
+    monkeypatch.setattr(acr_verifier, "MAX_GRAPH_MEMBERSHIP_PAGES", 1)
+    monkeypatch.setattr(acr_verifier, "MAX_CLASSIC_ROLE_ASSIGNMENT_PAGES", 1)
+    monkeypatch.setattr(acr_verifier, "MAX_ROLE_ASSIGNMENT_SCHEDULE_PAGES", 1)
+
+    assert _verify(stub)["verified"] is True
 
 
 def test_effective_access_follows_role_assignment_schedule_pagination() -> None:
@@ -1386,6 +1655,32 @@ def test_effective_access_rejects_schedule_query_set_over_call_bound(
     with pytest.raises(
         EffectiveAccessError,
         match="query set exceeds its API call bound",
+    ):
+        _verify(stub)
+
+
+def test_effective_access_rejects_classic_query_set_over_call_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stub = StubAzure()
+    monkeypatch.setattr(acr_verifier, "MAX_CLASSIC_ROLE_ASSIGNMENT_API_CALLS", 2)
+
+    with pytest.raises(
+        EffectiveAccessError,
+        match="classic role-assignment query set exceeds its API call bound",
+    ):
+        _verify(stub)
+
+
+def test_effective_access_rejects_classic_assignment_items_over_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stub = StubAzure()
+    monkeypatch.setattr(acr_verifier, "MAX_CLASSIC_ROLE_ASSIGNMENTS", 2)
+
+    with pytest.raises(
+        EffectiveAccessError,
+        match="classic role-assignment items exceed their bound",
     ):
         _verify(stub)
 
@@ -1530,5 +1825,5 @@ def test_effective_access_rejects_incomplete_assignment_document() -> None:
     stub = StubAzure()
     stub.direct[PRINCIPAL_IDS[0]] = {"value": []}
 
-    with pytest.raises(EffectiveAccessError, match="must be an array"):
+    with pytest.raises(EffectiveAccessError, match="must contain an array"):
         _verify(stub)

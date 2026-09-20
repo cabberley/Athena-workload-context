@@ -260,15 +260,15 @@ and condition bytes. Legacy mode carries null condition fields. A digest pull is
 identity evidence unless anonymous pull is explicitly disabled in management-plane readbacks both
 before and after the pull. The probe keeps the deployment-verifier Azure CLI context intact and
 uses an isolated CLI profile only for the managed identity. Root readiness additionally
-requires the PR #102-equivalent effective-assignment scan that resolves complete role definitions
+requires the authoritative PR #103 effective-assignment scan that resolves complete role definitions
 for direct, inherited, and group-derived grants across every subscription below the tenant root
 management group. Direct memberships are recursively traversed twice and must converge. The scan
 rejects every extra pull or escalation-capable assignment, including role-assignment
 administration, ACR credential administration, custom roles, and sibling registries in another
 subscription. PR #103 runs the complete scan before and after the digest pull, requires identical
-evidence digests, and embeds the final evidence in the pull-readiness document. The later PR #102
-integration rebase retains ownership of the governed migration from prior unconditioned Repository
-Reader assignments and must reconcile the identical scan semantics without divergence.
+evidence digests, and embeds the final evidence in the pull-readiness document. PR #102 must consume
+this evidence contract instead of retaining a second ACR classifier. Its final integration rebase
+still owns the governed migration from prior unconditioned Repository Reader assignments.
 
 Before setting publisher readiness, run
 `infra/wc027-guidance-authority-publisher/Test-AcrDigestPullReadiness.ps1` on an Azure host that can
@@ -298,13 +298,29 @@ continuations and fails closed on malformed pages, API errors, duplicate instanc
 instance, and total-call bounds. Quarantine and quarantined-artifact read permissions are treated
 as pull-capable whether they appear in `actions` or `dataActions`. Role-assignment and
 role-eligibility schedule request writes, approval-required eligibility writes, and role-management
-policy administration are escalation paths at scopes that can govern ACR.
+policy administration are escalation paths at scopes that can govern ACR. The same classification
+rejects tenant access elevation plus ACR quarantine mutation, task execution/administration,
+update-policy mutation, and quarantined-artifact writes.
 Pass the publisher deployment's exact image-pull identity resource output as
 `ManagedIdentityResourceId`; the probe live-reads that user-assigned identity before and after the
 pull and binds its resource, client, and principal IDs to both the effective scan and Docker login.
 The deployment-verifier identity must be able to read the tenant root management-group descendants,
 role assignments, and role-assignment schedule instances in every descendant subscription;
 incomplete hierarchy or PIM visibility fails closed.
+
+The effective-access JSON exposes a canonical `completeness` object for classic role assignments,
+PIM role-assignment schedule instances, transitive groups, sibling registries, ACR escalation
+paths, exact assignment readbacks, and pagination-budget enforcement. It also exposes the exact
+`paginationBudgets` contract: tenant-hierarchy pages and governed-subscription count; Graph pages
+per object and transitive groups per principal; classic-assignment pages per query, total API
+calls, and returned items; and role-assignment-schedule pages per query, total API calls, and
+returned instances. Classic assignments are read through explicit `roleAssignments@2022-04-01`
+REST pagination rather than an Azure CLI command that hides service page requests. The
+PowerShell probe and root Bicep gate require every completeness flag to be `true`, require the
+exact reviewed budget values and property sets, and include both objects in `evidenceDigest`.
+Downstream orchestration may consume that digest-bound proof but must not silently default a
+missing flag, accept altered summary arrays or property names, or recreate divergent ACR access
+semantics.
 
 Pass the script's compact JSON output unchanged as `wc027PublisherImagePullEvidenceJson`; the root
 gate matches the registry, image, client and principal identity, role assignment, mode, canonical
@@ -319,6 +335,11 @@ producer identities cannot enable any WC-027 Job. The proof is generated again a
 must reach root deployment within five minutes. Root uses its default
 `wc027ReadinessEvaluationTimeUtc` deployment instant to reject stale or future evidence; do not
 override that value during normal validation.
+
+After PR #99 introduces collector contract v10, the final integration rebase must update every
+exact collector schema-version and digest reference. That collector-contract reconciliation must
+not weaken or alias the authoritative WC-027 ACR evidence schema or its digest-covered
+`completeness` and `paginationBudgets` fields.
 
 The publisher independently exact-reads every referenced outbox Blob version before invoking its
 existing publication/activation service. Broker metadata without matching durable request bytes is

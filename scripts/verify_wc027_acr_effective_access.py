@@ -19,9 +19,13 @@ MAX_GRAPH_MEMBERSHIP_PAGES = 16
 MAX_TRANSITIVE_GROUPS = 4096
 MAX_TENANT_HIERARCHY_PAGES = 64
 MAX_GOVERNED_SUBSCRIPTIONS = 4096
+MAX_CLASSIC_ROLE_ASSIGNMENT_PAGES = 64
+MAX_CLASSIC_ROLE_ASSIGNMENT_API_CALLS = 16_384
+MAX_CLASSIC_ROLE_ASSIGNMENTS = 65_536
 MAX_ROLE_ASSIGNMENT_SCHEDULE_PAGES = 64
 MAX_ROLE_ASSIGNMENT_SCHEDULE_API_CALLS = 16_384
 MAX_ROLE_ASSIGNMENT_SCHEDULE_INSTANCES = 65_536
+ROLE_ASSIGNMENTS_API_VERSION = "2022-04-01"
 ROLE_ASSIGNMENT_SCHEDULE_API_VERSION = "2020-10-01"
 ACR_LEGACY_PULL_ACTION = "Microsoft.ContainerRegistry/registries/pull/read"
 ACR_REPOSITORY_CONTENT_READ_DATA_ACTION = (
@@ -38,6 +42,7 @@ ACR_PULL_CAPABLE_ACTIONS = (
     ACR_QUARANTINED_ARTIFACTS_READ_ACTION,
 )
 ACR_ESCALATION_ACTIONS = (
+    "Microsoft.Authorization/elevateAccess/action",
     "Microsoft.Authorization/roleAssignments/write",
     "Microsoft.Authorization/roleAssignmentScheduleRequests/write",
     "Microsoft.Authorization/roleEligibilityScheduleRequests/write",
@@ -51,6 +56,16 @@ ACR_ESCALATION_ACTIONS = (
     "Microsoft.ContainerRegistry/registries/generateCredentials/action",
     "Microsoft.ContainerRegistry/registries/tokens/write",
     "Microsoft.ContainerRegistry/registries/scopeMaps/write",
+    "Microsoft.ContainerRegistry/registries/quarantine/write",
+    "Microsoft.ContainerRegistry/registries/scheduleRun/action",
+    "Microsoft.ContainerRegistry/registries/tasks/listDetails/action",
+    "Microsoft.ContainerRegistry/registries/tasks/write",
+    "Microsoft.ContainerRegistry/registries/taskruns/listDetails/action",
+    "Microsoft.ContainerRegistry/registries/taskruns/write",
+    "Microsoft.ContainerRegistry/registries/updatePolicies/write",
+)
+ACR_ESCALATION_DATA_ACTIONS = (
+    "Microsoft.ContainerRegistry/registries/quarantinedArtifacts/write",
 )
 ACR_PULL_ROLE_ID = "7f951dda-4ed3-4680-a7ca-43fe172d538d"
 ACR_REPOSITORY_READER_ROLE_ID = "b93aa761-3e63-49ed-ac28-beffa264f7ac"
@@ -135,6 +150,27 @@ class _RolePermissionProfile:
 class _RoleAssignmentScheduleScanBudget:
     api_calls: int = 0
     instances: int = 0
+
+
+@dataclass(slots=True)
+class _ClassicRoleAssignmentScanBudget:
+    api_calls: int = 0
+    assignments: int = 0
+
+
+def _pagination_budgets() -> dict[str, int]:
+    return {
+        "tenantHierarchyMaxPages": MAX_TENANT_HIERARCHY_PAGES,
+        "governedSubscriptionMaxCount": MAX_GOVERNED_SUBSCRIPTIONS,
+        "graphMembershipMaxPagesPerObject": MAX_GRAPH_MEMBERSHIP_PAGES,
+        "transitiveGroupMaxCountPerPrincipal": MAX_TRANSITIVE_GROUPS,
+        "classicRoleAssignmentMaxPagesPerQuery": MAX_CLASSIC_ROLE_ASSIGNMENT_PAGES,
+        "classicRoleAssignmentMaxApiCalls": MAX_CLASSIC_ROLE_ASSIGNMENT_API_CALLS,
+        "classicRoleAssignmentMaxItems": MAX_CLASSIC_ROLE_ASSIGNMENTS,
+        "roleAssignmentScheduleMaxPagesPerQuery": MAX_ROLE_ASSIGNMENT_SCHEDULE_PAGES,
+        "roleAssignmentScheduleMaxApiCalls": MAX_ROLE_ASSIGNMENT_SCHEDULE_API_CALLS,
+        "roleAssignmentScheduleMaxInstances": MAX_ROLE_ASSIGNMENT_SCHEDULE_INSTANCES,
+    }
 
 
 def verify_effective_access(
@@ -234,14 +270,19 @@ def verify_effective_access(
         )
         for principal_id in sorted(expected_by_principal)
     }
-    minimum_schedule_calls = sum(
+    principal_subscription_queries = sum(
         (1 + len(group_ids)) * len(governed_subscription_ids)
         for group_ids in transitive_groups_by_principal.values()
     )
-    if minimum_schedule_calls > MAX_ROLE_ASSIGNMENT_SCHEDULE_API_CALLS:
+    if principal_subscription_queries > MAX_ROLE_ASSIGNMENT_SCHEDULE_API_CALLS:
         raise EffectiveAccessError(
             "active role-assignment schedule query set exceeds its API call bound"
         )
+    if principal_subscription_queries > MAX_CLASSIC_ROLE_ASSIGNMENT_API_CALLS:
+        raise EffectiveAccessError(
+            "classic role-assignment query set exceeds its API call bound"
+        )
+    classic_budget = _ClassicRoleAssignmentScanBudget()
     schedule_budget = _RoleAssignmentScheduleScanBudget()
     for principal_id in sorted(expected_by_principal):
         assignments = _resolved_effective_role_assignments(
@@ -250,6 +291,7 @@ def verify_effective_access(
             subscription_ids=governed_subscription_ids,
             governed_subscription_ids=governed_subscription_id_set,
             active_at=timestamp,
+            classic_budget=classic_budget,
             schedule_budget=schedule_budget,
             run_json=run_json,
         )
@@ -324,6 +366,16 @@ def verify_effective_access(
         "roleAssignmentScheduleInstancesComplete": True,
         "siblingRegistriesChecked": True,
         "acrEscalationPathsChecked": True,
+        "completeness": {
+            "classicRoleAssignments": True,
+            "pimRoleAssignmentScheduleInstances": True,
+            "transitiveGroups": True,
+            "siblingRegistries": True,
+            "acrEscalationPaths": True,
+            "exactAssignmentReadbacks": True,
+            "paginationBudgets": True,
+        },
+        "paginationBudgets": _pagination_budgets(),
         "expectedAssignmentIds": sorted(expected_ids),
         "principalIds": sorted(expected_by_principal),
         "registryResourceIds": sorted(
@@ -466,7 +518,7 @@ def _governed_tenant_subscriptions(
                 )
         continuation = page.get("nextLink")
         if continuation is None:
-            next_url = None
+            break
         elif isinstance(continuation, str) and continuation:
             next_url = continuation
         else:
@@ -700,6 +752,7 @@ def _resolved_effective_role_assignments(
     subscription_ids: Sequence[str],
     governed_subscription_ids: frozenset[str],
     active_at: datetime,
+    classic_budget: _ClassicRoleAssignmentScanBudget,
     schedule_budget: _RoleAssignmentScheduleScanBudget,
     run_json: JsonRunner,
 ) -> list[dict[str, Any]]:
@@ -713,7 +766,10 @@ def _resolved_effective_role_assignments(
             documents.append(
                 _effective_role_assignments(
                     effective_principal_id,
+                    principal_type=principal_type,
                     subscription_id=subscription_id,
+                    governed_subscription_ids=governed_subscription_ids,
+                    classic_budget=classic_budget,
                     run_json=run_json,
                 )
             )
@@ -737,51 +793,220 @@ def _resolved_effective_role_assignments(
 def _effective_role_assignments(
     principal_id: str,
     *,
+    principal_type: str,
     subscription_id: str,
+    governed_subscription_ids: frozenset[str],
+    classic_budget: _ClassicRoleAssignmentScanBudget,
     run_json: JsonRunner,
 ) -> list[dict[str, Any]]:
     subscription_scope = f"/subscriptions/{subscription_id}"
-    return _merge_assignment_documents(
+    filter_value = f"principalId eq '{principal_id}'"
+    query = urlencode(
         (
-            run_json(
-                [
-                    "az",
-                    "role",
-                    "assignment",
-                    "list",
-                    "--subscription",
-                    subscription_id,
-                    "--assignee-object-id",
-                    principal_id,
-                    "--all",
-                    "--only-show-errors",
-                    "--output",
-                    "json",
-                ],
-                f"effective ACR assignments for {principal_id}",
-            ),
-            run_json(
-                [
-                    "az",
-                    "role",
-                    "assignment",
-                    "list",
-                    "--subscription",
-                    subscription_id,
-                    "--assignee-object-id",
-                    principal_id,
-                    "--scope",
-                    subscription_scope,
-                    "--include-inherited",
-                    "--only-show-errors",
-                    "--output",
-                    "json",
-                ],
-                f"inherited ACR assignments for {principal_id}",
-            ),
+            ("api-version", ROLE_ASSIGNMENTS_API_VERSION),
+            ("$filter", filter_value),
         ),
-        field=f"effective ACR assignments for {principal_id}",
+        quote_via=quote,
     )
+    next_url: str | None = (
+        f"https://{ARM_HOST}{subscription_scope}/providers/"
+        f"Microsoft.Authorization/roleAssignments?{query}"
+    )
+    assignments: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+    seen_assignment_ids: set[str] = set()
+    for page_number in range(1, MAX_CLASSIC_ROLE_ASSIGNMENT_PAGES + 1):
+        if next_url is None:
+            return assignments
+        _validate_classic_role_assignments_url(
+            next_url,
+            subscription_id=subscription_id,
+            principal_id=principal_id,
+            first_page=page_number == 1,
+        )
+        if next_url in seen_urls:
+            raise EffectiveAccessError(
+                "classic role-assignment pagination contains a cycle"
+            )
+        seen_urls.add(next_url)
+        if classic_budget.api_calls >= MAX_CLASSIC_ROLE_ASSIGNMENT_API_CALLS:
+            raise EffectiveAccessError(
+                "classic role-assignment API calls exceed their bound"
+            )
+        classic_budget.api_calls += 1
+        page = _mapping(
+            run_json(
+                [
+                    "az",
+                    "rest",
+                    "--method",
+                    "get",
+                    "--url",
+                    next_url,
+                    "--only-show-errors",
+                    "--output",
+                    "json",
+                ],
+                (
+                    "classic role assignments for "
+                    f"{principal_type} {principal_id} in {subscription_scope} "
+                    f"page {page_number}"
+                ),
+            ),
+            field="classic role-assignment page",
+        )
+        values = page.get("value")
+        if not isinstance(values, list):
+            raise EffectiveAccessError(
+                "classic role-assignment page must contain an array"
+            )
+        for assignment_index, raw_assignment in enumerate(values):
+            if classic_budget.assignments >= MAX_CLASSIC_ROLE_ASSIGNMENTS:
+                raise EffectiveAccessError(
+                    "classic role-assignment items exceed their bound"
+                )
+            classic_budget.assignments += 1
+            assignment = _classic_role_assignment(
+                raw_assignment,
+                principal_id=principal_id,
+                principal_type=principal_type,
+                governed_subscription_ids=governed_subscription_ids,
+                field=(
+                    "classic role-assignment "
+                    f"page {page_number} item {assignment_index}"
+                ),
+            )
+            assignment_id = _string(
+                assignment.get("id"),
+                field="classic role-assignment ID",
+            ).casefold()
+            if assignment_id in seen_assignment_ids:
+                raise EffectiveAccessError(
+                    "classic role-assignment pages contain a duplicate"
+                )
+            seen_assignment_ids.add(assignment_id)
+            assignments.append(assignment)
+        continuation = page.get("nextLink")
+        if continuation is None:
+            return assignments
+        if not isinstance(continuation, str) or not continuation:
+            raise EffectiveAccessError(
+                "classic role-assignment continuation is invalid"
+            )
+        next_url = continuation
+    raise EffectiveAccessError(
+        "classic role-assignment pagination exceeded its bound"
+    )
+
+
+def _validate_classic_role_assignments_url(
+    url: str,
+    *,
+    subscription_id: str,
+    principal_id: str,
+    first_page: bool,
+) -> None:
+    if len(url) > 16_384:
+        raise EffectiveAccessError(
+            "classic role-assignment continuation is oversized"
+        )
+    parsed = urlparse(url)
+    expected_path = (
+        f"/subscriptions/{subscription_id}/providers/"
+        "Microsoft.Authorization/roleAssignments"
+    )
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    normalized_query: dict[str, list[str]] = {}
+    for key, values in query.items():
+        normalized_key = key.casefold()
+        if normalized_key in normalized_query:
+            raise EffectiveAccessError(
+                "classic role-assignment continuation is invalid"
+            )
+        normalized_query[normalized_key] = values
+    continuation_keys = {"$skiptoken"} & normalized_query.keys()
+    if (
+        parsed.scheme != "https"
+        or parsed.netloc.casefold() != ARM_HOST
+        or parsed.path.casefold() != expected_path.casefold()
+        or parsed.fragment
+        or parsed.username is not None
+        or parsed.password is not None
+        or any(
+            key not in {"api-version", "$filter", "$skiptoken"}
+            for key in normalized_query
+        )
+        or any(len(values) != 1 or not values[0] for values in normalized_query.values())
+        or normalized_query.get("api-version") != [ROLE_ASSIGNMENTS_API_VERSION]
+        or normalized_query.get("$filter")
+        != [f"principalId eq '{principal_id}'"]
+        or (first_page and continuation_keys)
+        or (not first_page and continuation_keys != {"$skiptoken"})
+    ):
+        raise EffectiveAccessError(
+            "classic role-assignment continuation is invalid"
+        )
+
+
+def _classic_role_assignment(
+    value: object,
+    *,
+    principal_id: str,
+    principal_type: str,
+    governed_subscription_ids: frozenset[str],
+    field: str,
+) -> dict[str, Any]:
+    resource = _mapping(value, field=field)
+    assignment_name = _canonical_uuid(
+        resource.get("name"),
+        field=f"{field} name",
+    )
+    if str(resource.get("type", "")).casefold() != (
+        "Microsoft.Authorization/roleAssignments"
+    ).casefold():
+        raise EffectiveAccessError(f"{field} type is invalid")
+    properties = _mapping(
+        resource.get("properties"),
+        field=f"{field} properties",
+    )
+    assignment_principal_id = _canonical_uuid(
+        properties.get("principalId"),
+        field=f"{field} principal ID",
+    )
+    if assignment_principal_id != principal_id:
+        raise EffectiveAccessError(f"{field} principal does not match its query")
+    if properties.get("principalType") != principal_type:
+        raise EffectiveAccessError(f"{field} principal type does not match its query")
+    scope = _canonical_governed_scope(
+        properties.get("scope"),
+        governed_subscription_ids=governed_subscription_ids,
+        field=f"{field} scope",
+    )
+    assignment_id = _canonical_role_assignment_origin_id(
+        resource.get("id"),
+        scope=scope,
+        field=f"{field} ID",
+    )
+    if assignment_id.rsplit("/", 1)[-1] != assignment_name:
+        raise EffectiveAccessError(f"{field} name does not match its ID")
+    return {
+        "id": assignment_id,
+        "principalId": assignment_principal_id,
+        "principalType": principal_type,
+        "roleDefinitionId": _string(
+            properties.get("roleDefinitionId"),
+            field=f"{field} role definition ID",
+        ),
+        "scope": scope,
+        "conditionVersion": _optional_string(
+            properties.get("conditionVersion"),
+            field=f"{field} conditionVersion",
+        ),
+        "condition": _optional_string(
+            properties.get("condition"),
+            field=f"{field} condition",
+        ),
+    }
 
 
 def _active_role_assignment_schedule_instances(
@@ -881,7 +1106,7 @@ def _active_role_assignment_schedule_instances(
                 active_assignments.append(active_assignment)
         continuation = page.get("nextLink")
         if continuation is None:
-            next_url = None
+            return active_assignments
         elif isinstance(continuation, str) and continuation:
             next_url = continuation
         else:
@@ -922,9 +1147,8 @@ def _validate_role_assignment_schedule_instances_url(
         "api-version",
         "$filter",
         "$skiptoken",
-        "$skip",
     }
-    continuation_keys = {"$skiptoken", "$skip"} & normalized_query.keys()
+    continuation_keys = {"$skiptoken"} & normalized_query.keys()
     if (
         parsed.scheme != "https"
         or parsed.netloc.casefold() != ARM_HOST
@@ -1207,7 +1431,7 @@ def _direct_parent_group_ids(
             group_ids.add(group_id)
         continuation = page.get("@odata.nextLink")
         if continuation is None:
-            next_url = None
+            return group_ids
         elif isinstance(continuation, str) and continuation:
             next_url = continuation
         else:
@@ -1384,6 +1608,14 @@ def _role_definition_grants_acr_escalation(
         )
         for profile in profiles
         for action in ACR_ESCALATION_ACTIONS
+    ) or any(
+        _permission_profile_grants_action(
+            profile,
+            action,
+            is_data_action=True,
+        )
+        for profile in profiles
+        for action in ACR_ESCALATION_DATA_ACTIONS
     )
 
 

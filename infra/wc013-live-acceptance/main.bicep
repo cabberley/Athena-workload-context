@@ -803,7 +803,7 @@ var wc027PublisherImagePullRegistryResourceIdSegments = concat(
 var wc027PublisherImagePullRegistryResourceIdValid = length(wc027PublisherImagePullRegistryResourceIdRawSegments) == 9 && empty(wc027PublisherImagePullRegistryResourceIdSegments[0]) && wc027PublisherImagePullRegistryResourceIdSegments[1] == 'subscriptions' && !empty(wc027PublisherImagePullRegistryResourceIdSegments[2]) && wc027PublisherImagePullRegistryResourceIdSegments[3] == 'resourceGroups' && !empty(wc027PublisherImagePullRegistryResourceIdSegments[4]) && wc027PublisherImagePullRegistryResourceIdSegments[5] == 'providers' && wc027PublisherImagePullRegistryResourceIdSegments[6] == 'Microsoft.ContainerRegistry' && wc027PublisherImagePullRegistryResourceIdSegments[7] == 'registries' && !empty(wc027PublisherImagePullRegistryResourceIdSegments[8]) && !contains(wc027ParsedPublisherConfiguration.imagePull.registryResourceId, '//') && !contains(wc027ParsedPublisherConfiguration.imagePull.registryResourceId, '?') && !contains(wc027ParsedPublisherConfiguration.imagePull.registryResourceId, '#') && !contains(wc027ParsedPublisherConfiguration.imagePull.registryResourceId, '%')
 var wc027ParsedPublisherImagePullEvidence = json(
   empty(wc027PublisherImagePullEvidenceJson)
-    ? '{"anonymousPullEnabled":true,"attempts":0,"condition":null,"conditionVersion":null,"effectiveAccess":{"acrEscalationPathsChecked":false,"anonymousPullEnabled":true,"convergedMembershipReadbacks":false,"directAssignmentsComplete":false,"directMembershipTraversalComplete":false,"evidenceDigest":"","exactAssignmentReadbacksComplete":false,"expectedAssignmentCount":0,"expectedAssignmentIds":[],"extraPullCapableAssignmentIds":[],"governedSubscriptionIds":[],"inheritedAssignmentsComplete":false,"principalIds":[],"pullCapableAssignmentCount":0,"registryResourceIds":[],"reviewedAssignments":[],"roleAssignmentScheduleInstancesComplete":false,"roleDefinitionsResolved":false,"schemaVersion":"","siblingRegistriesChecked":false,"tenantId":"","tenantSubscriptionHierarchyComplete":false,"transitiveGroupsComplete":false,"verified":false,"verifiedAt":"1970-01-01T00:00:00.000Z"},"image":"","managedIdentityClientId":"","managedIdentityPrincipalId":"","managedIdentityResourceId":"","maxAttempts":0,"registryResourceId":"","registryServer":"","repositoryName":"","roleAssignmentMode":"","roleAssignmentResourceId":"","roleDefinitionId":"","schemaVersion":"","success":false,"verifiedAt":"1970-01-01T00:00:00.000Z"}'
+    ? '{"anonymousPullEnabled":true,"attempts":0,"condition":null,"conditionVersion":null,"effectiveAccess":{"acrEscalationPathsChecked":false,"anonymousPullEnabled":true,"completeness":{"acrEscalationPaths":false,"classicRoleAssignments":false,"exactAssignmentReadbacks":false,"paginationBudgets":false,"pimRoleAssignmentScheduleInstances":false,"siblingRegistries":false,"transitiveGroups":false},"convergedMembershipReadbacks":false,"directAssignmentsComplete":false,"directMembershipTraversalComplete":false,"evidenceDigest":"","exactAssignmentReadbacksComplete":false,"expectedAssignmentCount":0,"expectedAssignmentIds":[],"extraPullCapableAssignmentIds":[],"governedSubscriptionIds":[],"inheritedAssignmentsComplete":false,"paginationBudgets":{"classicRoleAssignmentMaxApiCalls":0,"classicRoleAssignmentMaxItems":0,"classicRoleAssignmentMaxPagesPerQuery":0,"governedSubscriptionMaxCount":0,"graphMembershipMaxPagesPerObject":0,"roleAssignmentScheduleMaxApiCalls":0,"roleAssignmentScheduleMaxInstances":0,"roleAssignmentScheduleMaxPagesPerQuery":0,"tenantHierarchyMaxPages":0,"transitiveGroupMaxCountPerPrincipal":0},"principalIds":[],"pullCapableAssignmentCount":0,"registryResourceIds":[],"reviewedAssignments":[],"roleAssignmentScheduleInstancesComplete":false,"roleDefinitionsResolved":false,"schemaVersion":"","siblingRegistriesChecked":false,"tenantId":"","tenantSubscriptionHierarchyComplete":false,"transitiveGroupsComplete":false,"verified":false,"verifiedAt":"1970-01-01T00:00:00.000Z"},"image":"","managedIdentityClientId":"","managedIdentityPrincipalId":"","managedIdentityResourceId":"","maxAttempts":0,"registryResourceId":"","registryServer":"","repositoryName":"","roleAssignmentMode":"","roleAssignmentResourceId":"","roleDefinitionId":"","schemaVersion":"","success":false,"verifiedAt":"1970-01-01T00:00:00.000Z"}'
     : wc027PublisherImagePullEvidenceJson
 )
 var wc027ParsedProducerConfiguration = json(
@@ -1004,7 +1004,63 @@ var wc027ReviewedPublisherAcrAssignment = first(concat(
     }
   ]
 ))
-var wc027ReviewedRequestProducerAcrAssignmentValid = length(wc027ReviewedRequestProducerAcrAssignments) == 1 && wc027RequestProducerImagePullBindingValid && !contains([
+var wc027EffectiveExpectedAssignmentIds = map(
+  wc027ParsedEffectiveAcrAccess.expectedAssignmentIds,
+  assignmentId => toLower(assignmentId)
+)
+var wc027EffectivePrincipalIds = map(
+  wc027ParsedEffectiveAcrAccess.principalIds,
+  principalId => toLower(principalId)
+)
+var wc027EffectiveRegistryResourceIds = map(
+  wc027ParsedEffectiveAcrAccess.registryResourceIds,
+  registryResourceId => toLower(registryResourceId)
+)
+var wc027ReviewedAssignmentIds = union(
+  [
+    toLower(wc027ReviewedRequestProducerAcrAssignment.assignmentResourceId)
+  ],
+  [
+    toLower(wc027ReviewedFeedProducerAcrAssignment.assignmentResourceId)
+  ],
+  [
+    toLower(wc027ReviewedPublisherAcrAssignment.assignmentResourceId)
+  ]
+)
+var wc027ReviewedPrincipalIds = union(
+  [
+    toLower(wc027ReviewedRequestProducerAcrAssignment.principalId)
+  ],
+  [
+    toLower(wc027ReviewedFeedProducerAcrAssignment.principalId)
+  ],
+  [
+    toLower(wc027ReviewedPublisherAcrAssignment.principalId)
+  ]
+)
+var wc027ReviewedRegistryResourceIds = union(
+  [
+    toLower(wc027ReviewedRequestProducerAcrAssignment.registryResourceId)
+  ],
+  [
+    toLower(wc027ReviewedFeedProducerAcrAssignment.registryResourceId)
+  ],
+  [
+    toLower(wc027ReviewedPublisherAcrAssignment.registryResourceId)
+  ]
+)
+var wc027EffectiveAcrSummarySetsValid = !contains([
+  length(wc027EffectiveExpectedAssignmentIds) == length(wc027ReviewedAssignmentIds)
+  length(filter(wc027EffectiveExpectedAssignmentIds, assignmentId => contains(wc027ReviewedAssignmentIds, assignmentId))) == length(wc027EffectiveExpectedAssignmentIds)
+  length(filter(wc027ReviewedAssignmentIds, assignmentId => contains(wc027EffectiveExpectedAssignmentIds, assignmentId))) == length(wc027ReviewedAssignmentIds)
+  length(wc027EffectivePrincipalIds) == length(wc027ReviewedPrincipalIds)
+  length(filter(wc027EffectivePrincipalIds, principalId => contains(wc027ReviewedPrincipalIds, principalId))) == length(wc027EffectivePrincipalIds)
+  length(filter(wc027ReviewedPrincipalIds, principalId => contains(wc027EffectivePrincipalIds, principalId))) == length(wc027ReviewedPrincipalIds)
+  length(wc027EffectiveRegistryResourceIds) == length(wc027ReviewedRegistryResourceIds)
+  length(filter(wc027EffectiveRegistryResourceIds, registryResourceId => contains(wc027ReviewedRegistryResourceIds, registryResourceId))) == length(wc027EffectiveRegistryResourceIds)
+  length(filter(wc027ReviewedRegistryResourceIds, registryResourceId => contains(wc027EffectiveRegistryResourceIds, registryResourceId))) == length(wc027ReviewedRegistryResourceIds)
+], false)
+var wc027ReviewedRequestProducerAcrAssignmentValid = length(wc027ReviewedRequestProducerAcrAssignments) == 1 && length(items(wc027ReviewedRequestProducerAcrAssignment)) == 9 && wc027RequestProducerImagePullBindingValid && !contains([
   toLower(wc027ReviewedRequestProducerAcrAssignment.principalId) == toLower(wc027ParsedRequestProducerImagePullBinding.principalId)
   toLower(wc027ReviewedRequestProducerAcrAssignment.assignmentResourceId) == toLower(wc027ParsedRequestProducerImagePullBinding.roleAssignmentResourceId)
   toLower(wc027ReviewedRequestProducerAcrAssignment.registryResourceId) == toLower(wc027ParsedRequestProducerImagePullBinding.registryResourceId)
@@ -1014,7 +1070,7 @@ var wc027ReviewedRequestProducerAcrAssignmentValid = length(wc027ReviewedRequest
   wc027ReviewedRequestProducerAcrAssignment.conditionVersion == wc027ParsedRequestProducerImagePullBinding.conditionVersion
   wc027ReviewedRequestProducerAcrAssignment.condition == wc027ParsedRequestProducerImagePullBinding.condition
 ], false)
-var wc027ReviewedFeedProducerAcrAssignmentValid = length(wc027ReviewedFeedProducerAcrAssignments) == 1 && wc027FeedProducerImagePullBindingValid && !contains([
+var wc027ReviewedFeedProducerAcrAssignmentValid = length(wc027ReviewedFeedProducerAcrAssignments) == 1 && length(items(wc027ReviewedFeedProducerAcrAssignment)) == 9 && wc027FeedProducerImagePullBindingValid && !contains([
   toLower(wc027ReviewedFeedProducerAcrAssignment.principalId) == toLower(wc027ParsedFeedProducerImagePullBinding.principalId)
   toLower(wc027ReviewedFeedProducerAcrAssignment.assignmentResourceId) == toLower(wc027ParsedFeedProducerImagePullBinding.roleAssignmentResourceId)
   toLower(wc027ReviewedFeedProducerAcrAssignment.registryResourceId) == toLower(wc027ParsedFeedProducerImagePullBinding.registryResourceId)
@@ -1024,7 +1080,7 @@ var wc027ReviewedFeedProducerAcrAssignmentValid = length(wc027ReviewedFeedProduc
   wc027ReviewedFeedProducerAcrAssignment.conditionVersion == wc027ParsedFeedProducerImagePullBinding.conditionVersion
   wc027ReviewedFeedProducerAcrAssignment.condition == wc027ParsedFeedProducerImagePullBinding.condition
 ], false)
-var wc027ReviewedPublisherAcrAssignmentValid = length(wc027ReviewedPublisherAcrAssignments) == 1 && !contains([
+var wc027ReviewedPublisherAcrAssignmentValid = length(wc027ReviewedPublisherAcrAssignments) == 1 && length(items(wc027ReviewedPublisherAcrAssignment)) == 9 && !contains([
   toLower(wc027ReviewedPublisherAcrAssignment.principalId) == toLower(wc027ParsedPublisherConfiguration.imagePull.identityPrincipalId)
   toLower(wc027ReviewedPublisherAcrAssignment.assignmentResourceId) == toLower(wc027ParsedPublisherConfiguration.imagePull.roleAssignmentResourceId)
   toLower(wc027ReviewedPublisherAcrAssignment.registryResourceId) == toLower(wc027ParsedPublisherConfiguration.imagePull.registryResourceId)
@@ -1035,6 +1091,7 @@ var wc027ReviewedPublisherAcrAssignmentValid = length(wc027ReviewedPublisherAcrA
   wc027ReviewedPublisherAcrAssignment.condition == wc027ParsedPublisherConfiguration.imagePull.condition
 ], false)
 var wc027EffectiveAcrAssignmentsVerified = !contains([
+  length(items(wc027ParsedEffectiveAcrAccess)) == 27
   wc027ParsedEffectiveAcrAccess.schemaVersion == 'athena.wc027AcrEffectiveAccessEvidence.v1'
   wc027ParsedEffectiveAcrAccess.verified == true
   toLower(wc027ParsedEffectiveAcrAccess.tenantId) == toLower(tenant().tenantId)
@@ -1056,12 +1113,32 @@ var wc027EffectiveAcrAssignmentsVerified = !contains([
   wc027ParsedEffectiveAcrAccess.roleAssignmentScheduleInstancesComplete == true
   wc027ParsedEffectiveAcrAccess.siblingRegistriesChecked == true
   wc027ParsedEffectiveAcrAccess.acrEscalationPathsChecked == true
+  length(items(wc027ParsedEffectiveAcrAccess.completeness)) == 7
+  wc027ParsedEffectiveAcrAccess.completeness.classicRoleAssignments == true
+  wc027ParsedEffectiveAcrAccess.completeness.pimRoleAssignmentScheduleInstances == true
+  wc027ParsedEffectiveAcrAccess.completeness.transitiveGroups == true
+  wc027ParsedEffectiveAcrAccess.completeness.siblingRegistries == true
+  wc027ParsedEffectiveAcrAccess.completeness.acrEscalationPaths == true
+  wc027ParsedEffectiveAcrAccess.completeness.exactAssignmentReadbacks == true
+  wc027ParsedEffectiveAcrAccess.completeness.paginationBudgets == true
+  length(items(wc027ParsedEffectiveAcrAccess.paginationBudgets)) == 10
+  wc027ParsedEffectiveAcrAccess.paginationBudgets.tenantHierarchyMaxPages == 64
+  wc027ParsedEffectiveAcrAccess.paginationBudgets.governedSubscriptionMaxCount == 4096
+  wc027ParsedEffectiveAcrAccess.paginationBudgets.graphMembershipMaxPagesPerObject == 16
+  wc027ParsedEffectiveAcrAccess.paginationBudgets.transitiveGroupMaxCountPerPrincipal == 4096
+  wc027ParsedEffectiveAcrAccess.paginationBudgets.classicRoleAssignmentMaxPagesPerQuery == 64
+  wc027ParsedEffectiveAcrAccess.paginationBudgets.classicRoleAssignmentMaxApiCalls == 16384
+  wc027ParsedEffectiveAcrAccess.paginationBudgets.classicRoleAssignmentMaxItems == 65536
+  wc027ParsedEffectiveAcrAccess.paginationBudgets.roleAssignmentScheduleMaxPagesPerQuery == 64
+  wc027ParsedEffectiveAcrAccess.paginationBudgets.roleAssignmentScheduleMaxApiCalls == 16384
+  wc027ParsedEffectiveAcrAccess.paginationBudgets.roleAssignmentScheduleMaxInstances == 65536
   wc027EffectiveAcrEvidenceFresh
   wc027EffectiveAcrEvidenceDigestValid
   length(wc027ParsedEffectiveAcrAccess.expectedAssignmentIds) == 3
   length(wc027ParsedEffectiveAcrAccess.principalIds) == 3
   length(wc027ParsedEffectiveAcrAccess.registryResourceIds) >= 1
   length(wc027ReviewedEffectiveAcrAssignments) == 3
+  wc027EffectiveAcrSummarySetsValid
   length(filter(wc027ReviewedEffectiveAcrAssignmentLabels, label => label == 'request-producer')) == 1
   length(filter(wc027ReviewedEffectiveAcrAssignmentLabels, label => label == 'feed-producer')) == 1
   length(filter(wc027ReviewedEffectiveAcrAssignmentLabels, label => label == 'publisher')) == 1

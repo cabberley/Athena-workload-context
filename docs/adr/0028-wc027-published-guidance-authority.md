@@ -205,7 +205,7 @@ unchanged operator context and an isolated managed-identity CLI profile. The liv
 resource must return the exact resource, client, and principal IDs used for the scan, Docker login,
 publisher configuration, and Job registry binding.
 
-Root readiness additionally requires the PR #102-equivalent effective-assignment proof across the
+Root readiness additionally requires the authoritative PR #103 effective-assignment proof across the
 tenant root management-group hierarchy. Every descendant subscription is enumerated, direct group
 membership is traversed recursively twice without the eventual transitive-membership index, and
 the two closures must converge. Full role definitions are then resolved for every direct,
@@ -216,18 +216,30 @@ assignment schedule is not effective. Persistent role-assignment schedule mirror
 through their canonical origin role-assignment ID and must match the underlying reviewed grant.
 Any extra pull grant or escalation path—including
 `roleAssignments/write`, role-assignment or eligibility schedule-request writes, role-management
-policy administration, role-definition mutation, ACR credential administration, quarantine reads,
-custom roles, or a sibling registry in another subscription—fails closed. The scanner verifies
+policy administration, tenant access elevation, role-definition mutation, ACR credential
+administration, quarantine reads or mutation, task execution/administration, update-policy
+mutation, quarantined-artifact writes, custom roles, or a sibling registry in another
+subscription—fails closed. The scanner verifies
 every referenced registry's live permission mode, and the proof exact-matches each reviewed
 assignment's principal, registry scope, role, condition version, and canonical repository
 condition; legacy `AcrPull` accepts null condition fields only. The bounded publisher probe repeats
-the complete scan after the pull and requires an identical evidence digest. Request and feed
+the complete scan after the pull and requires an identical evidence digest. The digest covers a
+canonical completeness map for classic assignments, active PIM schedule instances, transitive
+groups, sibling registries, escalation paths, exact readbacks, and enforced pagination budgets,
+plus the exact numeric page, call, group, subscription, assignment, and schedule-instance limits.
+Classic assignments use explicit bounded `roleAssignments@2022-04-01` REST pagination, so the
+published API-call budget counts service pages rather than wrapper-command invocations. Consumers
+require the exact case-sensitive property sets and summary sets derived from the three reviewed
+assignments. PR #102 consumes this proof after rebase rather than owning another ACR classifier.
+Request and feed
 deployments also emit exact non-secret ACR binding JSON, and root readiness binds those two
 reviewed assignments plus the publisher assignment to their live Job identities, deployment RBAC
 sets, registries, and images instead of trusting labels or counts. Evidence older than five
 minutes, generated after the trusted deployment evaluation instant, or lacking a final post-pull
 scan is rejected. This allows the required later rebase and its governed legacy-assignment
-migration to reconcile without semantic divergence.
+migration to reconcile without semantic divergence. When PR #99's collector contract v10 becomes
+the integration base, exact collector schema and digest references must be updated without
+changing or aliasing this ACR evidence contract.
 
 ## Consequences
 
