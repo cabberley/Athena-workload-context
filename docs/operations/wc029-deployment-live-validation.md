@@ -84,8 +84,11 @@ predecessor receipt hashes, a deliberately narrowed exact stage-output schema, a
 effective-parameter binding. The foundation handoff carries one canonical SHA-256 over every
 non-WC-027 effective parameter rather than an open-ended parameter object. Missing, extra,
 cross-scope, changed, unapproved, or internally inconsistent plans, receipts, handoffs, parameters,
-and deployment outputs fail closed. Never call a later stage without the complete preceding
-handoff and independently reviewed receipt set.
+and deployment outputs fail closed. Handoff and receipt files are written into one immutable
+generation directory, fsynced, and exposed only after one atomic
+`athena.wc029EvidenceCommit.v1` manifest commits the complete pair. Readers reject orphaned,
+partial, uncommitted, cross-generation, or hash-mismatched evidence. Never call a later stage
+without the complete preceding handoff and independently reviewed receipt set.
 
 This four-stage tool establishes deployment wiring, not a publisher runtime invocation. The
 merged production publisher can publish `PublishedGuidanceAuthorityBinding.v2` to the producer
@@ -295,12 +298,23 @@ document, what-if, predecessor handoff, and receipt is read exactly once through
 non-reparse artifact reader. Its immutable raw bytes, parsed document, file identity, and SHA-256
 remain attached to that orchestration invocation; later checks never reopen the reviewed path.
 Every Azure deployment validate, what-if, and create command includes `--no-prompt true`, and the
-subprocess receives no stdin. Final planning compiles Bicep exactly once, writes the canonical ARM
-JSON to an immutable `*.template.json` review artifact, and records its path, bytes, identity, and
-SHA-256. Validate and what-if consume one private pinned copy of that ARM JSON plus one private
-pinned effective-parameter copy. Apply captures those reviewed artifacts without reopening Bicep
-and rematerializes the same bytes for its final what-if and create. Post-deployment template export
-must corroborate the reviewed ARM JSON; it is not the first detection of template drift.
+subprocess receives no stdin. Every Azure CLI and Bicep operation has an explicit bounded timeout.
+Read timeouts may participate only in an existing bounded read-only convergence loop. A
+deployment-create timeout is outcome-unknown: apply never invokes create again and may continue
+only by reconciling the exact deployment through read-only show/export operations. Final planning
+compiles Bicep exactly once, writes the canonical ARM JSON to an immutable `*.template.json`
+review artifact, and records its path, bytes, identity, and SHA-256. Validate and what-if consume
+one private pinned copy of that ARM JSON plus one private pinned effective-parameter copy. Apply
+captures those reviewed artifacts without reopening Bicep and rematerializes the same bytes for
+its final what-if and create. Post-deployment template export must corroborate the reviewed ARM
+JSON; it is not the first detection of template drift.
+
+Subscription-scope deployments use the reviewed deployment location directly. Producer and
+publisher are resource-group deployments: both plan and apply read the exact resource-group ID,
+name, provisioning state, and location and require `--location` to equal that live location. The
+group deployment commands correctly omit `--location`, while the reviewed plan and later evidence
+retain the validated resource-group location. A location mismatch blocks validation, what-if, and
+create.
 
 For producer, publisher, and live-acceptance stages the plan also records
 `authorityBlobInventory` plus its exact checkpoint SHA-256. Blob service versioning must be enabled.
@@ -336,14 +350,23 @@ Producer upgrades and publisher recovery must additionally supply
 earlier source commit, but its receipt, plan, handoff, stage scope, and inventory hashes must remain
 internally exact, including deployment name and predecessor-receipt lineage. Every pre-existing
 producer authority container, even an empty one, requires prior producer evidence; an out-of-band
-deployment cannot establish a new baseline. If a reviewed fresh producer create succeeds but
-eventually consistent ARM/RBAC readback or a crash before receipt publication prevents completion,
-rerun the same apply with `--resume-succeeded-deployment`. That read-only recovery path is limited
-to the original fresh producer plan: it never runs what-if or create, and it requires the exact
-succeeded deployment name, incremental mode, reviewed parameters, exported compiled template,
-outputs, enabled versioning, and empty container before issuing the recovery receipt. If the first
-attempt already published a handoff, the recovered handoff must be byte-identical. Deployment and
-readiness readbacks use eight bounded attempts with no delete or unreviewed mutation.
+deployment cannot establish a new baseline. Before every normal create, apply proves that the
+exact deployment name is absent. The create response must immediately prove `Succeeded`, the exact
+deployment ID/name/type/subscription/scope/resource group, incremental mode, current timestamp,
+correlation ID, duration, reviewed parameters, structural arrays, and outputs. A failed, canceled,
+mismatched, or stale response fails closed. A timeout, unreadable response, missing required
+field, or nonterminal response is outcome-unknown and enters bounded read-only reconciliation;
+create is never issued again. Reconciliation requires a deployment timestamp tied to the current
+attempt, so an older same-name deployment cannot be accepted.
+
+If a reviewed fresh producer create succeeds but eventually consistent ARM/RBAC readback or a
+crash before committed evidence publication prevents completion, rerun the same apply with
+`--resume-succeeded-deployment`. That read-only recovery path is limited to the original fresh
+producer plan: it never runs what-if or create, and it requires the exact succeeded deployment ID,
+name, scope, resource-group location, incremental mode, reviewed parameters, exported compiled
+template, outputs, enabled versioning, and empty container before issuing recovery evidence.
+Deployment and readiness readbacks use eight bounded attempts with no delete or unreviewed
+mutation.
 
 Identity and role migrations use two separately reviewed phases. Phase A runs
 `prepare-revocation`, verifies each exact stale assignment while it is still present, and emits
@@ -401,7 +424,7 @@ python $Orchestrator apply --plan-manifest <reviewed producer plan> `
   --reviewed-plan-sha256 <independently recorded sha256:...>
 
 # Only after the exact fresh producer deployment succeeded but evidence completion was
-# blocked by eventually consistent readback or a crash after the handoff write:
+# blocked by eventually consistent readback or before the atomic evidence commit:
 python $Orchestrator apply --plan-manifest <same reviewed producer plan> `
   --reviewed-plan-sha256 <same independently recorded sha256:...> `
   --resume-succeeded-deployment
@@ -435,23 +458,31 @@ python $Orchestrator apply --plan-manifest <reviewed live-acceptance plan> `
 Every `plan` command requires the fixed subscription, location, deployment name, reviewed
 parameter artifact, evidence directory, and explicit `--allow-change` entry for each approved
 create or modify. WC-027 resource-group stages additionally require
-`--resource-group rg-athena-wc013-live`. Do not treat these abbreviated placeholders as executable
-approval; record the complete reviewed commands and plan-file SHA-256 values separately in the
-evidence bundle. `apply` writes the immutable `athena.wc029DeploymentHandoff.v7` handoff and a separate
-`athena.wc029DeploymentReceipt.v4`, then prints the receipt path. Independently record the receipt
-SHA-256 before using it in a later stage. Each later `plan` loads the predecessor receipt, its
+`--resource-group rg-athena-wc013-live`, and their reviewed `--location` must equal that resource
+group's live location. Do not treat these abbreviated placeholders as executable approval; record
+the complete reviewed commands and plan-file SHA-256 values separately in the evidence bundle.
+`apply` writes `athena.wc029DeploymentHandoff.v7` and
+`athena.wc029DeploymentReceipt.v4` into a new UUID-named immutable generation, fsyncs the payloads
+and generation manifest, then atomically creates the single
+`athena.wc029EvidenceCommit.v1` pointer. It prints the committed generation's receipt path.
+The generation lives below `.<stage>-<deployment>.evidence-generations/<generation-id>/`; the
+stable `<stage>-<deployment>.evidence-commit.json` pointer is the only publication boundary.
+POSIX directory entries are fsynced directly; Windows uses a write-through namespace barrier
+rather than silently skipping directory durability.
+Independently record the receipt SHA-256 before using it in a later stage. Each later `plan` loads
+the committed pointer and generation manifest before accepting the predecessor receipt, its
 referenced plan, effective parameters, what-if, handoff, and earlier receipt chain; a handoff's
-self-computed hashes alone are never approval evidence. The evidence directory must be outside the
-repository. Planning and apply both refuse a dirty working tree, duplicate allowlist entries, the
-wrong stage scope, or any missing or extra predecessor handoff/receipt/approval digest.
+self-computed hashes or an uncommitted pair are never approval evidence. The evidence directory
+must be outside the repository. Planning and apply both refuse a dirty working tree, duplicate
+allowlist entries, the wrong stage scope, or any missing or extra predecessor
+handoff/receipt/approval digest.
 
-Fresh-producer recovery is idempotent across the handoff/receipt publication boundary. If create
-succeeded and the byte-exact handoff was durably written but the process stopped before writing
-the receipt, rerun the same reviewed plan with `--resume-succeeded-deployment`. The orchestrator
+Fresh-producer recovery is idempotent across the atomic evidence publication boundary. A crash can
+leave an orphaned incomplete or complete generation, but without the committed pointer no reader
+accepts any file from it. Rerunning the reviewed plan with `--resume-succeeded-deployment`
 re-attests the succeeded deployment, template, parameters, outputs, RBAC, deny assignments,
-image-pull proof, and authority checkpoint, then compares the existing handoff byte-for-byte with
-the newly derived handoff and writes only the missing receipt. An existing conflicting handoff or
-any existing receipt is never overwritten.
+image-pull proof, and authority checkpoint and publishes a new complete generation. Existing
+committed evidence is immutable and is never overwritten.
 
 The two WC-027 roots derive their configuration JSON from live ARM resource references, which ARM
 what-if cannot fully resolve. Their reviewed digest parameters are therefore recomputed against

@@ -173,7 +173,8 @@ deployment scope and predecessor-receipt lineage, and carries its post-deploymen
 forward; it cannot approve out-of-band content merely by observing it again. If fresh producer
 deployment succeeds before RBAC/readback convergence, the same reviewed plan can use the bounded,
 read-only `--resume-succeeded-deployment` path to re-attest the exact deployment and empty
-versioned container before issuing the missing receipt; it never creates or deletes resources.
+versioned container before publishing a new atomically committed handoff/receipt generation; it
+never creates or deletes resources.
 
 Upgrades from the earlier built-in Key Vault Crypto User assignments use a separate reviewed
 same-principal migration list. Supply each of the five exact legacy deterministic assignment IDs

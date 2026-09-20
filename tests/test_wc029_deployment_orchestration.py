@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -58,6 +58,50 @@ def _stub_required_template_parameter_names(
 
 def _digest(value: str) -> str:
     return f"sha256:{hashlib.sha256(value.encode('utf-8')).hexdigest()}"
+
+
+def _deployment_record(
+    *,
+    stage: str,
+    deployment_name: str,
+    parameters: dict[str, object],
+    outputs: dict[str, object] | None = None,
+    resource_group: str | None = RUNTIME_RESOURCE_GROUP,
+    location: str = "australiaeast",
+    provisioning_state: str = "Succeeded",
+    timestamp: str | None = None,
+    deployment_id: str | None = None,
+    mode: str = "Incremental",
+) -> dict[str, object]:
+    if deployment_id is None:
+        scope = (
+            f"/subscriptions/{SUBSCRIPTION_ID}"
+            if stage in orchestration.SUBSCRIPTION_STAGES
+            else (f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/{resource_group}")
+        )
+        deployment_id = f"{scope}/providers/Microsoft.Resources/deployments/{deployment_name}"
+    record: dict[str, object] = {
+        "id": deployment_id,
+        "name": deployment_name,
+        "type": "Microsoft.Resources/deployments",
+        "properties": {
+            "provisioningState": provisioning_state,
+            "mode": mode,
+            "timestamp": (datetime.now(UTC).isoformat() if timestamp is None else timestamp),
+            "duration": "PT1S",
+            "correlationId": "11111111-2222-4333-8444-555555555555",
+            "providers": [],
+            "dependencies": [],
+            "parameters": parameters,
+            "outputs": {
+                name: {"type": "object", "value": value}
+                for name, value in ({} if outputs is None else outputs).items()
+            },
+        },
+    }
+    if stage in orchestration.SUBSCRIPTION_STAGES:
+        record["location"] = location
+    return record
 
 
 def _write_parameters(path: Path, values: dict[str, object]) -> None:
@@ -1293,7 +1337,12 @@ def _write_stage_bundle(
     predecessor_hashes = {
         predecessor: bundle["receiptSha256"] for predecessor, bundle in predecessors.items()
     }
-    handoff_path = stage_directory / f"{stage}.handoff.json"
+    evidence_paths = orchestration._new_evidence_bundle_paths(
+        stage_directory,
+        stem=f"{stage}-synthetic-{stage}",
+    )
+    evidence_paths.generation_directory.mkdir(parents=True)
+    handoff_path = evidence_paths.handoff_path
     handoff_authority_inventory = (
         None
         if plan_authority_inventory is None
@@ -1323,7 +1372,7 @@ def _write_stage_bundle(
         authority_inventory=handoff_authority_inventory,
         image_pull_evidence=image_pull_evidence,
     )
-    receipt_path = stage_directory / f"{stage}.receipt.json"
+    receipt_path = evidence_paths.receipt_path
     _write_receipt(
         receipt_path,
         stage=stage,
@@ -1331,6 +1380,7 @@ def _write_stage_bundle(
         handoff_path=handoff_path,
         predecessor_receipt_sha256s=predecessor_hashes,
     )
+    orchestration._commit_evidence_generation(evidence_paths)
     return {
         "planPath": plan_path,
         "handoffPath": handoff_path,
@@ -1339,6 +1389,19 @@ def _write_stage_bundle(
         "authorityInventory": handoff_authority_inventory,
         "outputs": outputs,
     }
+
+
+def _recommit_test_evidence_pair(
+    handoff_path: Path,
+    receipt_path: Path,
+) -> None:
+    paths = orchestration._evidence_bundle_paths_from_artifacts(
+        handoff_path=handoff_path,
+        receipt_path=receipt_path,
+    )
+    paths.commit_manifest_path.unlink()
+    paths.generation_manifest_path.unlink()
+    orchestration._commit_evidence_generation(paths)
 
 
 def _accepted_readiness_outputs(
@@ -1641,6 +1704,57 @@ def test_azure_deployment_commands_are_noninteractive(operation: str) -> None:
     )
     no_prompt_index = command.index("--no-prompt")
     assert command[no_prompt_index + 1] == "true"
+    assert "--location" not in command
+
+
+def test_group_deployment_location_is_bound_to_live_resource_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requested_commands: list[list[str]] = []
+
+    def run_json(command: object, *, field: str) -> object:
+        arguments = list(command)
+        requested_commands.append(arguments)
+        return {
+            "id": (f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/{RUNTIME_RESOURCE_GROUP}"),
+            "name": RUNTIME_RESOURCE_GROUP,
+            "location": "australiaeast",
+            "properties": {"provisioningState": "Succeeded"},
+        }
+
+    monkeypatch.setattr(orchestration, "_run_json", run_json)
+    assert (
+        orchestration._effective_deployment_location(
+            stage="producer",
+            reviewed_location="australiaeast",
+            subscription_id=SUBSCRIPTION_ID,
+            resource_group=RUNTIME_RESOURCE_GROUP,
+        )
+        == "australiaeast"
+    )
+    assert requested_commands[0][:3] == ["az", "group", "show"]
+
+
+def test_group_deployment_location_mismatch_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        orchestration,
+        "_run_json",
+        lambda _command, *, field: {
+            "id": (f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/{RUNTIME_RESOURCE_GROUP}"),
+            "name": RUNTIME_RESOURCE_GROUP,
+            "location": "australiasoutheast",
+            "properties": {"provisioningState": "Succeeded"},
+        },
+    )
+    with pytest.raises(orchestration.OrchestrationError, match="does not match"):
+        orchestration._effective_deployment_location(
+            stage="publisher",
+            reviewed_location="australiaeast",
+            subscription_id=SUBSCRIPTION_ID,
+            resource_group=RUNTIME_RESOURCE_GROUP,
+        )
 
 
 def test_azure_command_stdin_is_closed(
@@ -1661,6 +1775,110 @@ def test_azure_command_stdin_is_closed(
     monkeypatch.setattr(orchestration.subprocess, "run", run)
     assert orchestration._run(["az", "deployment", "group", "validate"]) == "{}"
     assert captured["stdin"] is orchestration.subprocess.DEVNULL
+    assert captured["timeout"] == orchestration.DEPLOYMENT_VALIDATE_TIMEOUT_SECONDS
+
+
+def test_azure_command_timeout_is_bounded_and_redacted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret_output = "synthetic-sensitive-output"
+
+    def run(command: object, **kwargs: object) -> object:
+        raise orchestration.subprocess.TimeoutExpired(
+            command,
+            kwargs["timeout"],
+            output=secret_output,
+            stderr=secret_output,
+        )
+
+    monkeypatch.setattr(orchestration.shutil, "which", lambda _name: "az")
+    monkeypatch.setattr(orchestration.subprocess, "run", run)
+    with pytest.raises(orchestration._CommandTimeout) as caught:
+        orchestration._run(
+            [
+                "az",
+                "deployment",
+                "group",
+                "create",
+            ]
+        )
+    assert caught.value.outcome_unknown is True
+    assert caught.value.timeout_seconds == orchestration.DEPLOYMENT_CREATE_TIMEOUT_SECONDS
+    assert secret_output not in str(caught.value)
+
+
+def test_unclassified_azure_command_has_no_implicit_timeout() -> None:
+    with pytest.raises(orchestration.OrchestrationError, match="no reviewed bounded timeout"):
+        orchestration._run(["az", "synthetic", "unsupported"])
+
+
+@pytest.mark.parametrize(
+    ("command", "expected_timeout", "outcome_unknown"),
+    (
+        (
+            ["az", "deployment", "sub", "validate"],
+            orchestration.DEPLOYMENT_VALIDATE_TIMEOUT_SECONDS,
+            False,
+        ),
+        (
+            ["az", "deployment", "group", "what-if"],
+            orchestration.DEPLOYMENT_WHAT_IF_TIMEOUT_SECONDS,
+            False,
+        ),
+        (
+            ["az", "deployment", "group", "create"],
+            orchestration.DEPLOYMENT_CREATE_TIMEOUT_SECONDS,
+            True,
+        ),
+        (
+            ["az", "deployment", "group", "show"],
+            orchestration.AZURE_READ_TIMEOUT_SECONDS,
+            False,
+        ),
+        (
+            ["az", "bicep", "build"],
+            orchestration.BICEP_BUILD_TIMEOUT_SECONDS,
+            False,
+        ),
+        (
+            ["az", "storage", "blob", "download"],
+            orchestration.AZURE_LIST_TIMEOUT_SECONDS,
+            False,
+        ),
+        (
+            ["az", "containerapp", "job", "start"],
+            orchestration.CONTAINER_APP_JOB_START_TIMEOUT_SECONDS,
+            True,
+        ),
+    ),
+)
+def test_azure_operations_have_explicit_bounded_timeouts(
+    command: list[str],
+    expected_timeout: int,
+    outcome_unknown: bool,
+) -> None:
+    _, timeout_seconds, actual_outcome_unknown = orchestration._command_timeout(command)
+    assert timeout_seconds == expected_timeout
+    assert actual_outcome_unknown is outcome_unknown
+
+
+def test_run_bytes_maps_timeout_without_output_disclosure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def run(command: object, **kwargs: object) -> object:
+        raise orchestration.subprocess.TimeoutExpired(
+            command,
+            kwargs["timeout"],
+            output=b"synthetic-sensitive-output",
+            stderr=b"synthetic-sensitive-output",
+        )
+
+    monkeypatch.setattr(orchestration.shutil, "which", lambda _name: "az")
+    monkeypatch.setattr(orchestration.subprocess, "run", run)
+    with pytest.raises(orchestration._CommandTimeout) as caught:
+        orchestration._run_bytes(["az", "storage", "blob", "download"])
+    assert caught.value.outcome_unknown is False
+    assert "synthetic-sensitive-output" not in str(caught.value)
 
 
 def test_reviewed_create_uses_one_private_pinned_parameter_copy(
@@ -1703,6 +1921,11 @@ def test_reviewed_create_uses_one_private_pinned_parameter_copy(
 
     def run_json(command: object, *, field: str) -> object:
         arguments = list(command)
+        if arguments[:4] == ["az", "deployment", "group", "show"]:
+            raise orchestration._CommandFailure(
+                3,
+                "ERROR: (DeploymentNotFound) synthetic deployment is absent",
+            )
         pinned_path = Path(arguments[arguments.index("--parameters") + 1])
         pinned_template_path = Path(arguments[arguments.index("--template-file") + 1])
         parameter_paths.append(pinned_path)
@@ -1712,13 +1935,11 @@ def test_reviewed_create_uses_one_private_pinned_parameter_copy(
         assert pinned_template_path.read_bytes() == compiled_template_bytes
         if "what-if" in arguments:
             return reviewed_what_if
-        return {
-            "name": "synthetic",
-            "properties": {
-                "provisioningState": "Succeeded",
-                "outputs": {},
-            },
-        }
+        return _deployment_record(
+            stage="producer",
+            deployment_name="synthetic",
+            parameters={"reviewed": {"value": "exact"}},
+        )
 
     monkeypatch.setattr(orchestration, "_run_json", run_json)
     monkeypatch.setattr(
@@ -1816,12 +2037,14 @@ def test_resume_retries_attestation_without_recreating(
     ]
 
 
-def test_evidence_bundle_recovers_after_crash_between_handoff_and_receipt(
+def test_evidence_bundle_crash_before_receipt_never_commits_partial_pair(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    handoff_path = tmp_path / "producer-synthetic.handoff.json"
-    receipt_path = tmp_path / "producer-synthetic.receipt.json"
+    paths = orchestration._new_evidence_bundle_paths(
+        tmp_path,
+        stem="producer-synthetic",
+    )
     handoff_bytes = orchestration._canonical_json_file_bytes(
         {"applicationMode": "create", "evidence": "exact"}
     )
@@ -1831,35 +2054,115 @@ def test_evidence_bundle_recovers_after_crash_between_handoff_and_receipt(
     real_write = orchestration._write_new_bytes
 
     def crash_before_receipt(path: Path, raw_bytes: bytes) -> None:
-        if path == receipt_path:
+        if path == paths.receipt_path:
             raise orchestration.OrchestrationError("synthetic crash before receipt")
         real_write(path, raw_bytes)
 
     monkeypatch.setattr(orchestration, "_write_new_bytes", crash_before_receipt)
     with pytest.raises(orchestration.OrchestrationError, match="synthetic crash"):
         orchestration._publish_evidence_bundle(
-            handoff_path=handoff_path,
+            paths=paths,
             handoff_raw_bytes=handoff_bytes,
-            receipt_path=receipt_path,
             receipt_raw_bytes=receipt_bytes,
-            allow_existing_handoff=False,
         )
-    assert handoff_path.read_bytes() == handoff_bytes
-    assert not receipt_path.exists()
+    assert paths.handoff_path.read_bytes() == handoff_bytes
+    assert not paths.receipt_path.exists()
+    assert not paths.generation_manifest_path.exists()
+    assert not paths.commit_manifest_path.exists()
+    with pytest.raises(orchestration.OrchestrationError):
+        orchestration._capture_committed_evidence_pair(
+            handoff_path=paths.handoff_path,
+            receipt_path=paths.receipt_path,
+            artifact_reader=orchestration._ArtifactReader(),
+            field="synthetic crashed evidence",
+        )
 
     monkeypatch.setattr(orchestration, "_write_new_bytes", real_write)
-    orchestration._publish_evidence_bundle(
-        handoff_path=handoff_path,
-        handoff_raw_bytes=handoff_bytes,
-        receipt_path=receipt_path,
-        receipt_raw_bytes=receipt_bytes,
-        allow_existing_handoff=True,
+    retry_paths = orchestration._new_evidence_bundle_paths(
+        tmp_path,
+        stem="producer-synthetic",
     )
-    assert handoff_path.read_bytes() == handoff_bytes
-    assert receipt_path.read_bytes() == receipt_bytes
+    orchestration._publish_evidence_bundle(
+        paths=retry_paths,
+        handoff_raw_bytes=handoff_bytes,
+        receipt_raw_bytes=receipt_bytes,
+    )
+    handoff, receipt = orchestration._capture_committed_evidence_pair(
+        handoff_path=retry_paths.handoff_path,
+        receipt_path=retry_paths.receipt_path,
+        artifact_reader=orchestration._ArtifactReader(),
+        field="synthetic committed evidence",
+    )
+    assert handoff.raw_bytes == handoff_bytes
+    assert receipt.raw_bytes == receipt_bytes
 
 
-def test_resume_accepts_valid_partial_handoff_and_completes_only_receipt(
+def test_evidence_bundle_crash_before_commit_pointer_is_not_readable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = orchestration._new_evidence_bundle_paths(
+        tmp_path,
+        stem="publisher-synthetic",
+    )
+    handoff_bytes = orchestration._canonical_json_file_bytes(
+        {"applicationMode": "create", "evidence": "exact"}
+    )
+    receipt_bytes = orchestration._canonical_json_file_bytes(
+        {"handoffSha256": orchestration._sha256_bytes(handoff_bytes)}
+    )
+    real_write = orchestration._write_new_bytes
+
+    def crash_before_commit(path: Path, raw_bytes: bytes) -> None:
+        if path == paths.commit_manifest_path:
+            raise orchestration.OrchestrationError("synthetic crash before committed pointer")
+        real_write(path, raw_bytes)
+
+    monkeypatch.setattr(orchestration, "_write_new_bytes", crash_before_commit)
+    with pytest.raises(orchestration.OrchestrationError, match="committed pointer"):
+        orchestration._publish_evidence_bundle(
+            paths=paths,
+            handoff_raw_bytes=handoff_bytes,
+            receipt_raw_bytes=receipt_bytes,
+        )
+    assert paths.handoff_path.exists()
+    assert paths.receipt_path.exists()
+    assert paths.generation_manifest_path.exists()
+    assert not paths.commit_manifest_path.exists()
+    with pytest.raises(orchestration.OrchestrationError):
+        orchestration._capture_committed_evidence_pair(
+            handoff_path=paths.handoff_path,
+            receipt_path=paths.receipt_path,
+            artifact_reader=orchestration._ArtifactReader(),
+            field="synthetic uncommitted evidence",
+        )
+
+
+def test_evidence_bundle_fsyncs_generation_and_commit_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = orchestration._new_evidence_bundle_paths(
+        tmp_path,
+        stem="live-acceptance-synthetic",
+    )
+    fsynced_directories: list[Path] = []
+    monkeypatch.setattr(
+        orchestration,
+        "_fsync_directory",
+        lambda path: fsynced_directories.append(path.resolve()),
+    )
+    orchestration._publish_evidence_bundle(
+        paths=paths,
+        handoff_raw_bytes=orchestration._canonical_json_file_bytes({"evidence": "handoff"}),
+        receipt_raw_bytes=orchestration._canonical_json_file_bytes({"evidence": "receipt"}),
+    )
+    assert paths.generation_directory.resolve() in fsynced_directories
+    assert paths.commit_manifest_path.parent.resolve() in fsynced_directories
+    assert paths.commit_manifest_path.exists()
+
+
+def test_resume_rejects_uncommitted_partial_handoff(
     tmp_path: Path,
 ) -> None:
     handoff_path = tmp_path / "producer-synthetic.handoff.json"
@@ -1871,31 +2174,18 @@ def test_resume_accepts_valid_partial_handoff_and_completes_only_receipt(
         parameter_bindings=_producer_parameter_bindings(),
     )
     handoff_bytes = handoff_path.read_bytes()
-    loaded = orchestration._load_partial_handoff_for_resume(
-        handoff_path=handoff_path,
-        receipt_path=receipt_path,
-        resume_succeeded_deployment=True,
-        stage="producer",
-        artifact_reader=orchestration._ArtifactReader(),
-    )
-    assert loaded is not None
-    assert loaded["applicationMode"] == "create"
-
-    receipt_bytes = orchestration._canonical_json_file_bytes(
-        {"handoffSha256": orchestration._sha256_bytes(handoff_bytes)}
-    )
-    orchestration._publish_evidence_bundle(
-        handoff_path=handoff_path,
-        handoff_raw_bytes=handoff_bytes,
-        receipt_path=receipt_path,
-        receipt_raw_bytes=receipt_bytes,
-        allow_existing_handoff=True,
-    )
+    with pytest.raises(orchestration.OrchestrationError):
+        orchestration._capture_committed_evidence_pair(
+            handoff_path=handoff_path,
+            receipt_path=receipt_path,
+            artifact_reader=orchestration._ArtifactReader(),
+            field="synthetic partial evidence",
+        )
     assert handoff_path.read_bytes() == handoff_bytes
-    assert receipt_path.read_bytes() == receipt_bytes
+    assert not receipt_path.exists()
 
 
-def test_nonresume_apply_rejects_partial_handoff(tmp_path: Path) -> None:
+def test_uncommitted_complete_pair_without_manifest_is_rejected(tmp_path: Path) -> None:
     handoff_path = tmp_path / "producer-synthetic.handoff.json"
     receipt_path = tmp_path / "producer-synthetic.receipt.json"
     _write_handoff(
@@ -1904,13 +2194,17 @@ def test_nonresume_apply_rejects_partial_handoff(tmp_path: Path) -> None:
         _producer_outputs(),
         parameter_bindings=_producer_parameter_bindings(),
     )
-    with pytest.raises(orchestration.OrchestrationError, match="refusing to overwrite"):
-        orchestration._load_partial_handoff_for_resume(
+    receipt_path.write_bytes(
+        orchestration._canonical_json_file_bytes(
+            {"handoffSha256": orchestration._sha256_file(handoff_path)}
+        )
+    )
+    with pytest.raises(orchestration.OrchestrationError):
+        orchestration._capture_committed_evidence_pair(
             handoff_path=handoff_path,
             receipt_path=receipt_path,
-            resume_succeeded_deployment=False,
-            stage="producer",
             artifact_reader=orchestration._ArtifactReader(),
+            field="synthetic uncommitted pair",
         )
 
 
@@ -1930,27 +2224,35 @@ def test_immutable_evidence_write_is_atomic_on_publication_failure(
     assert list(tmp_path.glob(".evidence.json.*.tmp")) == []
 
 
-def test_partial_evidence_retry_rejects_conflicting_handoff(tmp_path: Path) -> None:
-    handoff_path = tmp_path / "producer-synthetic.handoff.json"
-    receipt_path = tmp_path / "producer-synthetic.receipt.json"
-    handoff_path.write_bytes(
+def test_evidence_directory_sync_is_not_silently_skipped(tmp_path: Path) -> None:
+    orchestration._fsync_directory(tmp_path)
+    if orchestration.os.name == "nt":
+        assert (tmp_path / ".athena-directory-sync").read_bytes() == b"athena-directory-sync\n"
+
+
+def test_evidence_generation_paths_are_immutable(tmp_path: Path) -> None:
+    paths = orchestration._new_evidence_bundle_paths(
+        tmp_path,
+        stem="producer-synthetic",
+    )
+    paths.generation_directory.mkdir(parents=True)
+    paths.handoff_path.write_bytes(
         orchestration._canonical_json_file_bytes(
             {"applicationMode": "create", "evidence": "conflicting"}
         )
     )
-    with pytest.raises(orchestration.OrchestrationError, match="conflicts"):
+    with pytest.raises(orchestration.OrchestrationError, match="reuse evidence generation"):
         orchestration._publish_evidence_bundle(
-            handoff_path=handoff_path,
+            paths=paths,
             handoff_raw_bytes=orchestration._canonical_json_file_bytes(
                 {"applicationMode": "create", "evidence": "exact"}
             ),
-            receipt_path=receipt_path,
             receipt_raw_bytes=orchestration._canonical_json_file_bytes(
                 {"handoffSha256": f"sha256:{'1' * 64}"}
             ),
-            allow_existing_handoff=True,
         )
-    assert not receipt_path.exists()
+    assert not paths.receipt_path.exists()
+    assert not paths.commit_manifest_path.exists()
 
 
 def test_succeeded_deployment_attestation_binds_template_and_parameters(
@@ -1972,18 +2274,14 @@ def test_succeeded_deployment_attestation_binds_template_and_parameters(
         arguments = list(command)
         if "export" in arguments:
             return compiled_template
-        return {
-            "name": "synthetic",
-            "properties": {
-                "provisioningState": "Succeeded",
-                "mode": "Incremental",
-                "parameters": {
-                    "reviewed": {"value": recorded_value},
-                    "defaulted": {"value": "default"},
-                },
-                "outputs": {},
+        return _deployment_record(
+            stage="producer",
+            deployment_name="synthetic",
+            parameters={
+                "reviewed": {"value": recorded_value},
+                "defaulted": {"value": "default"},
             },
-        }
+        )
 
     monkeypatch.setattr(orchestration, "_run_json", run_json)
     _, _, deployed_digest = orchestration._attest_succeeded_deployment(
@@ -2009,6 +2307,371 @@ def test_succeeded_deployment_attestation_binds_template_and_parameters(
             effective_parameters={"reviewed": {"value": "exact"}},
             compiled_template=compiled_template,
             compiled_template_sha256=compiled_digest,
+        )
+
+
+@pytest.mark.parametrize("state", ("Failed", "Canceled"))
+def test_create_response_rejects_failed_or_canceled_state(state: str) -> None:
+    compiled_template = {"parameters": {"reviewed": {"type": "string"}}}
+    record = _deployment_record(
+        stage="producer",
+        deployment_name="synthetic",
+        parameters={"reviewed": {"value": "exact"}},
+        provisioning_state=state,
+    )
+    with pytest.raises(orchestration.OrchestrationError, match=state):
+        orchestration._validate_succeeded_deployment_record(
+            record,
+            stage="producer",
+            deployment_name="synthetic",
+            subscription_id=SUBSCRIPTION_ID,
+            location="australiaeast",
+            resource_group=RUNTIME_RESOURCE_GROUP,
+            effective_parameters={"reviewed": {"value": "exact"}},
+            compiled_template=compiled_template,
+            minimum_timestamp=datetime.now(UTC),
+            incomplete_is_unknown=True,
+            field="synthetic create response",
+        )
+
+
+def test_create_response_terminal_state_precedes_missing_structure() -> None:
+    with pytest.raises(orchestration._TerminalDeploymentFailure, match="Failed"):
+        orchestration._validate_succeeded_deployment_record(
+            {"properties": {"provisioningState": "Failed"}},
+            stage="producer",
+            deployment_name="synthetic",
+            subscription_id=SUBSCRIPTION_ID,
+            location="australiaeast",
+            resource_group=RUNTIME_RESOURCE_GROUP,
+            effective_parameters={},
+            compiled_template={"parameters": {}},
+            minimum_timestamp=datetime.now(UTC),
+            incomplete_is_unknown=True,
+            field="synthetic create response",
+        )
+
+
+@pytest.mark.parametrize("state", ("Accepted", "Creating", "Updating"))
+def test_create_response_nonterminal_states_require_reconciliation(state: str) -> None:
+    with pytest.raises(orchestration._UnknownDeploymentOutcome, match="outcome is unknown"):
+        orchestration._validate_succeeded_deployment_record(
+            {"properties": {"provisioningState": state}},
+            stage="producer",
+            deployment_name="synthetic",
+            subscription_id=SUBSCRIPTION_ID,
+            location="australiaeast",
+            resource_group=RUNTIME_RESOURCE_GROUP,
+            effective_parameters={},
+            compiled_template={"parameters": {}},
+            minimum_timestamp=datetime.now(UTC),
+            incomplete_is_unknown=True,
+            field="synthetic create response",
+        )
+
+
+def test_terminal_deployment_failure_is_not_retried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+
+    def operation() -> None:
+        nonlocal attempts
+        attempts += 1
+        raise orchestration._TerminalDeploymentFailure("synthetic deployment failed")
+
+    monkeypatch.setattr(
+        orchestration.time,
+        "sleep",
+        lambda _seconds: pytest.fail("terminal deployment failure must not sleep"),
+    )
+    with pytest.raises(orchestration._TerminalDeploymentFailure):
+        orchestration._retry_eventually_consistent(
+            operation,
+            field="synthetic deployment",
+        )
+    assert attempts == 1
+
+
+def test_create_response_missing_structure_requires_unknown_outcome_reconciliation() -> None:
+    with pytest.raises(
+        orchestration._UnknownDeploymentOutcome,
+        match="omitted required field properties",
+    ):
+        orchestration._validate_succeeded_deployment_record(
+            {"name": "synthetic"},
+            stage="producer",
+            deployment_name="synthetic",
+            subscription_id=SUBSCRIPTION_ID,
+            location="australiaeast",
+            resource_group=RUNTIME_RESOURCE_GROUP,
+            effective_parameters={"reviewed": {"value": "exact"}},
+            compiled_template={"parameters": {"reviewed": {"type": "string"}}},
+            minimum_timestamp=datetime.now(UTC),
+            incomplete_is_unknown=True,
+            field="synthetic create response",
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ({"name": "other"}, "name"),
+        (
+            {
+                "id": (
+                    f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/other/providers/"
+                    "Microsoft.Resources/deployments/synthetic"
+                )
+            },
+            "scope",
+        ),
+        ({"mode": "Complete"}, "mode"),
+    ),
+)
+def test_create_response_rejects_mismatched_identity_scope_or_mode(
+    mutation: dict[str, str],
+    message: str,
+) -> None:
+    record = _deployment_record(
+        stage="producer",
+        deployment_name="synthetic",
+        parameters={"reviewed": {"value": "exact"}},
+    )
+    properties = record["properties"]
+    assert isinstance(properties, dict)
+    for key, value in mutation.items():
+        if key == "mode":
+            properties[key] = value
+        else:
+            record[key] = value
+    with pytest.raises(orchestration.OrchestrationError, match=message):
+        orchestration._validate_succeeded_deployment_record(
+            record,
+            stage="producer",
+            deployment_name="synthetic",
+            subscription_id=SUBSCRIPTION_ID,
+            location="australiaeast",
+            resource_group=RUNTIME_RESOURCE_GROUP,
+            effective_parameters={"reviewed": {"value": "exact"}},
+            compiled_template={"parameters": {"reviewed": {"type": "string"}}},
+            minimum_timestamp=datetime.now(UTC),
+            incomplete_is_unknown=True,
+            field="synthetic create response",
+        )
+
+
+def test_create_response_rejects_stale_same_name_deployment() -> None:
+    attempt_started = datetime.now(UTC)
+    record = _deployment_record(
+        stage="producer",
+        deployment_name="synthetic",
+        parameters={"reviewed": {"value": "exact"}},
+        timestamp=(attempt_started - timedelta(minutes=4)).isoformat(),
+    )
+    with pytest.raises(orchestration.OrchestrationError, match="stale"):
+        orchestration._validate_succeeded_deployment_record(
+            record,
+            stage="producer",
+            deployment_name="synthetic",
+            subscription_id=SUBSCRIPTION_ID,
+            location="australiaeast",
+            resource_group=RUNTIME_RESOURCE_GROUP,
+            effective_parameters={"reviewed": {"value": "exact"}},
+            compiled_template={"parameters": {"reviewed": {"type": "string"}}},
+            minimum_timestamp=attempt_started,
+            incomplete_is_unknown=True,
+            field="synthetic create response",
+        )
+
+
+def test_timed_out_create_uses_read_only_reconciliation_without_retrying_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parameter_document = {
+        "$schema": (
+            "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#"
+        ),
+        "contentVersion": "1.0.0.0",
+        "parameters": {"reviewed": {"value": "exact"}},
+    }
+    parameter_path = tmp_path / "parameters.json"
+    parameter_path.write_bytes(orchestration._canonical_json_file_bytes(parameter_document))
+    parameter_artifact = orchestration._ArtifactReader().capture_json(
+        parameter_path,
+        field="synthetic parameters",
+    )
+    compiled_template = {"parameters": {"reviewed": {"type": "string"}}}
+    compiled_bytes = orchestration._canonical_json_file_bytes(compiled_template)
+    compiled_artifact = orchestration._CapturedJsonArtifact(
+        path=Path("synthetic.template.json"),
+        raw_bytes=compiled_bytes,
+        document=compiled_template,
+        sha256=orchestration._sha256_bytes(compiled_bytes),
+        identity=orchestration._FileIdentity(9, 9, len(compiled_bytes), 9),
+    )
+    reviewed_what_if = {"status": "Succeeded", "properties": {"changes": []}}
+    create_calls = 0
+    attest_calls = 0
+
+    def run_json(command: object, *, field: str) -> object:
+        nonlocal create_calls
+        arguments = list(command)
+        if arguments[:4] == ["az", "deployment", "group", "show"]:
+            raise orchestration._CommandFailure(
+                3,
+                "ERROR: (DeploymentNotFound) synthetic deployment is absent",
+            )
+        if "what-if" in arguments:
+            return reviewed_what_if
+        assert "create" in arguments
+        create_calls += 1
+        raise orchestration._CommandTimeout(
+            operation="Azure group deployment create",
+            timeout_seconds=orchestration.DEPLOYMENT_CREATE_TIMEOUT_SECONDS,
+            outcome_unknown=True,
+        )
+
+    def attest(**kwargs: object) -> tuple[dict[str, object], str, str]:
+        nonlocal attest_calls
+        attest_calls += 1
+        assert kwargs["minimum_timestamp"] is not None
+        return {}, f"sha256:{'a' * 64}", f"sha256:{'b' * 64}"
+
+    monkeypatch.setattr(orchestration, "_run_json", run_json)
+    monkeypatch.setattr(orchestration, "_attest_succeeded_deployment", attest)
+    outputs, _, _ = orchestration._execute_reviewed_deployment(
+        resume_succeeded_deployment=False,
+        stage="producer",
+        deployment_name="synthetic",
+        subscription_id=SUBSCRIPTION_ID,
+        location="australiaeast",
+        resource_group=RUNTIME_RESOURCE_GROUP,
+        effective_parameter_artifact=parameter_artifact,
+        effective_parameters={"reviewed": {"value": "exact"}},
+        reviewed_what_if=reviewed_what_if,
+        compiled_template_artifact=compiled_artifact,
+        compiled_template=compiled_template,
+        compiled_template_sha256=compiled_artifact.sha256,
+    )
+    assert outputs == {}
+    assert create_calls == 1
+    assert attest_calls == 1
+
+
+def test_incomplete_create_response_uses_read_only_reconciliation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parameter_path = tmp_path / "parameters.json"
+    _write_parameters(parameter_path, {"reviewed": "exact"})
+    parameter_artifact = orchestration._ArtifactReader().capture_json(
+        parameter_path,
+        field="synthetic parameters",
+    )
+    compiled_template = {"parameters": {"reviewed": {"type": "string"}}}
+    compiled_bytes = orchestration._canonical_json_file_bytes(compiled_template)
+    compiled_artifact = orchestration._CapturedJsonArtifact(
+        path=Path("synthetic.template.json"),
+        raw_bytes=compiled_bytes,
+        document=compiled_template,
+        sha256=orchestration._sha256_bytes(compiled_bytes),
+        identity=orchestration._FileIdentity(11, 11, len(compiled_bytes), 11),
+    )
+    reviewed_what_if = {"status": "Succeeded", "properties": {"changes": []}}
+    create_calls = 0
+    attest_calls = 0
+
+    def run_json(command: object, *, field: str) -> object:
+        nonlocal create_calls
+        arguments = list(command)
+        if arguments[:4] == ["az", "deployment", "group", "show"]:
+            raise orchestration._CommandFailure(
+                3,
+                "ERROR: (DeploymentNotFound) synthetic deployment is absent",
+            )
+        if "what-if" in arguments:
+            return reviewed_what_if
+        create_calls += 1
+        return {"name": "synthetic"}
+
+    def attest(**kwargs: object) -> tuple[dict[str, object], str, str]:
+        nonlocal attest_calls
+        attest_calls += 1
+        assert kwargs["minimum_timestamp"] is not None
+        return {}, f"sha256:{'c' * 64}", f"sha256:{'d' * 64}"
+
+    monkeypatch.setattr(orchestration, "_run_json", run_json)
+    monkeypatch.setattr(orchestration, "_attest_succeeded_deployment", attest)
+    outputs, _, _ = orchestration._execute_reviewed_deployment(
+        resume_succeeded_deployment=False,
+        stage="producer",
+        deployment_name="synthetic",
+        subscription_id=SUBSCRIPTION_ID,
+        location="australiaeast",
+        resource_group=RUNTIME_RESOURCE_GROUP,
+        effective_parameter_artifact=parameter_artifact,
+        effective_parameters={"reviewed": {"value": "exact"}},
+        reviewed_what_if=reviewed_what_if,
+        compiled_template_artifact=compiled_artifact,
+        compiled_template=compiled_template,
+        compiled_template_sha256=compiled_artifact.sha256,
+    )
+    assert outputs == {}
+    assert create_calls == 1
+    assert attest_calls == 1
+
+
+def test_preexisting_same_name_deployment_blocks_create_reconciliation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parameter_path = tmp_path / "parameters.json"
+    _write_parameters(parameter_path, {"reviewed": "exact"})
+    parameter_artifact = orchestration._ArtifactReader().capture_json(
+        parameter_path,
+        field="synthetic parameters",
+    )
+    compiled_template = {"parameters": {"reviewed": {"type": "string"}}}
+    compiled_bytes = orchestration._canonical_json_file_bytes(compiled_template)
+    compiled_artifact = orchestration._CapturedJsonArtifact(
+        path=Path("synthetic.template.json"),
+        raw_bytes=compiled_bytes,
+        document=compiled_template,
+        sha256=orchestration._sha256_bytes(compiled_bytes),
+        identity=orchestration._FileIdentity(10, 10, len(compiled_bytes), 10),
+    )
+    reviewed_what_if = {"status": "Succeeded", "properties": {"changes": []}}
+
+    def run_json(command: object, *, field: str) -> object:
+        arguments = list(command)
+        if "what-if" in arguments:
+            return reviewed_what_if
+        if arguments[:4] == ["az", "deployment", "group", "show"]:
+            return _deployment_record(
+                stage="producer",
+                deployment_name="synthetic",
+                parameters={"reviewed": {"value": "stale"}},
+                timestamp="2020-01-01T00:00:00Z",
+            )
+        pytest.fail("deployment create must not run for a pre-existing name")
+
+    monkeypatch.setattr(orchestration, "_run_json", run_json)
+    with pytest.raises(orchestration.OrchestrationError, match="already exists"):
+        orchestration._execute_reviewed_deployment(
+            resume_succeeded_deployment=False,
+            stage="producer",
+            deployment_name="synthetic",
+            subscription_id=SUBSCRIPTION_ID,
+            location="australiaeast",
+            resource_group=RUNTIME_RESOURCE_GROUP,
+            effective_parameter_artifact=parameter_artifact,
+            effective_parameters={"reviewed": {"value": "exact"}},
+            reviewed_what_if=reviewed_what_if,
+            compiled_template_artifact=compiled_artifact,
+            compiled_template=compiled_template,
+            compiled_template_sha256=compiled_artifact.sha256,
         )
 
 
@@ -2528,21 +3191,27 @@ def test_predecessor_requires_exact_plan_and_trusted_receipt(
             reviewed_receipt_sha256=f"sha256:{'f' * 64}",
         )
 
-    forged_receipt = tmp_path / "forged-foundation.receipt.json"
+    forged_paths = orchestration._new_evidence_bundle_paths(
+        tmp_path,
+        stem="forged-foundation",
+    )
+    forged_paths.generation_directory.mkdir(parents=True)
+    forged_paths.handoff_path.write_bytes(Path(str(foundation["handoffPath"])).read_bytes())
     _write_receipt(
-        forged_receipt,
+        forged_paths.receipt_path,
         stage="foundation",
         plan_path=Path(str(foundation["planPath"])),
-        handoff_path=Path(str(foundation["handoffPath"])),
+        handoff_path=forged_paths.handoff_path,
         predecessor_receipt_sha256s={},
         reviewed_plan_sha256=f"sha256:{'e' * 64}",
     )
+    orchestration._commit_evidence_generation(forged_paths)
     with pytest.raises(orchestration.OrchestrationError, match="reviewed plan"):
         orchestration._load_verified_predecessor(
             expected_stage="foundation",
-            handoff_path=Path(str(foundation["handoffPath"])),
-            receipt_path=forged_receipt,
-            reviewed_receipt_sha256=orchestration._sha256_file(forged_receipt),
+            handoff_path=forged_paths.handoff_path,
+            receipt_path=forged_paths.receipt_path,
+            reviewed_receipt_sha256=orchestration._sha256_file(forged_paths.receipt_path),
         )
 
 
@@ -2589,6 +3258,10 @@ def test_predecessor_receipts_preserve_exact_approval_order(
     producer_receipt_path.write_text(
         json.dumps(producer_receipt),
         encoding="utf-8",
+    )
+    _recommit_test_evidence_pair(
+        Path(str(producer["handoffPath"])),
+        producer_receipt_path,
     )
     with pytest.raises(orchestration.OrchestrationError, match="receipt chain"):
         orchestration._load_verified_predecessors(
@@ -2724,6 +3397,7 @@ def test_prior_same_stage_receipt_accepts_an_exact_older_source_lineage(
     receipt["reviewedPlanSha256"] = plan_digest
     receipt["handoffSha256"] = orchestration._sha256_file(handoff_path)
     receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    _recommit_test_evidence_pair(handoff_path, receipt_path)
 
     record = orchestration._load_verified_prior_stage_inventory(
         expected_stage="producer",
@@ -2757,6 +3431,10 @@ def test_prior_same_stage_receipt_rejects_mismatched_deployment_lineage(
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     receipt["deploymentName"] = "synthetic-forged-producer"
     receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    _recommit_test_evidence_pair(
+        Path(str(producer["handoffPath"])),
+        receipt_path,
+    )
 
     with pytest.raises(orchestration.OrchestrationError, match="plan does not match"):
         orchestration._load_verified_prior_stage_inventory(
@@ -2790,6 +3468,10 @@ def test_prior_same_stage_receipt_rejects_mismatched_predecessor_chain(
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     receipt["predecessorReceiptSha256s"]["foundation"] = f"sha256:{'f' * 64}"
     receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    _recommit_test_evidence_pair(
+        Path(str(producer["handoffPath"])),
+        receipt_path,
+    )
 
     with pytest.raises(orchestration.OrchestrationError, match="predecessor receipt chain"):
         orchestration._load_verified_prior_stage_inventory(
@@ -2851,6 +3533,7 @@ def test_prior_same_stage_receipt_rejects_inventory_for_another_container(
     receipt["handoffSha256"] = orchestration._sha256_file(handoff_path)
     receipt["authorityBlobInventorySha256"] = handoff["authorityBlobInventorySha256"]
     receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    _recommit_test_evidence_pair(handoff_path, receipt_path)
 
     with pytest.raises(orchestration.OrchestrationError, match="exact handoff output"):
         orchestration._load_verified_prior_stage_inventory(
@@ -5546,6 +6229,78 @@ def test_image_pull_probe_rechecks_anonymous_pull_after_success(
         orchestration.TerminalEvidenceError,
         match="terminal.*anonymousPullEnabled",
     ):
+        orchestration._verify_digest_pinned_job_image_pull(
+            job_resource_id=str(outputs["producerJobResourceId"]),
+            image=str(outputs["producerImage"]),
+            container_name="wc027-enrichment-feed-producer",
+            registry_resource_id=str(outputs["registryResourceId"]),
+            principal_id=PRODUCER_BROKER_PRINCIPAL_ID,
+            registry_role_assignment_mode=str(outputs["registryRoleAssignmentMode"]),
+            registry_anonymous_pull_enabled=False,
+            registry_pull_role_definition_id=str(outputs["registryPullRoleDefinitionId"]),
+            registry_pull_role_assignment_resource_id=str(
+                outputs["registryPullRoleAssignmentResourceId"]
+            ),
+            subscription_id=SUBSCRIPTION_ID,
+        )
+    assert registry_reads == 2
+    assert start_attempts == 1
+
+
+def test_image_pull_post_success_read_timeout_is_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outputs = _producer_outputs()
+    registry_reads = 0
+    start_attempts = 0
+
+    def get_resource(resource_id: str, *, subscription_id: str) -> dict[str, object]:
+        nonlocal registry_reads
+        registry_reads += 1
+        if registry_reads == 2:
+            raise orchestration._CommandTimeout(
+                operation="Azure resource read",
+                timeout_seconds=orchestration.AZURE_READ_TIMEOUT_SECONDS,
+                outcome_unknown=False,
+            )
+        return {
+            "id": resource_id,
+            "properties": {
+                "roleAssignmentMode": outputs["registryRoleAssignmentMode"],
+                "anonymousPullEnabled": False,
+            },
+        }
+
+    def run_json(command: object, *, field: str) -> object:
+        nonlocal start_attempts
+        arguments = list(command)
+        if arguments[:4] == ["az", "containerapp", "job", "start"]:
+            start_attempts += 1
+            return {"name": "synthetic-pull"}
+        return {
+            "properties": {
+                "status": "Succeeded",
+                "template": {
+                    "containers": [
+                        {
+                            "name": "wc027-enrichment-feed-producer",
+                            "image": outputs["producerImage"],
+                            "command": ["/bin/sh"],
+                            "args": ["-c", "exit 0"],
+                        }
+                    ]
+                },
+            }
+        }
+
+    monkeypatch.setattr(orchestration, "_get_resource", get_resource)
+    monkeypatch.setattr(orchestration, "_run_json", run_json)
+    monkeypatch.setattr(
+        orchestration.time,
+        "sleep",
+        lambda _seconds: pytest.fail("post-success timeout must not be retried"),
+    )
+    with pytest.raises(orchestration.TerminalEvidenceError, match="timed out"):
         orchestration._verify_digest_pinned_job_image_pull(
             job_resource_id=str(outputs["producerJobResourceId"]),
             image=str(outputs["producerImage"]),
@@ -9325,6 +10080,7 @@ def test_apply_is_bound_to_external_digest_and_fresh_what_if() -> None:
     assert "athena.wc029DeploymentHandoff.v7" in source
     assert "athena.wc029ImagePullEvidence.v3" in source
     assert "athena.wc029RevocationPlan.v1" in source
+    assert "athena.wc029EvidenceCommit.v1" in source
     assert "predecessorReceiptSha256s" in source
     assert "--rotation-transition-assignment" in source
     assert "rotationTransitionAssignments" in source
@@ -9342,7 +10098,7 @@ def test_apply_is_bound_to_external_digest_and_fresh_what_if() -> None:
     assert "--prior-stage-reviewed-receipt-sha256" in source
     assert "priorStageReceipt" in source
     assert "receipt does not prove an independently reviewed plan" in source
-    assert "return receipt_path" in source
+    assert "return evidence_paths.receipt_path" in source
     assert "plan manifest does not match the independently reviewed SHA-256" in source
     assert 'operation="what-if"' in source
     assert "current what-if differs from the plan" in source
@@ -9351,6 +10107,21 @@ def test_apply_is_bound_to_external_digest_and_fresh_what_if() -> None:
     assert "_verify_rbac_resources(" in source
     assert "_verify_job_behavior(" in source
     assert "_verify_identities(" in source
+
+
+def test_group_scope_location_is_revalidated_for_plan_apply_and_evidence() -> None:
+    source = (ROOT / "scripts" / "wc029_deployment_orchestration.py").read_text(encoding="utf-8")
+    plan_start = source.index("def plan(")
+    apply_start = source.index("def apply(")
+    plan_source = source[plan_start:apply_start]
+    apply_source = source[apply_start:]
+    assert "effective_location = _effective_deployment_location(" in plan_source
+    assert plan_source.count("location=effective_location") == 2
+    assert '"location": effective_location' in plan_source
+    assert "location = _effective_deployment_location(" in apply_source
+    assert apply_source.index("location = _effective_deployment_location(") < apply_source.index(
+        "_execute_reviewed_deployment("
+    )
 
 
 def test_trigger_queue_transition_cleanup_precedes_apply_mutation() -> None:

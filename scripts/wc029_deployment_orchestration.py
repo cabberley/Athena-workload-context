@@ -16,11 +16,11 @@ import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Never
 from urllib.parse import parse_qs, urlencode, urlparse
-from uuid import UUID, uuid5
+from uuid import UUID, uuid4, uuid5
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -50,6 +50,7 @@ SOURCE_COMMIT = subprocess.run(  # noqa: S603
     check=True,
     capture_output=True,
     text=True,
+    timeout=30,
 ).stdout.strip()
 
 STAGES = ("foundation", "producer", "publisher", "live-acceptance")
@@ -83,6 +84,35 @@ MAX_LEGACY_ACR_PULL_MIGRATION_ASSIGNMENTS = 16
 MAX_AUTHORITY_CHECKPOINT_VERSIONS = 4096
 MAX_AUTHORITY_CHECKPOINT_CONTENT_BYTES = 64 * 1024 * 1024
 MAX_REVIEWED_ARTIFACT_BYTES = 64 * 1024 * 1024
+GIT_COMMAND_TIMEOUT_SECONDS = 30
+AZURE_READ_TIMEOUT_SECONDS = 180
+AZURE_LIST_TIMEOUT_SECONDS = 300
+BICEP_BUILD_TIMEOUT_SECONDS = 300
+DEPLOYMENT_VALIDATE_TIMEOUT_SECONDS = 900
+DEPLOYMENT_WHAT_IF_TIMEOUT_SECONDS = 1_800
+DEPLOYMENT_CREATE_TIMEOUT_SECONDS = 3_600
+CONTAINER_APP_JOB_START_TIMEOUT_SECONDS = 300
+DEPLOYMENT_TIMESTAMP_FUTURE_SKEW = timedelta(minutes=5)
+DEPLOYMENT_NONTERMINAL_STATES = frozenset(
+    {
+        "NotSpecified",
+        "Accepted",
+        "Running",
+        "Ready",
+        "Creating",
+        "Created",
+        "Updating",
+        "Deleting",
+    }
+)
+DEPLOYMENT_TERMINAL_FAILURE_STATES = frozenset(
+    {
+        "Failed",
+        "Canceled",
+        "Cancelled",
+        "Deleted",
+    }
+)
 READBACK_MAX_ATTEMPTS = 8
 READBACK_RETRY_SECONDS = 5.0
 IMAGE_PULL_EXECUTION_POLL_ATTEMPTS = 24
@@ -96,6 +126,19 @@ RECEIPT_SCHEMA_VERSION = "athena.wc029DeploymentReceipt.v4"
 REVOCATION_PLAN_SCHEMA_VERSION = "athena.wc029RevocationPlan.v1"
 AUTHORITY_BLOB_INVENTORY_SCHEMA_VERSION = "athena.wc029AuthorityBlobInventory.v2"
 IMAGE_PULL_EVIDENCE_SCHEMA_VERSION = "athena.wc029ImagePullEvidence.v3"
+EVIDENCE_COMMIT_SCHEMA_VERSION = "athena.wc029EvidenceCommit.v1"
+EVIDENCE_COMMIT_FIELDS = frozenset(
+    {
+        "schemaVersion",
+        "generationId",
+        "generationDirectory",
+        "generationManifestPath",
+        "handoffPath",
+        "handoffSha256",
+        "receiptPath",
+        "receiptSha256",
+    }
+)
 HANDOFF_FIELDS = frozenset(
     {
         "schemaVersion",
@@ -455,11 +498,36 @@ class TerminalEvidenceError(OrchestrationError):
     """Raised when successful execution is followed by non-retryable evidence drift."""
 
 
+class _UnknownDeploymentOutcome(OrchestrationError):
+    """Raised when deployment mutation may have happened but the response is not authoritative."""
+
+
+class _TerminalDeploymentFailure(OrchestrationError):
+    """Raised when ARM has authoritatively reported a failed or canceled deployment."""
+
+
 class _CommandFailure(OrchestrationError):
     def __init__(self, returncode: int, detail: str) -> None:
         self.returncode = returncode
         self.detail = detail
         super().__init__(f"command failed with exit code {returncode}: {detail}")
+
+
+class _CommandTimeout(OrchestrationError):
+    def __init__(
+        self,
+        *,
+        operation: str,
+        timeout_seconds: int,
+        outcome_unknown: bool,
+    ) -> None:
+        self.operation = operation
+        self.timeout_seconds = timeout_seconds
+        self.outcome_unknown = outcome_unknown
+        outcome = "; mutation outcome is unknown" if outcome_unknown else ""
+        super().__init__(
+            f"{operation} exceeded its bounded {timeout_seconds}-second timeout{outcome}"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -495,6 +563,16 @@ class _AuthorizationScanBudget:
                 "authorization assignment evidence exceeded its bounded item budget"
             )
         self.remaining_items -= 1
+
+
+@dataclass(frozen=True, slots=True)
+class _EvidenceBundlePaths:
+    generation_id: str
+    generation_directory: Path
+    generation_manifest_path: Path
+    commit_manifest_path: Path
+    handoff_path: Path
+    receipt_path: Path
 
 
 @dataclass(frozen=True, slots=True)
@@ -733,12 +811,16 @@ def _materialized_private_artifact(
 
 
 def _ensure_clean_worktree() -> None:
-    completed = subprocess.run(  # noqa: S603
-        ["git", "-C", str(ROOT), "status", "--porcelain=v1"],  # noqa: S607
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        completed = subprocess.run(  # noqa: S603
+            ["git", "-C", str(ROOT), "status", "--porcelain=v1"],  # noqa: S607
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=GIT_COMMAND_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        raise OrchestrationError("git worktree status exceeded its bounded timeout") from None
     if completed.stdout.strip():
         raise OrchestrationError(
             "deployment planning and apply require a clean committed working tree"
@@ -801,7 +883,7 @@ def _validate_resource_id_segment(segment: str, *, field: str) -> None:
         not segment
         or segment in {".", ".."}
         or segment != segment.strip()
-        or any(character in segment for character in ("\\", "?", "#"))
+        or any(character in segment for character in ("/", "\\", "?", "#"))
     ):
         raise OrchestrationError(f"{field} contains a noncanonical path segment")
 
@@ -1163,6 +1245,68 @@ def _require_subscription_resource_id_equal(
         raise OrchestrationError(f"{field} does not match its exact intended value")
 
 
+def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=".athena-directory-sync.",
+            suffix=".tmp",
+            dir=path,
+        )
+        temporary_path = Path(temporary_name)
+        marker_path = path / ".athena-directory-sync"
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                descriptor = -1
+                handle.write(b"athena-directory-sync\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            move_file = ctypes.WinDLL("kernel32", use_last_error=True).MoveFileExW
+            move_file.argtypes = [
+                wintypes.LPCWSTR,
+                wintypes.LPCWSTR,
+                wintypes.DWORD,
+            ]
+            move_file.restype = wintypes.BOOL
+            move_file_replace_existing = 0x1
+            move_file_write_through = 0x8
+            if not move_file(
+                str(temporary_path),
+                str(marker_path),
+                move_file_replace_existing | move_file_write_through,
+            ):
+                error_code = ctypes.get_last_error()
+                raise OSError(
+                    error_code,
+                    "MoveFileExW failed to flush the directory namespace",
+                    str(path),
+                )
+            temporary_path = None
+        except OSError as exc:
+            raise OrchestrationError(
+                f"cannot durably flush evidence directory {path}: {exc}"
+            ) from exc
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            if temporary_path is not None:
+                with suppress(FileNotFoundError):
+                    temporary_path.unlink()
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = -1
+    try:
+        descriptor = os.open(path, flags)
+        os.fsync(descriptor)
+    except OSError as exc:
+        raise OrchestrationError(f"cannot fsync evidence directory {path}: {exc}") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
 def _write_new_bytes(path: Path, raw_bytes: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor = -1
@@ -1188,6 +1332,7 @@ def _write_new_bytes(path: Path, raw_bytes: bytes) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.link(temporary_path, path)
+        _fsync_directory(path.parent)
     except FileExistsError as exc:
         raise OrchestrationError(f"refusing to overwrite immutable evidence {path}") from exc
     except OrchestrationError:
@@ -1208,55 +1353,206 @@ def _write_new_json(path: Path, value: object) -> None:
     _write_new_bytes(path, _canonical_json_file_bytes(value))
 
 
+def _new_evidence_bundle_paths(
+    evidence_directory: Path,
+    *,
+    stem: str,
+) -> _EvidenceBundlePaths:
+    _validate_resource_id_segment(
+        stem,
+        field="evidence bundle stem",
+    )
+    generation_id = str(uuid4())
+    generations_directory = evidence_directory / f".{stem}.evidence-generations"
+    generation_directory = generations_directory / generation_id
+    return _EvidenceBundlePaths(
+        generation_id=generation_id,
+        generation_directory=generation_directory,
+        generation_manifest_path=generation_directory / "generation-manifest.json",
+        commit_manifest_path=evidence_directory / f"{stem}.evidence-commit.json",
+        handoff_path=generation_directory / f"{stem}.handoff.json",
+        receipt_path=generation_directory / f"{stem}.receipt.json",
+    )
+
+
+def _evidence_bundle_paths_from_artifacts(
+    *,
+    handoff_path: Path,
+    receipt_path: Path,
+) -> _EvidenceBundlePaths:
+    absolute_handoff = handoff_path.resolve()
+    absolute_receipt = receipt_path.resolve()
+    if absolute_handoff.parent != absolute_receipt.parent:
+        raise OrchestrationError(
+            "deployment handoff and receipt must share one immutable generation"
+        )
+    generation_directory = absolute_handoff.parent
+    generations_directory = generation_directory.parent
+    prefix = "."
+    suffix = ".evidence-generations"
+    if not generations_directory.name.startswith(prefix) or not generations_directory.name.endswith(
+        suffix
+    ):
+        raise OrchestrationError(
+            "deployment handoff and receipt are outside an immutable evidence generation"
+        )
+    stem = generations_directory.name[len(prefix) : -len(suffix)]
+    _validate_resource_id_segment(
+        stem,
+        field="evidence bundle stem",
+    )
+    generation_id = generation_directory.name
+    try:
+        canonical_generation_id = str(UUID(generation_id))
+    except ValueError as exc:
+        raise OrchestrationError("evidence generation ID must be one UUID") from exc
+    if canonical_generation_id != generation_id:
+        raise OrchestrationError("evidence generation ID must use canonical lowercase UUID form")
+    expected_handoff = generation_directory / f"{stem}.handoff.json"
+    expected_receipt = generation_directory / f"{stem}.receipt.json"
+    if absolute_handoff != expected_handoff or absolute_receipt != expected_receipt:
+        raise OrchestrationError(
+            "deployment handoff and receipt names do not match their evidence generation"
+        )
+    return _EvidenceBundlePaths(
+        generation_id=generation_id,
+        generation_directory=generation_directory,
+        generation_manifest_path=generation_directory / "generation-manifest.json",
+        commit_manifest_path=generations_directory.parent / f"{stem}.evidence-commit.json",
+        handoff_path=absolute_handoff,
+        receipt_path=absolute_receipt,
+    )
+
+
+def _evidence_commit_document(
+    paths: _EvidenceBundlePaths,
+    *,
+    handoff_sha256: str,
+    receipt_sha256: str,
+) -> dict[str, str]:
+    return {
+        "schemaVersion": EVIDENCE_COMMIT_SCHEMA_VERSION,
+        "generationId": paths.generation_id,
+        "generationDirectory": str(paths.generation_directory.resolve()),
+        "generationManifestPath": str(paths.generation_manifest_path.resolve()),
+        "handoffPath": str(paths.handoff_path.resolve()),
+        "handoffSha256": handoff_sha256,
+        "receiptPath": str(paths.receipt_path.resolve()),
+        "receiptSha256": receipt_sha256,
+    }
+
+
+def _commit_evidence_generation(paths: _EvidenceBundlePaths) -> None:
+    handoff_bytes, _ = _read_regular_file_once(
+        paths.handoff_path,
+        field="generated deployment handoff",
+    )
+    receipt_bytes, _ = _read_regular_file_once(
+        paths.receipt_path,
+        field="generated deployment receipt",
+    )
+    commit = _evidence_commit_document(
+        paths,
+        handoff_sha256=_sha256_bytes(handoff_bytes),
+        receipt_sha256=_sha256_bytes(receipt_bytes),
+    )
+    commit_bytes = _canonical_json_file_bytes(commit)
+    _write_new_bytes(paths.generation_manifest_path, commit_bytes)
+    _fsync_directory(paths.generation_directory)
+    _write_new_bytes(paths.commit_manifest_path, commit_bytes)
+    _fsync_directory(paths.commit_manifest_path.parent)
+
+
 def _publish_evidence_bundle(
     *,
-    handoff_path: Path,
+    paths: _EvidenceBundlePaths,
     handoff_raw_bytes: bytes,
-    receipt_path: Path,
     receipt_raw_bytes: bytes,
-    allow_existing_handoff: bool,
 ) -> None:
-    if receipt_path.exists():
-        raise OrchestrationError(f"refusing to overwrite immutable evidence {receipt_path}")
-    if handoff_path.exists():
-        if not allow_existing_handoff:
-            raise OrchestrationError(f"refusing to overwrite immutable evidence {handoff_path}")
-        existing_handoff_bytes, _ = _read_regular_file_once(
-            handoff_path,
-            field="partially published deployment handoff",
+    if paths.commit_manifest_path.exists():
+        raise OrchestrationError(
+            f"refusing to overwrite committed evidence {paths.commit_manifest_path}"
         )
-        if existing_handoff_bytes != handoff_raw_bytes:
-            raise OrchestrationError(
-                "existing partial deployment handoff conflicts with revalidated deployment evidence"
-            )
-    else:
-        _write_new_bytes(handoff_path, handoff_raw_bytes)
-    _write_new_bytes(receipt_path, receipt_raw_bytes)
+    if paths.generation_directory.exists():
+        raise OrchestrationError(
+            f"refusing to reuse evidence generation {paths.generation_directory}"
+        )
+    generations_directory = paths.generation_directory.parent
+    if not generations_directory.exists():
+        generations_directory.mkdir(parents=True, exist_ok=False)
+        os.chmod(generations_directory, 0o700)
+        _fsync_directory(generations_directory.parent)
+    paths.generation_directory.mkdir(exist_ok=False)
+    os.chmod(paths.generation_directory, 0o700)
+    _fsync_directory(generations_directory)
+    _write_new_bytes(paths.handoff_path, handoff_raw_bytes)
+    _write_new_bytes(paths.receipt_path, receipt_raw_bytes)
+    _commit_evidence_generation(paths)
 
 
-def _load_partial_handoff_for_resume(
+def _capture_committed_evidence_pair(
     *,
     handoff_path: Path,
     receipt_path: Path,
-    resume_succeeded_deployment: bool,
-    stage: str,
     artifact_reader: _ArtifactReader,
-) -> dict[str, Any] | None:
-    if receipt_path.exists():
-        raise OrchestrationError(f"refusing to overwrite immutable evidence {receipt_path}")
-    if not handoff_path.exists():
-        return None
-    if not resume_succeeded_deployment:
-        raise OrchestrationError(f"refusing to overwrite immutable evidence {handoff_path}")
-    return _load_handoff(
-        handoff_path,
-        expected_stage=stage,
-        document=artifact_reader.capture_json(
-            handoff_path,
-            field="partially published deployment handoff",
-        ).document,
-        artifact_reader=artifact_reader,
+    field: str,
+) -> tuple[_CapturedJsonArtifact, _CapturedJsonArtifact]:
+    paths = _evidence_bundle_paths_from_artifacts(
+        handoff_path=handoff_path,
+        receipt_path=receipt_path,
     )
+    commit_capture = artifact_reader.capture_json(
+        paths.commit_manifest_path,
+        field=f"{field} committed manifest",
+    )
+    commit = _mapping(
+        commit_capture.document,
+        field=f"{field} committed manifest",
+    )
+    _require_exact_fields(
+        commit,
+        EVIDENCE_COMMIT_FIELDS,
+        field=f"{field} committed manifest",
+    )
+    if commit.get("schemaVersion") != EVIDENCE_COMMIT_SCHEMA_VERSION:
+        raise OrchestrationError("unsupported WC-029 evidence commit schema")
+    expected_commit = _evidence_commit_document(
+        paths,
+        handoff_sha256=_sha256_digest(
+            commit.get("handoffSha256"),
+            field=f"{field} committed handoff SHA-256",
+        ),
+        receipt_sha256=_sha256_digest(
+            commit.get("receiptSha256"),
+            field=f"{field} committed receipt SHA-256",
+        ),
+    )
+    if commit != expected_commit:
+        raise OrchestrationError(
+            f"{field} committed manifest does not match its immutable generation"
+        )
+    generation_manifest = artifact_reader.capture_json(
+        paths.generation_manifest_path,
+        field=f"{field} generation manifest",
+    )
+    if generation_manifest.raw_bytes != commit_capture.raw_bytes:
+        raise OrchestrationError(
+            f"{field} committed pointer does not match its generation manifest"
+        )
+    handoff_capture = artifact_reader.capture_json(
+        paths.handoff_path,
+        field=f"{field} handoff",
+    )
+    receipt_capture = artifact_reader.capture_json(
+        paths.receipt_path,
+        field=f"{field} receipt",
+    )
+    if (
+        handoff_capture.sha256 != expected_commit["handoffSha256"]
+        or receipt_capture.sha256 != expected_commit["receiptSha256"]
+    ):
+        raise OrchestrationError(f"{field} committed evidence pair changed after publication")
+    return handoff_capture, receipt_capture
 
 
 def _write_and_capture_exact_json(
@@ -2063,7 +2359,7 @@ def _load_plan_manifest(
         )
         if handoff_capture.sha256 != handoff_digest:
             raise OrchestrationError(f"plan {predecessor} handoff changed after review")
-    _string(manifest.get("location"), field="plan location")
+    _azure_location(manifest.get("location"), field="plan location")
     _string(manifest.get("deploymentName"), field="plan deployment name")
     return manifest
 
@@ -2358,9 +2654,11 @@ def _load_verified_predecessor(
         reviewed_receipt_sha256,
         field=f"{expected_stage} reviewed receipt SHA-256",
     )
-    receipt_capture = reader.capture_json(
-        receipt_path,
-        field=f"{expected_stage} receipt",
+    handoff_capture, receipt_capture = _capture_committed_evidence_pair(
+        handoff_path=handoff_path,
+        receipt_path=receipt_path,
+        artifact_reader=reader,
+        field=f"{expected_stage} deployment evidence",
     )
     receipt_document = receipt_capture.document
     actual_receipt_digest = receipt_capture.sha256
@@ -2457,10 +2755,6 @@ def _load_verified_predecessor(
     handoff_digest = _sha256_digest(
         receipt.get("handoffSha256"),
         field=f"{expected_stage} receipt handoff SHA-256",
-    )
-    handoff_capture = reader.capture_json(
-        handoff_path,
-        field=f"{expected_stage} handoff",
     )
     handoff_document = handoff_capture.document
     actual_handoff_digest = handoff_capture.sha256
@@ -2625,9 +2919,11 @@ def _load_verified_prior_stage_inventory(
         reviewed_receipt_sha256,
         field="prior stage reviewed receipt SHA-256",
     )
-    receipt_capture = reader.capture_json(
-        receipt_path,
-        field="prior stage receipt",
+    handoff_capture, receipt_capture = _capture_committed_evidence_pair(
+        handoff_path=handoff_path,
+        receipt_path=receipt_path,
+        artifact_reader=reader,
+        field="prior stage deployment evidence",
     )
     receipt_document = receipt_capture.document
     actual_receipt_digest = receipt_capture.sha256
@@ -2747,10 +3043,6 @@ def _load_verified_prior_stage_inventory(
         receipt.get("handoffSha256"),
         field="prior stage handoff SHA-256",
     )
-    handoff_capture = reader.capture_json(
-        handoff_path,
-        field="prior stage handoff",
-    )
     handoff_document = handoff_capture.document
     actual_handoff_digest = handoff_capture.sha256
     if actual_handoff_digest != handoff_digest:
@@ -2785,7 +3077,7 @@ def _load_verified_prior_stage_inventory(
     )
     if plan.get("templatePath") != expected_template_path:
         raise OrchestrationError("prior stage plan template does not match its exact stage")
-    _string(plan.get("location"), field="prior stage plan location")
+    _azure_location(plan.get("location"), field="prior stage plan location")
     for digest_name in (
         "templateSha256",
         "compiledTemplateSha256",
@@ -4623,6 +4915,109 @@ def _parameter_document(parameters: Mapping[str, object]) -> dict[str, object]:
     }
 
 
+def _azure_location(value: object, *, field: str) -> str:
+    location = _string(value, field=field)
+    if (
+        location != location.strip()
+        or location != location.casefold()
+        or re.fullmatch(r"[a-z0-9-]{1,64}", location) is None
+    ):
+        raise OrchestrationError(f"{field} must be one canonical Azure location")
+    return location
+
+
+def _resource_group_location(
+    *,
+    subscription_id: str,
+    resource_group: str,
+) -> str:
+    canonical_resource_group = _string(
+        resource_group,
+        field="deployment resource group",
+    )
+    _validate_resource_id_segment(
+        canonical_resource_group,
+        field="deployment resource group",
+    )
+    expected_id = f"/subscriptions/{subscription_id}/resourceGroups/{canonical_resource_group}"
+    document = _mapping(
+        _run_json(
+            [
+                "az",
+                "group",
+                "show",
+                "--subscription",
+                subscription_id,
+                "--name",
+                canonical_resource_group,
+                "--only-show-errors",
+                "--output",
+                "json",
+            ],
+            field="deployment resource group",
+        ),
+        field="deployment resource group",
+    )
+    actual_id = _canonical_subscription_resource_id(
+        document.get("id"),
+        subscription_id=subscription_id,
+        field="deployment resource-group ID",
+    )
+    if actual_id.casefold() != expected_id.casefold():
+        raise OrchestrationError(
+            "deployment resource-group readback does not match its exact scope"
+        )
+    if (
+        _string(document.get("name"), field="deployment resource-group name").casefold()
+        != canonical_resource_group.casefold()
+    ):
+        raise OrchestrationError("deployment resource-group readback does not match its exact name")
+    properties = _mapping(
+        document.get("properties"),
+        field="deployment resource-group properties",
+    )
+    _require_equal(
+        properties.get("provisioningState"),
+        "Succeeded",
+        field="deployment resource-group provisioning state",
+    )
+    return _azure_location(
+        document.get("location"),
+        field="deployment resource-group location",
+    )
+
+
+def _effective_deployment_location(
+    *,
+    stage: str,
+    reviewed_location: object,
+    subscription_id: str,
+    resource_group: str | None,
+) -> str:
+    location = _azure_location(
+        reviewed_location,
+        field="reviewed deployment location",
+    )
+    if stage in SUBSCRIPTION_STAGES:
+        if resource_group is not None:
+            raise OrchestrationError(
+                f"{stage} deployment location cannot be bound to a resource group"
+            )
+        return location
+    live_location = _resource_group_location(
+        subscription_id=subscription_id,
+        resource_group=_string(
+            resource_group,
+            field=f"{stage} deployment resource group",
+        ),
+    )
+    if live_location != location:
+        raise OrchestrationError(
+            f"{stage} reviewed location does not match the live resource-group location"
+        )
+    return live_location
+
+
 def _az_command(
     *,
     operation: str,
@@ -4662,21 +5057,114 @@ def _az_command(
     return command
 
 
+def _command_timeout(command: Sequence[str]) -> tuple[str, int, bool]:
+    arguments = list(command)
+    if not arguments or arguments[0] != "az":
+        raise OrchestrationError("subprocess operation has no reviewed timeout classification")
+    if len(arguments) >= 4 and arguments[1] == "deployment":
+        scope = arguments[2]
+        operation = arguments[3]
+        if scope not in {"sub", "group"}:
+            raise OrchestrationError("deployment command has an unsupported scope")
+        timeout_by_operation = {
+            "validate": DEPLOYMENT_VALIDATE_TIMEOUT_SECONDS,
+            "what-if": DEPLOYMENT_WHAT_IF_TIMEOUT_SECONDS,
+            "create": DEPLOYMENT_CREATE_TIMEOUT_SECONDS,
+            "show": AZURE_READ_TIMEOUT_SECONDS,
+            "export": AZURE_LIST_TIMEOUT_SECONDS,
+        }
+        timeout_seconds = timeout_by_operation.get(operation)
+        if timeout_seconds is None:
+            raise OrchestrationError("deployment command has no reviewed timeout")
+        return (
+            f"Azure {scope} deployment {operation}",
+            timeout_seconds,
+            operation == "create",
+        )
+    reviewed_operations: tuple[tuple[tuple[str, ...], str, int, bool], ...] = (
+        (("az", "bicep", "build"), "Bicep build", BICEP_BUILD_TIMEOUT_SECONDS, False),
+        (("az", "rest"), "Azure REST read", AZURE_READ_TIMEOUT_SECONDS, False),
+        (("az", "resource", "show"), "Azure resource read", AZURE_READ_TIMEOUT_SECONDS, False),
+        (("az", "group", "show"), "Azure resource-group read", AZURE_READ_TIMEOUT_SECONDS, False),
+        (
+            ("az", "role", "assignment", "list"),
+            "Azure role-assignment list",
+            AZURE_LIST_TIMEOUT_SECONDS,
+            False,
+        ),
+        (
+            ("az", "storage", "container", "exists"),
+            "Azure Blob container existence read",
+            AZURE_READ_TIMEOUT_SECONDS,
+            False,
+        ),
+        (
+            ("az", "storage", "blob", "list"),
+            "Azure Blob list",
+            AZURE_LIST_TIMEOUT_SECONDS,
+            False,
+        ),
+        (
+            ("az", "storage", "blob", "download"),
+            "Azure Blob download",
+            AZURE_LIST_TIMEOUT_SECONDS,
+            False,
+        ),
+        (
+            ("az", "storage", "account", "blob-service-properties", "show"),
+            "Azure Blob service properties read",
+            AZURE_READ_TIMEOUT_SECONDS,
+            False,
+        ),
+        (
+            ("az", "keyvault", "key", "show"),
+            "Azure Key Vault key read",
+            AZURE_READ_TIMEOUT_SECONDS,
+            False,
+        ),
+        (
+            ("az", "containerapp", "job", "start"),
+            "Azure Container Apps Job start",
+            CONTAINER_APP_JOB_START_TIMEOUT_SECONDS,
+            True,
+        ),
+        (
+            ("az", "containerapp", "job", "execution", "show"),
+            "Azure Container Apps Job execution read",
+            AZURE_READ_TIMEOUT_SECONDS,
+            False,
+        ),
+    )
+    for prefix, operation, timeout_seconds, outcome_unknown in reviewed_operations:
+        if tuple(arguments[: len(prefix)]) == prefix:
+            return operation, timeout_seconds, outcome_unknown
+    raise OrchestrationError("Azure CLI operation has no reviewed bounded timeout")
+
+
 def _run(command: Sequence[str]) -> str:
+    operation, timeout_seconds, outcome_unknown = _command_timeout(command)
     resolved_command = list(command)
     if resolved_command and resolved_command[0] == "az":
         az_executable = shutil.which("az") or shutil.which("az.cmd")
         if az_executable is None:
             raise OrchestrationError("Azure CLI executable is unavailable")
         resolved_command[0] = az_executable
-    completed = subprocess.run(  # noqa: S603
-        resolved_command,
-        cwd=ROOT,
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        completed = subprocess.run(  # noqa: S603
+            resolved_command,
+            cwd=ROOT,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        raise _CommandTimeout(
+            operation=operation,
+            timeout_seconds=timeout_seconds,
+            outcome_unknown=outcome_unknown,
+        ) from None
     if completed.returncode != 0:
         detail = completed.stderr.strip() or completed.stdout.strip()
         raise _CommandFailure(completed.returncode, detail)
@@ -4684,19 +5172,28 @@ def _run(command: Sequence[str]) -> str:
 
 
 def _run_bytes(command: Sequence[str]) -> bytes:
+    operation, timeout_seconds, outcome_unknown = _command_timeout(command)
     resolved_command = list(command)
     if resolved_command and resolved_command[0] == "az":
         az_executable = shutil.which("az") or shutil.which("az.cmd")
         if az_executable is None:
             raise OrchestrationError("Azure CLI executable is unavailable")
         resolved_command[0] = az_executable
-    completed = subprocess.run(  # noqa: S603
-        resolved_command,
-        cwd=ROOT,
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        check=False,
-    )
+    try:
+        completed = subprocess.run(  # noqa: S603
+            resolved_command,
+            cwd=ROOT,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            check=False,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        raise _CommandTimeout(
+            operation=operation,
+            timeout_seconds=timeout_seconds,
+            outcome_unknown=outcome_unknown,
+        ) from None
     if completed.returncode != 0:
         detail_bytes = completed.stderr.strip() or completed.stdout.strip()
         detail = detail_bytes.decode("utf-8", errors="replace")
@@ -4760,8 +5257,14 @@ def _retry_eventually_consistent[T](
     for attempt in range(1, READBACK_MAX_ATTEMPTS + 1):
         try:
             return operation()
-        except TerminalEvidenceError:
+        except TerminalEvidenceError, _TerminalDeploymentFailure, _UnknownDeploymentOutcome:
             raise
+        except _CommandTimeout as exc:
+            if exc.outcome_unknown:
+                raise
+            last_error = exc
+            if attempt < READBACK_MAX_ATTEMPTS:
+                time.sleep(READBACK_RETRY_SECONDS)
         except OrchestrationError as exc:
             last_error = exc
             if attempt == READBACK_MAX_ATTEMPTS:
@@ -4924,6 +5427,292 @@ def _verify_initial_publisher_absence(
         )
 
 
+def _deployment_resource_id(
+    *,
+    stage: str,
+    deployment_name: str,
+    subscription_id: str,
+    resource_group: str | None,
+) -> str:
+    _validate_resource_id_segment(
+        deployment_name,
+        field="deployment name",
+    )
+    if stage in SUBSCRIPTION_STAGES:
+        if resource_group is not None:
+            raise OrchestrationError(f"{stage} deployment cannot include a resource-group scope")
+        resource_id = (
+            f"/subscriptions/{subscription_id}/providers/"
+            f"Microsoft.Resources/deployments/{deployment_name}"
+        )
+    else:
+        canonical_resource_group = _string(
+            resource_group,
+            field=f"{stage} deployment resource group",
+        )
+        _validate_resource_id_segment(
+            canonical_resource_group,
+            field=f"{stage} deployment resource group",
+        )
+        resource_id = (
+            f"/subscriptions/{subscription_id}/resourceGroups/{canonical_resource_group}/"
+            f"providers/Microsoft.Resources/deployments/{deployment_name}"
+        )
+    return _canonical_subscription_resource_id(
+        resource_id,
+        subscription_id=subscription_id,
+        field="deployment resource ID",
+    )
+
+
+def _deployment_timestamp(value: object, *, field: str) -> datetime:
+    timestamp = _string(value, field=field)
+    if timestamp != timestamp.strip() or len(timestamp) > 128:
+        raise OrchestrationError(f"{field} must be one bounded UTC timestamp")
+    try:
+        parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise OrchestrationError(f"{field} must be one ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None:
+        raise OrchestrationError(f"{field} must include a UTC offset")
+    return parsed.astimezone(UTC)
+
+
+def _required_deployment_field(
+    value: Mapping[str, object],
+    name: str,
+    *,
+    field: str,
+    incomplete_is_unknown: bool,
+) -> object:
+    if name not in value:
+        if incomplete_is_unknown:
+            raise _UnknownDeploymentOutcome(
+                f"{field} omitted required field {name}; deployment outcome is unknown"
+            )
+        raise OrchestrationError(f"{field} omitted required field {name}")
+    return value[name]
+
+
+def _validate_succeeded_deployment_record(
+    document: object,
+    *,
+    stage: str,
+    deployment_name: str,
+    subscription_id: str,
+    location: str,
+    resource_group: str | None,
+    effective_parameters: Mapping[str, Mapping[str, object]],
+    compiled_template: Mapping[str, object],
+    minimum_timestamp: datetime | None,
+    incomplete_is_unknown: bool,
+    field: str,
+) -> dict[str, Any]:
+    root = _mapping(document, field=field)
+    properties = _mapping(
+        _required_deployment_field(
+            root,
+            "properties",
+            field=field,
+            incomplete_is_unknown=incomplete_is_unknown,
+        ),
+        field=f"{field} properties",
+    )
+    state = _string(
+        _required_deployment_field(
+            properties,
+            "provisioningState",
+            field=f"{field} properties",
+            incomplete_is_unknown=incomplete_is_unknown,
+        ),
+        field=f"{field} provisioning state",
+    )
+    if state in DEPLOYMENT_TERMINAL_FAILURE_STATES:
+        raise _TerminalDeploymentFailure(f"{field} provisioning state is {state}")
+    if state != "Succeeded":
+        if incomplete_is_unknown and state in DEPLOYMENT_NONTERMINAL_STATES:
+            raise _UnknownDeploymentOutcome(
+                f"{field} is still {state}; deployment outcome is unknown"
+            )
+        raise OrchestrationError(f"{field} provisioning state is unsupported: {state}")
+    expected_id = _deployment_resource_id(
+        stage=stage,
+        deployment_name=deployment_name,
+        subscription_id=subscription_id,
+        resource_group=resource_group,
+    )
+    actual_id = _canonical_subscription_resource_id(
+        _required_deployment_field(
+            root,
+            "id",
+            field=field,
+            incomplete_is_unknown=incomplete_is_unknown,
+        ),
+        subscription_id=subscription_id,
+        field=f"{field} ID",
+    )
+    if actual_id.casefold() != expected_id.casefold():
+        raise OrchestrationError(f"{field} ID does not match the exact deployment scope")
+    _require_equal(
+        _required_deployment_field(
+            root,
+            "name",
+            field=field,
+            incomplete_is_unknown=incomplete_is_unknown,
+        ),
+        deployment_name,
+        field=f"{field} name",
+    )
+    resource_type = _string(
+        _required_deployment_field(
+            root,
+            "type",
+            field=field,
+            incomplete_is_unknown=incomplete_is_unknown,
+        ),
+        field=f"{field} type",
+    )
+    if resource_type.casefold() != "microsoft.resources/deployments":
+        raise OrchestrationError(f"{field} type is not Microsoft.Resources/deployments")
+    if stage in SUBSCRIPTION_STAGES:
+        _require_equal(
+            _azure_location(
+                _required_deployment_field(
+                    root,
+                    "location",
+                    field=field,
+                    incomplete_is_unknown=incomplete_is_unknown,
+                ),
+                field=f"{field} location",
+            ),
+            location,
+            field=f"{field} location",
+        )
+    elif root.get("location") is not None:
+        _require_equal(
+            _azure_location(root.get("location"), field=f"{field} location"),
+            location,
+            field=f"{field} location",
+        )
+    _require_equal(
+        _required_deployment_field(
+            properties,
+            "mode",
+            field=f"{field} properties",
+            incomplete_is_unknown=incomplete_is_unknown,
+        ),
+        "Incremental",
+        field=f"{field} mode",
+    )
+    timestamp = _deployment_timestamp(
+        _required_deployment_field(
+            properties,
+            "timestamp",
+            field=f"{field} properties",
+            incomplete_is_unknown=incomplete_is_unknown,
+        ),
+        field=f"{field} timestamp",
+    )
+    now = datetime.now(UTC)
+    if timestamp > now + DEPLOYMENT_TIMESTAMP_FUTURE_SKEW:
+        raise OrchestrationError(f"{field} timestamp is implausibly in the future")
+    if minimum_timestamp is not None and timestamp < minimum_timestamp.astimezone(UTC):
+        raise OrchestrationError(f"{field} is stale relative to this deployment attempt")
+    try:
+        UUID(
+            _string(
+                _required_deployment_field(
+                    properties,
+                    "correlationId",
+                    field=f"{field} properties",
+                    incomplete_is_unknown=incomplete_is_unknown,
+                ),
+                field=f"{field} correlation ID",
+            )
+        )
+    except ValueError as exc:
+        raise OrchestrationError(f"{field} correlation ID must be one UUID") from exc
+    duration = _string(
+        _required_deployment_field(
+            properties,
+            "duration",
+            field=f"{field} properties",
+            incomplete_is_unknown=incomplete_is_unknown,
+        ),
+        field=f"{field} duration",
+    )
+    if len(duration) > 128 or not duration.startswith("P"):
+        raise OrchestrationError(f"{field} duration is invalid")
+    for list_field in ("providers", "dependencies"):
+        values = _required_deployment_field(
+            properties,
+            list_field,
+            field=f"{field} properties",
+            incomplete_is_unknown=incomplete_is_unknown,
+        )
+        if not isinstance(values, list):
+            raise OrchestrationError(f"{field} {list_field} must be an array")
+    recorded_parameters = _required_deployment_field(
+        properties,
+        "parameters",
+        field=f"{field} properties",
+        incomplete_is_unknown=incomplete_is_unknown,
+    )
+    _required_deployment_field(
+        properties,
+        "outputs",
+        field=f"{field} properties",
+        incomplete_is_unknown=incomplete_is_unknown,
+    )
+    _verify_recorded_deployment_parameters(
+        recorded_parameters,
+        effective_parameters=effective_parameters,
+        compiled_template=compiled_template,
+    )
+    return _deployment_outputs(root)
+
+
+def _verify_deployment_absent_before_create(
+    *,
+    stage: str,
+    deployment_name: str,
+    subscription_id: str,
+    resource_group: str | None,
+) -> None:
+    document = _run_json_allowing_absence(
+        _deployment_read_command(
+            operation="show",
+            stage=stage,
+            deployment_name=deployment_name,
+            subscription_id=subscription_id,
+            resource_group=resource_group,
+        ),
+        field="pre-create deployment readback",
+        absent_error_codes=frozenset({"DeploymentNotFound"}),
+    )
+    if document is None:
+        return
+    record = _mapping(document, field="pre-create deployment readback")
+    expected_id = _deployment_resource_id(
+        stage=stage,
+        deployment_name=deployment_name,
+        subscription_id=subscription_id,
+        resource_group=resource_group,
+    )
+    actual_id = _canonical_subscription_resource_id(
+        record.get("id"),
+        subscription_id=subscription_id,
+        field="pre-create deployment ID",
+    )
+    if actual_id.casefold() != expected_id.casefold() or record.get("name") != deployment_name:
+        raise OrchestrationError(
+            "pre-create deployment readback returned a mismatched same-name record"
+        )
+    raise OrchestrationError(
+        "deployment name already exists before create; refusing stale same-name reconciliation"
+    )
+
+
 def _verify_recorded_deployment_parameters(
     recorded: object,
     *,
@@ -4978,6 +5767,7 @@ def _attest_succeeded_deployment(
     effective_parameters: Mapping[str, Mapping[str, object]],
     compiled_template: Mapping[str, object],
     compiled_template_sha256: str,
+    minimum_timestamp: datetime | None = None,
 ) -> tuple[dict[str, Any], str, str]:
     record = _mapping(
         _run_json(
@@ -4992,35 +5782,18 @@ def _attest_succeeded_deployment(
         ),
         field="succeeded deployment record",
     )
-    _require_equal(
-        record.get("name"),
-        deployment_name,
-        field="succeeded deployment name",
-    )
-    properties = _mapping(
-        record.get("properties"),
-        field="succeeded deployment properties",
-    )
-    _require_equal(
-        properties.get("provisioningState"),
-        "Succeeded",
-        field="succeeded deployment provisioning state",
-    )
-    _require_equal(
-        properties.get("mode"),
-        "Incremental",
-        field="succeeded deployment mode",
-    )
-    if stage in SUBSCRIPTION_STAGES:
-        _require_equal(
-            record.get("location"),
-            location,
-            field="succeeded deployment location",
-        )
-    _verify_recorded_deployment_parameters(
-        properties.get("parameters"),
+    outputs = _validate_succeeded_deployment_record(
+        record,
+        stage=stage,
+        deployment_name=deployment_name,
+        subscription_id=subscription_id,
+        location=location,
+        resource_group=resource_group,
         effective_parameters=effective_parameters,
         compiled_template=compiled_template,
+        minimum_timestamp=minimum_timestamp,
+        incomplete_is_unknown=False,
+        field="succeeded deployment record",
     )
     exported_template = _mapping(
         _run_json(
@@ -5040,7 +5813,6 @@ def _attest_succeeded_deployment(
         raise OrchestrationError(
             "succeeded deployment template differs from the reviewed compiled template"
         )
-    outputs = _deployment_outputs(record)
     return (
         outputs,
         _sha256_bytes(_canonical_json_bytes(record)),
@@ -5064,6 +5836,8 @@ def _execute_reviewed_deployment(
     compiled_template_sha256: str,
 ) -> tuple[dict[str, Any], str, str]:
     created_outputs: dict[str, Any] | None = None
+    minimum_deployment_timestamp: datetime | None = None
+    unknown_outcome_reason: OrchestrationError | None = None
     if not resume_succeeded_deployment:
         with (
             _materialized_private_artifact(
@@ -5100,22 +5874,56 @@ def _execute_reviewed_deployment(
                 raise OrchestrationError(
                     "Azure state changed after review; current what-if differs from the plan"
                 )
-            result = _run_json(
-                _az_command(
-                    operation="create",
-                    stage=stage,
-                    deployment_name=deployment_name,
-                    subscription_id=subscription_id,
-                    location=location,
-                    resource_group=resource_group,
-                    template_path=pinned_template.path,
-                    parameter_path=pinned_parameters.path,
-                ),
-                field="deployment create",
+            _verify_deployment_absent_before_create(
+                stage=stage,
+                deployment_name=deployment_name,
+                subscription_id=subscription_id,
+                resource_group=resource_group,
             )
+            minimum_deployment_timestamp = datetime.now(UTC)
+            try:
+                result = _run_json(
+                    _az_command(
+                        operation="create",
+                        stage=stage,
+                        deployment_name=deployment_name,
+                        subscription_id=subscription_id,
+                        location=location,
+                        resource_group=resource_group,
+                        template_path=pinned_template.path,
+                        parameter_path=pinned_parameters.path,
+                    ),
+                    field="deployment create",
+                )
+            except _CommandTimeout as exc:
+                if not exc.outcome_unknown:
+                    raise
+                unknown_outcome_reason = exc
+            except _CommandFailure:
+                raise
+            except OrchestrationError as exc:
+                unknown_outcome_reason = _UnknownDeploymentOutcome(
+                    f"deployment create response was unreadable; outcome is unknown: {exc}"
+                )
+            else:
+                try:
+                    created_outputs = _validate_succeeded_deployment_record(
+                        result,
+                        stage=stage,
+                        deployment_name=deployment_name,
+                        subscription_id=subscription_id,
+                        location=location,
+                        resource_group=resource_group,
+                        effective_parameters=effective_parameters,
+                        compiled_template=compiled_template,
+                        minimum_timestamp=minimum_deployment_timestamp,
+                        incomplete_is_unknown=True,
+                        field="deployment create response",
+                    )
+                except _UnknownDeploymentOutcome as exc:
+                    unknown_outcome_reason = exc
             pinned_template.verify()
             pinned_parameters.verify()
-        created_outputs = _deployment_outputs(result)
     (
         outputs,
         deployment_record_sha256,
@@ -5130,8 +5938,13 @@ def _execute_reviewed_deployment(
             effective_parameters=effective_parameters,
             compiled_template=compiled_template,
             compiled_template_sha256=compiled_template_sha256,
+            minimum_timestamp=minimum_deployment_timestamp,
         ),
-        field="succeeded deployment attestation",
+        field=(
+            "unknown-outcome deployment read-only reconciliation"
+            if unknown_outcome_reason is not None
+            else "succeeded deployment attestation"
+        ),
     )
     if created_outputs is not None and _canonical_json_bytes(
         created_outputs
@@ -11780,6 +12593,15 @@ def _verify_digest_pinned_job_image_pull(
             )
         except TerminalEvidenceError:
             raise
+        except _CommandTimeout as exc:
+            if successful_execution_seen or exc.outcome_unknown:
+                raise TerminalEvidenceError(
+                    "digest-pinned image-pull evidence timed out after a successful "
+                    "or outcome-unknown mutation"
+                ) from exc
+            last_error = exc
+            if attempt < READBACK_MAX_ATTEMPTS:
+                time.sleep(READBACK_RETRY_SECONDS)
         except OrchestrationError as exc:
             if successful_execution_seen:
                 raise TerminalEvidenceError(
@@ -14105,6 +14927,12 @@ def plan(args: argparse.Namespace) -> Path:
         producer_handoff_path=args.producer_handoff,
         publisher_handoff_path=args.publisher_handoff,
     )
+    effective_location = _effective_deployment_location(
+        stage=args.stage,
+        reviewed_location=args.location,
+        subscription_id=subscription_id,
+        resource_group=args.resource_group,
+    )
     verified_predecessors = _load_verified_predecessors(
         stage=args.stage,
         handoff_paths=handoff_paths,
@@ -14500,7 +15328,7 @@ def plan(args: argparse.Namespace) -> Path:
                 stage=args.stage,
                 deployment_name=args.deployment_name,
                 subscription_id=subscription_id,
-                location=args.location,
+                location=effective_location,
                 resource_group=args.resource_group,
                 template_path=pinned_template.path,
                 parameter_path=pinned_parameters.path,
@@ -14514,7 +15342,7 @@ def plan(args: argparse.Namespace) -> Path:
                 stage=args.stage,
                 deployment_name=args.deployment_name,
                 subscription_id=subscription_id,
-                location=args.location,
+                location=effective_location,
                 resource_group=args.resource_group,
                 template_path=pinned_template.path,
                 parameter_path=pinned_parameters.path,
@@ -14543,7 +15371,7 @@ def plan(args: argparse.Namespace) -> Path:
         "stage": args.stage,
         "sourceCommit": SOURCE_COMMIT,
         "subscriptionId": subscription_id,
-        "location": args.location,
+        "location": effective_location,
         "resourceGroup": args.resource_group,
         "deploymentName": args.deployment_name,
         "templatePath": str(TEMPLATES[args.stage].relative_to(ROOT)).replace("\\", "/"),
@@ -14773,6 +15601,12 @@ def apply(args: argparse.Namespace) -> Path:
         None
         if resource_group_value is None
         else _string(resource_group_value, field="resource group")
+    )
+    location = _effective_deployment_location(
+        stage=stage,
+        reviewed_location=location,
+        subscription_id=subscription_id,
+        resource_group=resource_group,
     )
     prior_stage_handoff_value = manifest.get("priorStageHandoffPath")
     prior_stage_receipt_value = manifest.get("priorStageReceipt")
@@ -15222,28 +16056,15 @@ def apply(args: argparse.Namespace) -> Path:
             subscription_id=subscription_id,
             rotation_transitions=reviewed_rotation_transitions,
         )
-    handoff_path = args.plan_manifest.with_name(f"{stage}-{deployment_name}.handoff.json")
-    receipt_path = args.plan_manifest.with_name(f"{stage}-{deployment_name}.receipt.json")
-    existing_handoff_document = _load_partial_handoff_for_resume(
-        handoff_path=handoff_path,
-        receipt_path=receipt_path,
-        resume_succeeded_deployment=resume_succeeded_deployment,
-        stage=stage,
-        artifact_reader=artifact_reader,
+    evidence_paths = _new_evidence_bundle_paths(
+        args.plan_manifest.parent,
+        stem=f"{stage}-{deployment_name}",
     )
-    existing_handoff_application_mode = (
-        None
-        if existing_handoff_document is None
-        else _application_mode(
-            existing_handoff_document.get("applicationMode"),
-            field="partially published deployment handoff application mode",
+    if evidence_paths.commit_manifest_path.exists():
+        raise OrchestrationError(
+            "deployment evidence is already committed for this stage and deployment name"
         )
-    )
-    application_mode = (
-        existing_handoff_application_mode
-        if existing_handoff_application_mode is not None
-        else ("resume-succeeded-deployment" if resume_succeeded_deployment else "create")
-    )
+    application_mode = "resume-succeeded-deployment" if resume_succeeded_deployment else "create"
     (
         outputs,
         deployment_record_sha256,
@@ -15283,15 +16104,7 @@ def apply(args: argparse.Namespace) -> Path:
     bindings = _parameter_bindings(stage, effective_parameters)
     handoff_outputs = _handoff_outputs(stage, outputs)
     predecessor_receipt_hashes = _predecessor_receipt_hashes(verified_predecessors)
-    published_image_pull_evidence = (
-        image_pull_evidence
-        if existing_handoff_document is None
-        else _validated_image_pull_evidence(
-            existing_handoff_document.get("imagePullEvidence"),
-            stage=stage,
-            subscription_id=subscription_id,
-        )
-    )
+    published_image_pull_evidence = image_pull_evidence
     handoff = {
         "schemaVersion": HANDOFF_SCHEMA_VERSION,
         "stage": stage,
@@ -15332,7 +16145,7 @@ def apply(args: argparse.Namespace) -> Path:
         "planManifestPath": str(plan_artifact.path),
         "planManifestSha256": plan_artifact.sha256,
         "reviewedPlanSha256": reviewed_digest,
-        "handoffPath": str(handoff_path.resolve()),
+        "handoffPath": str(evidence_paths.handoff_path.resolve()),
         "handoffSha256": handoff_sha256,
         "predecessorReceiptSha256s": predecessor_receipt_hashes,
         "effectiveParameterSha256": effective_parameter_artifact.sha256,
@@ -15348,13 +16161,11 @@ def apply(args: argparse.Namespace) -> Path:
         ),
     }
     _publish_evidence_bundle(
-        handoff_path=handoff_path,
+        paths=evidence_paths,
         handoff_raw_bytes=handoff_raw_bytes,
-        receipt_path=receipt_path,
         receipt_raw_bytes=_canonical_json_file_bytes(receipt),
-        allow_existing_handoff=resume_succeeded_deployment,
     )
-    return receipt_path
+    return evidence_paths.receipt_path
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -15368,7 +16179,14 @@ def _parser() -> argparse.ArgumentParser:
     plan_parser = subparsers.add_parser("plan")
     plan_parser.add_argument("--stage", choices=STAGES, required=True)
     plan_parser.add_argument("--subscription", required=True)
-    plan_parser.add_argument("--location", required=True)
+    plan_parser.add_argument(
+        "--location",
+        required=True,
+        help=(
+            "Subscription deployment location; for producer/publisher this must "
+            "exactly match the live resource-group location."
+        ),
+    )
     plan_parser.add_argument("--resource-group")
     plan_parser.add_argument("--deployment-name", required=True)
     plan_parser.add_argument("--parameters", type=Path, required=True)
