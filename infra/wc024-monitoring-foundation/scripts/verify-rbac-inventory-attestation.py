@@ -185,6 +185,7 @@ def _base64url_decode_uint(value: str, *, field_name: str) -> bytes:
 
 
 def _standard_base64_decode_uint(value: object, *, field_name: str) -> bytes:
+    """Decode bytes transformed by Azure CLI before its JMESPath --query projection."""
     if not isinstance(value, str) or not value:
         _fail(f"{field_name} is missing or malformed")
     if len(value) % 4 != 0 or _STANDARD_BASE64_PATTERN.fullmatch(value) is None:

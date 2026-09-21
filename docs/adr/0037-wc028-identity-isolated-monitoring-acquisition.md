@@ -240,10 +240,12 @@ The coordinator:
   cryptographically verifies the detached RS256 reviewer signature with the resolved
   public key. The contract stores only canonical minimal RFC 7518 Base64urlUInt values, while the
   pinned Azure CLI boundary accepts only canonical padded-or-unpadded standard Base64 emitted by
-  `az keyvault key show`; both are decoded to bytes before comparison. Encoding aliases, padding
-  in the contract, leading-zero integers, even moduli, non-65537 exponents, and modulus sizes
-  outside exactly 2048, 3072, or 4096 bits fail closed. The v2 attestation domain is required for
-  inventory v6; the historical v1 domain remains valid only for historical inventory v4. This
+  `az keyvault key show`. Azure CLI applies that key-output transformation before its JMESPath
+  `--query` projection, so selecting only `key.n` and `key.e` does not preserve the REST
+  Base64URL representation. Both forms are decoded to bytes before comparison. Encoding aliases,
+  padding in the contract, leading-zero integers, even moduli, non-65537 exponents, and modulus
+  sizes outside exactly 2048, 3072, or 4096 bits fail closed. The v2 attestation domain is required
+  for inventory v6; the historical v1 domain remains valid only for historical inventory v4. This
   validation tightening does not change the attestation JSON shape, digest algorithm, or signed
   preimage fields. The
   verifier rejects a changed deployment, duplicate or out-of-scope targets, reused target/page

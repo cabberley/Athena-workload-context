@@ -1212,6 +1212,10 @@ def test_wc024_phase_two_cryptographically_verifies_external_rbac_review() -> No
     assert "type: 'UserAssigned'" in RBAC_INVENTORY_ATTESTATION_VALIDATION
     assert "'${verifierIdentityResourceId}': {}" in (RBAC_INVENTORY_ATTESTATION_VALIDATION)
     assert "az keyvault key show --id" in RBAC_INVENTORY_ATTESTATION_VALIDATION
+    assert (
+        "transforms Key Vault JWK bytes to standard Base64 before applying --query"
+        in RBAC_INVENTORY_ATTESTATION_VALIDATION
+    )
     assert "ATHENA_REVIEWER_JWK_JSON" in RBAC_INVENTORY_ATTESTATION_VALIDATION
     assert "Canonical unpadded RFC 7518 Base64urlUInt" in MAIN
     assert "Canonical unpadded RFC 7518 Base64urlUInt" in COLLECTOR_CONTRACT
@@ -1237,6 +1241,7 @@ def test_wc024_phase_two_cryptographically_verifies_external_rbac_review() -> No
     assert 'digest_payload.pop("inventoryDigest", None)' in RBAC_INVENTORY_ATTESTATION_VERIFIER
     assert "_base64url_decode_uint(" in RBAC_INVENTORY_ATTESTATION_VERIFIER
     assert "_standard_base64_decode_uint(" in RBAC_INVENTORY_ATTESTATION_VERIFIER
+    assert "before its JMESPath --query projection" in RBAC_INVENTORY_ATTESTATION_VERIFIER
     assert "hmac.compare_digest(jwk_modulus_bytes, modulus_bytes)" in (
         RBAC_INVENTORY_ATTESTATION_VERIFIER
     )

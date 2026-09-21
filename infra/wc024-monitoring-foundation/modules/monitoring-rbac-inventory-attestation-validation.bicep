@@ -207,6 +207,7 @@ resource attestationVerifier 'Microsoft.Resources/deploymentScripts@2023-08-01' 
     ]
     forceUpdateTag: signedPreimageDigest
     retentionInterval: 'PT1H'
+    // Azure CLI 2.88.0 transforms Key Vault JWK bytes to standard Base64 before applying --query.
     scriptContent: format(
       'set -euo pipefail\nexport ATHENA_REVIEWER_JWK_JSON="$(az keyvault key show --id "$ATHENA_REVIEWER_KEY_ID" --query \'{{kid:key.kid,kty:key.kty,key_ops:key.keyOps,n:key.n,e:key.e}}\' --output json --only-show-errors)"\nprintf \'%s\' \'{0}\' | base64 --decode > /tmp/verify-rbac-inventory-attestation.py\npython3 /tmp/verify-rbac-inventory-attestation.py',
       verifierSourceBase64

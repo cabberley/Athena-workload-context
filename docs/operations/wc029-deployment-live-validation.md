@@ -281,10 +281,11 @@ are not a trust root. The reviewer principal must be explicitly distinct from th
 runtime-support principal as well as the collector, context, attestor, and verifier principals.
 Treat the encodings as source-specific: Azure CLI `key show` output must be canonical standard
 Base64, while the configured contract must be canonical minimal RFC 7518 Base64urlUInt with no
-padding. Decode both to bytes before comparison; reject encoding aliases, whitespace, excess or
-missing standard padding, contract padding, leading-zero integers, an even modulus, modulus sizes
-other than exactly 2048, 3072, or 4096 bits, and any exponent other than the minimal `AQAB`
-encoding of 65537.
+padding. Azure CLI performs its key-output transformation before JMESPath `--query`, so projecting
+`key.n` and `key.e` does not bypass standard-Base64 conversion. Decode both to bytes before
+comparison; reject encoding aliases, whitespace, excess or missing standard padding, contract
+padding, leading-zero integers, an even modulus, modulus sizes other than exactly 2048, 3072, or
+4096 bits, and any exponent other than the minimal `AQAB` encoding of 65537.
 `publish-monitoring-contract.bicep` must report
 `effectiveRbacCryptographicReviewVerified=true`; a caller-supplied digest without a valid detached
 signature is not acceptance evidence. Publication requires collector contract v10, effective
