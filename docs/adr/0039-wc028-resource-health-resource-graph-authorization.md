@@ -49,6 +49,11 @@ binds each role definition, role name, and assignment scope. Its
 both grants, and both full role definitions. Contract v9 and inventory v4 remain parseable only as
 historical evidence and cannot execute current production acquisition.
 
+The acquisition receipt remains v6. Its verifier requires the reviewed collector contract to be
+v10, recomputes that exact contract digest, and binds the v5 inventory digest and source-manifest
+digest carried by every exchange and wire attempt. A v9 reviewed contract, a v9 contract digest in
+a v6 receipt, or a v9 Graph-only inventory topology is rejected after migration.
+
 The signed inventory verifier and publication template reject a missing or altered query action, a
 missing or altered availability action, a query assignment outside the exact workload resource
 group, a

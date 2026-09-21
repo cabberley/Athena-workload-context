@@ -2934,7 +2934,7 @@ def test_legacy_v8_permission_attested_contract_remains_readable() -> None:
     )
 
 
-def test_legacy_v9_trust_hardened_contract_remains_readable() -> None:
+def _legacy_v9_trust_hardened_contract() -> MonitoringCollectorContract:
     payload = _acquisition_collector_contract().model_dump(
         mode="python",
         by_alias=True,
@@ -2964,8 +2964,11 @@ def test_legacy_v9_trust_hardened_contract_remains_readable() -> None:
     )
     payload["effectiveRbacInventory"] = inventory
     payload["effectiveRbacInventoryAttestation"] = _effective_rbac_inventory_attestation(inventory)
+    return MonitoringCollectorContract(**payload)
 
-    legacy = MonitoringCollectorContract(**payload)
+
+def test_legacy_v9_trust_hardened_contract_remains_readable() -> None:
+    legacy = _legacy_v9_trust_hardened_contract()
 
     assert legacy.schema_version == "athena.wc028MonitoringCollectorContract.v9"
     assert legacy.resource_graph_query_role_definition_id is None
@@ -2977,6 +2980,43 @@ def test_legacy_v9_trust_hardened_contract_remains_readable() -> None:
         legacy.effective_rbac_inventory.schema_version
         == "athena.wc028MonitoringEffectiveRbacInventory.v4"
     )
+
+
+def test_v10_contract_rejects_v9_graph_only_inventory_topology() -> None:
+    payload = _acquisition_collector_contract().model_dump(
+        mode="python",
+        by_alias=True,
+        exclude_none=True,
+    )
+    legacy = _legacy_v9_trust_hardened_contract()
+    payload["effectiveRbacInventory"] = legacy.effective_rbac_inventory
+    payload["effectiveRbacInventoryAttestation"] = legacy.effective_rbac_inventory_attestation
+
+    with pytest.raises(
+        ValidationError,
+        match="does not match exact deployed assignments|version-bound effective RBAC inventory",
+    ):
+        MonitoringCollectorContract(**payload)
+
+
+def test_receipt_verifier_rejects_v9_contract_before_receipt_evaluation() -> None:
+    with pytest.raises(
+        ValueError,
+        match="production acquisition verification requires",
+    ):
+        verify_monitoring_acquisition_receipt_attestation(
+            MonitoringAcquisitionReceipt.model_construct(),
+            as_of=datetime(2026, 9, 21, tzinfo=UTC),
+            trusted_key_anchor=TrustedKeyAnchor.from_key_vault_key_id(
+                REVIEWED_SIGNING_KEY_URI,
+                public_key_fingerprint="sha256:" + ("0" * 64),
+            ),
+            key_resolver=lambda _anchor: None,
+            reviewed_collector_contract=_legacy_v9_trust_hardened_contract(),
+            expected_acquisition_authority_digest="sha256:" + ("1" * 64),
+            maximum_receipt_age_seconds=600,
+            expected_runtime_replay_binding=MonitoringRuntimeReplayBinding.model_construct(),
+        )
 
 
 @pytest.mark.parametrize(
@@ -4470,6 +4510,27 @@ def test_signed_acquisition_receipt_reverifies_deployed_identity_policy() -> Non
         maximum_receipt_age_seconds=600,
         expected_runtime_replay_binding=runtime_replay_binding,
     )
+    legacy_v9_contract = _legacy_v9_trust_hardened_contract()
+    with pytest.raises(
+        ValueError,
+        match="does not match deployed acquisition authority",
+    ):
+        verify_monitoring_acquisition_receipt_attestation(
+            receipt.model_copy(
+                update={
+                    "collector_contract_digest": (
+                        legacy_v9_contract.compute_artifact_digest_value()
+                    )
+                }
+            ),
+            as_of=observed_at,
+            trusted_key_anchor=anchor,
+            key_resolver=lambda _anchor: record,
+            reviewed_collector_contract=contract,
+            expected_acquisition_authority_digest=authority_digest,
+            maximum_receipt_age_seconds=600,
+            expected_runtime_replay_binding=runtime_replay_binding,
+        )
     mismatched_replay_payload = runtime_replay_binding.model_dump(
         mode="python",
         by_alias=True,
