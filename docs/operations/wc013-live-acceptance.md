@@ -188,12 +188,12 @@ The identities remain disjoint:
 1. the MCP/evidence identity is attached only to collector Jobs and alone has workload Reader;
 2. the context identity is attached only to acceptance and phase Jobs and has no workload Reader;
 3. the presentation identity is attached only to the presentation app for ACR authentication and
-   the private asset gateway, receiving only `AcrPull` at the existing registry plus Blob Data
-   Reader on `presentation-assets`;
+   the private asset gateway, receiving only the mode-compatible read-only ACR pull role plus Blob
+   Data Reader on `presentation-assets`;
 4. the deployment-owned collector-controller identity is not attached to any runtime and receives
    only the custom collector Job read/start/execution-read role on the four fixed collector Jobs
-   plus `AcrPull` on the existing registry for its exact controller image, with no deployment-read
-   permission and no broad Reader role;
+   plus the mode-compatible read-only ACR pull role for its exact controller image, with no
+   deployment-read permission and no broad Reader role;
 5. the operator reader principal remains read-only on the operational artifact container; and
 6. the workload identity in `workloadReceiptWriterObjectIds` writes exact run-scoped receipts and
    is neither an operator reader nor an Athena runtime.
@@ -213,8 +213,23 @@ key sign/verify, collected-evidence Reader, and operational-artifact Contributor
 identity receives only presentation-assets Reader and the controller receives none of those data-
 plane roles; neither receives MCP, workload, or broad ARM access. Operator principals retain
 operational-artifacts Reader and receive presentation-assets Contributor only for verified
-publication. The controller has only its three Job actions and registry-scoped `AcrPull`. The operator and workload arrays remain normalized and deployment fails if they
+publication. The controller has only its three Job actions and the registry-scoped role matching
+the reviewed ACR permission mode. The operator and workload arrays remain normalized and deployment fails if they
 overlap or contain either Athena runtime identity.
+
+`wc016ApprovedConfiguration.wc013AcrPullAssignments` inventories the exact current pull assignment
+for the acceptance, evidence, controller, presentation, detector, orchestrator, and notification
+principals. Each record carries the reviewed digest-pinned image, parsed repository name,
+server-returned registry ID, assignment ID, principal, role, permission mode, scope,
+service-principal type, and exact condition. Legacy `AcrPull` records have null conditions. In ABAC
+mode every `Container Registry Repository Reader` record has condition version `2.0` and the
+canonical exact repository-name condition; the presentation identity has separate assignments for
+the `athena/presentation-web` and `athena/wc013-live` images. WC-029 foundation and live-acceptance
+readiness require each ACR module and live registry readback to prove
+`anonymousPullEnabled: false`, re-read this inventory, resolve every effective role definition,
+and reject any extra
+pull-capable direct, inherited, or transitive-group assignment anywhere in the governed
+subscription, including grants on sibling registries.
 
 The presentation app uses a digest-pinned image and one 0.25-vCPU/0.5-GiB replica in
 `athena-wc013-live-mcp-env`. Its ingress is external to the Container Apps environment only so it
@@ -248,9 +263,10 @@ No client secret is created or accepted.
 The deployment identity needs resource deployment rights in the hosting resource group, role
 assignment rights at the supplied demo resource-group and ACR scopes, and permission to create the
 key-scoped and table-scoped data-plane role assignments and the narrowly assignable custom
-collector-controller role. The supplied existing ACR receives separate `AcrPull` assignments for
-the evidence, context, presentation, and controller identities; no broader registry role is
-assigned. The controller identity receives no registry push or management-plane Reader role. Review
+collector-controller role. The supplied existing ACR receives separate mode-compatible pull
+assignments for the evidence, context, presentation, and controller identities; no broader
+registry role is assigned. The controller identity receives no registry push or management-plane
+Reader role. Review
 the subscription what-if for deletes, public exposure, and all
 role assignments before creating a deployment.
 
@@ -499,7 +515,8 @@ One short-lived ARM access token is piped directly from Azure CLI to container s
 command argument, environment variable, file, mount, log value, or persisted container credential.
 The dedicated stdin credential consumes it once, checks bounded JWT audience/expiry, keeps it only
 in process memory, and redacts all token-related failures. The workflow never reads a deployment;
-the identity has only the exact Job role plus ACR `AcrPull`. Inputs remain closed choices for one
+the identity has only the exact Job role plus the mode-compatible read-only ACR pull role. Inputs
+remain closed choices for one
 exact deployment and `baseline`, `faulted`, or `recovered`—never a path, token, image, command,
 arguments, environment, or template.
 

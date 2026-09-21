@@ -30,6 +30,9 @@ jobs:
         run: python -m mypy src
       - name: Test
         run: python -m pytest
+      - name: Test WC-029 monitoring readiness rules
+        shell: pwsh
+        run: ./tests/Test-Wc029MonitoringReadiness.ps1
       - name: Test immutable controller container
         shell: pwsh
         run: ./test-controller-container.ps1

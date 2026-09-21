@@ -97,7 +97,8 @@ read/add/update permission, and its binding signer has only exact-key sign permi
   authorities can contain selectable options.
 - Readiness remains an operational assertion. Shipping the publisher and feed runtime does not
   set `wc027PublisherReady` or `wc027FeedV2ProducerReady`; both remain false until exact deployed
-  Job/configuration/RBAC evidence and end-to-end behavior are proven.
+  Job/configuration/RBAC and publisher-to-producer queue wiring are proven. Setting them true
+  enables bounded runtime acceptance and is not itself proof of end-to-end behavior.
 
 ## Alternatives considered
 

@@ -68,8 +68,12 @@ endpoint/DNS boundary.
 `wc027FeedV2ProducerReady` remains false by default. Setting it true also requires the exact
 deployed `Microsoft.App/jobs` resource ID, the deployed configuration digest, the WC-016 runtime,
 an explicitly ready binding publisher, and matching deployment-derived identity/RBAC evidence.
-Because that publisher is not yet implemented, the current deployment contract constrains its
-readiness input to `false`; activation requires a later reviewed publisher integration.
+The flag records deployment-wiring readiness so a bounded runtime invocation can proceed; it is
+not an end-to-end completion signal.
+The separately governed production publisher is now implemented. Its deployment must prove the
+exact request queue, producer trigger queue, broker sender/receiver roles, generated
+configuration, attached identities, and binding trust before activation. Deployment does not
+itself create or submit an authoritative publication request.
 
 ## Consequences
 
@@ -78,10 +82,12 @@ readiness input to `false`; activation requires a later reviewed publisher integ
 - Partial enrichment, pointer, registry, or feed-index writes are recoverable without an early
   notification.
 - The producer can be deployed dormant while Notification v2 remains disabled.
-- The repository still has no automatic publisher for
-  `PublishedGuidanceAuthorityBinding.v2`. Until the separately governed guidance-authority
-  publisher submits this exact signed contract, operators may use the bounded submit CLI only with
-  an already-authoritative binding. The runtime does not mint or weaken that authority.
+- The merged guidance-authority publisher creates, signs, activates, and publishes
+  `PublishedGuidanceAuthorityBinding.v2` to the producer trigger queue after receiving one valid
+  `GuidanceAuthorityPublicationRequest.v1`.
+- The repository still has no automatic production component that constructs and submits that
+  publication request. Operators may use the bounded request-submit CLI only with an
+  already-authoritative signed request. The runtime does not mint or weaken that authority.
 
 ## Alternatives considered
 

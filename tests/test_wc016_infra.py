@@ -13,19 +13,23 @@ WC016_DOCKERFILES = (
     ROOT / "apps" / "incident-orchestrator" / "Dockerfile",
 )
 SIGNAL_RBAC = (
-    ROOT
-    / "infra"
-    / "wc013-live-acceptance"
-    / "modules"
-    / "wc016-signal-reader-rbac.bicep"
+    ROOT / "infra" / "wc013-live-acceptance" / "modules" / "wc016-signal-reader-rbac.bicep"
 )
 SIGNAL_ROLE = (
-    ROOT
-    / "infra"
-    / "wc013-live-acceptance"
-    / "modules"
-    / "wc016-signal-reader-role.bicep"
+    ROOT / "infra" / "wc013-live-acceptance" / "modules" / "wc016-signal-reader-role.bicep"
 )
+
+
+def test_wc016_notification_outbox_is_not_idle_auto_deleted() -> None:
+    source = RUNTIME_BICEP.read_text(encoding="utf-8")
+    notification_start = source.index(
+        "resource notificationOutbox 'Microsoft.ServiceBus/namespaces/queues@"
+    )
+    notification_end = source.index("\n}\n", notification_start)
+    notification = source[notification_start:notification_end]
+
+    assert "autoDeleteOnIdle: 'P10675199DT2H48M5.4775807S'" in notification
+    assert "autoDeleteOnIdle: 'PT5M'" not in notification
 
 
 def test_wc016_images_install_only_hash_locked_dependencies_from_reviewed_index() -> None:
@@ -42,10 +46,7 @@ def test_wc016_images_install_only_hash_locked_dependencies_from_reviewed_index(
         for line in lock.splitlines()
     )
     assert all("--hash=sha256:" in block for block in requirement_blocks)
-    assert all(
-        re.match(r"^[a-z0-9][a-z0-9._-]+==[^\s\\]+", block)
-        for block in requirement_blocks
-    )
+    assert all(re.match(r"^[a-z0-9][a-z0-9._-]+==[^\s\\]+", block) for block in requirement_blocks)
     assert not {
         "httpx",
         "jsonschema",
@@ -63,10 +64,7 @@ def test_wc016_images_install_only_hash_locked_dependencies_from_reviewed_index(
         dockerfile = dockerfile_path.read_text(encoding="utf-8")
         assert "ARG PIP_INDEX_URL" not in dockerfile
         assert "COPY requirements-wc016.lock ./" in dockerfile
-        assert (
-            "--index-url https://packagefeedproxy.microsoft.io/pypi/simple/"
-            in dockerfile
-        )
+        assert "--index-url https://packagefeedproxy.microsoft.io/pypi/simple/" in dockerfile
         assert "--require-hashes" in dockerfile
         assert "--only-binary=:all:" in dockerfile
         assert "--requirement requirements-wc016.lock" in dockerfile
@@ -171,14 +169,8 @@ def test_wc016_is_composed_into_wc013_with_exact_outputs_and_narrow_access() -> 
     assert "param wc016RuntimeEnabled bool = false" in source
     assert "param wc027FeedV2ProducerReady bool = false" in source
     assert "param wc027EnrichmentFeedProducerJobResourceId string = ''" in source
-    assert (
-        "param wc027EnrichmentFeedProducerConfigurationDigest string = ''"
-        in source
-    )
-    assert (
-        "param wc027EnrichmentFeedProducerConfigurationJson string = ''"
-        in source
-    )
+    assert "param wc027EnrichmentFeedProducerConfigurationDigest string = ''" in source
+    assert "param wc027EnrichmentFeedProducerConfigurationJson string = ''" in source
     assert "param wc016LegacyCleanupConfirmed bool = false" in source
     assert "= if (validatedWc016RuntimeEnabled)" in source
     assert "wc016RuntimeEnabled && !wc016LegacyCleanupConfirmed" in source
@@ -200,14 +192,9 @@ def test_wc016_is_composed_into_wc013_with_exact_outputs_and_narrow_access() -> 
     assert "incidentOrchestratorPrincipalId" in source
     assert "param wc016NotificationStateTableName string = 'Wc016NotificationState'" in source
     assert (
-        "param wc016NotificationStatePartitionKey string = "
-        "'wc016-notification-delivery'"
-        in source
+        "param wc016NotificationStatePartitionKey string = 'wc016-notification-delivery'" in source
     )
-    assert (
-        "notificationStateTableName: wc016NotificationStateTableName"
-        in source
-    )
+    assert "notificationStateTableName: wc016NotificationStateTableName" in source
     assert (
         "notificationStateTableName: acceptanceResources.outputs.notificationStateTableName"
         in source
@@ -226,48 +213,42 @@ def test_wc016_is_composed_into_wc013_with_exact_outputs_and_narrow_access() -> 
     assert "roleDefinitionId: wc016SignalReaderRole!.outputs.roleDefinitionId" in source
     assert (
         "module wc016SignalReaderRole 'modules/wc016-signal-reader-role.bicep' = "
-        "if (validatedWc016RuntimeEnabled)"
-        in source
+        "if (validatedWc016RuntimeEnabled)" in source
     )
     assert (
         "module wc016SignalReaderRbac 'modules/wc016-signal-reader-rbac.bicep' = "
-        "if (validatedWc016RuntimeEnabled)"
-        in source
+        "if (validatedWc016RuntimeEnabled)" in source
     )
-    assert source.count(
-        "module wc016DetectorImagePull 'modules/acr-pull-rbac.bicep' = "
-        "if (validatedWc016RuntimeEnabled)"
-    ) == 1
+    assert (
+        source.count(
+            "module wc016DetectorImagePull 'modules/acr-pull-rbac.bicep' = "
+            "if (validatedWc016RuntimeEnabled)"
+        )
+        == 1
+    )
     assert "principalId: detectorPrincipalId" in signal_rbac
     assert "principalId: orchestratorPrincipalId" in signal_rbac
     assert "Microsoft.Resources/subscriptions/resourceGroups/read" not in source
 
     resources = (
-        ROOT
-        / "infra"
-        / "wc013-live-acceptance"
-        / "modules"
-        / "acceptance-resources.bicep"
+        ROOT / "infra" / "wc013-live-acceptance" / "modules" / "acceptance-resources.bicep"
     ).read_text(encoding="utf-8")
     assert "param wc016RuntimeEnabled bool = false" in resources
     assert "roleAssignments: wc016RuntimeEnabled" in resources
     assert (
         "resource detectorStateTableDataContributor "
         "'Microsoft.Authorization/roleAssignments@2022-04-01' = "
-        "if (wc016RuntimeEnabled)"
-        in resources
+        "if (wc016RuntimeEnabled)" in resources
     )
     assert (
         "resource notificationStateTableDataContributor "
         "'Microsoft.Authorization/roleAssignments@2022-04-01' = "
-        "if (wc016RuntimeEnabled)"
-        in resources
+        "if (wc016RuntimeEnabled)" in resources
     )
     assert "principalId: notificationDispatcherPrincipalId" in resources
     assert (
         "resource notificationStateTable "
-        "'Microsoft.Storage/storageAccounts/tableServices/tables@2025-06-01'"
-        in resources
+        "'Microsoft.Storage/storageAccounts/tableServices/tables@2025-06-01'" in resources
     )
     detector_role = _resource_block(resources, "detectorStateTableDataContributor")
     notification_role = _resource_block(
@@ -282,20 +263,17 @@ def test_wc016_is_composed_into_wc013_with_exact_outputs_and_narrow_access() -> 
     assert (
         "resource incidentPresentationAssetBlobDataContributor "
         "'Microsoft.Authorization/roleAssignments@2022-04-01' = "
-        "if (wc016RuntimeEnabled)"
-        in resources
+        "if (wc016RuntimeEnabled)" in resources
     )
     assert (
         "resource incidentAssetBlobDataReader "
         "'Microsoft.Authorization/roleAssignments@2022-04-01' = "
-        "if (wc016RuntimeEnabled)"
-        in resources
+        "if (wc016RuntimeEnabled)" in resources
     )
     assert (
         "\nresource notificationIncidentAssetBlobDataReader "
         "'Microsoft.Authorization/roleAssignments@2022-04-01' = "
-        "if (wc016RuntimeEnabled)"
-        in resources
+        "if (wc016RuntimeEnabled)" in resources
     )
     assert "\n  resource notificationIncidentAssetBlobDataReader " not in resources
     notification_blob_reader = _resource_block(
@@ -346,10 +324,7 @@ def test_wc016_deployment_parameters_use_published_image_digests() -> None:
     assert '"wc016RuntimeEnabled"' in source
     assert '"wc016LegacyCleanupConfirmed"' in source
     assert source.count('"value": true') >= 2
-    assert (
-        "sha256:7e0b51de2b9968f6f1ae9df0ee981154dc8fe9ee463055031b556ee075351964"
-        in source
-    )
+    assert "sha256:7e0b51de2b9968f6f1ae9df0ee981154dc8fe9ee463055031b556ee075351964" in source
 
 
 def test_wc016_cleanup_script_is_exact_auditable_and_read_only_by_default() -> None:
@@ -383,8 +358,7 @@ def test_wc016_cleanup_script_is_exact_auditable_and_read_only_by_default() -> N
         "athena-wc013-live-load-balancer-dip-availability",
     ):
         assert (
-            "$resourceGroupId/providers/Microsoft.Insights/metricAlerts/"
-            f"{alert_name}\""
+            f'$resourceGroupId/providers/Microsoft.Insights/metricAlerts/{alert_name}"'
         ) in source
 
     assert "[switch]$Apply" in source
@@ -410,12 +384,10 @@ def test_wc016_cleanup_script_is_exact_auditable_and_read_only_by_default() -> N
     assert "allLegacyMetricAlertsAbsentBefore" in source
     assert "allLegacyMetricAlertsAbsentAfter" in source
     assert (
-        "expectedLegacyRoleAssignmentCountBefore = "
-        "$beforeExpectedLegacyRoleAssignments.Count"
+        "expectedLegacyRoleAssignmentCountBefore = $beforeExpectedLegacyRoleAssignments.Count"
     ) in source
     assert (
-        "unexpectedLegacyRoleAssignmentCountBefore = "
-        "$beforeUnexpectedLegacyRoleAssignments.Count"
+        "unexpectedLegacyRoleAssignmentCountBefore = $beforeUnexpectedLegacyRoleAssignments.Count"
     ) in source
     assert (
         "evidenceSenderAssignmentCountBefore = $beforeEvidenceSenderAssignments.Count"
@@ -449,30 +421,14 @@ def test_wc016_cleanup_script_is_exact_auditable_and_read_only_by_default() -> N
         maxsplit=1,
     )[0]
     assert allowlist.count("[pscustomobject][ordered]@{") == 11
-    assert (
-        allowlist.count(
-            "principalName = 'athena-wc013-live-wc016-normalizer-id'"
-        )
-        == 3
-    )
-    assert (
-        allowlist.count(
-            "principalName = 'athena-wc013-live-wc016-orchestrator-id'"
-        )
-        == 5
-    )
-    assert (
-        allowlist.count(
-            "principalName = 'athena-wc013-live-wc016-notification-id'"
-        )
-        == 2
-    )
+    assert allowlist.count("principalName = 'athena-wc013-live-wc016-normalizer-id'") == 3
+    assert allowlist.count("principalName = 'athena-wc013-live-wc016-orchestrator-id'") == 5
+    assert allowlist.count("principalName = 'athena-wc013-live-wc016-notification-id'") == 2
     assert "principalName = $evidenceIdentityName" in allowlist
     assert "scope = $legacySigningKeyId.ToLowerInvariant()" in allowlist
     assert "scope = $legacyPresentationContainerId.ToLowerInvariant()" in allowlist
     assert source.count("$Apply -and -not $mutationBlocked") == 2
     assert (
         "throw 'WC-016 cleanup blocked before mutation because a legacy principal "
-        "has an unexpected role assignment.'"
-        in source
+        "has an unexpected role assignment.'" in source
     )
