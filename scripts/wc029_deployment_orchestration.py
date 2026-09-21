@@ -120,7 +120,7 @@ MINIMUM_RSA_KEY_SIZE_BITS = 2048
 REVIEWED_RSA_KEY_SIZE_BITS = 3072
 REVIEWED_RSA_KEY_OPERATIONS = frozenset({"sign", "verify"})
 PREFLIGHT_PATH = ROOT / "src" / "athena_context" / "wc029_preflight.py"
-PLAN_SCHEMA_VERSION = "athena.wc029DeploymentPlan.v7"
+PLAN_SCHEMA_VERSION = "athena.wc029DeploymentPlan.v8"
 HANDOFF_SCHEMA_VERSION = "athena.wc029DeploymentHandoff.v7"
 RECEIPT_SCHEMA_VERSION = "athena.wc029DeploymentReceipt.v4"
 REVOCATION_PLAN_SCHEMA_VERSION = "athena.wc029RevocationPlan.v1"
@@ -172,6 +172,7 @@ PLAN_FIELDS = frozenset(
         "sourceCommit",
         "subscriptionId",
         "location",
+        "resourceGroupLocationSha256",
         "resourceGroup",
         "deploymentName",
         "templatePath",
@@ -2360,6 +2361,11 @@ def _load_plan_manifest(
         if handoff_capture.sha256 != handoff_digest:
             raise OrchestrationError(f"plan {predecessor} handoff changed after review")
     _azure_location(manifest.get("location"), field="plan location")
+    _validated_resource_group_location_sha256(
+        manifest.get("resourceGroupLocationSha256"),
+        stage=stage,
+        field="plan resource-group location SHA-256",
+    )
     _string(manifest.get("deploymentName"), field="plan deployment name")
     return manifest
 
@@ -3078,6 +3084,11 @@ def _load_verified_prior_stage_inventory(
     if plan.get("templatePath") != expected_template_path:
         raise OrchestrationError("prior stage plan template does not match its exact stage")
     _azure_location(plan.get("location"), field="prior stage plan location")
+    _validated_resource_group_location_sha256(
+        plan.get("resourceGroupLocationSha256"),
+        stage=expected_stage,
+        field="prior stage plan resource-group location SHA-256",
+    )
     for digest_name in (
         "templateSha256",
         "compiledTemplateSha256",
@@ -4930,7 +4941,7 @@ def _resource_group_location(
     *,
     subscription_id: str,
     resource_group: str,
-) -> str:
+) -> tuple[str, str]:
     canonical_resource_group = _string(
         resource_group,
         field="deployment resource group",
@@ -4981,10 +4992,17 @@ def _resource_group_location(
         "Succeeded",
         field="deployment resource-group provisioning state",
     )
-    return _azure_location(
+    location = _azure_location(
         document.get("location"),
         field="deployment resource-group location",
     )
+    evidence = {
+        "id": expected_id,
+        "name": canonical_resource_group,
+        "location": location,
+        "provisioningState": "Succeeded",
+    }
+    return location, _sha256_bytes(_canonical_json_bytes(evidence))
 
 
 def _effective_deployment_location(
@@ -4993,7 +5011,8 @@ def _effective_deployment_location(
     reviewed_location: object,
     subscription_id: str,
     resource_group: str | None,
-) -> str:
+    expected_resource_group_location_sha256: object | None = None,
+) -> tuple[str, str | None]:
     location = _azure_location(
         reviewed_location,
         field="reviewed deployment location",
@@ -5003,8 +5022,12 @@ def _effective_deployment_location(
             raise OrchestrationError(
                 f"{stage} deployment location cannot be bound to a resource group"
             )
-        return location
-    live_location = _resource_group_location(
+        if expected_resource_group_location_sha256 is not None:
+            raise OrchestrationError(
+                f"{stage} subscription deployment cannot carry resource-group location evidence"
+            )
+        return location, None
+    live_location, live_evidence_sha256 = _resource_group_location(
         subscription_id=subscription_id,
         resource_group=_string(
             resource_group,
@@ -5015,7 +5038,29 @@ def _effective_deployment_location(
         raise OrchestrationError(
             f"{stage} reviewed location does not match the live resource-group location"
         )
-    return live_location
+    if expected_resource_group_location_sha256 is not None:
+        expected_sha256 = _sha256_digest(
+            expected_resource_group_location_sha256,
+            field=f"{stage} resource-group location evidence SHA-256",
+        )
+        if live_evidence_sha256 != expected_sha256:
+            raise OrchestrationError(
+                f"{stage} resource-group location evidence changed after review"
+            )
+    return live_location, live_evidence_sha256
+
+
+def _validated_resource_group_location_sha256(
+    value: object,
+    *,
+    stage: str,
+    field: str,
+) -> str | None:
+    if stage in SUBSCRIPTION_STAGES:
+        if value is not None:
+            raise OrchestrationError(f"{field} must be absent for a subscription-scope deployment")
+        return None
+    return _sha256_digest(value, field=field)
 
 
 def _az_command(
@@ -5259,12 +5304,8 @@ def _retry_eventually_consistent[T](
             return operation()
         except TerminalEvidenceError, _TerminalDeploymentFailure, _UnknownDeploymentOutcome:
             raise
-        except _CommandTimeout as exc:
-            if exc.outcome_unknown:
-                raise
-            last_error = exc
-            if attempt < READBACK_MAX_ATTEMPTS:
-                time.sleep(READBACK_RETRY_SECONDS)
+        except _CommandTimeout:
+            raise
         except OrchestrationError as exc:
             last_error = exc
             if attempt == READBACK_MAX_ATTEMPTS:
@@ -5541,18 +5582,24 @@ def _validate_succeeded_deployment_record(
         subscription_id=subscription_id,
         resource_group=resource_group,
     )
-    actual_id = _canonical_subscription_resource_id(
-        _required_deployment_field(
-            root,
-            "id",
-            field=field,
-            incomplete_is_unknown=incomplete_is_unknown,
-        ),
-        subscription_id=subscription_id,
-        field=f"{field} ID",
+    actual_id = _required_deployment_field(
+        root,
+        "id",
+        field=field,
+        incomplete_is_unknown=incomplete_is_unknown,
     )
-    if actual_id.casefold() != expected_id.casefold():
-        raise OrchestrationError(f"{field} ID does not match the exact deployment scope")
+    _require_subscription_resource_id_equal(
+        actual_id,
+        expected_id,
+        subscription_id=subscription_id,
+        field=f"{field} ID and subscription scope",
+    )
+    if stage not in SUBSCRIPTION_STAGES:
+        _require_resource_id_equal(
+            actual_id,
+            expected_id,
+            field=f"{field} resource-group deployment scope",
+        )
     _require_equal(
         _required_deployment_field(
             root,
@@ -5767,8 +5814,20 @@ def _attest_succeeded_deployment(
     effective_parameters: Mapping[str, Mapping[str, object]],
     compiled_template: Mapping[str, object],
     compiled_template_sha256: str,
+    resource_group_location_sha256: str | None,
     minimum_timestamp: datetime | None = None,
 ) -> tuple[dict[str, Any], str, str]:
+    if stage not in SUBSCRIPTION_STAGES and resource_group_location_sha256 is None:
+        raise OrchestrationError(
+            f"{stage} deployment attestation requires reviewed resource-group location evidence"
+        )
+    _effective_deployment_location(
+        stage=stage,
+        reviewed_location=location,
+        subscription_id=subscription_id,
+        resource_group=resource_group,
+        expected_resource_group_location_sha256=resource_group_location_sha256,
+    )
     record = _mapping(
         _run_json(
             _deployment_read_command(
@@ -5834,7 +5893,19 @@ def _execute_reviewed_deployment(
     compiled_template_artifact: _CapturedJsonArtifact,
     compiled_template: Mapping[str, object],
     compiled_template_sha256: str,
+    resource_group_location_sha256: str | None,
 ) -> tuple[dict[str, Any], str, str]:
+    if stage not in SUBSCRIPTION_STAGES and resource_group_location_sha256 is None:
+        raise OrchestrationError(
+            f"{stage} deployment create requires reviewed resource-group location evidence"
+        )
+    _effective_deployment_location(
+        stage=stage,
+        reviewed_location=location,
+        subscription_id=subscription_id,
+        resource_group=resource_group,
+        expected_resource_group_location_sha256=resource_group_location_sha256,
+    )
     created_outputs: dict[str, Any] | None = None
     minimum_deployment_timestamp: datetime | None = None
     unknown_outcome_reason: OrchestrationError | None = None
@@ -5938,6 +6009,7 @@ def _execute_reviewed_deployment(
             effective_parameters=effective_parameters,
             compiled_template=compiled_template,
             compiled_template_sha256=compiled_template_sha256,
+            resource_group_location_sha256=resource_group_location_sha256,
             minimum_timestamp=minimum_deployment_timestamp,
         ),
         field=(
@@ -12904,9 +12976,7 @@ def _verify_digest_pinned_job_image_pull(
                     "digest-pinned image-pull evidence timed out after a successful "
                     "or outcome-unknown mutation"
                 ) from exc
-            last_error = exc
-            if attempt < READBACK_MAX_ATTEMPTS:
-                time.sleep(READBACK_RETRY_SECONDS)
+            raise
         except OrchestrationError as exc:
             if successful_execution_seen:
                 raise TerminalEvidenceError(
@@ -15239,7 +15309,7 @@ def plan(args: argparse.Namespace) -> Path:
         producer_handoff_path=args.producer_handoff,
         publisher_handoff_path=args.publisher_handoff,
     )
-    effective_location = _effective_deployment_location(
+    effective_location, resource_group_location_sha256 = _effective_deployment_location(
         stage=args.stage,
         reviewed_location=args.location,
         subscription_id=subscription_id,
@@ -15684,6 +15754,7 @@ def plan(args: argparse.Namespace) -> Path:
         "sourceCommit": SOURCE_COMMIT,
         "subscriptionId": subscription_id,
         "location": effective_location,
+        "resourceGroupLocationSha256": resource_group_location_sha256,
         "resourceGroup": args.resource_group,
         "deploymentName": args.deployment_name,
         "templatePath": str(TEMPLATES[args.stage].relative_to(ROOT)).replace("\\", "/"),
@@ -15914,11 +15985,12 @@ def apply(args: argparse.Namespace) -> Path:
         if resource_group_value is None
         else _string(resource_group_value, field="resource group")
     )
-    location = _effective_deployment_location(
+    location, resource_group_location_sha256 = _effective_deployment_location(
         stage=stage,
         reviewed_location=location,
         subscription_id=subscription_id,
         resource_group=resource_group,
+        expected_resource_group_location_sha256=manifest.get("resourceGroupLocationSha256"),
     )
     prior_stage_handoff_value = manifest.get("priorStageHandoffPath")
     prior_stage_receipt_value = manifest.get("priorStageReceipt")
@@ -16394,6 +16466,7 @@ def apply(args: argparse.Namespace) -> Path:
         compiled_template_artifact=compiled_template_artifact,
         compiled_template=compiled_template,
         compiled_template_sha256=compiled_template_sha256,
+        resource_group_location_sha256=resource_group_location_sha256,
     )
     (
         post_deployment_authority_inventory,

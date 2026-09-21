@@ -323,15 +323,15 @@ Run the four orchestration stages in order. Use a unique deployment name and a n
 directory for each plan. Review the generated `*.what-if.json` and `*.plan.json` before running
 `apply`; the apply command rejects any changed byte.
 
-The final plan schema is `athena.wc029DeploymentPlan.v7`. Every reviewed plan, base/effective parameter
+The final plan schema is `athena.wc029DeploymentPlan.v8`. Every reviewed plan, base/effective parameter
 document, what-if, predecessor handoff, and receipt is read exactly once through the secure
 non-reparse artifact reader. Its immutable raw bytes, parsed document, file identity, and SHA-256
 remain attached to that orchestration invocation; later checks never reopen the reviewed path.
 Every Azure deployment validate, what-if, and create command includes `--no-prompt true`, and the
 subprocess receives no stdin. Every Azure CLI and Bicep operation has an explicit bounded timeout.
-Read timeouts may participate only in an existing bounded read-only convergence loop. A
+A read-only timeout terminates that operation and is never hidden by a generic retry. A
 deployment-create timeout is outcome-unknown: apply never invokes create again and may continue
-only by reconciling the exact deployment through read-only show/export operations. Final planning
+only through the dedicated `_attest_succeeded_deployment` read-only reconciliation path. Final planning
 compiles Bicep exactly once, writes the canonical ARM JSON to an immutable `*.template.json`
 review artifact, and records its path, bytes, identity, and SHA-256. Validate and what-if consume
 one private pinned copy of that ARM JSON plus one private pinned effective-parameter copy. Apply
@@ -343,8 +343,9 @@ Subscription-scope deployments use the reviewed deployment location directly. Pr
 publisher are resource-group deployments: both plan and apply read the exact resource-group ID,
 name, provisioning state, and location and require `--location` to equal that live location. The
 group deployment commands correctly omit `--location`, while the reviewed plan and later evidence
-retain the validated resource-group location. A location mismatch blocks validation, what-if, and
-create.
+retain the validated resource-group location and a SHA-256 over its canonical readback. Apply
+rechecks that digest before the final what-if/create and again before each deployment attestation.
+A location or evidence mismatch blocks validation, what-if, create, and attestation.
 
 For producer, publisher, and live-acceptance stages the plan also records
 `authorityBlobInventory` plus its exact checkpoint SHA-256. Blob service versioning must be enabled.

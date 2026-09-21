@@ -104,6 +104,51 @@ def _deployment_record(
     return record
 
 
+def _resource_group_location_sha256(
+    resource_group: str = RUNTIME_RESOURCE_GROUP,
+    location: str = "australiaeast",
+) -> str:
+    return orchestration._sha256_bytes(
+        orchestration._canonical_json_bytes(
+            {
+                "id": (f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/{resource_group}"),
+                "name": resource_group,
+                "location": location,
+                "provisioningState": "Succeeded",
+            }
+        )
+    )
+
+
+def _stub_resource_group_location(
+    monkeypatch: pytest.MonkeyPatch,
+) -> str:
+    evidence_sha256 = _resource_group_location_sha256()
+
+    def effective_location(
+        *,
+        stage: str,
+        reviewed_location: object,
+        subscription_id: str,
+        resource_group: str | None,
+        expected_resource_group_location_sha256: object | None = None,
+    ) -> tuple[str, str | None]:
+        assert stage in {"producer", "publisher"}
+        assert reviewed_location == "australiaeast"
+        assert subscription_id == SUBSCRIPTION_ID
+        assert resource_group == RUNTIME_RESOURCE_GROUP
+        if expected_resource_group_location_sha256 is not None:
+            assert expected_resource_group_location_sha256 == evidence_sha256
+        return "australiaeast", evidence_sha256
+
+    monkeypatch.setattr(
+        orchestration,
+        "_effective_deployment_location",
+        effective_location,
+    )
+    return evidence_sha256
+
+
 def _write_parameters(path: Path, values: dict[str, object]) -> None:
     path.write_bytes(
         orchestration._canonical_json_file_bytes(
@@ -500,6 +545,20 @@ def _write_plan(
         "sourceCommit": orchestration.SOURCE_COMMIT,
         "subscriptionId": SUBSCRIPTION_ID,
         "location": "australiaeast",
+        "resourceGroupLocationSha256": (
+            None
+            if resource_group is None
+            else orchestration._sha256_bytes(
+                orchestration._canonical_json_bytes(
+                    {
+                        "id": (f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/{resource_group}"),
+                        "name": resource_group,
+                        "location": "australiaeast",
+                        "provisioningState": "Succeeded",
+                    }
+                )
+            )
+        ),
         "resourceGroup": resource_group,
         "deploymentName": f"synthetic-{stage}",
         "templatePath": str(orchestration.TEMPLATES[stage].relative_to(ROOT)).replace("\\", "/"),
@@ -1746,15 +1805,14 @@ def test_group_deployment_location_is_bound_to_live_resource_group(
         }
 
     monkeypatch.setattr(orchestration, "_run_json", run_json)
-    assert (
-        orchestration._effective_deployment_location(
-            stage="producer",
-            reviewed_location="australiaeast",
-            subscription_id=SUBSCRIPTION_ID,
-            resource_group=RUNTIME_RESOURCE_GROUP,
-        )
-        == "australiaeast"
+    location, evidence_sha256 = orchestration._effective_deployment_location(
+        stage="producer",
+        reviewed_location="australiaeast",
+        subscription_id=SUBSCRIPTION_ID,
+        resource_group=RUNTIME_RESOURCE_GROUP,
     )
+    assert location == "australiaeast"
+    assert evidence_sha256 == _resource_group_location_sha256()
     assert requested_commands[0][:3] == ["az", "group", "show"]
 
 
@@ -1777,6 +1835,29 @@ def test_group_deployment_location_mismatch_fails_closed(
             reviewed_location="australiaeast",
             subscription_id=SUBSCRIPTION_ID,
             resource_group=RUNTIME_RESOURCE_GROUP,
+        )
+
+
+def test_group_deployment_location_hash_mismatch_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        orchestration,
+        "_run_json",
+        lambda _command, *, field: {
+            "id": (f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/{RUNTIME_RESOURCE_GROUP}"),
+            "name": RUNTIME_RESOURCE_GROUP,
+            "location": "australiaeast",
+            "properties": {"provisioningState": "Succeeded"},
+        },
+    )
+    with pytest.raises(orchestration.OrchestrationError, match="changed after review"):
+        orchestration._effective_deployment_location(
+            stage="producer",
+            reviewed_location="australiaeast",
+            subscription_id=SUBSCRIPTION_ID,
+            resource_group=RUNTIME_RESOURCE_GROUP,
+            expected_resource_group_location_sha256=f"sha256:{'f' * 64}",
         )
 
 
@@ -1904,6 +1985,33 @@ def test_run_bytes_maps_timeout_without_output_disclosure(
     assert "synthetic-sensitive-output" not in str(caught.value)
 
 
+def test_read_only_timeout_is_terminal_and_not_retried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+
+    def operation() -> None:
+        nonlocal attempts
+        attempts += 1
+        raise orchestration._CommandTimeout(
+            operation="Azure resource read",
+            timeout_seconds=orchestration.AZURE_READ_TIMEOUT_SECONDS,
+            outcome_unknown=False,
+        )
+
+    monkeypatch.setattr(
+        orchestration.time,
+        "sleep",
+        lambda _seconds: pytest.fail("read timeout must not be retried"),
+    )
+    with pytest.raises(orchestration._CommandTimeout):
+        orchestration._retry_eventually_consistent(
+            operation,
+            field="synthetic readback",
+        )
+    assert attempts == 1
+
+
 def test_reviewed_create_uses_one_private_pinned_parameter_copy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1974,6 +2082,7 @@ def test_reviewed_create_uses_one_private_pinned_parameter_copy(
             f"sha256:{'2' * 64}",
         ),
     )
+    resource_group_location_sha256 = _stub_resource_group_location(monkeypatch)
     outputs, _, _ = orchestration._execute_reviewed_deployment(
         resume_succeeded_deployment=False,
         stage="producer",
@@ -1987,6 +2096,7 @@ def test_reviewed_create_uses_one_private_pinned_parameter_copy(
         compiled_template_artifact=compiled_template_artifact,
         compiled_template=compiled_template,
         compiled_template_sha256=compiled_template_artifact.sha256,
+        resource_group_location_sha256=resource_group_location_sha256,
     )
     assert outputs == {}
     assert len(parameter_paths) == 2
@@ -2022,6 +2132,7 @@ def test_resume_retries_attestation_without_recreating(
         "sleep",
         lambda seconds: sleeps.append(seconds),
     )
+    resource_group_location_sha256 = _stub_resource_group_location(monkeypatch)
     artifact = orchestration._CapturedJsonArtifact(
         path=Path("captured.parameters.json"),
         raw_bytes=b"{}\n",
@@ -2051,6 +2162,7 @@ def test_resume_retries_attestation_without_recreating(
         compiled_template_artifact=compiled_template_artifact,
         compiled_template={"parameters": {}},
         compiled_template_sha256=compiled_template_artifact.sha256,
+        resource_group_location_sha256=resource_group_location_sha256,
     )
     assert outputs == {}
     assert attempts == 3
@@ -2335,6 +2447,7 @@ def test_succeeded_deployment_attestation_binds_template_and_parameters(
         )
 
     monkeypatch.setattr(orchestration, "_run_json", run_json)
+    resource_group_location_sha256 = _stub_resource_group_location(monkeypatch)
     _, _, deployed_digest = orchestration._attest_succeeded_deployment(
         stage="producer",
         deployment_name="synthetic",
@@ -2344,6 +2457,7 @@ def test_succeeded_deployment_attestation_binds_template_and_parameters(
         effective_parameters={"reviewed": {"value": "exact"}},
         compiled_template=compiled_template,
         compiled_template_sha256=compiled_digest,
+        resource_group_location_sha256=resource_group_location_sha256,
     )
     assert deployed_digest == compiled_digest
 
@@ -2358,6 +2472,7 @@ def test_succeeded_deployment_attestation_binds_template_and_parameters(
             effective_parameters={"reviewed": {"value": "exact"}},
             compiled_template=compiled_template,
             compiled_template_sha256=compiled_digest,
+            resource_group_location_sha256=resource_group_location_sha256,
         )
 
 
@@ -2592,6 +2707,7 @@ def test_timed_out_create_uses_read_only_reconciliation_without_retrying_mutatio
 
     monkeypatch.setattr(orchestration, "_run_json", run_json)
     monkeypatch.setattr(orchestration, "_attest_succeeded_deployment", attest)
+    resource_group_location_sha256 = _stub_resource_group_location(monkeypatch)
     outputs, _, _ = orchestration._execute_reviewed_deployment(
         resume_succeeded_deployment=False,
         stage="producer",
@@ -2605,6 +2721,7 @@ def test_timed_out_create_uses_read_only_reconciliation_without_retrying_mutatio
         compiled_template_artifact=compiled_artifact,
         compiled_template=compiled_template,
         compiled_template_sha256=compiled_artifact.sha256,
+        resource_group_location_sha256=resource_group_location_sha256,
     )
     assert outputs == {}
     assert create_calls == 1
@@ -2655,6 +2772,7 @@ def test_incomplete_create_response_uses_read_only_reconciliation(
 
     monkeypatch.setattr(orchestration, "_run_json", run_json)
     monkeypatch.setattr(orchestration, "_attest_succeeded_deployment", attest)
+    resource_group_location_sha256 = _stub_resource_group_location(monkeypatch)
     outputs, _, _ = orchestration._execute_reviewed_deployment(
         resume_succeeded_deployment=False,
         stage="producer",
@@ -2668,6 +2786,7 @@ def test_incomplete_create_response_uses_read_only_reconciliation(
         compiled_template_artifact=compiled_artifact,
         compiled_template=compiled_template,
         compiled_template_sha256=compiled_artifact.sha256,
+        resource_group_location_sha256=resource_group_location_sha256,
     )
     assert outputs == {}
     assert create_calls == 1
@@ -2709,6 +2828,7 @@ def test_preexisting_same_name_deployment_blocks_create_reconciliation(
         pytest.fail("deployment create must not run for a pre-existing name")
 
     monkeypatch.setattr(orchestration, "_run_json", run_json)
+    resource_group_location_sha256 = _stub_resource_group_location(monkeypatch)
     with pytest.raises(orchestration.OrchestrationError, match="already exists"):
         orchestration._execute_reviewed_deployment(
             resume_succeeded_deployment=False,
@@ -2723,6 +2843,7 @@ def test_preexisting_same_name_deployment_blocks_create_reconciliation(
             compiled_template_artifact=compiled_artifact,
             compiled_template=compiled_template,
             compiled_template_sha256=compiled_artifact.sha256,
+            resource_group_location_sha256=resource_group_location_sha256,
         )
 
 
@@ -10776,7 +10897,7 @@ def test_apply_is_bound_to_external_digest_and_fresh_what_if() -> None:
     assert '--foundation-reviewed-receipt-sha256"' in source
     assert '--producer-reviewed-receipt-sha256"' in source
     assert '--publisher-reviewed-receipt-sha256"' in source
-    assert "athena.wc029DeploymentPlan.v7" in source
+    assert "athena.wc029DeploymentPlan.v8" in source
     assert "athena.wc029DeploymentReceipt.v4" in source
     assert "athena.wc029DeploymentHandoff.v7" in source
     assert "athena.wc029ImagePullEvidence.v3" in source
@@ -10816,13 +10937,16 @@ def test_group_scope_location_is_revalidated_for_plan_apply_and_evidence() -> No
     apply_start = source.index("def apply(")
     plan_source = source[plan_start:apply_start]
     apply_source = source[apply_start:]
-    assert "effective_location = _effective_deployment_location(" in plan_source
+    assert (
+        "effective_location, resource_group_location_sha256 = _effective_deployment_location("
+    ) in plan_source
     assert plan_source.count("location=effective_location") == 2
     assert '"location": effective_location' in plan_source
-    assert "location = _effective_deployment_location(" in apply_source
-    assert apply_source.index("location = _effective_deployment_location(") < apply_source.index(
-        "_execute_reviewed_deployment("
-    )
+    apply_location = "location, resource_group_location_sha256 = _effective_deployment_location("
+    assert apply_location in apply_source
+    assert apply_source.index(apply_location) < apply_source.index("_execute_reviewed_deployment(")
+    assert '"resourceGroupLocationSha256": resource_group_location_sha256' in plan_source
+    assert "resource_group_location_sha256=resource_group_location_sha256" in apply_source
 
 
 def test_trigger_queue_transition_cleanup_precedes_apply_mutation() -> None:

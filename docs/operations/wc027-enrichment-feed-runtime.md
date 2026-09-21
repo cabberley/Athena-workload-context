@@ -156,7 +156,7 @@ public material, EC keys, version drift, wrong fingerprints, or extra/missing ke
 before readiness.
 
 The guidance-authority storage account must have Blob versioning enabled. Each reviewed
-`athena.wc029DeploymentPlan.v7` records a digest-chained authority checkpoint. One
+`athena.wc029DeploymentPlan.v8` records a digest-chained authority checkpoint. One
 version-inclusive listing supplies exact case-sensitive names, version IDs, ETags, and lengths.
 Every newly observed exact version is downloaded, SHA-256 hashed, and validated as the canonical
 published authority or binding contract. Prior versions and digests must remain byte-identical;
