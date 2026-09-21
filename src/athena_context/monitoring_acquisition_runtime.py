@@ -123,7 +123,6 @@ _RESOURCE_LOG_ALLOWED_OPERATIONS = (
     "Microsoft.Insights/Logs/VMConnection/Read",
 )
 _RESOURCE_HEALTH_ALLOWED_OPERATIONS = ("Microsoft.ResourceGraph/resources/read",)
-_BLOCKED_PR99_CONTRACT_SCHEMA_VERSION = "athena.wc028MonitoringCollectorContract.v8"
 _ACR_PULL_ROLE_DEFINITION_GUID = "7f951dda-4ed3-4680-a7ca-43fe172d538d"
 _ACR_PULL_ROLE_NAME = "AcrPull"
 _ACR_PULL_ACTION = "Microsoft.ContainerRegistry/registries/pull/read"
@@ -2728,14 +2727,14 @@ def _validate_acquisition_authority_preflight(
 def _require_pr99_conditioned_blob_contract(
     collector_contract: MonitoringCollectorContract,
 ) -> None:
-    if collector_contract.schema_version == _BLOCKED_PR99_CONTRACT_SCHEMA_VERSION:
-        raise MonitoringAcquisitionJobError(
-            "WC-028 deployment remains blocked until PR #99 publishes the conditioned "
-            "known-name Blob read and add/action collector contract and bootstrap, "
-            "reviewed storage-protection contract, signed persistence replay binding, "
-            "ancestor-complete collector RBAC evidence, and new explicit receipt and "
-            "authority schemas for mandatory wire attempts and their call budget"
-        )
+    del collector_contract
+    raise MonitoringAcquisitionJobError(
+        "WC-028 deployment remains blocked until the PR #99 restack pins the exact successor "
+        "collector schema and digest together with the conditioned known-name Blob read and "
+        "add/action bootstrap, reviewed storage-protection contract, signed persistence replay "
+        "binding, ancestor-complete collector RBAC evidence, and successor receipt and authority "
+        "schemas for mandatory wire attempts and their call budget"
+    )
 
 
 def _blocked_pr99_storage_readiness_verifier(

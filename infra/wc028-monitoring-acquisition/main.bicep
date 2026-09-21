@@ -88,7 +88,7 @@ param monitoringEvidenceImmutabilityRetentionDays int
 @description('Reviewed WC-028 runtime configuration. It contains no credentials and is secret-backed to avoid command-line or plain environment disclosure.')
 param acquisitionRuntimeConfigurationJson string
 
-@description('Hard deployment gate. This draft must remain false until PR #99 publishes the conditioned add-only Blob bootstrap, reviewed storage contract, signed replay binding, ancestor-complete collector RBAC evidence, and explicit successor receipt/authority schemas for mandatory wire attempts and call budgets.')
+@description('Hard deployment gate. This draft must remain false until the PR #99 restack pins the exact successor collector schema and digest and publishes the conditioned add-only Blob bootstrap, reviewed storage contract, signed replay binding, ancestor-complete collector RBAC evidence, and explicit successor receipt/authority schemas for mandatory wire attempts and call budgets.')
 @allowed([
   false
 ])
@@ -101,7 +101,7 @@ var parsedRuntimeConfiguration = json(acquisitionRuntimeConfigurationJson)
 var configuredStorageReadiness = parsedRuntimeConfiguration.monitoringEvidenceStorageReadiness
 var validatedPr99RuntimeDependencyGate = pr99RuntimeDependenciesReady
   ? 'ready'
-  : fail('WC-028 deployment remains blocked pending the complete reviewed PR #99 storage, replay, ancestor-RBAC, receipt, and authority contracts')
+  : fail('WC-028 deployment remains blocked pending the exact successor collector schema and digest plus the complete reviewed PR #99 storage, replay, ancestor-RBAC, receipt, and authority contracts')
 var registrySegments = split(registryResourceId, '/')
 var registryResourceGroupName = length(registrySegments) == 9 && toLower(
   registrySegments[1]

@@ -1542,10 +1542,25 @@ def test_current_nil_subscription_contract_is_rejected_at_startup() -> None:
 def test_current_published_contract_remains_blocked_on_pr99_bootstrap() -> None:
     with pytest.raises(
         MonitoringAcquisitionJobError,
-        match="blocked until PR #99 publishes the conditioned",
+        match="blocked until the PR #99 restack pins the exact successor",
     ) as exc_info:
         runtime_module._require_pr99_conditioned_blob_contract(_acquisition_collector_contract())
+    assert "collector schema and digest" in str(exc_info.value)
     assert "receipt and authority schemas" in str(exc_info.value)
+
+
+def test_unreviewed_successor_contract_cannot_bypass_pr99_gate() -> None:
+    unreviewed_successor = SimpleNamespace(
+        schema_version="athena.wc028MonitoringCollectorContract.unreviewed-successor"
+    )
+
+    with pytest.raises(
+        MonitoringAcquisitionJobError,
+        match="exact successor collector schema and digest",
+    ):
+        runtime_module._require_pr99_conditioned_blob_contract(
+            cast(Any, unreviewed_successor)
+        )
 
 
 def test_authority_scope_digest_and_freshness_fail_before_external_reads(

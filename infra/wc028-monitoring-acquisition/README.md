@@ -107,8 +107,11 @@ IP Flow calls and no IP Flow RBAC.
 > revision, a reviewed storage-protection contract, and the collector-signed persistence replay
 > binding. PR #99 must also replace its current subscription-descendant-only inventory with
 > ancestor-complete evidence that can detect inherited management-group or tenant-root grants.
-> This branch must then be restacked on that exact head. Runtime startup also fails closed explicitly
-> on the currently published contract schema. The Bicep
+> This branch must then be restacked on that exact head. Runtime startup remains unconditionally
+> blocked in this draft; merely changing the shared current-schema constant cannot make an
+> intermediate successor deployable. The final restack may replace the runtime gate only while
+> pinning the exact reviewed successor schema and its authority-bound collector-contract digest.
+> The Bicep
 > `pr99RuntimeDependenciesReady` parameter is constrained to `false`; its deployment-time failure
 > is referenced by every RBAC module and the Container Apps Job, so this draft cannot grant roles or
 > create a runnable Job.
