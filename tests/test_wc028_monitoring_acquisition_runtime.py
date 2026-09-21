@@ -1591,6 +1591,8 @@ def test_current_published_contract_remains_blocked_on_pr99_bootstrap() -> None:
     ) as exc_info:
         runtime_module._require_pr99_conditioned_blob_contract(_acquisition_collector_contract())
     assert "collector schema and digest" in str(exc_info.value)
+    assert "runtime-support hierarchy evidence" in str(exc_info.value)
+    assert "two-phase support RBAC bootstrap handoff" in str(exc_info.value)
     assert "receipt and authority schemas" in str(exc_info.value)
 
 
@@ -2751,6 +2753,7 @@ def _commit_port(
         ]
         | None
     ) = None,
+    trusted_clock: Callable[[], datetime] | None = None,
 ) -> MonitoringEvidenceCommitPort:
     private_key = private_key or rsa.generate_private_key(
         public_exponent=65537,
@@ -2774,6 +2777,8 @@ def _commit_port(
         enabled=True,
         activated_at=datetime(2020, 1, 1, tzinfo=UTC),
     )
+    receipt = case.prepared.monitoring_bundle.acquisition_receipt
+    assert receipt is not None
     return MonitoringEvidenceCommitPort(
         monitoring_writer=monitoring_store,
         monitoring_current_reader=monitoring_store,
@@ -2794,6 +2799,10 @@ def _commit_port(
                     )
                 )
             )
+        ),
+        trusted_clock=(
+            trusted_clock
+            or (lambda: receipt.execution_started_at + timedelta(seconds=120))
         ),
         key_record=key_record,
     )
@@ -3049,6 +3058,241 @@ def test_commit_port_recovers_partial_write_before_manifest(
 
     assert committed.monitoring_handoff.evidence.name in store.blobs
     assert any(name.endswith("/manifest.json") for name in store.blobs)
+
+
+@pytest.mark.parametrize(
+    ("recovery_offset", "should_expire"),
+    (
+        (timedelta(milliseconds=-1), False),
+        (timedelta(0), False),
+        (timedelta(milliseconds=1), True),
+    ),
+)
+def test_partial_recovery_requires_live_correlation_window_before_manifest(
+    persistence_case: _PersistenceCase,
+    recovery_offset: timedelta,
+    should_expire: bool,
+) -> None:
+    store = _MemoryStore(
+        container_name="monitoring-evidence",
+        fail_once_on_suffix="/manifest.json",
+    )
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    with (
+        pytest.raises(RuntimeError, match="staged persistence failure"),
+        _commit_port(
+            store,
+            persistence_case,
+            private_key=private_key,
+        ).transaction(persistence_case.prepared),
+    ):
+        pass
+    manifest_name, recovery_name, _ = runtime_module._monitoring_persistence_blob_names(
+        PERSISTENCE_REPLAY_KEY
+    )
+    state = runtime_module.MonitoringPersistenceRecoveryState.model_validate_json(
+        store.blobs[recovery_name].payload
+    )
+    create_count = len(store.create_requests)
+    recovery_port = _commit_port(
+        store,
+        persistence_case,
+        private_key=private_key,
+        trusted_clock=lambda: state.expires_at + recovery_offset,
+    )
+    probe = runtime_module._probe_monitoring_persistence(
+        reader=store,
+        replay_key=PERSISTENCE_REPLAY_KEY,
+    )
+
+    if should_expire:
+        with pytest.raises(
+            MonitoringAcquisitionJobError,
+            match="expired recovery requires a new execution/replay key",
+        ):
+            recovery_port.recover(probe)
+        assert manifest_name not in store.blobs
+        assert len(store.create_requests) == create_count
+    else:
+        recovered = recovery_port.recover(probe)
+        assert recovered is not None
+        assert recovered.correlation_request.expires_at == state.expires_at
+        assert manifest_name in store.blobs
+        assert len(store.create_requests) == create_count + 1
+
+
+def test_partial_recovery_rechecks_expiry_before_missing_evidence_write(
+    persistence_case: _PersistenceCase,
+) -> None:
+    store = _MemoryStore(
+        container_name="monitoring-evidence",
+        fail_once_on_suffix="/evidence.json",
+    )
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    with (
+        pytest.raises(RuntimeError, match="staged persistence failure"),
+        _commit_port(
+            store,
+            persistence_case,
+            private_key=private_key,
+        ).transaction(persistence_case.prepared),
+    ):
+        pass
+    manifest_name, recovery_name, evidence_name = (
+        runtime_module._monitoring_persistence_blob_names(PERSISTENCE_REPLAY_KEY)
+    )
+    state = runtime_module.MonitoringPersistenceRecoveryState.model_validate_json(
+        store.blobs[recovery_name].payload
+    )
+    recovery_times = iter(
+        (
+            state.expires_at - timedelta(milliseconds=1),
+            state.expires_at + timedelta(milliseconds=1),
+        )
+    )
+    create_count = len(store.create_requests)
+
+    with pytest.raises(
+        MonitoringAcquisitionJobError,
+        match="expired recovery requires a new execution/replay key",
+    ):
+        _commit_port(
+            store,
+            persistence_case,
+            private_key=private_key,
+            trusted_clock=lambda: next(recovery_times),
+        ).recover(
+            runtime_module._probe_monitoring_persistence(
+                reader=store,
+                replay_key=PERSISTENCE_REPLAY_KEY,
+            )
+        )
+
+    assert recovery_name in store.blobs
+    assert evidence_name not in store.blobs
+    assert manifest_name not in store.blobs
+    assert len(store.create_requests) == create_count
+
+
+def test_partial_recovery_rechecks_expiry_immediately_before_manifest_write(
+    persistence_case: _PersistenceCase,
+) -> None:
+    store = _MemoryStore(
+        container_name="monitoring-evidence",
+        fail_once_on_suffix="/manifest.json",
+    )
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    with (
+        pytest.raises(RuntimeError, match="staged persistence failure"),
+        _commit_port(
+            store,
+            persistence_case,
+            private_key=private_key,
+        ).transaction(persistence_case.prepared),
+    ):
+        pass
+    manifest_name, recovery_name, evidence_name = (
+        runtime_module._monitoring_persistence_blob_names(PERSISTENCE_REPLAY_KEY)
+    )
+    state = runtime_module.MonitoringPersistenceRecoveryState.model_validate_json(
+        store.blobs[recovery_name].payload
+    )
+    recovery_times = iter(
+        (
+            state.expires_at - timedelta(milliseconds=1),
+            state.expires_at + timedelta(milliseconds=1),
+        )
+    )
+    create_count = len(store.create_requests)
+
+    with pytest.raises(
+        MonitoringAcquisitionJobError,
+        match="expired recovery requires a new execution/replay key",
+    ):
+        _commit_port(
+            store,
+            persistence_case,
+            private_key=private_key,
+            trusted_clock=lambda: next(recovery_times),
+        ).recover(
+            runtime_module._probe_monitoring_persistence(
+                reader=store,
+                replay_key=PERSISTENCE_REPLAY_KEY,
+            )
+        )
+
+    assert recovery_name in store.blobs
+    assert evidence_name in store.blobs
+    assert manifest_name not in store.blobs
+    assert len(store.create_requests) == create_count
+
+
+def test_fresh_transaction_rejects_expiry_before_first_durable_write(
+    persistence_case: _PersistenceCase,
+) -> None:
+    store = _MemoryStore(container_name="monitoring-evidence")
+    receipt = persistence_case.prepared.monitoring_bundle.acquisition_receipt
+    assert receipt is not None
+    expires_at = receipt.execution_started_at + timedelta(
+        seconds=persistence_case.configuration.request_lifetime_seconds
+    )
+
+    with (
+        pytest.raises(
+            MonitoringAcquisitionJobError,
+            match="expired recovery requires a new execution/replay key",
+        ),
+        _commit_port(
+            store,
+            persistence_case,
+            trusted_clock=lambda: expires_at + timedelta(milliseconds=1),
+        ).transaction(persistence_case.prepared),
+    ):
+        pass
+
+    assert store.create_requests == []
+    assert store.blobs == {}
+
+
+def test_complete_expired_recovery_is_not_returned_as_live_correlation(
+    persistence_case: _PersistenceCase,
+) -> None:
+    store = _MemoryStore(container_name="monitoring-evidence")
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    with _commit_port(
+        store,
+        persistence_case,
+        private_key=private_key,
+    ).transaction(persistence_case.prepared):
+        pass
+    manifest_name, recovery_name, _ = runtime_module._monitoring_persistence_blob_names(
+        PERSISTENCE_REPLAY_KEY
+    )
+    assert manifest_name in store.blobs
+    state = runtime_module.MonitoringPersistenceRecoveryState.model_validate_json(
+        store.blobs[recovery_name].payload
+    )
+    create_count = len(store.create_requests)
+    recovery_port = _commit_port(
+        store,
+        persistence_case,
+        private_key=private_key,
+        trusted_clock=lambda: state.expires_at + timedelta(milliseconds=1),
+    )
+
+    with pytest.raises(
+        MonitoringAcquisitionJobError,
+        match="expired recovery requires a new execution/replay key",
+    ):
+        recovery_port.recover(
+            runtime_module._probe_monitoring_persistence(
+                reader=store,
+                replay_key=PERSISTENCE_REPLAY_KEY,
+            )
+        )
+
+    assert manifest_name in store.blobs
+    assert len(store.create_requests) == create_count
 
 
 def test_commit_port_recovers_ambiguous_create_by_exact_known_name(

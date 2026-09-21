@@ -47,6 +47,10 @@ signature binds the complete replay-v3 execution, cleanup, incident revision, re
 prepared bundle, and the originally accepted support-inventory digest and lifetime. Rehashing any
 field without a new valid collector signature is rejected. Evidence without that signed state is
 rejected until PR #99 exposes the same complete recovery binding in the signed acquisition receipt.
+Recovery uses a trusted millisecond-UTC clock before any partial-recovery write and again before
+publishing a missing manifest. A recovery after `expiresAt` leaves the signed partial artifacts
+uncommitted and requires a new execution and replay key. An already complete but expired manifest
+remains available as durable audit evidence but is not returned as a live correlation request.
 Current support-RBAC freshness is required only when no durable recovery artifact exists and the Job
 will perform new support-key, identity, or monitoring-source I/O. A caller failure leaves no commit
 marker. The current contract does not execute or persist supporting change controls.

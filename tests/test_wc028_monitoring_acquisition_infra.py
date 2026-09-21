@@ -261,6 +261,7 @@ def test_storage_readiness_gates_writer_rbac_and_job_on_exact_wc024_readback() -
         "var readinessPreimage = ",
         "var computedReadbackBindingId = guid(readinessPreimage)",
         "expectedReadbackBindingId == computedReadbackBindingId",
+        "signingKeySeparationGate == 'separate'",
         "output validatedStorageReadinessDigest string",
     ):
         assert expected in source
@@ -283,6 +284,7 @@ def test_storage_readiness_gates_writer_rbac_and_job_on_exact_wc024_readback() -
     assert (
         "expectedReadbackBindingId: string(validatedConfiguredStorageReadiness.readbackBindingId)"
     ) in main
+    assert "signingKeySeparationGate: validatedSigningKeySeparation" in main
     assert "param pr99RuntimeDependenciesReady bool = false" in main
     assert (
         "WC-028 deployment remains blocked pending the exact successor collector schema and "

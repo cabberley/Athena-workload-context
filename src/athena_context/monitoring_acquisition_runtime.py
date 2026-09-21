@@ -2820,6 +2820,7 @@ class MonitoringEvidenceCommitPort:
             [MonitoringEvidenceStorageReadiness],
             MonitoringEvidenceStorageReadiness,
         ],
+        trusted_clock: Callable[[], datetime] = _utc_now_milliseconds,
         key_resolver: TrustedKeyResolver | None = None,
         key_record: TrustedKeyRecord | None = None,
     ) -> None:
@@ -2838,6 +2839,7 @@ class MonitoringEvidenceCommitPort:
         self._monitoring_intent_reference = monitoring_intent_reference
         self._acquisition_receipt_verifier = acquisition_receipt_verifier
         self._storage_readiness_verifier = storage_readiness_verifier
+        self._trusted_clock = trusted_clock
         self._key_resolver: TrustedKeyResolver
         if key_resolver is None:
             record = key_record or TrustedKeyRecord(
@@ -2859,6 +2861,24 @@ class MonitoringEvidenceCommitPort:
             self._key_resolver = resolve
         else:
             self._key_resolver = key_resolver
+
+    def _require_live_correlation_window(
+        self,
+        state: MonitoringPersistenceRecoveryState,
+    ) -> None:
+        recovered_at = self._trusted_clock()
+        if (
+            not isinstance(recovered_at, datetime)
+            or recovered_at.utcoffset() != UTC.utcoffset(recovered_at)
+            or recovered_at.microsecond % 1000
+        ):
+            raise MonitoringAcquisitionJobError(
+                "trusted recovery clock must return millisecond UTC"
+            )
+        if recovered_at > state.expires_at:
+            raise MonitoringAcquisitionJobError(
+                "expired recovery requires a new execution/replay key"
+            )
 
     @staticmethod
     def _observation_health_state(observation: object) -> str | None:
@@ -3486,6 +3506,7 @@ class MonitoringEvidenceCommitPort:
                 raise MonitoringAcquisitionJobError(
                     "commit manifest correlation request is not byte-identical"
                 )
+            self._require_live_correlation_window(state)
             return RecoveredMonitoringAcquisitionJobOutcome(
                 committed=committed,
                 correlation_request=rebuilt_correlation,
@@ -3498,6 +3519,7 @@ class MonitoringEvidenceCommitPort:
         self._verify_recovery_state_attestation(state)
         self._verify_acquisition_receipt(state)
         prepared = self._validate_recovery_state_binding(state)
+        self._require_live_correlation_window(state)
         _revalidate_monitoring_evidence_storage_readiness(
             configuration=self._configuration,
             expected_signed_digest=(state.monitoring_evidence_storage_readiness_digest),
@@ -3505,6 +3527,7 @@ class MonitoringEvidenceCommitPort:
         )
         state_reference = self._reference_from_result(probe.recovery_state_result)
         if evidence_bundle is None:
+            self._require_live_correlation_window(state)
             evidence_reference = self._write(
                 writer=self._monitoring_writer,
                 current_reader=self._monitoring_current_reader,
@@ -3531,6 +3554,7 @@ class MonitoringEvidenceCommitPort:
             committed=committed,
             correlation_request=correlation_request,
         )
+        self._require_live_correlation_window(state)
         self._write(
             writer=self._monitoring_writer,
             current_reader=self._monitoring_current_reader,
@@ -3610,12 +3634,14 @@ class MonitoringEvidenceCommitPort:
             expected_signed_digest=(state.monitoring_evidence_storage_readiness_digest),
             verifier=self._storage_readiness_verifier,
         )
+        self._require_live_correlation_window(state)
         state_reference = self._write(
             writer=self._monitoring_writer,
             current_reader=self._monitoring_current_reader,
             blob_name=recovery_blob_name,
             payload=state.canonical_bytes(),
         )
+        self._require_live_correlation_window(state)
         evidence_reference = self._write(
             writer=self._monitoring_writer,
             current_reader=self._monitoring_current_reader,
@@ -3639,6 +3665,7 @@ class MonitoringEvidenceCommitPort:
             committed=committed,
             correlation_request=correlation_request,
         )
+        self._require_live_correlation_window(state)
         self._write(
             writer=self._monitoring_writer,
             current_reader=self._monitoring_current_reader,
