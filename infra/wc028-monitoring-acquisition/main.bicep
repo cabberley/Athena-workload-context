@@ -33,14 +33,27 @@ param monitoringEvidenceStorageAccountResourceId string
 @description('Existing WC-024 monitoring evidence container resource ID.')
 param monitoringEvidenceContainerResourceId string
 
+@description('Existing exact WC-024 collector signing key ARM resource ID.')
+param monitoringCollectorSigningKeyResourceId string
+
 @description('Existing exact versioned WC-024 collector signing key URI.')
 param monitoringCollectorSigningKeyUriWithVersion string
+
+@description('SHA-256 public-key fingerprint independently read from the exact WC-024 collector signing key version.')
+@minLength(71)
+@maxLength(71)
+param monitoringCollectorSigningKeyPublicKeyFingerprint string
 
 @description('Exact monitoring-intent signing key resource ID whose public key may be read.')
 param monitoringIntentSigningKeyResourceId string
 
 @description('Exact versioned monitoring-intent signing key URI trusted by the reviewed runtime configuration.')
 param monitoringIntentSigningKeyUriWithVersion string
+
+@description('SHA-256 public-key fingerprint independently read from the exact monitoring-intent signing key version.')
+@minLength(71)
+@maxLength(71)
+param monitoringIntentSigningKeyPublicKeyFingerprint string
 
 @description('Existing immutable source-authority storage account resource ID. It must differ from monitoring evidence storage.')
 param sourceAuthorityStorageAccountResourceId string
@@ -88,7 +101,7 @@ param monitoringEvidenceImmutabilityRetentionDays int
 @description('Reviewed WC-028 runtime configuration. It contains no credentials and is secret-backed to avoid command-line or plain environment disclosure.')
 param acquisitionRuntimeConfigurationJson string
 
-@description('Hard deployment gate. This draft must remain false until the PR #99 restack pins the exact successor collector schema and digest and publishes the conditioned add-only Blob bootstrap, reviewed storage contract, signed replay binding, ancestor-complete collector RBAC evidence, and explicit successor receipt/authority schemas for mandatory wire attempts and call budgets.')
+@description('Hard deployment gate. This draft must remain false until the PR #99 restack pins the exact successor collector schema and digest and publishes the conditioned add-only Blob bootstrap, reviewed storage contract, signed replay binding, upstream-bound runtime-support hierarchy evidence, a completed two-phase support-RBAC bootstrap handoff, ancestor-complete collector RBAC evidence, and explicit successor receipt/authority schemas for mandatory wire attempts and call budgets.')
 @allowed([
   false
 ])
@@ -101,7 +114,7 @@ var parsedRuntimeConfiguration = json(acquisitionRuntimeConfigurationJson)
 var configuredStorageReadiness = parsedRuntimeConfiguration.monitoringEvidenceStorageReadiness
 var validatedPr99RuntimeDependencyGate = pr99RuntimeDependenciesReady
   ? 'ready'
-  : fail('WC-028 deployment remains blocked pending the exact successor collector schema and digest plus the complete reviewed PR #99 storage, replay, ancestor-RBAC, receipt, and authority contracts')
+  : fail('WC-028 deployment remains blocked pending the exact successor collector schema and digest, upstream-bound support hierarchy, completed support-RBAC bootstrap handoff, and complete reviewed PR #99 storage, replay, ancestor-RBAC, receipt, and authority contracts')
 var registrySegments = split(registryResourceId, '/')
 var registryResourceGroupName = length(registrySegments) == 9 && toLower(
   registrySegments[1]
@@ -229,40 +242,175 @@ var validatedConfiguredStorageReadiness = parsedRuntimeConfiguration.schemaVersi
 ) == 36 && toLower(string(configuredStorageReadiness.readbackBindingId)) != nilGuid
   ? configuredStorageReadiness
   : fail('runtime configuration storage readiness does not match the exact reviewed WC-024 readback inputs')
-var validatedSigningKeyUri = contains(
-  toLower(monitoringCollectorSigningKeyUriWithVersion),
-  '/keys/monitoring-evidence-signing/'
+var configuredCollectorSigningKey = parsedRuntimeConfiguration.collectorSigningKey
+var configuredMonitoringIntentTrustedKey = parsedRuntimeConfiguration.monitoringIntentTrustedKey
+var collectorSigningKeyResourceSegments = split(monitoringCollectorSigningKeyResourceId, '/')
+var collectorSigningKeyResourceGroupName = length(
+  collectorSigningKeyResourceSegments
+) == 11 && toLower(collectorSigningKeyResourceSegments[1]) == 'subscriptions' && toLower(
+  collectorSigningKeyResourceSegments[2]
+) == toLower(subscription().subscriptionId) && toLower(
+  collectorSigningKeyResourceSegments[3]
+) == 'resourcegroups' && !empty(collectorSigningKeyResourceSegments[4]) && toLower(
+  collectorSigningKeyResourceSegments[5]
+) == 'providers' && toLower(collectorSigningKeyResourceSegments[6]) == 'microsoft.keyvault' && toLower(
+  collectorSigningKeyResourceSegments[7]
+) == 'vaults' && toLower(collectorSigningKeyResourceSegments[9]) == 'keys' && !empty(
+  collectorSigningKeyResourceSegments[8]
+) && !empty(collectorSigningKeyResourceSegments[10])
+  ? collectorSigningKeyResourceSegments[4]
+  : fail('monitoringCollectorSigningKeyResourceId must identify one exact Key Vault key in the deployment subscription')
+var collectorSigningKeyVaultName = collectorSigningKeyResourceSegments[8]
+var collectorSigningKeyName = collectorSigningKeyResourceSegments[10]
+resource collectorSigningKeyResourceGroup 'Microsoft.Resources/resourceGroups@2025-04-01' existing = {
+  name: collectorSigningKeyResourceGroupName
+  scope: subscription()
+}
+resource collectorSigningKeyVault 'Microsoft.KeyVault/vaults@2024-11-01' existing = {
+  name: collectorSigningKeyVaultName
+  scope: collectorSigningKeyResourceGroup
+}
+resource collectorSigningKey 'Microsoft.KeyVault/vaults/keys@2024-11-01' existing = {
+  parent: collectorSigningKeyVault
+  name: collectorSigningKeyName
+}
+var validatedCollectorSigningKeyResourceId = toLower(collectorSigningKey.id) == toLower(
+  monitoringCollectorSigningKeyResourceId
 )
-  ? monitoringCollectorSigningKeyUriWithVersion
-  : fail('WC-028 must reuse the exact versioned WC-024 monitoring evidence signing key')
+  ? collectorSigningKey.id
+  : fail('monitoringCollectorSigningKeyResourceId does not resolve to the exact WC-024 collector signing key')
+var collectorSigningKeyUriSegments = split(monitoringCollectorSigningKeyUriWithVersion, '/')
+var collectorSigningKeyUriPrefix = 'https://${collectorSigningKeyVaultName}${environment().suffixes.keyvaultDns}/keys/${collectorSigningKeyName}/'
+var validatedSigningKeyUri = length(
+  collectorSigningKeyUriSegments
+) == 6 && startsWith(
+  toLower(monitoringCollectorSigningKeyUriWithVersion),
+  toLower(collectorSigningKeyUriPrefix)
+) && !empty(collectorSigningKeyUriSegments[5]) && toLower(
+  string(collectorSigningKey.properties.keyUriWithVersion)
+) == toLower(monitoringCollectorSigningKeyUriWithVersion) && toLower(
+  string(configuredCollectorSigningKey.keyVaultKeyId)
+) == toLower(monitoringCollectorSigningKeyUriWithVersion)
+  ? string(collectorSigningKey.properties.keyUriWithVersion)
+  : fail('WC-028 collector signing key URI must be the exact configured version of monitoringCollectorSigningKeyResourceId')
 var monitoringIntentKeyResourceSegments = split(monitoringIntentSigningKeyResourceId, '/')
 var monitoringIntentKeyUriSegments = split(monitoringIntentSigningKeyUriWithVersion, '/')
-var monitoringIntentVaultName = length(monitoringIntentKeyResourceSegments) == 11
-  ? monitoringIntentKeyResourceSegments[8]
-  : ''
-var monitoringIntentKeyName = length(monitoringIntentKeyResourceSegments) == 11
-  ? monitoringIntentKeyResourceSegments[10]
-  : ''
-var monitoringIntentKeyUriPrefix = 'https://${monitoringIntentVaultName}.${environment().suffixes.keyvaultDns}/keys/${monitoringIntentKeyName}/'
-var validatedMonitoringIntentSigningKeyResourceId = length(
+var monitoringIntentKeyResourceGroupName = length(
   monitoringIntentKeyResourceSegments
 ) == 11 && toLower(monitoringIntentKeyResourceSegments[1]) == 'subscriptions' && toLower(
+  monitoringIntentKeyResourceSegments[2]
+) == toLower(subscription().subscriptionId) && toLower(
   monitoringIntentKeyResourceSegments[3]
-) == 'resourcegroups' && toLower(monitoringIntentKeyResourceSegments[5]) == 'providers' && toLower(
-  monitoringIntentKeyResourceSegments[6]
-) == 'microsoft.keyvault' && toLower(monitoringIntentKeyResourceSegments[7]) == 'vaults' && toLower(
-  monitoringIntentKeyResourceSegments[9]
-) == 'keys' && !empty(monitoringIntentVaultName) && !empty(monitoringIntentKeyName)
-  ? monitoringIntentSigningKeyResourceId
-  : fail('monitoringIntentSigningKeyResourceId must identify one exact Key Vault key')
+) == 'resourcegroups' && !empty(monitoringIntentKeyResourceSegments[4]) && toLower(
+  monitoringIntentKeyResourceSegments[5]
+) == 'providers' && toLower(monitoringIntentKeyResourceSegments[6]) == 'microsoft.keyvault' && toLower(
+  monitoringIntentKeyResourceSegments[7]
+) == 'vaults' && toLower(monitoringIntentKeyResourceSegments[9]) == 'keys' && !empty(
+  monitoringIntentKeyResourceSegments[8]
+) && !empty(monitoringIntentKeyResourceSegments[10])
+  ? monitoringIntentKeyResourceSegments[4]
+  : fail('monitoringIntentSigningKeyResourceId must identify one exact Key Vault key in the deployment subscription')
+var monitoringIntentVaultName = monitoringIntentKeyResourceSegments[8]
+var monitoringIntentKeyName = monitoringIntentKeyResourceSegments[10]
+resource monitoringIntentKeyResourceGroup 'Microsoft.Resources/resourceGroups@2025-04-01' existing = {
+  name: monitoringIntentKeyResourceGroupName
+  scope: subscription()
+}
+resource monitoringIntentKeyVault 'Microsoft.KeyVault/vaults@2024-11-01' existing = {
+  name: monitoringIntentVaultName
+  scope: monitoringIntentKeyResourceGroup
+}
+resource monitoringIntentSigningKey 'Microsoft.KeyVault/vaults/keys@2024-11-01' existing = {
+  parent: monitoringIntentKeyVault
+  name: monitoringIntentKeyName
+}
+var monitoringIntentKeyUriPrefix = 'https://${monitoringIntentVaultName}${environment().suffixes.keyvaultDns}/keys/${monitoringIntentKeyName}/'
+var validatedMonitoringIntentSigningKeyResourceId = toLower(
+  monitoringIntentSigningKey.id
+) == toLower(monitoringIntentSigningKeyResourceId) && toLower(
+  string(parsedRuntimeConfiguration.monitoringIntentSigningKeyResourceId)
+) == toLower(monitoringIntentSigningKey.id)
+  ? monitoringIntentSigningKey.id
+  : fail('monitoringIntentSigningKeyResourceId and the embedded runtime configuration must resolve to the exact monitoring-intent signing key')
 var validatedMonitoringIntentSigningKeyUri = length(
   monitoringIntentKeyUriSegments
 ) == 6 && startsWith(
   toLower(monitoringIntentSigningKeyUriWithVersion),
   toLower(monitoringIntentKeyUriPrefix)
-) && !empty(monitoringIntentKeyUriSegments[5])
-  ? monitoringIntentSigningKeyUriWithVersion
+) && !empty(monitoringIntentKeyUriSegments[5]) && toLower(
+  string(monitoringIntentSigningKey.properties.keyUriWithVersion)
+) == toLower(monitoringIntentSigningKeyUriWithVersion) && toLower(
+  string(configuredMonitoringIntentTrustedKey.keyVaultKeyId)
+) == toLower(monitoringIntentSigningKeyUriWithVersion)
+  ? string(monitoringIntentSigningKey.properties.keyUriWithVersion)
   : fail('monitoringIntentSigningKeyUriWithVersion must be one exact versioned URI for monitoringIntentSigningKeyResourceId')
+var collectorSigningKeyFingerprint = toLower(string(configuredCollectorSigningKey.publicKeyFingerprint))
+var monitoringIntentKeyFingerprint = toLower(
+  string(configuredMonitoringIntentTrustedKey.publicKeyFingerprint)
+)
+var collectorSigningKeyFingerprintCandidate = replace(
+  monitoringCollectorSigningKeyPublicKeyFingerprint,
+  'sha256:',
+  ''
+)
+var collectorSigningKeyFingerprintWithoutDigits = replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(
+  collectorSigningKeyFingerprintCandidate,
+  '0',
+  ''
+), '1', ''), '2', ''), '3', ''), '4', ''), '5', ''), '6', ''), '7', ''), '8', ''), '9', '')
+var collectorSigningKeyFingerprintInvalidCharacters = replace(replace(replace(replace(replace(replace(
+  collectorSigningKeyFingerprintWithoutDigits,
+  'a',
+  ''
+), 'b', ''), 'c', ''), 'd', ''), 'e', ''), 'f', '')
+var intentSigningKeyFingerprintCandidate = replace(
+  monitoringIntentSigningKeyPublicKeyFingerprint,
+  'sha256:',
+  ''
+)
+var intentSigningKeyFingerprintWithoutDigits = replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(
+  intentSigningKeyFingerprintCandidate,
+  '0',
+  ''
+), '1', ''), '2', ''), '3', ''), '4', ''), '5', ''), '6', ''), '7', ''), '8', ''), '9', '')
+var intentSigningKeyFingerprintInvalidCharacters = replace(replace(replace(replace(replace(replace(
+  intentSigningKeyFingerprintWithoutDigits,
+  'a',
+  ''
+), 'b', ''), 'c', ''), 'd', ''), 'e', ''), 'f', '')
+var validatedCollectorSigningKeyFingerprint = monitoringCollectorSigningKeyPublicKeyFingerprint == toLower(
+  monitoringCollectorSigningKeyPublicKeyFingerprint
+) && startsWith(
+  monitoringCollectorSigningKeyPublicKeyFingerprint,
+  'sha256:'
+) && length(
+  collectorSigningKeyFingerprintCandidate
+) == 64 && empty(
+  collectorSigningKeyFingerprintInvalidCharacters
+) && monitoringCollectorSigningKeyPublicKeyFingerprint != rejectedEvidenceDigest && collectorSigningKeyFingerprint == monitoringCollectorSigningKeyPublicKeyFingerprint
+  ? monitoringCollectorSigningKeyPublicKeyFingerprint
+  : fail('monitoringCollectorSigningKeyPublicKeyFingerprint must be the independently measured fingerprint embedded in collectorSigningKey')
+var validatedMonitoringIntentSigningKeyFingerprint = monitoringIntentSigningKeyPublicKeyFingerprint == toLower(
+  monitoringIntentSigningKeyPublicKeyFingerprint
+) && startsWith(
+  monitoringIntentSigningKeyPublicKeyFingerprint,
+  'sha256:'
+) && length(
+  intentSigningKeyFingerprintCandidate
+) == 64 && empty(
+  intentSigningKeyFingerprintInvalidCharacters
+) && monitoringIntentSigningKeyPublicKeyFingerprint != rejectedEvidenceDigest && monitoringIntentKeyFingerprint == monitoringIntentSigningKeyPublicKeyFingerprint
+  ? monitoringIntentSigningKeyPublicKeyFingerprint
+  : fail('monitoringIntentSigningKeyPublicKeyFingerprint must be the independently measured fingerprint embedded in monitoringIntentTrustedKey')
+var validatedSigningKeySeparation = toLower(
+  validatedCollectorSigningKeyResourceId
+) != toLower(
+  validatedMonitoringIntentSigningKeyResourceId
+) && toLower(validatedSigningKeyUri) != toLower(
+  validatedMonitoringIntentSigningKeyUri
+) && validatedCollectorSigningKeyFingerprint != validatedMonitoringIntentSigningKeyFingerprint
+  ? 'separate'
+  : fail('collector receipt signing and human-owned monitoring-intent keys must use distinct ARM resources, exact versions, and public-key fingerprints')
 var configurationDigestCandidate = replace(acquisitionRuntimeConfigurationDigest, 'sha256:', '')
 var configurationDigestWithoutDigits = replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(
   configurationDigestCandidate,
@@ -352,8 +500,8 @@ var resourceTags = union(tags, {
   monitoringEvidenceStorageReadinessDigest: monitoringEvidenceStorageReadinessDigest
   evidenceStorageAccountResourceId: validatedEvidenceStorageAccountResourceId
   evidenceContainerResourceId: validatedEvidenceContainerResourceId
-  signingKeyUri: validatedSigningKeyUri
-  monitoringIntentSigningKeyUri: validatedMonitoringIntentSigningKeyUri
+  signingKeyUri: monitoringCollectorSigningKeyUriWithVersion
+  monitoringIntentSigningKeyUri: monitoringIntentSigningKeyUriWithVersion
 })
 var acrPullRoleDefinitionId = subscriptionResourceId(
   'Microsoft.Authorization/roleDefinitions',
@@ -375,7 +523,9 @@ var validatedRegistryResourceId = toLower(registry.id) == toLower(registryResour
   : fail('registryResourceId does not resolve to the reviewed ACR')
 
 module storageReadiness 'modules/storage-readiness.bicep' = {
-  name: 'wc028-monitoring-evidence-storage-readiness'
+  name: validatedPr99RuntimeDependencyGate == 'ready'
+    ? 'wc028-monitoring-evidence-storage-readiness'
+    : 'wc028-monitoring-evidence-storage-readiness-blocked'
   scope: subscription()
   params: {
     storageAccountResourceId: validatedEvidenceStorageAccountResourceId
@@ -384,6 +534,7 @@ module storageReadiness 'modules/storage-readiness.bicep' = {
     expectedImmutabilityRetentionDays: int(validatedConfiguredStorageReadiness.immutabilityRetentionDays)
     storageReadinessDigest: string(validatedConfiguredStorageReadiness.readinessDigest)
     expectedReadbackBindingId: string(validatedConfiguredStorageReadiness.readbackBindingId)
+    signingKeySeparationGate: validatedSigningKeySeparation
   }
 }
 

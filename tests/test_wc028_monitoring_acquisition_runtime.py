@@ -146,6 +146,11 @@ COLLECTOR_KEY_ID = (
     "https://synthetic-monitoring-kv.vault.azure.net/keys/"
     "monitoring-evidence-signing/11111111111111111111111111111111"
 )
+COLLECTOR_KEY_ARM_RESOURCE_ID = (
+    f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg-athena-demo-monitoring/"
+    "providers/Microsoft.KeyVault/vaults/synthetic-monitoring-kv/"
+    "keys/monitoring-evidence-signing"
+)
 INTENT_KEY_ID = (
     "https://synthetic-context-kv.vault.azure.net/keys/"
     "monitoring-intent-signing/22222222222222222222222222222222"
@@ -720,6 +725,46 @@ def test_configuration_preserves_identity_and_storage_separation(
     shared_support_principal["runtimeSupportIdentityPrincipalId"] = COLLECTOR_PRINCIPAL_ID
     with pytest.raises(ValidationError, match="client/principal identities"):
         Wc028MonitoringAcquisitionJobConfiguration.model_validate(shared_support_principal)
+
+
+def test_configuration_rejects_shared_collector_and_monitoring_intent_key() -> None:
+    shared_key = _configuration_payload()
+    shared_key["monitoringIntentSigningKeyResourceId"] = COLLECTOR_KEY_ARM_RESOURCE_ID
+    shared_key["monitoringIntentTrustedKey"] = copy.deepcopy(shared_key["collectorSigningKey"])
+    shared_key["runtimeSupportEffectiveRbacInventory"] = _runtime_support_rbac_inventory(
+        monitoring_intent_key_resource_id=COLLECTOR_KEY_ARM_RESOURCE_ID,
+    )
+    _refresh_configuration_replay_key(shared_key)
+
+    with pytest.raises(ValidationError, match="distinct Key Vault key resources"):
+        Wc028MonitoringAcquisitionJobConfiguration.model_validate(shared_key)
+
+    shared_key_resource = _configuration_payload()
+    collector_key = cast(
+        dict[str, object],
+        shared_key_resource["collectorSigningKey"],
+    )
+    collector_key["keyVaultKeyId"] = (
+        "https://synthetic-context-kv.vault.azure.net/keys/"
+        "monitoring-intent-signing/33333333333333333333333333333333"
+    )
+    _refresh_configuration_replay_key(shared_key_resource)
+
+    with pytest.raises(ValidationError, match="distinct Key Vault key resources"):
+        Wc028MonitoringAcquisitionJobConfiguration.model_validate(shared_key_resource)
+
+
+def test_configuration_rejects_shared_key_fingerprint_under_distinct_ids() -> None:
+    shared_fingerprint = _configuration_payload()
+    collector_key = cast(
+        dict[str, object],
+        shared_fingerprint["collectorSigningKey"],
+    )
+    collector_key["publicKeyFingerprint"] = DIGEST_A
+    _refresh_configuration_replay_key(shared_fingerprint)
+
+    with pytest.raises(ValidationError, match="distinct public-key fingerprints"):
+        Wc028MonitoringAcquisitionJobConfiguration.model_validate(shared_fingerprint)
 
 
 def test_configuration_accepts_tenant_bound_identity_proof_audience() -> None:
@@ -2436,6 +2481,42 @@ def test_runtime_support_key_guard_preserves_request_error_when_postcheck_also_f
         for note in caught.value.__notes__
     )
     assert validation_calls == 2
+    assert clock_values == []
+
+
+def test_runtime_support_key_guard_preserves_request_error_on_nonmonotonic_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configuration = Wc028MonitoringAcquisitionJobConfiguration.model_validate(
+        _configuration_payload()
+    )
+    clock_values = [NOW, NOW - timedelta(seconds=1)]
+
+    def utc_now() -> datetime:
+        if not clock_values:
+            raise AssertionError("runtime-support key guard requested an unexpected timestamp")
+        return clock_values.pop(0)
+
+    monkeypatch.setattr(runtime_module, "_utc_now_milliseconds", utc_now)
+    monkeypatch.setattr(
+        runtime_module,
+        "_validate_runtime_support_effective_rbac",
+        lambda **_kwargs: None,
+    )
+    request_error = ServiceRequestError("synthetic primary key transport failure")
+
+    with (
+        pytest.raises(ServiceRequestError) as caught,
+        runtime_module._guard_runtime_support_key_request(configuration=configuration),
+    ):
+        raise request_error
+
+    assert caught.value is request_error
+    assert any(
+        "post-request runtime-support RBAC revalidation also failed" in note
+        and "request interval is non-monotonic" in note
+        for note in caught.value.__notes__
+    )
     assert clock_values == []
 
 

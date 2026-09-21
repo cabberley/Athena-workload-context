@@ -1073,8 +1073,37 @@ class Wc028MonitoringAcquisitionJobConfiguration(_StrictRuntimeModel):
             == self.runtime_support_monitoring_intent_key_reader_role_definition_id
         ):
             raise ValueError("runtime-support role IDs do not bind exact ACR and key-read roles")
+        collector_key_url = urlsplit(self.collector_signing_key.key_vault_key_id)
         key_url = urlsplit(self.monitoring_intent_trusted_key.key_vault_key_id)
+        collector_key_path_segments = collector_key_url.path.strip("/").split("/")
         key_path_segments = key_url.path.strip("/").split("/")
+        if (
+            self.collector_signing_key.key_vault_key_id.casefold()
+            == self.monitoring_intent_trusted_key.key_vault_key_id.casefold()
+            or (
+                collector_key_url.hostname is not None
+                and key_url.hostname is not None
+                and collector_key_url.hostname.casefold() == key_url.hostname.casefold()
+                and len(collector_key_path_segments) == 3
+                and len(key_path_segments) == 3
+                and collector_key_path_segments[0].casefold() == "keys"
+                and key_path_segments[0].casefold() == "keys"
+                and collector_key_path_segments[1].casefold()
+                == key_path_segments[1].casefold()
+            )
+        ):
+            raise ValueError(
+                "collector receipt signing and monitoring-intent trust must use distinct "
+                "Key Vault key resources and exact versions"
+            )
+        if (
+            self.collector_signing_key.public_key_fingerprint
+            == self.monitoring_intent_trusted_key.public_key_fingerprint
+        ):
+            raise ValueError(
+                "collector receipt signing and monitoring-intent trust must use distinct "
+                "public-key fingerprints"
+            )
         key_vault_name = (
             key_url.hostname.removesuffix(".vault.azure.net")
             if key_url.hostname is not None
@@ -2732,8 +2761,9 @@ def _require_pr99_conditioned_blob_contract(
         "WC-028 deployment remains blocked until the PR #99 restack pins the exact successor "
         "collector schema and digest together with the conditioned known-name Blob read and "
         "add/action bootstrap, reviewed storage-protection contract, signed persistence replay "
-        "binding, ancestor-complete collector RBAC evidence, and successor receipt and authority "
-        "schemas for mandatory wire attempts and their call budget"
+        "binding, upstream-bound runtime-support hierarchy evidence, a completed two-phase support "
+        "RBAC bootstrap handoff, ancestor-complete collector RBAC evidence, and successor receipt "
+        "and authority schemas for mandatory wire attempts and their call budget"
     )
 
 

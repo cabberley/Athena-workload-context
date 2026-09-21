@@ -21,6 +21,12 @@ param storageReadinessDigest string
 @description('ARM guid() binding computed from the exact runtime storage-readiness preimage.')
 param expectedReadbackBindingId string
 
+@description('Validated root-deployment proof that collector receipt and monitoring-intent keys are distinct.')
+@allowed([
+  'separate'
+])
+param signingKeySeparationGate string
+
 var normalizedStorageAccountResourceId = toLower(storageAccountResourceId)
 var normalizedContainerResourceId = toLower(containerResourceId)
 var subscriptionPrefix = toLower('/subscriptions/${subscription().subscriptionId}/')
@@ -83,7 +89,7 @@ var validatedStorageReadinessDigest = toLower(storageAccount.id) == normalizedSt
   monitoringEvidenceContainer.id
 ) == normalizedContainerResourceId && toLower(
   expectedContainerResourceId
-) == normalizedContainerResourceId && blobService.properties.isVersioningEnabled == true && monitoringEvidenceContainer.properties.publicAccess == 'None' && monitoringEvidenceImmutability.properties.state == expectedImmutabilityPolicyState && monitoringEvidenceImmutability.properties.immutabilityPeriodSinceCreationInDays == expectedImmutabilityRetentionDays && monitoringEvidenceImmutability.properties.allowProtectedAppendWrites == false && monitoringEvidenceImmutability.properties.allowProtectedAppendWritesAll == false && expectedReadbackBindingId == computedReadbackBindingId
+) == normalizedContainerResourceId && signingKeySeparationGate == 'separate' && blobService.properties.isVersioningEnabled == true && monitoringEvidenceContainer.properties.publicAccess == 'None' && monitoringEvidenceImmutability.properties.state == expectedImmutabilityPolicyState && monitoringEvidenceImmutability.properties.immutabilityPeriodSinceCreationInDays == expectedImmutabilityRetentionDays && monitoringEvidenceImmutability.properties.allowProtectedAppendWrites == false && monitoringEvidenceImmutability.properties.allowProtectedAppendWritesAll == false && expectedReadbackBindingId == computedReadbackBindingId
   ? validatedDigest
   : fail('WC-024 monitoring evidence storage is not versioned or does not match the reviewed immutability policy and retention')
 

@@ -42,9 +42,12 @@ def test_wc028_job_reuses_wc024_identity_key_and_evidence_boundary() -> None:
         "monitoringEvidenceStorageReadinessDigest",
         "monitoringEvidenceImmutabilityPolicyState",
         "monitoringEvidenceImmutabilityRetentionDays",
+        "monitoringCollectorSigningKeyResourceId",
         "monitoringCollectorSigningKeyUriWithVersion",
+        "monitoringCollectorSigningKeyPublicKeyFingerprint",
         "monitoringIntentSigningKeyResourceId",
         "monitoringIntentSigningKeyUriWithVersion",
+        "monitoringIntentSigningKeyPublicKeyFingerprint",
         "ATHENA_WC028_MONITORING_ACQUISITION_CONFIG_JSON",
         "ATHENA_WC028_MONITORING_ACQUISITION_CONFIG_DIGEST",
         "ATHENA_WC028_DEPLOYED_LEGACY_COLLECTOR_RBAC_CLEANUP_DIGEST",
@@ -165,6 +168,53 @@ def test_wc028_job_adds_no_broad_reader_or_monitoring_mutation() -> None:
     assert "principalId: collectorPrincipalId" in source
 
 
+def test_runtime_signing_keys_are_resolved_and_separated_before_modules() -> None:
+    source = BICEP.read_text(encoding="utf-8")
+
+    for expected in (
+        "param monitoringCollectorSigningKeyResourceId string",
+        "resource collectorSigningKeyVault 'Microsoft.KeyVault/vaults@2024-11-01' existing",
+        "resource collectorSigningKey 'Microsoft.KeyVault/vaults/keys@2024-11-01' existing",
+        "resource monitoringIntentKeyVault 'Microsoft.KeyVault/vaults@2024-11-01' existing",
+        "resource monitoringIntentSigningKey 'Microsoft.KeyVault/vaults/keys@2024-11-01' existing",
+        "collectorSigningKey.properties.keyUriWithVersion",
+        "monitoringIntentSigningKey.properties.keyUriWithVersion",
+        "${collectorSigningKeyVaultName}${environment().suffixes.keyvaultDns}",
+        "${monitoringIntentVaultName}${environment().suffixes.keyvaultDns}",
+        "param monitoringCollectorSigningKeyPublicKeyFingerprint string",
+        "param monitoringIntentSigningKeyPublicKeyFingerprint string",
+        "validatedCollectorSigningKeyFingerprint",
+        "validatedMonitoringIntentSigningKeyFingerprint",
+        "validatedCollectorSigningKeyResourceId",
+        "validatedMonitoringIntentSigningKeyResourceId",
+        "string(parsedRuntimeConfiguration.monitoringIntentSigningKeyResourceId)",
+        "toLower(validatedSigningKeyUri) != toLower(",
+        (
+            "validatedCollectorSigningKeyFingerprint != "
+            "validatedMonitoringIntentSigningKeyFingerprint"
+        ),
+        "signingKeySeparationGate: validatedSigningKeySeparation",
+        (
+            "collector receipt signing and human-owned monitoring-intent keys must use distinct "
+            "ARM resources, exact versions, and public-key fingerprints"
+        ),
+        "validatedPr99RuntimeDependencyGate = pr99RuntimeDependenciesReady",
+    ):
+        assert expected in source
+
+    assert source.index("var validatedSigningKeySeparation") < source.index(
+        "module storageReadiness"
+    )
+    assert source.index("var validatedSigningKeySeparation") < source.index(
+        "module acquisitionRbac"
+    )
+    assert source.index("var validatedSigningKeySeparation") < source.index(
+        "resource acquisitionJob"
+    )
+    assert "${collectorSigningKeyVaultName}.${environment().suffixes.keyvaultDns}" not in source
+    assert "${monitoringIntentVaultName}.${environment().suffixes.keyvaultDns}" not in source
+
+
 def test_runtime_iac_adds_only_exact_create_and_known_name_read_storage_grant() -> None:
     role_source = (INFRA / "modules" / "acquisition-rbac.bicep").read_text(encoding="utf-8")
     assignment_source = (
@@ -236,10 +286,11 @@ def test_storage_readiness_gates_writer_rbac_and_job_on_exact_wc024_readback() -
     assert "param pr99RuntimeDependenciesReady bool = false" in main
     assert (
         "WC-028 deployment remains blocked pending the exact successor collector schema and "
-        "digest plus the complete reviewed PR #99 storage, replay, ancestor-RBAC, receipt, "
-        "and authority contracts"
+        "digest, upstream-bound support hierarchy, completed support-RBAC bootstrap handoff, "
+        "and complete reviewed PR #99 storage, replay, ancestor-RBAC, receipt, and authority "
+        "contracts"
     ) in main
-    assert main.count("validatedPr99RuntimeDependencyGate == 'ready'") == 3
+    assert main.count("validatedPr99RuntimeDependencyGate == 'ready'") == 4
 
 
 def test_upgrade_cleanup_targets_only_exact_legacy_collector_bindings() -> None:

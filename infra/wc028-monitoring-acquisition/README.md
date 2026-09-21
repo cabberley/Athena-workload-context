@@ -60,10 +60,7 @@ and approved change scope. It also binds:
 
 - the WC-024 collector resource, client, and principal identities;
 - the separate runtime-support resource, client, and principal identities;
-- the exact registry and monitoring-intent key scopes, the two permitted role IDs, and fresh
-  hierarchy-complete runtime-support effective-RBAC evidence covering every intervening ARM scope
-  (including the containing Key Vault and leaf key), direct and inherited assignments, transitive
-  groups, active PIM schedules, conditions, and deny assignments;
+- the exact registry and monitoring-intent key scopes and the two permitted role IDs;
 - the separate Athena context resource and principal identities;
 - the monitoring-evidence storage endpoint and container;
 - the non-zero storage-readiness digest and exact versioning/immutability readback;
@@ -74,6 +71,13 @@ and approved change scope. It also binds:
 - a non-zero one-execution ID plus deterministic persistence replay key. Refreshing the current
   support inventory does not change the stable recovery path; the collector-signed recovery state
   retains the original inventory digest and execution-time validity window.
+
+The collector receipt key and human-owned monitoring-intent key must use different Key Vault key
+resources, exact versioned URIs, and public-key fingerprints. The root template resolves both ARM
+key resources, reads each resource's actual `keyUriWithVersion`, and compares those bindings with
+the embedded runtime configuration before its dependency gate can release any module or Job. The
+two fingerprint parameters must come from independent read-only public-key preflight, not be copied
+from the configuration being validated.
 
 Every physical monitoring-intent Key Vault request is wrapped at the HTTP transport boundary.
 Trusted time and runtime-support RBAC are revalidated immediately before and after each attempt,
@@ -107,6 +111,12 @@ IP Flow calls and no IP Flow RBAC.
 > revision, a reviewed storage-protection contract, and the collector-signed persistence replay
 > binding. PR #99 must also replace its current subscription-descendant-only inventory with
 > ancestor-complete evidence that can detect inherited management-group or tenant-root grants.
+> The provisional runtime-support inventory v1 is not sufficient to open the gate: the restack must
+> bind a successor inventory to the upstream reviewed management-group hierarchy, ordered adjacent
+> scope edges ending at the tenant root, target-bound scope reads, and genuinely independent first
+> and second collection snapshots. Deployment must also be split into a support-RBAC bootstrap
+> phase and a later inventory/config-validation plus Job phase; a pre-bootstrap inventory cannot
+> authorize the Job.
 > This branch must then be restacked on that exact head. Runtime startup remains unconditionally
 > blocked in this draft; merely changing the shared current-schema constant cannot make an
 > intermediate successor deployable. The final restack may replace the runtime gate only while
