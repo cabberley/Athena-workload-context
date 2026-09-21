@@ -295,12 +295,20 @@ their canonical `originRoleAssignmentId`, must agree with the underlying role as
 not double-count one of the exact three reviewed assignments. Pagination follows only canonical
 `management.azure.com`
 continuations and fails closed on malformed pages, API errors, duplicate instances, or page,
-instance, and total-call bounds. Quarantine and quarantined-artifact read permissions are treated
-as pull-capable whether they appear in `actions` or `dataActions`. Role-assignment and
-role-eligibility schedule request writes, approval-required eligibility writes, and role-management
-policy administration are escalation paths at scopes that can govern ACR. The same classification
-rejects tenant access elevation plus ACR quarantine mutation, task execution/administration,
-update-policy mutation, and quarantined-artifact writes.
+instance, and total-call bounds. Pull classification keeps Azure RBAC permission planes exact:
+`registries/pull/read` and `registries/quarantine/read` grant pull only through `actions`, while
+`registries/repositories/content/read` and `registries/quarantinedArtifacts/read` grant pull only
+through `dataActions`. Wildcards are matched case-insensitively within the same plane, with
+same-permission-block `notActions` or `notDataActions` subtraction. An exclusion is not a deny:
+another effective role assignment that grants one of the four permissions still wins.
+Repository metadata or catalog reads, registry management reads, and login/control-plane
+management alone are not image-pull permission. `AcrQuarantineReader` and
+`AcrQuarantineWriter` remain pull-capable because they include the exact quarantine control read
+and quarantined-artifact data read. Role-assignment and role-eligibility schedule request writes,
+approval-required eligibility writes, and role-management policy administration are escalation
+paths at scopes that can govern ACR. The same classification rejects tenant access elevation plus
+ACR quarantine mutation, task execution/administration, update-policy mutation, and
+quarantined-artifact writes.
 Pass the publisher deployment's exact image-pull identity resource output as
 `ManagedIdentityResourceId`; the probe live-reads that user-assigned identity before and after the
 pull and binds its resource, client, and principal IDs to both the effective scan and Docker login.

@@ -12,13 +12,17 @@ from scripts.verify_wc027_acr_effective_access import (
     ABAC_ROLE_ASSIGNMENT_MODE,
     ACR_ESCALATION_ACTIONS,
     ACR_ESCALATION_DATA_ACTIONS,
+    ACR_PULL_ACTIONS,
+    ACR_PULL_DATA_ACTIONS,
     ACR_PULL_ROLE_ID,
     ACR_QUARANTINE_READ_ACTION,
-    ACR_QUARANTINED_ARTIFACTS_READ_ACTION,
+    ACR_QUARANTINED_ARTIFACTS_READ_DATA_ACTION,
+    ACR_REPOSITORY_CONTENT_READ_DATA_ACTION,
     ACR_REPOSITORY_READER_ROLE_ID,
     EffectiveAccessError,
     ExpectedAssignment,
     _repository_condition,
+    _role_definition_grants_acr_pull,
     verify_effective_access,
 )
 
@@ -88,6 +92,14 @@ EXPECTED_ESCALATION_ACTIONS = (
 EXPECTED_ESCALATION_DATA_ACTIONS = (
     "Microsoft.ContainerRegistry/registries/quarantinedArtifacts/write",
 )
+EXPECTED_PULL_ACTIONS = (
+    "Microsoft.ContainerRegistry/registries/pull/read",
+    "Microsoft.ContainerRegistry/registries/quarantine/read",
+)
+EXPECTED_PULL_DATA_ACTIONS = (
+    "Microsoft.ContainerRegistry/registries/repositories/content/read",
+    "Microsoft.ContainerRegistry/registries/quarantinedArtifacts/read",
+)
 
 
 def _expected_assignments() -> tuple[ExpectedAssignment, ...]:
@@ -137,6 +149,19 @@ def _role_definition(
             "permissions": [permission],
         },
     }
+
+
+def _grants_acr_pull(permission: dict[str, object]) -> bool:
+    return _role_definition_grants_acr_pull(
+        _role_definition(
+            (
+                f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+                "Microsoft.Authorization/roleDefinitions/"
+                "98989898-9898-4898-8898-989898989898"
+            ),
+            permission,
+        )
+    )
 
 
 def _assignment(
@@ -414,6 +439,161 @@ def _classic_next_link(principal_id: str, page_number: int) -> str:
     )
 
 
+def test_acr_pull_action_contract_uses_exact_control_and_data_planes() -> None:
+    assert ACR_PULL_ACTIONS == EXPECTED_PULL_ACTIONS
+    assert ACR_PULL_DATA_ACTIONS == EXPECTED_PULL_DATA_ACTIONS
+
+
+@pytest.mark.parametrize(
+    "permission",
+    (
+        _permission(actions=(EXPECTED_PULL_ACTIONS[0],)),
+        _permission(actions=(EXPECTED_PULL_ACTIONS[1],)),
+        _permission(data_actions=(EXPECTED_PULL_DATA_ACTIONS[0],)),
+        _permission(data_actions=(EXPECTED_PULL_DATA_ACTIONS[1],)),
+    ),
+)
+def test_acr_pull_classifier_accepts_each_exact_pull_permission(
+    permission: dict[str, object],
+) -> None:
+    assert _grants_acr_pull(permission)
+
+
+@pytest.mark.parametrize(
+    "permission",
+    (
+        _permission(data_actions=(EXPECTED_PULL_ACTIONS[0],)),
+        _permission(data_actions=(EXPECTED_PULL_ACTIONS[1],)),
+        _permission(actions=(EXPECTED_PULL_DATA_ACTIONS[0],)),
+        _permission(actions=(EXPECTED_PULL_DATA_ACTIONS[1],)),
+    ),
+)
+def test_acr_pull_classifier_rejects_pull_permissions_in_the_wrong_plane(
+    permission: dict[str, object],
+) -> None:
+    assert not _grants_acr_pull(permission)
+
+
+@pytest.mark.parametrize(
+    "permission",
+    (
+        _permission(actions=("Microsoft.ContainerRegistry/registries/*",)),
+        _permission(data_actions=("Microsoft.ContainerRegistry/registries/*",)),
+    ),
+)
+def test_acr_pull_classifier_honors_wildcards_in_each_permission_plane(
+    permission: dict[str, object],
+) -> None:
+    assert _grants_acr_pull(permission)
+
+
+@pytest.mark.parametrize(
+    "permission",
+    (
+        _permission(
+            actions=("Microsoft.ContainerRegistry/registries/*",),
+            not_actions=EXPECTED_PULL_ACTIONS,
+        ),
+        _permission(
+            data_actions=("Microsoft.ContainerRegistry/registries/*",),
+            not_data_actions=EXPECTED_PULL_DATA_ACTIONS,
+        ),
+    ),
+)
+def test_acr_pull_classifier_honors_same_role_exclusions(
+    permission: dict[str, object],
+) -> None:
+    assert not _grants_acr_pull(permission)
+
+
+@pytest.mark.parametrize(
+    "permission",
+    (
+        _permission(actions=(EXPECTED_PULL_ACTIONS[0].upper(),)),
+        _permission(actions=(EXPECTED_PULL_ACTIONS[1].upper(),)),
+        _permission(data_actions=(EXPECTED_PULL_DATA_ACTIONS[0].upper(),)),
+        _permission(data_actions=(EXPECTED_PULL_DATA_ACTIONS[1].upper(),)),
+    ),
+)
+def test_acr_pull_classifier_is_case_insensitive(
+    permission: dict[str, object],
+) -> None:
+    assert _grants_acr_pull(permission)
+
+
+@pytest.mark.parametrize(
+    "permission",
+    (
+        _permission(
+            data_actions=(
+                "Microsoft.ContainerRegistry/registries/repositories/metadata/read",
+            )
+        ),
+        _permission(
+            data_actions=(
+                "Microsoft.ContainerRegistry/registries/repositories/catalog/read",
+            )
+        ),
+        _permission(actions=("Microsoft.ContainerRegistry/registries/read",)),
+        _permission(
+            actions=(
+                "Microsoft.ContainerRegistry/registries/listCredentials/action",
+            )
+        ),
+    ),
+)
+def test_acr_pull_classifier_rejects_non_pull_registry_permissions(
+    permission: dict[str, object],
+) -> None:
+    assert not _grants_acr_pull(permission)
+
+
+@pytest.mark.parametrize(
+    ("role_name", "permission"),
+    (
+        (
+            "AcrPull",
+            _permission(actions=(ACR_PULL_ACTIONS[0],)),
+        ),
+        (
+            "Container Registry Repository Reader",
+            _permission(
+                data_actions=(
+                    ACR_REPOSITORY_CONTENT_READ_DATA_ACTION,
+                    "Microsoft.ContainerRegistry/registries/repositories/metadata/read",
+                )
+            ),
+        ),
+        (
+            "AcrQuarantineReader",
+            _permission(
+                actions=(ACR_QUARANTINE_READ_ACTION,),
+                data_actions=(ACR_QUARANTINED_ARTIFACTS_READ_DATA_ACTION,),
+            ),
+        ),
+        (
+            "AcrQuarantineWriter",
+            _permission(
+                actions=(
+                    ACR_QUARANTINE_READ_ACTION,
+                    "Microsoft.ContainerRegistry/registries/quarantine/write",
+                ),
+                data_actions=(
+                    ACR_QUARANTINED_ARTIFACTS_READ_DATA_ACTION,
+                    "Microsoft.ContainerRegistry/registries/quarantinedArtifacts/write",
+                ),
+            ),
+        ),
+    ),
+)
+def test_acr_pull_classifier_recognizes_pull_capable_built_in_role_shapes(
+    role_name: str,
+    permission: dict[str, object],
+) -> None:
+    assert role_name
+    assert _grants_acr_pull(permission)
+
+
 def test_effective_access_accepts_only_the_three_exact_direct_assignments() -> None:
     stub = StubAzure()
 
@@ -666,7 +846,9 @@ def test_effective_access_rejects_mixed_modes_across_different_registries() -> N
         ),
         (
             "custom-quarantined-artifacts-read",
-            _permission(actions=(ACR_QUARANTINED_ARTIFACTS_READ_ACTION,)),
+            _permission(
+                data_actions=(ACR_QUARANTINED_ARTIFACTS_READ_DATA_ACTION,)
+            ),
         ),
         (
             "role-assignment-writer",
@@ -1199,15 +1381,17 @@ def test_effective_access_rejects_transitive_group_active_pim_assignment() -> No
 
 
 @pytest.mark.parametrize(
-    "action",
+    "permission",
     (
-        ACR_QUARANTINE_READ_ACTION,
-        ACR_QUARANTINED_ARTIFACTS_READ_ACTION,
+        _permission(actions=(ACR_QUARANTINE_READ_ACTION,)),
+        _permission(
+            data_actions=(ACR_QUARANTINED_ARTIFACTS_READ_DATA_ACTION,)
+        ),
     ),
 )
 @pytest.mark.parametrize("assignment_source", ("direct", "inherited", "transitive-group"))
 def test_effective_access_rejects_quarantine_pull_paths(
-    action: str,
+    permission: dict[str, object],
     assignment_source: str,
 ) -> None:
     stub = StubAzure()
@@ -1219,7 +1403,7 @@ def test_effective_access_rejects_quarantine_pull_paths(
     )
     stub.roles[role_definition_id.casefold()] = _role_definition(
         role_definition_id,
-        _permission(actions=(action,)),
+        permission,
     )
     assignment_principal_id = (
         group_id if assignment_source == "transitive-group" else PRINCIPAL_IDS[2]
@@ -1258,13 +1442,15 @@ def test_effective_access_rejects_quarantine_pull_paths(
 
 
 @pytest.mark.parametrize(
-    "action",
+    "permission",
     (
-        ACR_QUARANTINE_READ_ACTION,
-        ACR_QUARANTINED_ARTIFACTS_READ_ACTION,
+        _permission(data_actions=(ACR_QUARANTINE_READ_ACTION,)),
+        _permission(actions=(ACR_QUARANTINED_ARTIFACTS_READ_DATA_ACTION,)),
     ),
 )
-def test_effective_access_rejects_quarantine_custom_data_actions(action: str) -> None:
+def test_effective_access_ignores_quarantine_permissions_in_the_wrong_plane(
+    permission: dict[str, object],
+) -> None:
     stub = StubAzure()
     role_definition_id = (
         f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
@@ -1273,7 +1459,7 @@ def test_effective_access_rejects_quarantine_custom_data_actions(action: str) ->
     )
     stub.roles[role_definition_id.casefold()] = _role_definition(
         role_definition_id,
-        _permission(data_actions=(action,)),
+        permission,
     )
     direct = stub.direct[PRINCIPAL_IDS[0]]
     assert isinstance(direct, list)
@@ -1284,8 +1470,7 @@ def test_effective_access_rejects_quarantine_custom_data_actions(action: str) ->
         )
     )
 
-    with pytest.raises(EffectiveAccessError, match="pull-capable assignment"):
-        _verify(stub)
+    assert _verify(stub)["verified"] is True
 
 
 def test_effective_access_rejects_missing_expected_assignment() -> None:
@@ -1322,9 +1507,7 @@ def test_effective_access_rejects_cross_component_expected_repository() -> None:
             actions=("*",),
             not_actions=(
                 "Microsoft.ContainerRegistry/registries/pull/read",
-                "Microsoft.ContainerRegistry/registries/repositories/content/read",
                 "Microsoft.ContainerRegistry/registries/quarantine/read",
-                "Microsoft.ContainerRegistry/registries/quarantinedArtifacts/read",
                 "Microsoft.Authorization/elevateAccess/action",
                 "Microsoft.Authorization/roleAssignments/write",
                 "Microsoft.Authorization/roleAssignmentScheduleRequests/write",
@@ -1354,9 +1537,7 @@ def test_effective_access_rejects_cross_component_expected_repository() -> None:
         _permission(
             data_actions=("*",),
             not_data_actions=(
-                "Microsoft.ContainerRegistry/registries/pull/read",
                 "Microsoft.ContainerRegistry/registries/repositories/content/read",
-                "Microsoft.ContainerRegistry/registries/quarantine/read",
                 "Microsoft.ContainerRegistry/registries/quarantinedArtifacts/read",
                 "Microsoft.ContainerRegistry/registries/quarantinedArtifacts/write",
             ),
@@ -1386,6 +1567,71 @@ def test_effective_access_honors_not_actions_and_not_data_actions(
     )
 
     assert _verify(stub)["verified"] is True
+
+
+@pytest.mark.parametrize(
+    ("excluded_permission", "regrant_permission"),
+    (
+        (
+            _permission(
+                actions=("*",),
+                not_actions=EXPECTED_PULL_ACTIONS + EXPECTED_ESCALATION_ACTIONS,
+            ),
+            _permission(actions=(EXPECTED_PULL_ACTIONS[0],)),
+        ),
+        (
+            _permission(
+                data_actions=("*",),
+                not_data_actions=(
+                    EXPECTED_PULL_DATA_ACTIONS + EXPECTED_ESCALATION_DATA_ACTIONS
+                ),
+            ),
+            _permission(data_actions=(EXPECTED_PULL_DATA_ACTIONS[0],)),
+        ),
+    ),
+)
+def test_effective_access_second_role_regrant_wins_over_other_role_exclusion(
+    excluded_permission: dict[str, object],
+    regrant_permission: dict[str, object],
+) -> None:
+    stub = StubAzure()
+    excluded_role_id = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+        "Microsoft.Authorization/roleDefinitions/"
+        "97979797-9797-4797-8797-979797979797"
+    )
+    regrant_role_id = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+        "Microsoft.Authorization/roleDefinitions/"
+        "98989898-9898-4898-8898-989898989897"
+    )
+    stub.roles[excluded_role_id.casefold()] = _role_definition(
+        excluded_role_id,
+        excluded_permission,
+    )
+    stub.roles[regrant_role_id.casefold()] = _role_definition(
+        regrant_role_id,
+        regrant_permission,
+    )
+    direct = stub.direct[PRINCIPAL_IDS[0]]
+    assert isinstance(direct, list)
+    direct.extend(
+        (
+            _extra_assignment(
+                principal_id=PRINCIPAL_IDS[0],
+                role_definition_id=excluded_role_id,
+                assignment_guid="97979797-9797-4797-8797-979797979798",
+            ),
+            _extra_assignment(
+                principal_id=PRINCIPAL_IDS[0],
+                role_definition_id=regrant_role_id,
+                assignment_guid="98989898-9898-4898-8898-989898989899",
+            ),
+        )
+    )
+
+    with pytest.raises(EffectiveAccessError, match="unreviewed direct"):
+        _verify(stub)
 
 
 @pytest.mark.parametrize(

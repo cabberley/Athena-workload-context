@@ -219,7 +219,12 @@ Any extra pull grant or escalation path—including
 policy administration, tenant access elevation, role-definition mutation, ACR credential
 administration, quarantine reads or mutation, task execution/administration, update-policy
 mutation, quarantined-artifact writes, custom roles, or a sibling registry in another
-subscription—fails closed. The scanner verifies
+subscription—fails closed. Pull classification preserves the Azure RBAC plane boundary:
+legacy pull and quarantine read are control-plane `actions`; repository-content and
+quarantined-artifact reads are `dataActions`. Wrong-plane strings, metadata/catalog reads, and
+registry login or management reads do not count as pull. Wildcards and same-role exclusions use
+normal role-definition semantics, while a separate effective role can re-grant an excluded
+permission because `NotActions` and `NotDataActions` are not deny assignments. The scanner verifies
 every referenced registry's live permission mode, and the proof exact-matches each reviewed
 assignment's principal, registry scope, role, condition version, and canonical repository
 condition; legacy `AcrPull` accepts null condition fields only. The bounded publisher probe repeats

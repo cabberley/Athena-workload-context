@@ -32,14 +32,16 @@ ACR_REPOSITORY_CONTENT_READ_DATA_ACTION = (
     "Microsoft.ContainerRegistry/registries/repositories/content/read"
 )
 ACR_QUARANTINE_READ_ACTION = "Microsoft.ContainerRegistry/registries/quarantine/read"
-ACR_QUARANTINED_ARTIFACTS_READ_ACTION = (
+ACR_QUARANTINED_ARTIFACTS_READ_DATA_ACTION = (
     "Microsoft.ContainerRegistry/registries/quarantinedArtifacts/read"
 )
-ACR_PULL_CAPABLE_ACTIONS = (
+ACR_PULL_ACTIONS = (
     ACR_LEGACY_PULL_ACTION,
-    ACR_REPOSITORY_CONTENT_READ_DATA_ACTION,
     ACR_QUARANTINE_READ_ACTION,
-    ACR_QUARANTINED_ARTIFACTS_READ_ACTION,
+)
+ACR_PULL_DATA_ACTIONS = (
+    ACR_REPOSITORY_CONTENT_READ_DATA_ACTION,
+    ACR_QUARANTINED_ARTIFACTS_READ_DATA_ACTION,
 )
 ACR_ESCALATION_ACTIONS = (
     "Microsoft.Authorization/elevateAccess/action",
@@ -1575,11 +1577,18 @@ def _role_definition_grants_acr_pull(
         _permission_profile_grants_action(
             profile,
             action,
-            is_data_action=is_data_action,
+            is_data_action=False,
         )
         for profile in profiles
-        for action in ACR_PULL_CAPABLE_ACTIONS
-        for is_data_action in (False, True)
+        for action in ACR_PULL_ACTIONS
+    ) or any(
+        _permission_profile_grants_action(
+            profile,
+            action,
+            is_data_action=True,
+        )
+        for profile in profiles
+        for action in ACR_PULL_DATA_ACTIONS
     )
 
 
