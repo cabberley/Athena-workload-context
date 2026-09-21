@@ -607,6 +607,50 @@ def test_activity_log_client_uses_exact_resource_filter_and_service_values() -> 
     ]
 
 
+@pytest.mark.parametrize(
+    "channel_specific_cause",
+    (
+        {"properties": {"healthEventCause": "PlatformInitiated"}},
+        {"properties": {"cause": "UserInitiated"}},
+        {"eventProperties": {"cause": "PlatformInitiated"}},
+    ),
+)
+def test_activity_log_channel_specific_cause_is_not_promoted_into_change_evidence(
+    channel_specific_cause: dict[str, object],
+) -> None:
+    request = _activity_request()
+    source_row: dict[str, object] = {
+        "category": {"value": "Administrative"},
+        "operationName": {
+            "value": "Microsoft.Network/networkSecurityGroups/securityRules/write"
+        },
+        "status": {"value": "Succeeded"},
+        "level": "Informational",
+        "resourceId": PRODUCTION_NSG_RULE_ID,
+        "correlationId": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        "eventTimestamp": (NOW - timedelta(minutes=5)).isoformat(),
+        **channel_specific_cause,
+    }
+    client = AzureActivityLogAcquisitionClient(
+        credential=_Credential(),
+        reviewed_contract=_acquisition_collector_contract(),
+        _transport=_MockTransport(_ResponseSpec({"value": [source_row]})),
+    )
+
+    result = client.query_activity_log(request)
+
+    assert len(result.rows) == 1
+    assert result.rows[0].model_dump(mode="json", by_alias=True) == {
+        "category": "Administrative",
+        "operationName": "Microsoft.Network/networkSecurityGroups/securityRules/write",
+        "resultType": "Succeeded",
+        "level": "Informational",
+        "targetResourceId": PRODUCTION_NSG_RULE_ID.casefold(),
+        "correlationId": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        "occurredAt": (NOW - timedelta(minutes=5)).isoformat().replace("+00:00", "Z"),
+    }
+
+
 def test_resource_graph_client_uses_generated_bounded_change_query() -> None:
     request = _resource_graph_request()
     occurred_at = NOW - timedelta(minutes=5)
@@ -825,7 +869,7 @@ def test_resource_health_result_row_keeps_legacy_reason_parseable() -> None:
     assert row.reason_type == "PlatformInitiated"
 
 
-def test_resource_health_graph_retains_resolved_transition() -> None:
+def test_resource_health_current_available_does_not_inherit_prior_event_cause() -> None:
     request = _resource_health_request()
     transport = _MockTransport(
         _ResponseSpec(
@@ -836,7 +880,12 @@ def test_resource_health_graph_retains_resolved_transition() -> None:
                         "occurredAt": (NOW - timedelta(minutes=2)).isoformat(),
                         "previousStatus": "Unavailable",
                         "currentStatus": "Available",
-                        "reasonType": "UserInitiated",
+                        "context": "Platform Initiated",
+                        "reasonType": "Unplanned",
+                        "healthEventCause": "PlatformInitiated",
+                        "recentlyResolved": {
+                            "resolvedTime": (NOW - timedelta(minutes=1)).isoformat(),
+                        },
                     }
                 ],
                 "resultTruncated": False,

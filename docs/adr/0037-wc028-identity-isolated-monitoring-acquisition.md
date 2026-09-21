@@ -190,8 +190,13 @@ The coordinator:
   `resourceHealthReasonAuthorityMode=availabilityStatusUnknownOnly` and
   `resourceHealthReasonEvidenceVersion=2`. Historical v2 monitoring intents remain parseable, but
   a current execution preflight accepts only the exact `Unknown` reason filter before credential
-  or source I/O; platform- or user-initiated filters fail closed. Built-in Reader remains limited
-  to the already reviewed DCR/DCE-association and flow-log child resources.
+  or source I/O; platform- or user-initiated filters fail closed. Cause-like metadata on a current
+  `Available` row, including prior-event `context`, `reasonType`, `healthEventCause`, or
+  `recentlyResolved` values, never changes that `Unknown` attribution. The Activity Log client is
+  retained only for exact change evidence and does not promote channel-specific
+  `properties.healthEventCause`, `properties.cause`, or `eventProperties.cause` paths into Resource
+  Health reason evidence. Built-in Reader remains limited to the already reviewed
+  DCR/DCE-association and flow-log child resources.
 - provisions a separate WC-028 resource-log role with only
   `Microsoft.Insights/Logs/Heartbeat/Read`, `Perf/Read`, `InsightsMetrics/Read`, `Syslog/Read`, and
   `VMConnection/Read`, assigns it only at the 11 exact approved VMs, and includes no invented NTA

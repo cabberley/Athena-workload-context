@@ -223,7 +223,11 @@ published v10 collector contract must contain
 `resourceHealthReasonAuthorityMode=availabilityStatusUnknownOnly` and
 `resourceHealthReasonEvidenceVersion=2`. Historical intent objects may still be parsed, but the
 current acquisition preflight must reject any non-`Unknown` reason filter before identity or
-source I/O.
+source I/O. A current `Available` row carrying prior-event `context`, `reasonType`,
+`healthEventCause`, or `recentlyResolved` metadata must still emit `Unknown`, never Platform or
+User attribution. Do not combine Activity Log's channel-specific `properties.healthEventCause`,
+`properties.cause`, or `eventProperties.cause` paths into one assumed JSON contract; the current
+Activity Log path remains change evidence only.
 
 For flow coverage, both declared legacy table names, `NTANetAnalytics` and
 `AzureNetworkAnalytics_CL`, are unsupported under the same exact path, direction, and five-tuple
