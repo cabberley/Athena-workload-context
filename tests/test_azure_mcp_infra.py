@@ -220,7 +220,7 @@ def test_official_reader_covers_required_resource_health_read() -> None:
     required = ROLE_CATALOG["requiredPermissions"]["resourceHealthAvailability"]
     assert reader["roleType"] == "BuiltInRole"
     assert reader["id"] == "acdd72a7-3385-48ef-bd42-f606fba81ae7"
-    assert required == "Microsoft.ResourceHealth/availabilityStatuses/current/read"
+    assert required == "Microsoft.ResourceHealth/availabilityStatuses/read"
     assert required.endswith("/read")
     assert "*/read" in reader["actions"]
     assert reader["dataActions"] == []

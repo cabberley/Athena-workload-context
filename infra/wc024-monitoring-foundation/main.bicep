@@ -568,14 +568,6 @@ module monitoringEvidenceReaderAssignments 'modules/monitoring-evidence-reader-r
   }
 }
 
-module resourceGraphQueryReaderAssignment 'modules/resource-graph-query-reader-rbac.bicep' = {
-  name: 'resource-graph-query-reader-assignment'
-  scope: resourceGroup(workloadResourceGroupName)
-  params: {
-    collectorPrincipalId: monitoringEvidenceSeams.outputs.collectorIdentityPrincipalId
-  }
-}
-
 module workloadEvidenceReaderAssignments 'modules/workload-monitoring-evidence-reader-rbac.bicep' = {
   name: 'workload-monitoring-evidence-reader-assignments'
   scope: resourceGroup(workloadResourceGroupName)
@@ -824,10 +816,9 @@ var collectorContractInputs = {
   identityProofAppRoleValue: monitoringIdentityProofAuthority.outputs.identityProofAppRoleValue
   identityProofAppRoleAssignmentId: monitoringIdentityProofAuthority.outputs.identityProofAppRoleAssignmentId
   identityProofAssignedPrincipalId: monitoringIdentityProofAuthority.outputs.identityProofAssignedPrincipalId
-  resourceGraphQueryRoleDefinitionId: resourceGraphQueryReaderAssignment.outputs.resourceGraphQueryRoleDefinitionId
-  resourceGraphQueryRoleName: resourceGraphQueryReaderAssignment.outputs.resourceGraphQueryRoleName
-  resourceGraphQueryScopeId: resourceGraphQueryReaderAssignment.outputs.resourceGraphQueryScopeId
-  resourceGraphQueryAllowedOperations: resourceGraphQueryReaderAssignment.outputs.resourceGraphQueryAllowedOperations
+  resourceGraphQueryRoleDefinitionId: workloadEvidenceReaderAssignments.outputs.resourceGraphQueryRoleDefinitionId
+  resourceGraphQueryRoleName: workloadEvidenceReaderAssignments.outputs.resourceGraphQueryRoleName
+  resourceGraphQueryScopeId: workloadEvidenceReaderAssignments.outputs.resourceGraphQueryScopeId
   resourceHealthRoleDefinitionId: workloadEvidenceReaderAssignments.outputs.resourceHealthRoleDefinitionId
   resourceHealthRoleName: workloadEvidenceReaderAssignments.outputs.resourceHealthRoleName
   resourceHealthScopeIds: workloadEvidenceReaderAssignments.outputs.resourceHealthScopeIds

@@ -98,8 +98,6 @@ type MonitoringReadOperation = Literal[
     "Microsoft.Network/networkWatchers/flowLogs/read",
     "Microsoft.Network/networkWatchers/ipFlowVerify/action",
     "Microsoft.Network/networkWatchers/ipFlowVerify/read",
-    "Microsoft.ResourceHealth/AvailabilityStatuses/read",
-    "Microsoft.ResourceHealth/AvailabilityStatuses/current/read",
     "Microsoft.ResourceHealth/availabilityStatuses/read",
     "Microsoft.ResourceGraph/resources/read",
     "Microsoft.Insights/logs/Heartbeat/read",
@@ -116,12 +114,7 @@ type MonitoringIpFlowVerifyOperation = Literal[
     "Microsoft.Network/networkWatchers/ipFlowVerify/action",
     "Microsoft.Network/networkWatchers/ipFlowVerify/read",
 ]
-type MonitoringResourceGraphQueryOperation = Literal[
-    "Microsoft.ResourceGraph/resources/read",
-]
 type MonitoringResourceHealthOperation = Literal[
-    "Microsoft.ResourceHealth/AvailabilityStatuses/read",
-    "Microsoft.ResourceHealth/AvailabilityStatuses/current/read",
     "Microsoft.ResourceHealth/availabilityStatuses/read",
     "Microsoft.ResourceGraph/resources/read",
 ]
@@ -344,11 +337,15 @@ _EXPECTED_PREVIOUS_PERMISSION_ATTESTED_RESOURCE_HEALTH_OPERATIONS: tuple[
 ] = (
     "Microsoft.ResourceGraph/resources/read",
 )
-_EXPECTED_RESOURCE_GRAPH_QUERY_OPERATIONS: tuple[MonitoringResourceGraphQueryOperation, ...] = (
+_EXPECTED_RESOURCE_GRAPH_QUERY_OPERATIONS: tuple[MonitoringResourceHealthOperation, ...] = (
     "Microsoft.ResourceGraph/resources/read",
 )
-_EXPECTED_RESOURCE_HEALTH_OPERATIONS: tuple[MonitoringResourceHealthOperation, ...] = (
+_EXPECTED_RESOURCE_HEALTH_ROLE_OPERATIONS: tuple[MonitoringResourceHealthOperation, ...] = (
     "Microsoft.ResourceHealth/availabilityStatuses/read",
+)
+_EXPECTED_RESOURCE_HEALTH_OPERATIONS: tuple[MonitoringResourceHealthOperation, ...] = (
+    *_EXPECTED_RESOURCE_GRAPH_QUERY_OPERATIONS,
+    *_EXPECTED_RESOURCE_HEALTH_ROLE_OPERATIONS,
 )
 _EXPECTED_RESOURCE_LOG_OPERATIONS: tuple[MonitoringResourceLogOperation, ...] = (
     "Microsoft.Insights/Logs/Heartbeat/Read",
@@ -358,7 +355,7 @@ _EXPECTED_RESOURCE_LOG_OPERATIONS: tuple[MonitoringResourceLogOperation, ...] = 
     "Microsoft.Insights/Logs/VMConnection/Read",
 )
 _EXPECTED_PREVIOUS_RESOURCE_HEALTH_OPERATIONS: tuple[MonitoringResourceHealthOperation, ...] = (
-    "Microsoft.ResourceHealth/AvailabilityStatuses/read",
+    "Microsoft.ResourceHealth/availabilityStatuses/read",
 )
 _EXPECTED_PREVIOUS_RESOURCE_LOG_OPERATIONS: tuple[MonitoringResourceLogOperation, ...] = (
     "Microsoft.Insights/logs/Heartbeat/read",
@@ -414,7 +411,6 @@ _EXPECTED_PREVIOUS_PERMISSION_ATTESTED_READ_OPERATIONS: tuple[
 )
 _EXPECTED_ACQUISITION_READ_OPERATIONS: tuple[MonitoringReadOperation, ...] = (
     *_EXPECTED_READ_OPERATIONS[3:],
-    *_EXPECTED_RESOURCE_GRAPH_QUERY_OPERATIONS,
     *_EXPECTED_RESOURCE_HEALTH_OPERATIONS,
     *_EXPECTED_RESOURCE_LOG_OPERATIONS,
 )
@@ -3675,14 +3671,6 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
         min_length=1,
         max_length=2048,
     )
-    resource_graph_query_allowed_operations: (
-        tuple[MonitoringResourceGraphQueryOperation, ...] | None
-    ) = Field(
-        default=None,
-        alias="resourceGraphQueryAllowedOperations",
-        min_length=len(_EXPECTED_RESOURCE_GRAPH_QUERY_OPERATIONS),
-        max_length=len(_EXPECTED_RESOURCE_GRAPH_QUERY_OPERATIONS),
-    )
     resource_health_role_definition_id: str | None = Field(
         default=None,
         alias="resourceHealthRoleDefinitionId",
@@ -3705,7 +3693,7 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
         Field(
             default=None,
             alias="resourceHealthAllowedOperations",
-            min_length=len(_EXPECTED_RESOURCE_HEALTH_OPERATIONS),
+            min_length=1,
             max_length=len(_EXPECTED_RESOURCE_HEALTH_OPERATIONS),
         )
     )
@@ -4136,7 +4124,6 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
             self.resource_graph_query_role_definition_id,
             self.resource_graph_query_role_name,
             self.resource_graph_query_scope_id,
-            self.resource_graph_query_allowed_operations,
         )
         measured_rbac_common_fields = (
             self.signal_reader_role_name,
@@ -4476,8 +4463,6 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
             )
         if self.schema_version == MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION and (
             any(item is None for item in (*resource_health_fields, *resource_graph_query_fields))
-            or self.resource_graph_query_allowed_operations
-            != _EXPECTED_RESOURCE_GRAPH_QUERY_OPERATIONS
             or self.resource_health_allowed_operations != _EXPECTED_RESOURCE_HEALTH_OPERATIONS
         ):
             raise ValueError(
@@ -5251,7 +5236,7 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
                     else MONITORING_PREVIOUS_EFFECTIVE_RBAC_INVENTORY_SCHEMA_VERSION
                 )
                 expected_resource_health_role_actions = (
-                    _EXPECTED_RESOURCE_HEALTH_OPERATIONS
+                    _EXPECTED_RESOURCE_HEALTH_ROLE_OPERATIONS
                     if current_resource_health_authorization
                     else _EXPECTED_PREVIOUS_PERMISSION_ATTESTED_RESOURCE_HEALTH_OPERATIONS
                 )
@@ -6143,7 +6128,7 @@ def _validate_current_effective_rbac_evidence(
         )
 
     expected_resource_health_operations = (
-        _EXPECTED_RESOURCE_HEALTH_OPERATIONS
+        _EXPECTED_RESOURCE_HEALTH_ROLE_OPERATIONS
         if is_current_resource_health_authorization
         else _EXPECTED_PREVIOUS_PERMISSION_ATTESTED_RESOURCE_HEALTH_OPERATIONS
     )
@@ -7611,7 +7596,6 @@ def verify_monitoring_acquisition_receipt_attestation(
         or reviewed_collector_contract.resource_graph_query_role_definition_id is None
         or reviewed_collector_contract.resource_graph_query_role_name is None
         or reviewed_collector_contract.resource_graph_query_scope_id is None
-        or reviewed_collector_contract.resource_graph_query_allowed_operations is None
         or reviewed_collector_contract.resource_health_role_definition_id is None
         or reviewed_collector_contract.resource_health_scope_ids is None
         or reviewed_collector_contract.resource_health_allowed_operations is None

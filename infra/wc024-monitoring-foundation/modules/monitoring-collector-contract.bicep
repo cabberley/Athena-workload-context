@@ -105,11 +105,6 @@ param resourceGraphQueryRoleName string
 @description('Exact approved workload resource-group scope at which the Resource Graph query operation is authorized.')
 param resourceGraphQueryScopeId string
 
-@description('Exact Azure Resource Graph query operation allowlist.')
-@minLength(1)
-@maxLength(1)
-param resourceGraphQueryAllowedOperations array
-
 @description('Exact custom role definition resource ID for Resource Health availability reads.')
 param resourceHealthRoleDefinitionId string
 
@@ -121,9 +116,9 @@ param resourceHealthRoleName string
 @maxLength(11)
 param resourceHealthScopeIds array
 
-@description('Exact Resource Health management-plane operation allowlist.')
-@minLength(1)
-@maxLength(1)
+@description('Exact Resource Graph query plus Resource Health availability operation allowlist.')
+@minLength(2)
+@maxLength(2)
 param resourceHealthAllowedOperations array
 
 @description('Resource ID of the isolated effective RBAC attestor identity.')
@@ -445,6 +440,12 @@ output collectorContract object = collectorContract
 var validatedAcquisitionWorkspaceAccessControlMode = workspaceAccessControlMode == 'workspaceAndResourceContext'
   ? workspaceAccessControlMode
   : fail('production monitoring acquisition requires resource-context Log Analytics mode')
+var validatedResourceHealthAllowedOperations = resourceHealthAllowedOperations == [
+  'Microsoft.ResourceGraph/resources/read'
+  'Microsoft.ResourceHealth/availabilityStatuses/read'
+]
+  ? resourceHealthAllowedOperations
+  : fail('production Resource Health acquisition requires the exact Resource Graph and availability-status operations')
 
 output acquisitionCollectorContract object = union(collectorContract, {
   schemaVersion: 'athena.wc028MonitoringCollectorContract.v10'
@@ -515,11 +516,10 @@ output acquisitionCollectorContract object = union(collectorContract, {
   resourceGraphQueryRoleDefinitionId: resourceGraphQueryRoleDefinitionId
   resourceGraphQueryRoleName: resourceGraphQueryRoleName
   resourceGraphQueryScopeId: resourceGraphQueryScopeId
-  resourceGraphQueryAllowedOperations: resourceGraphQueryAllowedOperations
   resourceHealthRoleDefinitionId: resourceHealthRoleDefinitionId
   resourceHealthRoleName: resourceHealthRoleName
   resourceHealthScopeIds: resourceHealthScopeIds
-  resourceHealthAllowedOperations: resourceHealthAllowedOperations
+  resourceHealthAllowedOperations: validatedResourceHealthAllowedOperations
   signingKeyArmResourceId: signingKeyArmResourceId
   signingKeyCryptoUserRoleDefinitionId: signingKeyCryptoUserRoleDefinitionId
   evidenceBlobServiceResourceId: evidenceBlobServiceResourceId
@@ -547,8 +547,7 @@ output acquisitionCollectorContract object = union(collectorContract, {
       collectorContract.allowedReadOperations,
       operation => !startsWith(toLower(operation), 'microsoft.operationalinsights/workspaces')
     ),
-    resourceGraphQueryAllowedOperations,
-    resourceHealthAllowedOperations,
+    validatedResourceHealthAllowedOperations,
     resourceLogAllowedOperations
   )
 })

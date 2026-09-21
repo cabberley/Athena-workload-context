@@ -32,7 +32,7 @@
     "microsoft.insights/logs/vmconnection/read"
   ],
   "resourceHealthRoleActions": [
-    "microsoft.resourcehealth/availabilitystatuses/current/read"
+    "microsoft.resourcehealth/availabilitystatuses/read"
   ],
   "collectorSecurityGroupIds": [],
   "athenaContextSecurityGroupIds": [],
@@ -545,13 +545,13 @@
       "roleDefinitionId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.authorization/roledefinitions/0790d6f2-9553-5b63-84ac-56596b7e4072",
       "roleDefinitionName": "Athena WC-028 VM Resource Health Reader",
       "actions": [
-        "microsoft.resourcehealth/availabilitystatuses/current/read"
+        "microsoft.resourcehealth/availabilitystatuses/read"
       ],
       "notActions": [],
       "dataActions": [],
       "notDataActions": [],
-      "rawDefinitionDigest": "sha256:bf23385a01d36b7001daccaf9e6bbe497fc57e13aef396bc30cf07ec05b6290f",
-      "definitionDigest": "sha256:e04001a4468090f6e9af13222c5c24d69a83bdf4c6c1996801d96f3a846d33c6"
+      "rawDefinitionDigest": "sha256:475b2bb9ce8794d5fcf6c58efef477a6e33fe62f5b4bdd573d0c4d24c50bdc98",
+      "definitionDigest": "sha256:b77e9b6f5c313605c3e37683d27ba8f187ddc1f49c49050f0d9bf96f4a825910"
     },
     {
       "roleDefinitionId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.authorization/roledefinitions/f33a4363-5d9a-5d50-9871-c08582234978",
@@ -573,7 +573,7 @@
   "denyAssignments": [],
   "activePimScheduleInstances": [],
   "roleDefinitionRawPageDigests": [
-    "sha256:025ad387028001ba38399b836f2392b59047491c46df67b942361b74d56acb45"
+    "sha256:ac534b5adea12069f9df15ba149b11dd0debddf3029f2af5e07da5d61340ee58"
   ],
   "denyAssignmentRawPageDigests": [
     "sha256:0594ae3648fdbbec62d39aba86a3ba20a849f088b70e92f13c367da9ee9bc95c"
@@ -581,8 +581,8 @@
   "pimScheduleInstanceRawPageDigests": [
     "sha256:8959f9366f36fe82895ee188994b77fe18ec6cf00b06532747ed2462fb817320"
   ],
-  "firstRawSnapshotDigest": "sha256:02fa3793a08ae8a28bdf29d2a19b7ccb93673c96e1a537963d71e17740694dd7",
-  "secondRawSnapshotDigest": "sha256:02fa3793a08ae8a28bdf29d2a19b7ccb93673c96e1a537963d71e17740694dd7",
+  "firstRawSnapshotDigest": "sha256:38abd4bde50276f00cf832f3a8e0d49f8bebee4ebfffdca11e2c67203490f0e6",
+  "secondRawSnapshotDigest": "sha256:38abd4bde50276f00cf832f3a8e0d49f8bebee4ebfffdca11e2c67203490f0e6",
   "repeatedReadStable": true,
   "assignmentCount": 62,
   "sourceReference": {
@@ -591,5 +591,5 @@
     "contentDigest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
   },
   "sourceManifestDigest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-  "inventoryDigest": "sha256:460032818e434fcd8de7d9f066a767f1c8e36e0810044ccc85a7b7122fe3ec25"
+  "inventoryDigest": "sha256:5d6b081a23b542d157f1d0b1919af90b7bc3353a804962bdc90fa089be50aee7"
 }

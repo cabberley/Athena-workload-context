@@ -2,7 +2,7 @@
 
 - **Status:** Proposed
 - **Date:** 2026-09-18
-- **Amended:** 2026-09-20
+- **Amended:** 2026-09-21
 
 ## Context
 
@@ -41,10 +41,13 @@ Use two exact custom roles and two non-overlapping assignment shapes:
    management-group, or tenant scope.
 
 The collector contract advances to `athena.wc028MonitoringCollectorContract.v10`. It separately
-binds each role definition, role name, action allowlist, and assignment scope. The effective RBAC
-inventory advances to `athena.wc028MonitoringEffectiveRbacInventory.v5` and separately records
-both action fingerprints, both grants, and both full role definitions. Contract v9 and inventory
-v4 remain parseable only as historical evidence and cannot execute current production acquisition.
+binds each role definition, role name, and assignment scope. Its
+`resourceHealthAllowedOperations` field is the exact ordered tuple
+`Microsoft.ResourceGraph/resources/read`,
+`Microsoft.ResourceHealth/availabilityStatuses/read`. The effective RBAC inventory advances to
+`athena.wc028MonitoringEffectiveRbacInventory.v5` and separately records both action fingerprints,
+both grants, and both full role definitions. Contract v9 and inventory v4 remain parseable only as
+historical evidence and cannot execute current production acquisition.
 
 The signed inventory verifier and publication template reject a missing or altered query action, a
 missing or altered availability action, a query assignment outside the exact workload resource

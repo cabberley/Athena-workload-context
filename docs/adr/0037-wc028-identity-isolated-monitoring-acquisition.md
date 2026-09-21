@@ -2,7 +2,7 @@
 
 - **Status:** Proposed
 - **Date:** 2026-09-13
-- **Amended:** 2026-09-20
+- **Amended:** 2026-09-21
 
 ## Context
 
@@ -280,8 +280,10 @@ ambiguous incident transitions fail before the persistence transaction is entere
   support for WC-024 v2 and legacy WC-028 v3-v9 contracts. Production verification requires the
   full reviewed v10 contract, permission-attested resource-context logs, effective RBAC inventory
   v5, separate attestor identity, exact conditioned Blob persistence, storage readback, identity
-  proof, a workload-resource-group-scoped Resource Graph query grant, and per-VM Resource Health
-  availability grants.
+  proof, the canonical Resource Health acquisition operation tuple
+  (`Microsoft.ResourceGraph/resources/read`,
+  `Microsoft.ResourceHealth/availabilityStatuses/read`), a workload-resource-group-scoped
+  Resource Graph query grant, and per-VM Resource Health availability grants.
 - Legacy acquisition-authority v1-v5 documents remain readable, but only v6 authorities can execute
   production acquisition. Production receipt verification requires receipt v6, verifies its
   authority-specific logical and physical call budgets, and derives deployed

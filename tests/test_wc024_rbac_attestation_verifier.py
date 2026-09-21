@@ -275,6 +275,11 @@ def test_deployment_verifier_rejects_inventory_changed_after_review(
             ["microsoft.resourcegraph/resources/read"],
             "Resource Health availability permission",
         ),
+        (
+            "resourceHealthRoleActions",
+            ["microsoft.resourcehealth/availabilitystatuses/current/read"],
+            "Resource Health availability permission",
+        ),
     ),
 )
 def test_deployment_verifier_rejects_missing_resource_health_permissions(

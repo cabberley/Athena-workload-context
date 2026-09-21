@@ -1227,6 +1227,20 @@ def _execute(
     return outcome, commit, intent
 
 
+def test_resource_health_acquisition_contract_binds_both_permissions_independently() -> None:
+    contract = _acquisition_collector_contract()
+
+    assert contract.resource_health_allowed_operations == (
+        "Microsoft.ResourceGraph/resources/read",
+        "Microsoft.ResourceHealth/availabilityStatuses/read",
+    )
+    assert contract.resource_graph_query_scope_id == contract.workload_resource_group_id.casefold()
+    assert contract.resource_health_scope_ids == contract.signal_read_scope_ids
+    assert "Microsoft.ResourceHealth/availabilityStatuses/current/read" not in (
+        contract.allowed_read_operations
+    )
+
+
 def test_acquisition_derives_strict_requests_and_commits_one_batch() -> None:
     port = _AcquisitionPort()
     outcome, commit, intent = _execute(port)

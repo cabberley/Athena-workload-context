@@ -156,7 +156,7 @@ RESOURCE_HEALTH_ROLE_DEFINITION_ID = (
     f"{WORKLOAD_RESOURCE_GROUP_ROOT}/providers/Microsoft.Authorization/"
     "roleDefinitions/0790d6f2-9553-5b63-84ac-56596b7e4072"
 )
-PREVIOUS_RESOURCE_HEALTH_OPERATIONS = ("Microsoft.ResourceHealth/AvailabilityStatuses/read",)
+PREVIOUS_RESOURCE_HEALTH_OPERATIONS = ("Microsoft.ResourceHealth/availabilityStatuses/read",)
 PREVIOUS_PERMISSION_ATTESTED_RESOURCE_HEALTH_OPERATIONS = (
     "Microsoft.ResourceGraph/resources/read",
 )
@@ -166,7 +166,11 @@ RESOURCE_GRAPH_QUERY_ROLE_DEFINITION_ID = (
 )
 RESOURCE_GRAPH_QUERY_SCOPE_ID = WORKLOAD_RESOURCE_GROUP_ROOT
 RESOURCE_GRAPH_QUERY_OPERATIONS = ("Microsoft.ResourceGraph/resources/read",)
-RESOURCE_HEALTH_OPERATIONS = ("Microsoft.ResourceHealth/availabilityStatuses/read",)
+RESOURCE_HEALTH_ROLE_OPERATIONS = ("Microsoft.ResourceHealth/availabilityStatuses/read",)
+RESOURCE_HEALTH_OPERATIONS = (
+    *RESOURCE_GRAPH_QUERY_OPERATIONS,
+    *RESOURCE_HEALTH_ROLE_OPERATIONS,
+)
 PREVIOUS_RESOURCE_LOG_OPERATIONS = (
     "Microsoft.Insights/logs/Heartbeat/read",
     "Microsoft.Insights/logs/NTANetAnalytics/read",
@@ -315,7 +319,6 @@ V10_ONLY_CONTRACT_FIELDS = (
     "resourceGraphQueryRoleDefinitionId",
     "resourceGraphQueryRoleName",
     "resourceGraphQueryScopeId",
-    "resourceGraphQueryAllowedOperations",
 )
 V8_ONLY_CONTRACT_FIELDS = (
     "workspaceResourceContextAccessEnabled",
@@ -1335,6 +1338,16 @@ def _effective_rbac_inventory(payload: dict[str, object]) -> dict[str, object]:
     principal_id = str(payload["monitoringReaderPrincipalId"])
     evidence_writer_role_definition_id = str(payload["evidenceWriterRoleDefinitionId"])
     resource_health_operations = tuple(payload["resourceHealthAllowedOperations"])
+    resource_graph_query_operations = (
+        resource_health_operations[:1]
+        if payload.get("resourceGraphQueryRoleDefinitionId") is not None
+        else ()
+    )
+    resource_health_role_operations = (
+        resource_health_operations[1:]
+        if resource_graph_query_operations
+        else resource_health_operations
+    )
     conditioned_evidence_writer = (
         evidence_writer_role_definition_id.casefold()
         == EVIDENCE_WRITER_ROLE_DEFINITION_ID.casefold()
@@ -1426,7 +1439,7 @@ def _effective_rbac_inventory(payload: dict[str, object]) -> dict[str, object]:
                 _effective_rbac_role_definition(
                     role_definition_id=RESOURCE_HEALTH_ROLE_DEFINITION_ID,
                     role_definition_name=RESOURCE_HEALTH_ROLE_NAME,
-                    actions=resource_health_operations,
+                    actions=resource_health_role_operations,
                 ),
                 _effective_rbac_role_definition(
                     role_definition_id=evidence_writer_role_definition_id,
@@ -1475,7 +1488,7 @@ def _effective_rbac_inventory(payload: dict[str, object]) -> dict[str, object]:
             _effective_rbac_role_definition(
                 role_definition_id=str(payload["resourceGraphQueryRoleDefinitionId"]),
                 role_definition_name=str(payload["resourceGraphQueryRoleName"]),
-                actions=tuple(payload["resourceGraphQueryAllowedOperations"]),
+                actions=resource_graph_query_operations,
             )
         )
     role_definitions = tuple(
@@ -1742,7 +1755,7 @@ def _effective_rbac_inventory(payload: dict[str, object]) -> dict[str, object]:
             sorted(item.casefold() for item in RESOURCE_LOG_OPERATIONS)
         ),
         "resourceHealthRoleActions": tuple(
-            item.casefold() for item in resource_health_operations
+            item.casefold() for item in resource_health_role_operations
         ),
         "collectorSecurityGroupIds": (),
         "athenaContextSecurityGroupIds": (),
@@ -1782,7 +1795,7 @@ def _effective_rbac_inventory(payload: dict[str, object]) -> dict[str, object]:
     }
     if payload.get("resourceGraphQueryRoleDefinitionId") is not None:
         inventory_payload["resourceGraphQueryRoleActions"] = tuple(
-            item.casefold() for item in tuple(payload["resourceGraphQueryAllowedOperations"])
+            item.casefold() for item in resource_graph_query_operations
         )
     return {
         **inventory_payload,
@@ -2291,7 +2304,6 @@ def _acquisition_collector_contract() -> MonitoringCollectorContract:
             "resourceGraphQueryRoleDefinitionId": RESOURCE_GRAPH_QUERY_ROLE_DEFINITION_ID,
             "resourceGraphQueryRoleName": RESOURCE_GRAPH_QUERY_ROLE_NAME,
             "resourceGraphQueryScopeId": RESOURCE_GRAPH_QUERY_SCOPE_ID,
-            "resourceGraphQueryAllowedOperations": RESOURCE_GRAPH_QUERY_OPERATIONS,
             "resourceHealthRoleDefinitionId": RESOURCE_HEALTH_ROLE_DEFINITION_ID,
             "resourceHealthRoleName": RESOURCE_HEALTH_ROLE_NAME,
             "resourceHealthScopeIds": SIGNAL_READ_SCOPE_IDS,
@@ -2302,7 +2314,6 @@ def _acquisition_collector_contract() -> MonitoringCollectorContract:
                     for operation in payload["allowedReadOperations"]
                     if not operation.startswith("Microsoft.OperationalInsights/workspaces")
                 ),
-                *RESOURCE_GRAPH_QUERY_OPERATIONS,
                 *RESOURCE_HEALTH_OPERATIONS,
                 *RESOURCE_LOG_OPERATIONS,
             ),
@@ -2458,9 +2469,13 @@ def test_acquisition_collector_contract_authorizes_receipt_handoff() -> None:
     )
     assert contract.resource_graph_query_role_name == RESOURCE_GRAPH_QUERY_ROLE_NAME
     assert contract.resource_graph_query_scope_id == RESOURCE_GRAPH_QUERY_SCOPE_ID.casefold()
-    assert contract.resource_graph_query_allowed_operations == RESOURCE_GRAPH_QUERY_OPERATIONS
     assert contract.resource_health_scope_ids == SIGNAL_READ_SCOPE_IDS
     assert contract.resource_health_allowed_operations == RESOURCE_HEALTH_OPERATIONS
+    assert "resourceGraphQueryAllowedOperations" not in contract.model_dump(
+        mode="python",
+        by_alias=True,
+        exclude_none=True,
+    )
     assert "Microsoft.ResourceHealth/availabilityStatuses/current/read" not in (
         contract.allowed_read_operations
     )
@@ -2664,6 +2679,9 @@ def test_legacy_v2_effective_rbac_inventory_is_parse_only() -> None:
         LEGACY_EFFECTIVE_RBAC_INVENTORY_V2_EXAMPLE.read_text(encoding="utf-8")
     )
     assert legacy_inventory.schema_version == "athena.wc028MonitoringEffectiveRbacInventory.v2"
+    assert legacy_inventory.resource_health_role_actions == (
+        "microsoft.resourcehealth/availabilitystatuses/read",
+    )
 
     payload = _acquisition_collector_contract().model_dump(
         mode="python",
@@ -2980,15 +2998,23 @@ def test_legacy_v9_trust_hardened_contract_remains_readable() -> None:
         ("identityProofMaximumLifetimeSeconds", None),
         ("resourceGraphQueryRoleDefinitionId", READER_ROLE_DEFINITION_ID),
         ("resourceGraphQueryScopeId", f"/subscriptions/{SUBSCRIPTION_ID}"),
-        (
-            "resourceGraphQueryAllowedOperations",
-            ("Microsoft.ResourceHealth/availabilityStatuses/read",),
-        ),
         ("resourceHealthRoleDefinitionId", READER_ROLE_DEFINITION_ID),
         ("resourceHealthScopeIds", SIGNAL_READ_SCOPE_IDS[:-1]),
         (
             "resourceHealthScopeIds",
             (*SIGNAL_READ_SCOPE_IDS[:-1], UNAPPROVED_PEER_VM_ID),
+        ),
+        (
+            "resourceHealthAllowedOperations",
+            ("Microsoft.ResourceHealth/availabilityStatuses/current/read",),
+        ),
+        (
+            "resourceHealthAllowedOperations",
+            RESOURCE_HEALTH_ROLE_OPERATIONS,
+        ),
+        (
+            "resourceHealthAllowedOperations",
+            RESOURCE_GRAPH_QUERY_OPERATIONS,
         ),
         ("resourceHealthAllowedOperations", ("Microsoft.ResourceHealth/events/read",)),
         ("workspaceAccessControlMode", "workspaceOnly"),

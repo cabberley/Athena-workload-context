@@ -205,6 +205,12 @@ accepting the phase-one handoff:
   tenant scope, and no Resource Graph query assignment exists at subscription, management-group,
   tenant, or individual-VM scope.
 
+The published v10 `resourceHealthAllowedOperations` field must contain exactly, in order,
+`Microsoft.ResourceGraph/resources/read` and
+`Microsoft.ResourceHealth/availabilityStatuses/read`. The `/current/read` variant is not accepted
+because this provider contract queries `HealthResources` and does not invoke the current-status
+endpoint.
+
 Fail the gate if either role, action, or assignment shape is absent or broader. Under the collector
 identity, execute the reviewed `HealthResources` query with one approved VM and one clearly
 synthetic unapproved peer VM in the KQL filter. The approved VM may be returned; the peer must not

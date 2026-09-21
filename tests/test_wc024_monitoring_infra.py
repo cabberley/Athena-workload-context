@@ -39,9 +39,6 @@ READER_RBAC = (WC024_ROOT / "modules" / "monitoring-evidence-reader-rbac.bicep")
 WORKLOAD_READER_RBAC = (
     WC024_ROOT / "modules" / "workload-monitoring-evidence-reader-rbac.bicep"
 ).read_text(encoding="utf-8")
-RESOURCE_GRAPH_QUERY_RBAC = (
-    WC024_ROOT / "modules" / "resource-graph-query-reader-rbac.bicep"
-).read_text(encoding="utf-8")
 NETWORK_WATCHER_READER_RBAC = (
     WC024_ROOT / "modules" / "network-watcher-monitoring-evidence-reader-rbac.bicep"
 ).read_text(encoding="utf-8")
@@ -656,30 +653,44 @@ def test_wc024_rbac_is_collector_only_and_narrow() -> None:
     assert "roleDefinitionId: readerRoleDefinitionId" not in resource_health_assignment
     assert "0790d6f2-9553-5b63-84ac-56596b7e4072" in WORKLOAD_READER_RBAC
     assert "Microsoft.ResourceHealth/availabilityStatuses/read" in WORKLOAD_READER_RBAC
-    assert "Microsoft.ResourceGraph/resources/read" not in WORKLOAD_READER_RBAC
-    assert "Microsoft.ResourceHealth/AvailabilityStatuses/current/read" not in (
+    resource_health_role = WORKLOAD_READER_RBAC.split(
+        "resource resourceHealthRoleDefinition",
+        maxsplit=1,
+    )[1].split("var signalReaderPermission", maxsplit=1)[0]
+    assert "Microsoft.ResourceGraph/resources/read" not in resource_health_role
+    assert "Microsoft.Compute/virtualMachines/read" not in resource_health_role
+    assert "Microsoft.ResourceHealth/availabilityStatuses/current/read" not in (
         WORKLOAD_READER_RBAC
     )
-    assert "Microsoft.Compute/virtualMachines/read" not in WORKLOAD_READER_RBAC
     assert "resourceHealthAllowedOperations" in WORKLOAD_READER_RBAC
-    assert "5687977f-aa06-5699-8e18-1a54a074b532" in RESOURCE_GRAPH_QUERY_RBAC
-    assert "Microsoft.ResourceGraph/resources/read" in RESOURCE_GRAPH_QUERY_RBAC
-    assert "Microsoft.ResourceHealth/availabilityStatuses/read" not in (
-        RESOURCE_GRAPH_QUERY_RBAC
-    )
-    assert "targetScope = 'resourceGroup'" in RESOURCE_GRAPH_QUERY_RBAC
-    assert "scope: resourceGroup()" in RESOURCE_GRAPH_QUERY_RBAC
-    assert "resourceGroup().id" in RESOURCE_GRAPH_QUERY_RBAC
-    assert "subscription().id" not in RESOURCE_GRAPH_QUERY_RBAC
-    assert "*/read" not in RESOURCE_GRAPH_QUERY_RBAC
-    assert "Microsoft.Compute/virtualMachines/read" not in RESOURCE_GRAPH_QUERY_RBAC
-    assert "resource-graph-query-reader-assignment" in MAIN
-    query_assignment = MAIN.split(
-        "module resourceGraphQueryReaderAssignment",
+    assert "5687977f-aa06-5699-8e18-1a54a074b532" in WORKLOAD_READER_RBAC
+    assert "Microsoft.ResourceGraph/resources/read" in WORKLOAD_READER_RBAC
+    query_role = WORKLOAD_READER_RBAC.split(
+        "resource resourceGraphQueryRoleDefinition",
         maxsplit=1,
-    )[1].split("module workloadEvidenceReaderAssignments", maxsplit=1)[0]
-    assert "scope: resourceGroup(workloadResourceGroupName)" in query_assignment
-    assert "scope: subscription()" not in query_assignment
+    )[1].split("resource resourceHealthRoleDefinition", maxsplit=1)[0]
+    assert "resourceGroup().id" in query_role
+    assert "subscription().id" not in query_role
+    assert "Microsoft.ResourceHealth/availabilityStatuses/read" not in query_role
+    assert "*/read" not in query_role
+    assert "Microsoft.Compute/virtualMachines/read" not in query_role
+    query_assignment = WORKLOAD_READER_RBAC.split(
+        "resource collectorResourceGraphQueryReader",
+        maxsplit=1,
+    )[1].split("resource collectorVmSignalReaders", maxsplit=1)[0]
+    assert "scope: resourceGroup()" in query_assignment
+    assert "roleDefinitionId: resourceGraphQueryRoleDefinition.id" in query_assignment
+    assert "scope: approvedVms[index]" not in query_assignment
+    assert "resourceGraphQueryRoleDefinitionId" in WORKLOAD_READER_RBAC
+    assert "resourceGraphQueryScopeId" in WORKLOAD_READER_RBAC
+    assert "resourceHealthAllowedOperations" in WORKLOAD_READER_RBAC
+    assert (
+        "resourceHealthAllowedOperations = concat(\n"
+        "  resourceGraphQueryAllowedOperations,\n"
+        "  resourceHealthRoleAllowedOperations\n"
+        ")" in WORKLOAD_READER_RBAC
+    )
+    assert "workloadEvidenceReaderAssignments.outputs.resourceGraphQueryRoleDefinitionId" in MAIN
     assert "dataActions: []" in WORKLOAD_READER_RBAC
     assert "expectedSignalReaderActions" in WORKLOAD_READER_RBAC
     assert "unexpectedSignalReaderActions" in WORKLOAD_READER_RBAC
@@ -918,6 +929,9 @@ def test_wc024_collector_contract_is_signed_handoff_ready_and_generic_only() -> 
     assert "resourceGraphQueryRoleActions" in PUBLISH_CONTRACT
     assert "resourceHealthRoleActions" in PUBLISH_CONTRACT
     assert "resourceGraphQueryScopeIsExact" in PUBLISH_CONTRACT
+    assert "resourceHealthOperationTupleIsExact" in PUBLISH_CONTRACT
+    assert "contractInputs.resourceHealthAllowedOperations[0]" in PUBLISH_CONTRACT
+    assert "contractInputs.resourceHealthAllowedOperations[1]" in PUBLISH_CONTRACT
     assert "length(normalizedResourceHealthScopeIds) + 5" in PUBLISH_CONTRACT
     assert "expectedHandoffId = guid(" in PUBLISH_CONTRACT
     assert "handoff.handoffId == expectedHandoffId" in PUBLISH_CONTRACT
@@ -1035,14 +1049,12 @@ def test_wc024_collector_contract_is_signed_handoff_ready_and_generic_only() -> 
         COLLECTOR_CONTRACT
     )
     assert "resourceGraphQueryScopeId: resourceGraphQueryScopeId" in COLLECTOR_CONTRACT
-    assert "resourceGraphQueryAllowedOperations: resourceGraphQueryAllowedOperations" in (
-        COLLECTOR_CONTRACT
-    )
     assert "resourceHealthRoleDefinitionId: resourceHealthRoleDefinitionId" in (COLLECTOR_CONTRACT)
     assert "resourceHealthScopeIds: resourceHealthScopeIds" in COLLECTOR_CONTRACT
-    assert "resourceHealthAllowedOperations: resourceHealthAllowedOperations" in (
+    assert "resourceHealthAllowedOperations: validatedResourceHealthAllowedOperations" in (
         COLLECTOR_CONTRACT
     )
+    assert "validatedResourceHealthAllowedOperations" in COLLECTOR_CONTRACT
     assert "workspaceResourceContextAccessEnabled" in DATA_PLATFORM
     assert "resourceContextTablePlans" in DATA_PLATFORM
     assert "plan: resourceContextTables[index].properties.plan == 'Analytics'" in (DATA_PLATFORM)
