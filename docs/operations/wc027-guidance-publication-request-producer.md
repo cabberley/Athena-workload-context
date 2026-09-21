@@ -287,15 +287,32 @@ assignment outputs as `ManagedIdentityPrincipalId` and
 assignment results; missing reviewed assignments; condition, scope, or role drift; and every
 additional direct, inherited, transitive-group, active time-bound/PIM, custom-role, or
 sibling-registry pull grant. For each reviewed service principal and every recursively discovered
-parent group, it queries `roleAssignmentScheduleInstances` at every governed subscription scope
-with the exact principal filter. Only assignment schedules whose UTC interval is active at the
-verification instant are effective; eligibility alone is not effective until activation produces
-a role-assignment schedule instance. Persistent-assignment schedule mirrors are joined through
-their canonical `originRoleAssignmentId`, must agree with the underlying role assignment, and do
-not double-count one of the exact three reviewed assignments. Pagination follows only canonical
-`management.azure.com`
-continuations and fails closed on malformed pages, API errors, duplicate instances, or page,
-instance, and total-call bounds. Pull classification keeps Azure RBAC permission planes exact:
+parent group, it queries the stable `2020-10-01` ARM collections for
+`roleAssignmentScheduleInstances`, `roleAssignmentSchedules`,
+`roleEligibilityScheduleInstances`, `roleEligibilitySchedules`,
+`roleAssignmentScheduleRequests`, and `roleEligibilityScheduleRequests` at every governed
+subscription scope with the documented exact-principal filter. Request collections are never
+queried with undocumented `assignedTo(...)` filtering. Because `az rest` returns one page, the
+scanner follows each server-provided `nextLink` verbatim only after validating HTTPS, the ARM
+host, exact collection path, API version, principal filter, continuation token, cycle freedom,
+and shared page, item, and call limits.
+
+Assignment schedule instances represent current privileges only; a future-start instance is
+invalid evidence. Eligibility instances are current latent activation rights. Assignment and
+eligibility schedules supply the canonical current-or-future state, so an empty instance
+collection cannot attest that no upcoming access exists. Current assignment schedules must agree
+with their current instance; future or otherwise unmatched pull-capable schedules fail closed.
+Eligibility schedules remain latent pull capability until expired or terminal. Requests are only
+supplementary: unresolved grant/activate/extend/renew requests fail closed, while completed,
+failed, canceled, remove, and deactivate requests do not recreate state that is absent from the
+schedule collections. Unknown status, resource type, assignment/member/request type, UTC interval,
+expiration shape, or condition/version pair is rejected.
+
+Persistent-assignment schedule mirrors are joined through their canonical
+`originRoleAssignmentId`, must agree with the underlying role assignment, and do not double-count
+one of the exact three reviewed assignments. Current schedule and instance mirrors must also agree
+exactly on assignment type, member type, principal, role, scope, condition version, and condition,
+including null-versus-non-null condition fields. Pull classification keeps Azure RBAC permission planes exact:
 `registries/pull/read` and `registries/quarantine/read` grant pull only through `actions`, while
 `registries/repositories/content/read` and `registries/quarantinedArtifacts/read` grant pull only
 through `dataActions`. Wildcards are matched case-insensitively within the same plane, with
@@ -314,7 +331,8 @@ registries in either mode. Role-assignment and role-eligibility schedule request
 approval-required eligibility writes, and role-management policy administration are escalation
 paths at scopes that can govern ACR. The same classification rejects tenant access elevation plus
 ACR quarantine mutation, task execution/administration, update-policy mutation, and
-quarantined-artifact writes.
+quarantined-artifact writes. Only documented Authorization provider actions are classified; the
+request-validation REST operation does not create a synthetic `validate/action` escalation entry.
 Pass the publisher deployment's exact image-pull identity resource output as
 `ManagedIdentityResourceId`; the probe live-reads that user-assigned identity before and after the
 pull and binds its resource, client, and principal IDs to both the effective scan and Docker login.
@@ -327,8 +345,9 @@ PIM role-assignment schedule instances, transitive groups, sibling registries, A
 paths, exact assignment readbacks, and pagination-budget enforcement. It also exposes the exact
 `paginationBudgets` contract: tenant-hierarchy pages and governed-subscription count; Graph pages
 per object and transitive groups per principal; classic-assignment pages per query, total API
-calls, and returned items; and role-assignment-schedule pages per query, total API calls, and
-returned instances. Classic assignments are read through explicit `roleAssignments@2022-04-01`
+calls, and returned items; and shared PIM role-management pages per query, total API calls, and
+returned resources across all six stable collections. Classic assignments are read through
+explicit `roleAssignments@2022-04-01`
 REST pagination rather than an Azure CLI command that hides service page requests. The
 PowerShell probe and root Bicep gate require every completeness flag to be `true`, require the
 exact reviewed budget values and property sets, and include both objects in `evidenceDigest`.

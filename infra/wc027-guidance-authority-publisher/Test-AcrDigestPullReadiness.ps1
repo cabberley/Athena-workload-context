@@ -358,6 +358,10 @@ function Get-EffectiveAccessEvidence {
             'directMembershipTraversalComplete'
             'convergedMembershipReadbacks'
             'roleAssignmentScheduleInstancesComplete'
+            'roleAssignmentSchedulesComplete'
+            'roleEligibilityScheduleInstancesComplete'
+            'roleEligibilitySchedulesComplete'
+            'roleManagementPendingRequestsComplete'
             'siblingRegistriesChecked'
             'acrEscalationPathsChecked'
             'completeness'
@@ -376,6 +380,10 @@ function Get-EffectiveAccessEvidence {
         -ExpectedNames @(
             'classicRoleAssignments'
             'pimRoleAssignmentScheduleInstances'
+            'pimRoleAssignmentSchedules'
+            'pimRoleEligibilityScheduleInstances'
+            'pimRoleEligibilitySchedules'
+            'pimPendingGrantRequests'
             'transitiveGroups'
             'siblingRegistries'
             'acrEscalationPaths'
@@ -393,9 +401,9 @@ function Get-EffectiveAccessEvidence {
             'classicRoleAssignmentMaxPagesPerQuery'
             'classicRoleAssignmentMaxApiCalls'
             'classicRoleAssignmentMaxItems'
-            'roleAssignmentScheduleMaxPagesPerQuery'
-            'roleAssignmentScheduleMaxApiCalls'
-            'roleAssignmentScheduleMaxInstances'
+            'pimRoleManagementMaxPagesPerQuery'
+            'pimRoleManagementMaxApiCalls'
+            'pimRoleManagementMaxItems'
         )
     $reviewedAssignments = @($evidence.reviewedAssignments)
     foreach ($reviewedAssignment in $reviewedAssignments) {
@@ -467,12 +475,52 @@ function Get-EffectiveAccessEvidence {
                 -Value $evidence.roleAssignmentScheduleInstancesComplete `
                 -Expected $true
         ) -or
+        -not (
+            Test-JsonBoolean `
+                -Value $evidence.roleAssignmentSchedulesComplete `
+                -Expected $true
+        ) -or
+        -not (
+            Test-JsonBoolean `
+                -Value $evidence.roleEligibilityScheduleInstancesComplete `
+                -Expected $true
+        ) -or
+        -not (
+            Test-JsonBoolean `
+                -Value $evidence.roleEligibilitySchedulesComplete `
+                -Expected $true
+        ) -or
+        -not (
+            Test-JsonBoolean `
+                -Value $evidence.roleManagementPendingRequestsComplete `
+                -Expected $true
+        ) -or
         -not (Test-JsonBoolean -Value $evidence.siblingRegistriesChecked -Expected $true) -or
         -not (Test-JsonBoolean -Value $evidence.acrEscalationPathsChecked -Expected $true) -or
         -not (Test-JsonBoolean -Value $completeness.classicRoleAssignments -Expected $true) -or
         -not (
             Test-JsonBoolean `
                 -Value $completeness.pimRoleAssignmentScheduleInstances `
+                -Expected $true
+        ) -or
+        -not (
+            Test-JsonBoolean `
+                -Value $completeness.pimRoleAssignmentSchedules `
+                -Expected $true
+        ) -or
+        -not (
+            Test-JsonBoolean `
+                -Value $completeness.pimRoleEligibilityScheduleInstances `
+                -Expected $true
+        ) -or
+        -not (
+            Test-JsonBoolean `
+                -Value $completeness.pimRoleEligibilitySchedules `
+                -Expected $true
+        ) -or
+        -not (
+            Test-JsonBoolean `
+                -Value $completeness.pimPendingGrantRequests `
                 -Expected $true
         ) -or
         -not (Test-JsonBoolean -Value $completeness.transitiveGroups -Expected $true) -or
@@ -521,18 +569,18 @@ function Get-EffectiveAccessEvidence {
         ) -or
         -not (
             Test-JsonInteger `
-                -Value $paginationBudgets.roleAssignmentScheduleMaxPagesPerQuery `
+                -Value $paginationBudgets.pimRoleManagementMaxPagesPerQuery `
                 -Expected 64
         ) -or
         -not (
             Test-JsonInteger `
-                -Value $paginationBudgets.roleAssignmentScheduleMaxApiCalls `
-                -Expected 16384
+                -Value $paginationBudgets.pimRoleManagementMaxApiCalls `
+                -Expected 98304
         ) -or
         -not (
             Test-JsonInteger `
-                -Value $paginationBudgets.roleAssignmentScheduleMaxInstances `
-                -Expected 65536
+                -Value $paginationBudgets.pimRoleManagementMaxItems `
+                -Expected 262144
         ) -or
         @($evidence.expectedAssignmentIds).Count -ne 3 -or
         @($evidence.principalIds).Count -ne 3 -or

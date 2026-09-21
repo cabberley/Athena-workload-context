@@ -803,7 +803,7 @@ var wc027PublisherImagePullRegistryResourceIdSegments = concat(
 var wc027PublisherImagePullRegistryResourceIdValid = length(wc027PublisherImagePullRegistryResourceIdRawSegments) == 9 && empty(wc027PublisherImagePullRegistryResourceIdSegments[0]) && wc027PublisherImagePullRegistryResourceIdSegments[1] == 'subscriptions' && !empty(wc027PublisherImagePullRegistryResourceIdSegments[2]) && wc027PublisherImagePullRegistryResourceIdSegments[3] == 'resourceGroups' && !empty(wc027PublisherImagePullRegistryResourceIdSegments[4]) && wc027PublisherImagePullRegistryResourceIdSegments[5] == 'providers' && wc027PublisherImagePullRegistryResourceIdSegments[6] == 'Microsoft.ContainerRegistry' && wc027PublisherImagePullRegistryResourceIdSegments[7] == 'registries' && !empty(wc027PublisherImagePullRegistryResourceIdSegments[8]) && !contains(wc027ParsedPublisherConfiguration.imagePull.registryResourceId, '//') && !contains(wc027ParsedPublisherConfiguration.imagePull.registryResourceId, '?') && !contains(wc027ParsedPublisherConfiguration.imagePull.registryResourceId, '#') && !contains(wc027ParsedPublisherConfiguration.imagePull.registryResourceId, '%')
 var wc027ParsedPublisherImagePullEvidence = json(
   empty(wc027PublisherImagePullEvidenceJson)
-    ? '{"anonymousPullEnabled":true,"attempts":0,"condition":null,"conditionVersion":null,"effectiveAccess":{"acrEscalationPathsChecked":false,"anonymousPullEnabled":true,"completeness":{"acrEscalationPaths":false,"classicRoleAssignments":false,"exactAssignmentReadbacks":false,"paginationBudgets":false,"pimRoleAssignmentScheduleInstances":false,"siblingRegistries":false,"transitiveGroups":false},"convergedMembershipReadbacks":false,"directAssignmentsComplete":false,"directMembershipTraversalComplete":false,"evidenceDigest":"","exactAssignmentReadbacksComplete":false,"expectedAssignmentCount":0,"expectedAssignmentIds":[],"extraPullCapableAssignmentIds":[],"governedSubscriptionIds":[],"inheritedAssignmentsComplete":false,"paginationBudgets":{"classicRoleAssignmentMaxApiCalls":0,"classicRoleAssignmentMaxItems":0,"classicRoleAssignmentMaxPagesPerQuery":0,"governedSubscriptionMaxCount":0,"graphMembershipMaxPagesPerObject":0,"roleAssignmentScheduleMaxApiCalls":0,"roleAssignmentScheduleMaxInstances":0,"roleAssignmentScheduleMaxPagesPerQuery":0,"tenantHierarchyMaxPages":0,"transitiveGroupMaxCountPerPrincipal":0},"principalIds":[],"pullCapableAssignmentCount":0,"registryResourceIds":[],"reviewedAssignments":[],"roleAssignmentScheduleInstancesComplete":false,"roleDefinitionsResolved":false,"schemaVersion":"","siblingRegistriesChecked":false,"tenantId":"","tenantSubscriptionHierarchyComplete":false,"transitiveGroupsComplete":false,"verified":false,"verifiedAt":"1970-01-01T00:00:00.000Z"},"image":"","managedIdentityClientId":"","managedIdentityPrincipalId":"","managedIdentityResourceId":"","maxAttempts":0,"registryResourceId":"","registryServer":"","repositoryName":"","roleAssignmentMode":"","roleAssignmentResourceId":"","roleDefinitionId":"","schemaVersion":"","success":false,"verifiedAt":"1970-01-01T00:00:00.000Z"}'
+    ? '{"anonymousPullEnabled":true,"attempts":0,"condition":null,"conditionVersion":null,"effectiveAccess":{"acrEscalationPathsChecked":false,"anonymousPullEnabled":true,"completeness":{"acrEscalationPaths":false,"classicRoleAssignments":false,"exactAssignmentReadbacks":false,"paginationBudgets":false,"pimPendingGrantRequests":false,"pimRoleAssignmentScheduleInstances":false,"pimRoleAssignmentSchedules":false,"pimRoleEligibilityScheduleInstances":false,"pimRoleEligibilitySchedules":false,"siblingRegistries":false,"transitiveGroups":false},"convergedMembershipReadbacks":false,"directAssignmentsComplete":false,"directMembershipTraversalComplete":false,"evidenceDigest":"","exactAssignmentReadbacksComplete":false,"expectedAssignmentCount":0,"expectedAssignmentIds":[],"extraPullCapableAssignmentIds":[],"governedSubscriptionIds":[],"inheritedAssignmentsComplete":false,"paginationBudgets":{"classicRoleAssignmentMaxApiCalls":0,"classicRoleAssignmentMaxItems":0,"classicRoleAssignmentMaxPagesPerQuery":0,"governedSubscriptionMaxCount":0,"graphMembershipMaxPagesPerObject":0,"pimRoleManagementMaxApiCalls":0,"pimRoleManagementMaxItems":0,"pimRoleManagementMaxPagesPerQuery":0,"tenantHierarchyMaxPages":0,"transitiveGroupMaxCountPerPrincipal":0},"principalIds":[],"pullCapableAssignmentCount":0,"registryResourceIds":[],"reviewedAssignments":[],"roleAssignmentScheduleInstancesComplete":false,"roleAssignmentSchedulesComplete":false,"roleDefinitionsResolved":false,"roleEligibilityScheduleInstancesComplete":false,"roleEligibilitySchedulesComplete":false,"roleManagementPendingRequestsComplete":false,"schemaVersion":"","siblingRegistriesChecked":false,"tenantId":"","tenantSubscriptionHierarchyComplete":false,"transitiveGroupsComplete":false,"verified":false,"verifiedAt":"1970-01-01T00:00:00.000Z"},"image":"","managedIdentityClientId":"","managedIdentityPrincipalId":"","managedIdentityResourceId":"","maxAttempts":0,"registryResourceId":"","registryServer":"","repositoryName":"","roleAssignmentMode":"","roleAssignmentResourceId":"","roleDefinitionId":"","schemaVersion":"","success":false,"verifiedAt":"1970-01-01T00:00:00.000Z"}'
     : wc027PublisherImagePullEvidenceJson
 )
 var wc027ParsedProducerConfiguration = json(
@@ -1091,7 +1091,7 @@ var wc027ReviewedPublisherAcrAssignmentValid = length(wc027ReviewedPublisherAcrA
   wc027ReviewedPublisherAcrAssignment.condition == wc027ParsedPublisherConfiguration.imagePull.condition
 ], false)
 var wc027EffectiveAcrAssignmentsVerified = !contains([
-  length(items(wc027ParsedEffectiveAcrAccess)) == 27
+  length(items(wc027ParsedEffectiveAcrAccess)) == 31
   wc027ParsedEffectiveAcrAccess.schemaVersion == 'athena.wc027AcrEffectiveAccessEvidence.v1'
   wc027ParsedEffectiveAcrAccess.verified == true
   toLower(wc027ParsedEffectiveAcrAccess.tenantId) == toLower(tenant().tenantId)
@@ -1111,11 +1111,19 @@ var wc027EffectiveAcrAssignmentsVerified = !contains([
   wc027ParsedEffectiveAcrAccess.directMembershipTraversalComplete == true
   wc027ParsedEffectiveAcrAccess.convergedMembershipReadbacks == true
   wc027ParsedEffectiveAcrAccess.roleAssignmentScheduleInstancesComplete == true
+  wc027ParsedEffectiveAcrAccess.roleAssignmentSchedulesComplete == true
+  wc027ParsedEffectiveAcrAccess.roleEligibilityScheduleInstancesComplete == true
+  wc027ParsedEffectiveAcrAccess.roleEligibilitySchedulesComplete == true
+  wc027ParsedEffectiveAcrAccess.roleManagementPendingRequestsComplete == true
   wc027ParsedEffectiveAcrAccess.siblingRegistriesChecked == true
   wc027ParsedEffectiveAcrAccess.acrEscalationPathsChecked == true
-  length(items(wc027ParsedEffectiveAcrAccess.completeness)) == 7
+  length(items(wc027ParsedEffectiveAcrAccess.completeness)) == 11
   wc027ParsedEffectiveAcrAccess.completeness.classicRoleAssignments == true
   wc027ParsedEffectiveAcrAccess.completeness.pimRoleAssignmentScheduleInstances == true
+  wc027ParsedEffectiveAcrAccess.completeness.pimRoleAssignmentSchedules == true
+  wc027ParsedEffectiveAcrAccess.completeness.pimRoleEligibilityScheduleInstances == true
+  wc027ParsedEffectiveAcrAccess.completeness.pimRoleEligibilitySchedules == true
+  wc027ParsedEffectiveAcrAccess.completeness.pimPendingGrantRequests == true
   wc027ParsedEffectiveAcrAccess.completeness.transitiveGroups == true
   wc027ParsedEffectiveAcrAccess.completeness.siblingRegistries == true
   wc027ParsedEffectiveAcrAccess.completeness.acrEscalationPaths == true
@@ -1129,9 +1137,9 @@ var wc027EffectiveAcrAssignmentsVerified = !contains([
   wc027ParsedEffectiveAcrAccess.paginationBudgets.classicRoleAssignmentMaxPagesPerQuery == 64
   wc027ParsedEffectiveAcrAccess.paginationBudgets.classicRoleAssignmentMaxApiCalls == 16384
   wc027ParsedEffectiveAcrAccess.paginationBudgets.classicRoleAssignmentMaxItems == 65536
-  wc027ParsedEffectiveAcrAccess.paginationBudgets.roleAssignmentScheduleMaxPagesPerQuery == 64
-  wc027ParsedEffectiveAcrAccess.paginationBudgets.roleAssignmentScheduleMaxApiCalls == 16384
-  wc027ParsedEffectiveAcrAccess.paginationBudgets.roleAssignmentScheduleMaxInstances == 65536
+  wc027ParsedEffectiveAcrAccess.paginationBudgets.pimRoleManagementMaxPagesPerQuery == 64
+  wc027ParsedEffectiveAcrAccess.paginationBudgets.pimRoleManagementMaxApiCalls == 98304
+  wc027ParsedEffectiveAcrAccess.paginationBudgets.pimRoleManagementMaxItems == 262144
   wc027EffectiveAcrEvidenceFresh
   wc027EffectiveAcrEvidenceDigestValid
   length(wc027ParsedEffectiveAcrAccess.expectedAssignmentIds) == 3

@@ -102,6 +102,14 @@ EXPECTED_PULL_DATA_ACTIONS = (
     "Microsoft.ContainerRegistry/registries/repositories/content/read",
     "Microsoft.ContainerRegistry/registries/quarantinedArtifacts/read",
 )
+PIM_RESOURCE_TYPES = (
+    "roleAssignmentScheduleInstances",
+    "roleAssignmentSchedules",
+    "roleEligibilityScheduleInstances",
+    "roleEligibilitySchedules",
+    "roleAssignmentScheduleRequests",
+    "roleEligibilityScheduleRequests",
+)
 
 
 def _expected_assignments() -> tuple[ExpectedAssignment, ...]:
@@ -230,6 +238,26 @@ class StubAzure:
             tuple[str, str],
             list[dict[str, object]],
         ] = {}
+        self.assignment_schedule_pages: dict[
+            tuple[str, str],
+            list[dict[str, object]],
+        ] = {}
+        self.eligibility_instance_pages: dict[
+            tuple[str, str],
+            list[dict[str, object]],
+        ] = {}
+        self.eligibility_schedule_pages: dict[
+            tuple[str, str],
+            list[dict[str, object]],
+        ] = {}
+        self.assignment_request_pages: dict[
+            tuple[str, str],
+            list[dict[str, object]],
+        ] = {}
+        self.eligibility_request_pages: dict[
+            tuple[str, str],
+            list[dict[str, object]],
+        ] = {}
         self.assignment_readbacks: dict[str, dict[str, object]] = {
             item.assignment_resource_id.casefold(): {
                 "id": item.assignment_resource_id,
@@ -343,13 +371,23 @@ class StubAzure:
                 if continuation is not None:
                     page_index = int(continuation[0].removeprefix("page")) - 1
                 return deepcopy(pages[page_index])
-            if "/roleAssignmentScheduleInstances?" in url:
+            resource_type = urlparse(url).path.rsplit("/", 1)[-1]
+            pim_page_sources = {
+                "roleAssignmentScheduleInstances": self.schedule_pages,
+                "roleAssignmentSchedules": self.assignment_schedule_pages,
+                "roleEligibilityScheduleInstances": self.eligibility_instance_pages,
+                "roleEligibilitySchedules": self.eligibility_schedule_pages,
+                "roleAssignmentScheduleRequests": self.assignment_request_pages,
+                "roleEligibilityScheduleRequests": self.eligibility_request_pages,
+            }
+            if resource_type in pim_page_sources:
                 parsed = urlparse(url)
                 query = parse_qs(parsed.query)
                 schedule_filter = query["$filter"][0]
+                assert "assignedTo" not in schedule_filter
                 principal_id = schedule_filter.removeprefix("principalId eq ")
                 subscription_id = parsed.path.split("/subscriptions/", 1)[1].split("/", 1)[0]
-                pages = self.schedule_pages.get(
+                pages = pim_page_sources[resource_type].get(
                     (subscription_id, principal_id),
                     [{"value": [], "nextLink": None}],
                 )
@@ -455,9 +493,11 @@ def _schedule_instance(
     principal_type: str,
     role_definition_id: str,
     instance_guid: str = "89898989-8989-4989-8989-898989898989",
+    schedule_guid: str | None = None,
     origin_role_assignment_id: str | None = None,
     scope: str = SIBLING_REGISTRY_ID,
     assignment_type: str = "Activated",
+    member_type: str = "Direct",
     status: str = "Provisioned",
     start_date_time: str = "2026-09-17T01:00:00Z",
     end_date_time: str | None = "2026-09-17T03:00:00Z",
@@ -469,6 +509,7 @@ def _schedule_instance(
         f"{scope_prefix}/providers/Microsoft.Authorization/"
         f"roleAssignments/{instance_guid}"
     )
+    effective_schedule_guid = schedule_guid or instance_guid
     return {
         "id": (
             f"{scope_prefix}/providers/Microsoft.Authorization/"
@@ -481,12 +522,148 @@ def _schedule_instance(
             "principalType": principal_type,
             "roleDefinitionId": role_definition_id,
             "originRoleAssignmentId": effective_origin_role_assignment_id,
+            "roleAssignmentScheduleId": (
+                f"{scope_prefix}/providers/Microsoft.Authorization/"
+                f"roleAssignmentSchedules/{effective_schedule_guid}"
+            ),
             "scope": scope,
             "assignmentType": assignment_type,
-            "memberType": "Direct",
+            "memberType": member_type,
             "status": status,
             "startDateTime": start_date_time,
             "endDateTime": end_date_time,
+            "conditionVersion": condition_version,
+            "condition": condition,
+        },
+    }
+
+
+def _role_assignment_schedule(
+    *,
+    principal_id: str,
+    principal_type: str,
+    role_definition_id: str,
+    schedule_guid: str = "89898989-8989-4989-8989-898989898989",
+    scope: str = SIBLING_REGISTRY_ID,
+    assignment_type: str = "Assigned",
+    member_type: str = "Direct",
+    status: str = "Provisioned",
+    start_date_time: str = "2026-09-17T01:00:00Z",
+    end_date_time: str | None = "2026-09-17T03:00:00Z",
+    condition_version: str | None = None,
+    condition: str | None = None,
+) -> dict[str, object]:
+    scope_prefix = "" if scope == "/" else scope
+    return {
+        "id": (
+            f"{scope_prefix}/providers/Microsoft.Authorization/"
+            f"roleAssignmentSchedules/{schedule_guid}"
+        ),
+        "name": schedule_guid,
+        "type": "Microsoft.Authorization/roleAssignmentSchedules",
+        "properties": {
+            "principalId": principal_id,
+            "principalType": principal_type,
+            "roleDefinitionId": role_definition_id,
+            "scope": scope,
+            "assignmentType": assignment_type,
+            "memberType": member_type,
+            "status": status,
+            "startDateTime": start_date_time,
+            "endDateTime": end_date_time,
+            "conditionVersion": condition_version,
+            "condition": condition,
+        },
+    }
+
+
+def _role_eligibility_resource(
+    *,
+    resource_type: str,
+    principal_id: str,
+    principal_type: str,
+    role_definition_id: str,
+    resource_guid: str = "87878787-8787-4787-8787-878787878787",
+    scope: str = SIBLING_REGISTRY_ID,
+    status: str = "Provisioned",
+    start_date_time: str = "2026-09-17T01:00:00Z",
+    end_date_time: str | None = "2026-09-17T03:00:00Z",
+    condition_version: str | None = None,
+    condition: str | None = None,
+) -> dict[str, object]:
+    assert resource_type in {
+        "roleEligibilityScheduleInstances",
+        "roleEligibilitySchedules",
+    }
+    scope_prefix = "" if scope == "/" else scope
+    properties: dict[str, object] = {
+        "principalId": principal_id,
+        "principalType": principal_type,
+        "roleDefinitionId": role_definition_id,
+        "scope": scope,
+        "memberType": "Direct",
+        "status": status,
+        "startDateTime": start_date_time,
+        "endDateTime": end_date_time,
+        "conditionVersion": condition_version,
+        "condition": condition,
+    }
+    if resource_type == "roleEligibilityScheduleInstances":
+        properties["roleEligibilityScheduleId"] = (
+            f"{scope_prefix}/providers/Microsoft.Authorization/"
+            f"roleEligibilitySchedules/{resource_guid}"
+        )
+    return {
+        "id": (
+            f"{scope_prefix}/providers/Microsoft.Authorization/"
+            f"{resource_type}/{resource_guid}"
+        ),
+        "name": resource_guid,
+        "type": f"Microsoft.Authorization/{resource_type}",
+        "properties": properties,
+    }
+
+
+def _role_management_request(
+    *,
+    resource_type: str,
+    principal_id: str,
+    principal_type: str,
+    role_definition_id: str,
+    request_guid: str = "86868686-8686-4686-8686-868686868686",
+    scope: str = SIBLING_REGISTRY_ID,
+    request_type: str = "AdminAssign",
+    status: str = "PendingApproval",
+    condition_version: str | None = None,
+    condition: str | None = None,
+) -> dict[str, object]:
+    assert resource_type in {
+        "roleAssignmentScheduleRequests",
+        "roleEligibilityScheduleRequests",
+    }
+    scope_prefix = "" if scope == "/" else scope
+    return {
+        "id": (
+            f"{scope_prefix}/providers/Microsoft.Authorization/"
+            f"{resource_type}/{request_guid}"
+        ),
+        "name": request_guid,
+        "type": f"Microsoft.Authorization/{resource_type}",
+        "properties": {
+            "principalId": principal_id,
+            "principalType": principal_type,
+            "roleDefinitionId": role_definition_id,
+            "scope": scope,
+            "requestType": request_type,
+            "status": status,
+            "scheduleInfo": {
+                "startDateTime": "2026-09-17T03:00:00Z",
+                "expiration": {
+                    "type": "AfterDuration",
+                    "endDateTime": None,
+                    "duration": "PT1H",
+                },
+            },
             "conditionVersion": condition_version,
             "condition": condition,
         },
@@ -497,6 +674,19 @@ def _schedule_next_link(principal_id: str, page_number: int) -> str:
     return (
         f"https://management.azure.com/subscriptions/{SUBSCRIPTION_ID}/providers/"
         "Microsoft.Authorization/roleAssignmentScheduleInstances?"
+        f"api-version=2020-10-01&%24filter=principalId%20eq%20{principal_id}"
+        f"&%24skiptoken=page{page_number}"
+    )
+
+
+def _pim_next_link(
+    resource_type: str,
+    principal_id: str,
+    page_number: int,
+) -> str:
+    return (
+        f"https://management.azure.com/subscriptions/{SUBSCRIPTION_ID}/providers/"
+        f"Microsoft.Authorization/{resource_type}?"
         f"api-version=2020-10-01&%24filter=principalId%20eq%20{principal_id}"
         f"&%24skiptoken=page{page_number}"
     )
@@ -725,6 +915,10 @@ def test_effective_access_accepts_only_the_three_exact_direct_assignments() -> N
     assert evidence["completeness"] == {
         "classicRoleAssignments": True,
         "pimRoleAssignmentScheduleInstances": True,
+        "pimRoleAssignmentSchedules": True,
+        "pimRoleEligibilityScheduleInstances": True,
+        "pimRoleEligibilitySchedules": True,
+        "pimPendingGrantRequests": True,
         "transitiveGroups": True,
         "siblingRegistries": True,
         "acrEscalationPaths": True,
@@ -739,9 +933,9 @@ def test_effective_access_accepts_only_the_three_exact_direct_assignments() -> N
         "classicRoleAssignmentMaxPagesPerQuery": 64,
         "classicRoleAssignmentMaxApiCalls": 16_384,
         "classicRoleAssignmentMaxItems": 65_536,
-        "roleAssignmentScheduleMaxPagesPerQuery": 64,
-        "roleAssignmentScheduleMaxApiCalls": 16_384,
-        "roleAssignmentScheduleMaxInstances": 65_536,
+        "pimRoleManagementMaxPagesPerQuery": 64,
+        "pimRoleManagementMaxApiCalls": 98_304,
+        "pimRoleManagementMaxItems": 262_144,
     }
     assert str(evidence["evidenceDigest"]).startswith("sha256:")
     assert evidence["extraPullCapableAssignmentIds"] == []
@@ -757,11 +951,23 @@ def test_effective_access_accepts_only_the_three_exact_direct_assignments() -> N
         and "/roleAssignments?" in command[command.index("--url") + 1]
         for command in stub.commands
     ) == 3
-    assert sum(
-        command[1] == "rest"
-        and "/roleAssignmentScheduleInstances?" in command[command.index("--url") + 1]
-        for command in stub.commands
-    ) == 3
+    for resource_type in PIM_RESOURCE_TYPES:
+        resource_commands = [
+            command
+            for command in stub.commands
+            if command[1] == "rest"
+            and (
+                f"/Microsoft.Authorization/{resource_type}?"
+                in command[command.index("--url") + 1]
+            )
+        ]
+        assert len(resource_commands) == 3
+        assert all(
+            "api-version=2020-10-01" in command[command.index("--url") + 1]
+            and "principalId%20eq%20" in command[command.index("--url") + 1]
+            and "assignedTo" not in command[command.index("--url") + 1]
+            for command in resource_commands
+        )
     mode_commands = [
         command
         for command in stub.commands
@@ -808,11 +1014,148 @@ def test_effective_access_accepts_expected_assignment_schedule_mirrors() -> None
                 "nextLink": None,
             }
         ]
+        stub.assignment_schedule_pages[(SUBSCRIPTION_ID, expected.principal_id)] = [
+            {
+                "value": [
+                    _role_assignment_schedule(
+                        principal_id=expected.principal_id,
+                        principal_type="ServicePrincipal",
+                        role_definition_id=REPOSITORY_READER_ROLE_DEFINITION_ID,
+                        schedule_guid=schedule_instance_guid,
+                        scope=REGISTRY_ID,
+                        assignment_type="Assigned",
+                        status="Accepted",
+                        end_date_time=None,
+                        condition_version="2.0",
+                        condition=_repository_condition(expected.repository_name),
+                    )
+                ],
+                "nextLink": None,
+            }
+        ]
 
     evidence = _verify(stub)
 
     assert evidence["verified"] is True
     assert evidence["pullCapableAssignmentCount"] == 3
+
+
+@pytest.mark.parametrize(
+    (
+        "instance_assignment_type",
+        "schedule_assignment_type",
+        "instance_member_type",
+        "schedule_member_type",
+    ),
+    (
+        ("Assigned", "Activated", "Direct", "Direct"),
+        ("Assigned", "Assigned", "Direct", "Inherited"),
+    ),
+)
+def test_effective_access_rejects_conflicting_schedule_mirror_types(
+    instance_assignment_type: str,
+    schedule_assignment_type: str,
+    instance_member_type: str,
+    schedule_member_type: str,
+) -> None:
+    stub = StubAzure()
+    expected = _expected_assignments()[0]
+    schedule_guid = SCHEDULE_INSTANCE_GUIDS[0]
+    stub.schedule_pages[(SUBSCRIPTION_ID, expected.principal_id)] = [
+        {
+            "value": [
+                _schedule_instance(
+                    principal_id=expected.principal_id,
+                    principal_type="ServicePrincipal",
+                    role_definition_id=REPOSITORY_READER_ROLE_DEFINITION_ID,
+                    instance_guid=schedule_guid,
+                    origin_role_assignment_id=expected.assignment_resource_id,
+                    scope=REGISTRY_ID,
+                    assignment_type=instance_assignment_type,
+                    member_type=instance_member_type,
+                    status="Accepted",
+                    end_date_time=None,
+                    condition_version="2.0",
+                    condition=_repository_condition(expected.repository_name),
+                )
+            ],
+            "nextLink": None,
+        }
+    ]
+    stub.assignment_schedule_pages[(SUBSCRIPTION_ID, expected.principal_id)] = [
+        {
+            "value": [
+                _role_assignment_schedule(
+                    principal_id=expected.principal_id,
+                    principal_type="ServicePrincipal",
+                    role_definition_id=REPOSITORY_READER_ROLE_DEFINITION_ID,
+                    schedule_guid=schedule_guid,
+                    scope=REGISTRY_ID,
+                    assignment_type=schedule_assignment_type,
+                    member_type=schedule_member_type,
+                    status="Accepted",
+                    end_date_time=None,
+                    condition_version="2.0",
+                    condition=_repository_condition(expected.repository_name),
+                )
+            ],
+            "nextLink": None,
+        }
+    ]
+
+    with pytest.raises(EffectiveAccessError, match="conflicting evidence"):
+        _verify(stub)
+
+
+def test_effective_access_rejects_conditionless_pim_mirror_of_abac_assignment() -> None:
+    stub = StubAzure()
+    expected = _expected_assignments()[0]
+    schedule_guid = SCHEDULE_INSTANCE_GUIDS[0]
+    stub.schedule_pages[(SUBSCRIPTION_ID, expected.principal_id)] = [
+        {
+            "value": [
+                _schedule_instance(
+                    principal_id=expected.principal_id,
+                    principal_type="ServicePrincipal",
+                    role_definition_id=REPOSITORY_READER_ROLE_DEFINITION_ID,
+                    instance_guid=schedule_guid,
+                    origin_role_assignment_id=expected.assignment_resource_id,
+                    scope=REGISTRY_ID,
+                    assignment_type="Assigned",
+                    status="Accepted",
+                    end_date_time=None,
+                    condition_version=None,
+                    condition=None,
+                )
+            ],
+            "nextLink": None,
+        }
+    ]
+    stub.assignment_schedule_pages[(SUBSCRIPTION_ID, expected.principal_id)] = [
+        {
+            "value": [
+                _role_assignment_schedule(
+                    principal_id=expected.principal_id,
+                    principal_type="ServicePrincipal",
+                    role_definition_id=REPOSITORY_READER_ROLE_DEFINITION_ID,
+                    schedule_guid=schedule_guid,
+                    scope=REGISTRY_ID,
+                    assignment_type="Assigned",
+                    status="Accepted",
+                    end_date_time=None,
+                    condition_version=None,
+                    condition=None,
+                )
+            ],
+            "nextLink": None,
+        }
+    ]
+
+    with pytest.raises(
+        EffectiveAccessError,
+        match="conflicting duplicate assignment",
+    ):
+        _verify(stub)
 
 
 def test_effective_access_accepts_legacy_acr_pull_only_with_null_conditions() -> None:
@@ -1192,6 +1535,10 @@ def test_effective_access_escalation_action_contract_is_complete() -> None:
     assert set(ACR_ESCALATION_DATA_ACTIONS) == set(
         EXPECTED_ESCALATION_DATA_ACTIONS
     )
+    assert all(
+        "validate/action" not in action.casefold()
+        for action in (*ACR_ESCALATION_ACTIONS, *ACR_ESCALATION_DATA_ACTIONS)
+    )
 
 
 @pytest.mark.parametrize("action", EXPECTED_ESCALATION_ACTIONS)
@@ -1452,7 +1799,7 @@ def test_effective_access_rejects_cross_subscription_active_pim_assignment() -> 
         _verify(stub)
 
 
-def test_effective_access_ignores_not_yet_active_assignment_schedule_instance() -> None:
+def test_effective_access_rejects_future_assignment_schedule_instance() -> None:
     stub = StubAzure()
     role_definition_id = (
         f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
@@ -1477,7 +1824,352 @@ def test_effective_access_ignores_not_yet_active_assignment_schedule_instance() 
         }
     ]
 
+    with pytest.raises(
+        EffectiveAccessError,
+        match="cannot start in the future",
+    ):
+        _verify(stub)
+
+
+def test_effective_access_rejects_upcoming_assignment_schedule_when_instances_empty() -> None:
+    stub = StubAzure()
+    stub.assignment_schedule_pages[(SUBSCRIPTION_ID, PRINCIPAL_IDS[0])] = [
+        {
+            "value": [
+                _role_assignment_schedule(
+                    principal_id=PRINCIPAL_IDS[0],
+                    principal_type="ServicePrincipal",
+                    role_definition_id=REPOSITORY_READER_ROLE_DEFINITION_ID,
+                    start_date_time="2026-09-17T03:00:00Z",
+                    end_date_time="2026-09-17T04:00:00Z",
+                )
+            ],
+            "nextLink": None,
+        }
+    ]
+
+    with pytest.raises(EffectiveAccessError, match="active-PIM"):
+        _verify(stub)
+
+
+def test_effective_access_rejects_current_assignment_schedule_when_instances_empty() -> None:
+    stub = StubAzure()
+    stub.assignment_schedule_pages[(SUBSCRIPTION_ID, PRINCIPAL_IDS[0])] = [
+        {
+            "value": [
+                _role_assignment_schedule(
+                    principal_id=PRINCIPAL_IDS[0],
+                    principal_type="ServicePrincipal",
+                    role_definition_id=REPOSITORY_READER_ROLE_DEFINITION_ID,
+                )
+            ],
+            "nextLink": None,
+        }
+    ]
+
+    with pytest.raises(EffectiveAccessError, match="active-PIM"):
+        _verify(stub)
+
+
+def test_effective_access_rejects_current_eligibility_instance_as_latent_access() -> None:
+    stub = StubAzure()
+    stub.eligibility_instance_pages[(SUBSCRIPTION_ID, PRINCIPAL_IDS[0])] = [
+        {
+            "value": [
+                _role_eligibility_resource(
+                    resource_type="roleEligibilityScheduleInstances",
+                    principal_id=PRINCIPAL_IDS[0],
+                    principal_type="ServicePrincipal",
+                    role_definition_id=REPOSITORY_READER_ROLE_DEFINITION_ID,
+                )
+            ],
+            "nextLink": None,
+        }
+    ]
+
+    with pytest.raises(EffectiveAccessError, match="active-PIM"):
+        _verify(stub)
+
+
+def test_effective_access_rejects_upcoming_eligibility_schedule_as_latent_access() -> None:
+    stub = StubAzure()
+    stub.eligibility_schedule_pages[(SUBSCRIPTION_ID, PRINCIPAL_IDS[0])] = [
+        {
+            "value": [
+                _role_eligibility_resource(
+                    resource_type="roleEligibilitySchedules",
+                    principal_id=PRINCIPAL_IDS[0],
+                    principal_type="ServicePrincipal",
+                    role_definition_id=REPOSITORY_READER_ROLE_DEFINITION_ID,
+                    start_date_time="2026-09-17T03:00:00Z",
+                    end_date_time="2026-09-17T04:00:00Z",
+                )
+            ],
+            "nextLink": None,
+        }
+    ]
+
+    with pytest.raises(EffectiveAccessError, match="active-PIM"):
+        _verify(stub)
+
+
+@pytest.mark.parametrize(
+    ("resource_type", "page_attribute"),
+    (
+        ("roleAssignmentScheduleRequests", "assignment_request_pages"),
+        ("roleEligibilityScheduleRequests", "eligibility_request_pages"),
+    ),
+)
+def test_effective_access_rejects_pending_pim_grant_requests(
+    resource_type: str,
+    page_attribute: str,
+) -> None:
+    stub = StubAzure()
+    pages = getattr(stub, page_attribute)
+    pages[(SUBSCRIPTION_ID, PRINCIPAL_IDS[0])] = [
+        {
+            "value": [
+                _role_management_request(
+                    resource_type=resource_type,
+                    principal_id=PRINCIPAL_IDS[0],
+                    principal_type="ServicePrincipal",
+                    role_definition_id=REPOSITORY_READER_ROLE_DEFINITION_ID,
+                )
+            ],
+            "nextLink": None,
+        }
+    ]
+
+    with pytest.raises(EffectiveAccessError, match="active-PIM"):
+        _verify(stub)
+
+
+@pytest.mark.parametrize(
+    ("request_type", "status"),
+    (
+        ("AdminAssign", "Provisioned"),
+        ("AdminAssign", "ScheduleCreated"),
+        ("AdminRemove", "PendingApproval"),
+        ("SelfDeactivate", "PendingEvaluation"),
+    ),
+)
+def test_effective_access_does_not_reconstruct_state_from_resolved_or_removal_requests(
+    request_type: str,
+    status: str,
+) -> None:
+    stub = StubAzure()
+    stub.assignment_request_pages[(SUBSCRIPTION_ID, PRINCIPAL_IDS[0])] = [
+        {
+            "value": [
+                _role_management_request(
+                    resource_type="roleAssignmentScheduleRequests",
+                    principal_id=PRINCIPAL_IDS[0],
+                    principal_type="ServicePrincipal",
+                    role_definition_id=REPOSITORY_READER_ROLE_DEFINITION_ID,
+                    request_type=request_type,
+                    status=status,
+                )
+            ],
+            "nextLink": None,
+        }
+    ]
+
     assert _verify(stub)["verified"] is True
+
+
+def test_effective_access_rejects_unknown_pim_schedule_status() -> None:
+    stub = StubAzure()
+    stub.eligibility_schedule_pages[(SUBSCRIPTION_ID, PRINCIPAL_IDS[0])] = [
+        {
+            "value": [
+                _role_eligibility_resource(
+                    resource_type="roleEligibilitySchedules",
+                    principal_id=PRINCIPAL_IDS[0],
+                    principal_type="ServicePrincipal",
+                    role_definition_id=REPOSITORY_READER_ROLE_DEFINITION_ID,
+                    status="SyntheticUnknown",
+                )
+            ],
+            "nextLink": None,
+        }
+    ]
+
+    with pytest.raises(EffectiveAccessError, match="status is invalid"):
+        _verify(stub)
+
+
+def test_effective_access_rejects_unknown_pim_assignment_type() -> None:
+    stub = StubAzure()
+    stub.assignment_schedule_pages[(SUBSCRIPTION_ID, PRINCIPAL_IDS[0])] = [
+        {
+            "value": [
+                _role_assignment_schedule(
+                    principal_id=PRINCIPAL_IDS[0],
+                    principal_type="ServicePrincipal",
+                    role_definition_id=REPOSITORY_READER_ROLE_DEFINITION_ID,
+                    assignment_type="SyntheticUnknown",
+                )
+            ],
+            "nextLink": None,
+        }
+    ]
+
+    with pytest.raises(EffectiveAccessError, match="assignment type is invalid"):
+        _verify(stub)
+
+
+def test_effective_access_rejects_unknown_pim_condition_version() -> None:
+    stub = StubAzure()
+    stub.eligibility_schedule_pages[(SUBSCRIPTION_ID, PRINCIPAL_IDS[0])] = [
+        {
+            "value": [
+                _role_eligibility_resource(
+                    resource_type="roleEligibilitySchedules",
+                    principal_id=PRINCIPAL_IDS[0],
+                    principal_type="ServicePrincipal",
+                    role_definition_id=REPOSITORY_READER_ROLE_DEFINITION_ID,
+                    condition_version="1.0",
+                    condition=_repository_condition(REPOSITORIES[0]),
+                )
+            ],
+            "nextLink": None,
+        }
+    ]
+
+    with pytest.raises(EffectiveAccessError, match="condition is invalid"):
+        _verify(stub)
+
+
+def test_effective_access_rejects_incomplete_pim_condition_pair() -> None:
+    stub = StubAzure()
+    stub.eligibility_schedule_pages[(SUBSCRIPTION_ID, PRINCIPAL_IDS[0])] = [
+        {
+            "value": [
+                _role_eligibility_resource(
+                    resource_type="roleEligibilitySchedules",
+                    principal_id=PRINCIPAL_IDS[0],
+                    principal_type="ServicePrincipal",
+                    role_definition_id=REPOSITORY_READER_ROLE_DEFINITION_ID,
+                    condition_version="2.0",
+                    condition=None,
+                )
+            ],
+            "nextLink": None,
+        }
+    ]
+
+    with pytest.raises(EffectiveAccessError, match="condition is invalid"):
+        _verify(stub)
+
+
+def test_effective_access_rejects_unknown_pim_resource_type() -> None:
+    stub = StubAzure()
+    eligibility = _role_eligibility_resource(
+        resource_type="roleEligibilitySchedules",
+        principal_id=PRINCIPAL_IDS[0],
+        principal_type="ServicePrincipal",
+        role_definition_id=REPOSITORY_READER_ROLE_DEFINITION_ID,
+    )
+    eligibility["type"] = "Microsoft.Authorization/syntheticSchedules"
+    stub.eligibility_schedule_pages[(SUBSCRIPTION_ID, PRINCIPAL_IDS[0])] = [
+        {
+            "value": [eligibility],
+            "nextLink": None,
+        }
+    ]
+
+    with pytest.raises(EffectiveAccessError, match="type is invalid"):
+        _verify(stub)
+
+
+def test_effective_access_rejects_non_utc_pim_schedule_time() -> None:
+    stub = StubAzure()
+    stub.eligibility_schedule_pages[(SUBSCRIPTION_ID, PRINCIPAL_IDS[0])] = [
+        {
+            "value": [
+                _role_eligibility_resource(
+                    resource_type="roleEligibilitySchedules",
+                    principal_id=PRINCIPAL_IDS[0],
+                    principal_type="ServicePrincipal",
+                    role_definition_id=REPOSITORY_READER_ROLE_DEFINITION_ID,
+                    start_date_time="2026-09-17T01:00:00+01:00",
+                )
+            ],
+            "nextLink": None,
+        }
+    ]
+
+    with pytest.raises(EffectiveAccessError, match="must be a UTC timestamp"):
+        _verify(stub)
+
+
+def test_effective_access_rejects_future_eligibility_instance() -> None:
+    stub = StubAzure()
+    stub.eligibility_instance_pages[(SUBSCRIPTION_ID, PRINCIPAL_IDS[0])] = [
+        {
+            "value": [
+                _role_eligibility_resource(
+                    resource_type="roleEligibilityScheduleInstances",
+                    principal_id=PRINCIPAL_IDS[0],
+                    principal_type="ServicePrincipal",
+                    role_definition_id=REPOSITORY_READER_ROLE_DEFINITION_ID,
+                    start_date_time="2026-09-17T03:00:00Z",
+                    end_date_time="2026-09-17T04:00:00Z",
+                )
+            ],
+            "nextLink": None,
+        }
+    ]
+
+    with pytest.raises(EffectiveAccessError, match="cannot start in the future"):
+        _verify(stub)
+
+
+def test_effective_access_rejects_unknown_pim_request_type() -> None:
+    stub = StubAzure()
+    stub.assignment_request_pages[(SUBSCRIPTION_ID, PRINCIPAL_IDS[0])] = [
+        {
+            "value": [
+                _role_management_request(
+                    resource_type="roleAssignmentScheduleRequests",
+                    principal_id=PRINCIPAL_IDS[0],
+                    principal_type="ServicePrincipal",
+                    role_definition_id=REPOSITORY_READER_ROLE_DEFINITION_ID,
+                    request_type="Validate",
+                )
+            ],
+            "nextLink": None,
+        }
+    ]
+
+    with pytest.raises(EffectiveAccessError, match="request type is invalid"):
+        _verify(stub)
+
+
+def test_effective_access_rejects_unknown_pim_request_expiration() -> None:
+    stub = StubAzure()
+    request = _role_management_request(
+        resource_type="roleEligibilityScheduleRequests",
+        principal_id=PRINCIPAL_IDS[0],
+        principal_type="ServicePrincipal",
+        role_definition_id=REPOSITORY_READER_ROLE_DEFINITION_ID,
+    )
+    properties = request["properties"]
+    assert isinstance(properties, dict)
+    schedule_info = properties["scheduleInfo"]
+    assert isinstance(schedule_info, dict)
+    expiration = schedule_info["expiration"]
+    assert isinstance(expiration, dict)
+    expiration["type"] = "SyntheticUnknown"
+    stub.eligibility_request_pages[(SUBSCRIPTION_ID, PRINCIPAL_IDS[0])] = [
+        {
+            "value": [request],
+            "nextLink": None,
+        }
+    ]
+
+    with pytest.raises(EffectiveAccessError, match="expiration type is invalid"):
+        _verify(stub)
 
 
 def test_effective_access_rejects_schedule_instance_principal_mismatch() -> None:
@@ -1913,7 +2605,7 @@ def test_effective_access_rejects_expected_assignment_profile_drift(
         EffectiveAccessError,
         match=(
             "not exact|exact registry|principal type|canonical for its scope|"
-            "missing an exact reviewed"
+            "missing an exact reviewed|condition is invalid"
         ),
     ):
         _verify(stub)
@@ -2060,7 +2752,42 @@ def test_effective_access_accepts_terminal_pages_at_exact_page_limits(
     monkeypatch.setattr(acr_verifier, "MAX_TENANT_HIERARCHY_PAGES", 1)
     monkeypatch.setattr(acr_verifier, "MAX_GRAPH_MEMBERSHIP_PAGES", 1)
     monkeypatch.setattr(acr_verifier, "MAX_CLASSIC_ROLE_ASSIGNMENT_PAGES", 1)
-    monkeypatch.setattr(acr_verifier, "MAX_ROLE_ASSIGNMENT_SCHEDULE_PAGES", 1)
+    monkeypatch.setattr(acr_verifier, "MAX_PIM_ROLE_MANAGEMENT_PAGES", 1)
+
+    assert _verify(stub)["verified"] is True
+
+
+@pytest.mark.parametrize(
+    ("resource_type", "page_attribute"),
+    (
+        ("roleAssignmentScheduleInstances", "schedule_pages"),
+        ("roleAssignmentSchedules", "assignment_schedule_pages"),
+        ("roleEligibilityScheduleInstances", "eligibility_instance_pages"),
+        ("roleEligibilitySchedules", "eligibility_schedule_pages"),
+        ("roleAssignmentScheduleRequests", "assignment_request_pages"),
+        ("roleEligibilityScheduleRequests", "eligibility_request_pages"),
+    ),
+)
+def test_effective_access_follows_each_pim_collection_next_link(
+    resource_type: str,
+    page_attribute: str,
+) -> None:
+    stub = StubAzure()
+    pages = getattr(stub, page_attribute)
+    pages[(SUBSCRIPTION_ID, PRINCIPAL_IDS[0])] = [
+        {
+            "value": [],
+            "nextLink": _pim_next_link(
+                resource_type,
+                PRINCIPAL_IDS[0],
+                2,
+            ),
+        },
+        {
+            "value": [],
+            "nextLink": None,
+        },
+    ]
 
     assert _verify(stub)["verified"] is True
 
@@ -2116,8 +2843,30 @@ def test_effective_access_rejects_untrusted_schedule_continuation() -> None:
 
     with pytest.raises(
         EffectiveAccessError,
-        match="role-assignment schedule continuation is invalid",
+        match="PIM role-management continuation is invalid",
     ):
+        _verify(stub)
+
+
+def test_effective_access_rejects_pim_pagination_cycle() -> None:
+    stub = StubAzure()
+    page_two = _pim_next_link(
+        "roleAssignmentScheduleInstances",
+        PRINCIPAL_IDS[0],
+        2,
+    )
+    stub.schedule_pages[(SUBSCRIPTION_ID, PRINCIPAL_IDS[0])] = [
+        {
+            "value": [],
+            "nextLink": page_two,
+        },
+        {
+            "value": [],
+            "nextLink": page_two,
+        },
+    ]
+
+    with pytest.raises(EffectiveAccessError, match="pagination contains a cycle"):
         _verify(stub)
 
 
@@ -2131,11 +2880,11 @@ def test_effective_access_rejects_schedule_pagination_over_bound(
             "nextLink": _schedule_next_link(PRINCIPAL_IDS[0], 2),
         }
     ]
-    monkeypatch.setattr(acr_verifier, "MAX_ROLE_ASSIGNMENT_SCHEDULE_PAGES", 1)
+    monkeypatch.setattr(acr_verifier, "MAX_PIM_ROLE_MANAGEMENT_PAGES", 1)
 
     with pytest.raises(
         EffectiveAccessError,
-        match="schedule pagination exceeded its bound",
+        match="PIM role-management pagination exceeded its bound",
     ):
         _verify(stub)
 
@@ -2144,11 +2893,11 @@ def test_effective_access_rejects_schedule_query_set_over_call_bound(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     stub = StubAzure()
-    monkeypatch.setattr(acr_verifier, "MAX_ROLE_ASSIGNMENT_SCHEDULE_API_CALLS", 2)
+    monkeypatch.setattr(acr_verifier, "MAX_PIM_ROLE_MANAGEMENT_API_CALLS", 2)
 
     with pytest.raises(
         EffectiveAccessError,
-        match="query set exceeds its API call bound",
+        match="PIM role-management query set exceeds its API call bound",
     ):
         _verify(stub)
 
@@ -2201,11 +2950,11 @@ def test_effective_access_rejects_schedule_instance_count_over_bound(
             "nextLink": None,
         }
     ]
-    monkeypatch.setattr(acr_verifier, "MAX_ROLE_ASSIGNMENT_SCHEDULE_INSTANCES", 0)
+    monkeypatch.setattr(acr_verifier, "MAX_PIM_ROLE_MANAGEMENT_ITEMS", 0)
 
     with pytest.raises(
         EffectiveAccessError,
-        match="schedule instances exceed their bound",
+        match="PIM role-management items exceed their bound",
     ):
         _verify(stub)
 
@@ -2240,7 +2989,7 @@ def test_effective_access_rejects_incomplete_schedule_page() -> None:
 
     with pytest.raises(
         EffectiveAccessError,
-        match="schedule page must contain an array",
+        match="PIM role-management page must contain an array",
     ):
         _verify(stub)
 

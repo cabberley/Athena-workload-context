@@ -22,11 +22,11 @@ MAX_GOVERNED_SUBSCRIPTIONS = 4096
 MAX_CLASSIC_ROLE_ASSIGNMENT_PAGES = 64
 MAX_CLASSIC_ROLE_ASSIGNMENT_API_CALLS = 16_384
 MAX_CLASSIC_ROLE_ASSIGNMENTS = 65_536
-MAX_ROLE_ASSIGNMENT_SCHEDULE_PAGES = 64
-MAX_ROLE_ASSIGNMENT_SCHEDULE_API_CALLS = 16_384
-MAX_ROLE_ASSIGNMENT_SCHEDULE_INSTANCES = 65_536
+MAX_PIM_ROLE_MANAGEMENT_PAGES = 64
+MAX_PIM_ROLE_MANAGEMENT_API_CALLS = 98_304
+MAX_PIM_ROLE_MANAGEMENT_ITEMS = 262_144
 ROLE_ASSIGNMENTS_API_VERSION = "2022-04-01"
-ROLE_ASSIGNMENT_SCHEDULE_API_VERSION = "2020-10-01"
+PIM_ROLE_MANAGEMENT_API_VERSION = "2020-10-01"
 ACR_LEGACY_PULL_ACTION = "Microsoft.ContainerRegistry/registries/pull/read"
 ACR_REPOSITORY_CONTENT_READ_DATA_ACTION = (
     "Microsoft.ContainerRegistry/registries/repositories/content/read"
@@ -123,6 +123,40 @@ _INACTIVE_ROLE_ASSIGNMENT_SCHEDULE_STATUSES = frozenset(
         "Invalid",
     }
 )
+_RESOLVED_ROLE_MANAGEMENT_REQUEST_STATUSES = frozenset(
+    {
+        "Granted",
+        "Provisioned",
+        "ScheduleCreated",
+    }
+)
+_ROLE_MANAGEMENT_REQUEST_TYPES = frozenset(
+    {
+        "AdminAssign",
+        "AdminRemove",
+        "AdminUpdate",
+        "AdminExtend",
+        "AdminRenew",
+        "SelfActivate",
+        "SelfDeactivate",
+        "SelfExtend",
+        "SelfRenew",
+    }
+)
+_ROLE_MANAGEMENT_REMOVAL_REQUEST_TYPES = frozenset(
+    {
+        "AdminRemove",
+        "SelfDeactivate",
+    }
+)
+_PIM_ROLE_MANAGEMENT_RESOURCE_TYPES = (
+    "roleAssignmentScheduleInstances",
+    "roleAssignmentSchedules",
+    "roleEligibilityScheduleInstances",
+    "roleEligibilitySchedules",
+    "roleAssignmentScheduleRequests",
+    "roleEligibilityScheduleRequests",
+)
 type JsonRunner = Callable[[Sequence[str], str], object]
 
 
@@ -149,9 +183,9 @@ class _RolePermissionProfile:
 
 
 @dataclass(slots=True)
-class _RoleAssignmentScheduleScanBudget:
+class _PimRoleManagementScanBudget:
     api_calls: int = 0
-    instances: int = 0
+    items: int = 0
 
 
 @dataclass(slots=True)
@@ -169,9 +203,9 @@ def _pagination_budgets() -> dict[str, int]:
         "classicRoleAssignmentMaxPagesPerQuery": MAX_CLASSIC_ROLE_ASSIGNMENT_PAGES,
         "classicRoleAssignmentMaxApiCalls": MAX_CLASSIC_ROLE_ASSIGNMENT_API_CALLS,
         "classicRoleAssignmentMaxItems": MAX_CLASSIC_ROLE_ASSIGNMENTS,
-        "roleAssignmentScheduleMaxPagesPerQuery": MAX_ROLE_ASSIGNMENT_SCHEDULE_PAGES,
-        "roleAssignmentScheduleMaxApiCalls": MAX_ROLE_ASSIGNMENT_SCHEDULE_API_CALLS,
-        "roleAssignmentScheduleMaxInstances": MAX_ROLE_ASSIGNMENT_SCHEDULE_INSTANCES,
+        "pimRoleManagementMaxPagesPerQuery": MAX_PIM_ROLE_MANAGEMENT_PAGES,
+        "pimRoleManagementMaxApiCalls": MAX_PIM_ROLE_MANAGEMENT_API_CALLS,
+        "pimRoleManagementMaxItems": MAX_PIM_ROLE_MANAGEMENT_ITEMS,
     }
 
 
@@ -280,16 +314,19 @@ def verify_effective_access(
         (1 + len(group_ids)) * len(governed_subscription_ids)
         for group_ids in transitive_groups_by_principal.values()
     )
-    if principal_subscription_queries > MAX_ROLE_ASSIGNMENT_SCHEDULE_API_CALLS:
+    minimum_pim_calls = principal_subscription_queries * len(
+        _PIM_ROLE_MANAGEMENT_RESOURCE_TYPES
+    )
+    if minimum_pim_calls > MAX_PIM_ROLE_MANAGEMENT_API_CALLS:
         raise EffectiveAccessError(
-            "active role-assignment schedule query set exceeds its API call bound"
+            "PIM role-management query set exceeds its API call bound"
         )
     if principal_subscription_queries > MAX_CLASSIC_ROLE_ASSIGNMENT_API_CALLS:
         raise EffectiveAccessError(
             "classic role-assignment query set exceeds its API call bound"
         )
     classic_budget = _ClassicRoleAssignmentScanBudget()
-    schedule_budget = _RoleAssignmentScheduleScanBudget()
+    pim_budget = _PimRoleManagementScanBudget()
     for principal_id in sorted(expected_by_principal):
         assignments = _resolved_effective_role_assignments(
             principal_id,
@@ -298,7 +335,7 @@ def verify_effective_access(
             governed_subscription_ids=governed_subscription_id_set,
             active_at=timestamp,
             classic_budget=classic_budget,
-            schedule_budget=schedule_budget,
+            pim_budget=pim_budget,
             run_json=run_json,
         )
         for index, raw_assignment in enumerate(assignments):
@@ -373,11 +410,19 @@ def verify_effective_access(
         "directMembershipTraversalComplete": True,
         "convergedMembershipReadbacks": True,
         "roleAssignmentScheduleInstancesComplete": True,
+        "roleAssignmentSchedulesComplete": True,
+        "roleEligibilityScheduleInstancesComplete": True,
+        "roleEligibilitySchedulesComplete": True,
+        "roleManagementPendingRequestsComplete": True,
         "siblingRegistriesChecked": True,
         "acrEscalationPathsChecked": True,
         "completeness": {
             "classicRoleAssignments": True,
             "pimRoleAssignmentScheduleInstances": True,
+            "pimRoleAssignmentSchedules": True,
+            "pimRoleEligibilityScheduleInstances": True,
+            "pimRoleEligibilitySchedules": True,
+            "pimPendingGrantRequests": True,
             "transitiveGroups": True,
             "siblingRegistries": True,
             "acrEscalationPaths": True,
@@ -817,7 +862,7 @@ def _resolved_effective_role_assignments(
     governed_subscription_ids: frozenset[str],
     active_at: datetime,
     classic_budget: _ClassicRoleAssignmentScanBudget,
-    schedule_budget: _RoleAssignmentScheduleScanBudget,
+    pim_budget: _PimRoleManagementScanBudget,
     run_json: JsonRunner,
 ) -> list[dict[str, Any]]:
     documents: list[object] = []
@@ -838,13 +883,13 @@ def _resolved_effective_role_assignments(
                 )
             )
             documents.append(
-                _active_role_assignment_schedule_instances(
+                _effective_pim_role_assignments(
                     effective_principal_id,
                     principal_type=principal_type,
                     subscription_id=subscription_id,
                     governed_subscription_ids=governed_subscription_ids,
                     active_at=active_at,
-                    schedule_budget=schedule_budget,
+                    pim_budget=pim_budget,
                     run_json=run_json,
                 )
             )
@@ -1053,6 +1098,10 @@ def _classic_role_assignment(
     )
     if assignment_id.rsplit("/", 1)[-1] != assignment_name:
         raise EffectiveAccessError(f"{field} name does not match its ID")
+    condition_version, condition = _role_management_condition(
+        properties,
+        field=field,
+    )
     return {
         "id": assignment_id,
         "principalId": assignment_principal_id,
@@ -1062,61 +1111,156 @@ def _classic_role_assignment(
             field=f"{field} role definition ID",
         ),
         "scope": scope,
-        "conditionVersion": _optional_string(
-            properties.get("conditionVersion"),
-            field=f"{field} conditionVersion",
-        ),
-        "condition": _optional_string(
-            properties.get("condition"),
-            field=f"{field} condition",
-        ),
+        "conditionVersion": condition_version,
+        "condition": condition,
     }
 
 
-def _active_role_assignment_schedule_instances(
+def _effective_pim_role_assignments(
     principal_id: str,
     *,
     principal_type: str,
     subscription_id: str,
     governed_subscription_ids: frozenset[str],
     active_at: datetime,
-    schedule_budget: _RoleAssignmentScheduleScanBudget,
+    pim_budget: _PimRoleManagementScanBudget,
     run_json: JsonRunner,
 ) -> list[dict[str, Any]]:
+    resources = {
+        resource_type: _pim_role_management_resources(
+            resource_type,
+            principal_id=principal_id,
+            subscription_id=subscription_id,
+            pim_budget=pim_budget,
+            run_json=run_json,
+        )
+        for resource_type in _PIM_ROLE_MANAGEMENT_RESOURCE_TYPES
+    }
+    assignments: list[dict[str, Any]] = []
+    current_assignments_by_schedule_id: dict[str, dict[str, Any]] = {}
+    for index, resource in enumerate(resources["roleAssignmentScheduleInstances"]):
+        schedule_id, assignment = _role_assignment_schedule_instance(
+            resource,
+            principal_id=principal_id,
+            principal_type=principal_type,
+            governed_subscription_ids=governed_subscription_ids,
+            active_at=active_at,
+            field=f"role-assignment schedule instance {index}",
+        )
+        if assignment is None:
+            continue
+        normalized_schedule_id = schedule_id.casefold()
+        if normalized_schedule_id in current_assignments_by_schedule_id:
+            raise EffectiveAccessError(
+                "current role-assignment schedule instances contain a duplicate schedule"
+            )
+        current_assignments_by_schedule_id[normalized_schedule_id] = assignment
+        assignments.append(assignment)
+
+    for index, resource in enumerate(resources["roleAssignmentSchedules"]):
+        schedule_id, schedule_assignment = _role_assignment_schedule(
+            resource,
+            principal_id=principal_id,
+            principal_type=principal_type,
+            governed_subscription_ids=governed_subscription_ids,
+            active_at=active_at,
+            field=f"role-assignment schedule {index}",
+        )
+        if schedule_assignment is None:
+            continue
+        current_assignment = current_assignments_by_schedule_id.get(
+            schedule_id.casefold()
+        )
+        if current_assignment is not None:
+            _require_matching_role_management_grants(
+                current_assignment,
+                schedule_assignment,
+                field="current role-assignment schedule and instance",
+            )
+            continue
+        assignments.append(schedule_assignment)
+
+    for resource_type in (
+        "roleEligibilityScheduleInstances",
+        "roleEligibilitySchedules",
+    ):
+        for index, resource in enumerate(resources[resource_type]):
+            eligibility = _role_eligibility_schedule(
+                resource,
+                resource_type=resource_type,
+                principal_id=principal_id,
+                principal_type=principal_type,
+                governed_subscription_ids=governed_subscription_ids,
+                active_at=active_at,
+                field=f"{resource_type} item {index}",
+            )
+            if eligibility is not None:
+                assignments.append(eligibility)
+
+    for resource_type in (
+        "roleAssignmentScheduleRequests",
+        "roleEligibilityScheduleRequests",
+    ):
+        for index, resource in enumerate(resources[resource_type]):
+            pending_request = _pending_role_management_request(
+                resource,
+                resource_type=resource_type,
+                principal_id=principal_id,
+                principal_type=principal_type,
+                governed_subscription_ids=governed_subscription_ids,
+                field=f"{resource_type} item {index}",
+            )
+            if pending_request is not None:
+                assignments.append(pending_request)
+    return assignments
+
+
+def _pim_role_management_resources(
+    resource_type: str,
+    *,
+    principal_id: str,
+    subscription_id: str,
+    pim_budget: _PimRoleManagementScanBudget,
+    run_json: JsonRunner,
+) -> list[dict[str, Any]]:
+    if resource_type not in _PIM_ROLE_MANAGEMENT_RESOURCE_TYPES:
+        raise EffectiveAccessError("PIM role-management resource type is invalid")
     subscription_scope = f"/subscriptions/{subscription_id}"
+    filter_value = f"principalId eq {principal_id}"
     query = urlencode(
         (
-            ("api-version", ROLE_ASSIGNMENT_SCHEDULE_API_VERSION),
-            ("$filter", f"principalId eq {principal_id}"),
+            ("api-version", PIM_ROLE_MANAGEMENT_API_VERSION),
+            ("$filter", filter_value),
         ),
         quote_via=quote,
     )
     next_url: str | None = (
         f"https://{ARM_HOST}{subscription_scope}/providers/"
-        f"Microsoft.Authorization/roleAssignmentScheduleInstances?{query}"
+        f"Microsoft.Authorization/{resource_type}?{query}"
     )
-    active_assignments: list[dict[str, Any]] = []
+    resources: list[dict[str, Any]] = []
     seen_urls: set[str] = set()
-    seen_instance_ids: set[str] = set()
-    for page_number in range(1, MAX_ROLE_ASSIGNMENT_SCHEDULE_PAGES + 1):
+    seen_resource_ids: set[str] = set()
+    for page_number in range(1, MAX_PIM_ROLE_MANAGEMENT_PAGES + 1):
         if next_url is None:
-            return active_assignments
-        _validate_role_assignment_schedule_instances_url(
+            return resources
+        _validate_pim_role_management_url(
             next_url,
+            resource_type=resource_type,
             subscription_id=subscription_id,
             principal_id=principal_id,
             first_page=page_number == 1,
         )
         if next_url in seen_urls:
             raise EffectiveAccessError(
-                "active role-assignment schedule pagination contains a cycle"
+                "PIM role-management pagination contains a cycle"
             )
         seen_urls.add(next_url)
-        if schedule_budget.api_calls >= MAX_ROLE_ASSIGNMENT_SCHEDULE_API_CALLS:
+        if pim_budget.api_calls >= MAX_PIM_ROLE_MANAGEMENT_API_CALLS:
             raise EffectiveAccessError(
-                "active role-assignment schedule API calls exceed their bound"
+                "PIM role-management API calls exceed their bound"
             )
-        schedule_budget.api_calls += 1
+        pim_budget.api_calls += 1
         page = _mapping(
             run_json(
                 [
@@ -1131,72 +1275,66 @@ def _active_role_assignment_schedule_instances(
                     "json",
                 ],
                 (
-                    "active role-assignment schedules for "
-                    f"{principal_type} {principal_id} in {subscription_scope} "
+                    f"{resource_type} for {principal_id} in {subscription_scope} "
                     f"page {page_number}"
                 ),
             ),
-            field="active role-assignment schedule page",
+            field=f"{resource_type} page",
         )
         values = page.get("value")
         if not isinstance(values, list):
             raise EffectiveAccessError(
-                "active role-assignment schedule page must contain an array"
+                "PIM role-management page must contain an array"
             )
-        schedule_budget.instances += len(values)
-        if schedule_budget.instances > MAX_ROLE_ASSIGNMENT_SCHEDULE_INSTANCES:
-            raise EffectiveAccessError(
-                "active role-assignment schedule instances exceed their bound"
-            )
-        for instance_index, raw_instance in enumerate(values):
-            instance_id, active_assignment = _role_assignment_schedule_instance(
-                raw_instance,
-                principal_id=principal_id,
-                principal_type=principal_type,
-                governed_subscription_ids=governed_subscription_ids,
-                active_at=active_at,
-                field=(
-                    "active role-assignment schedule "
-                    f"page {page_number} item {instance_index}"
-                ),
-            )
-            normalized_instance_id = instance_id.casefold()
-            if normalized_instance_id in seen_instance_ids:
+        for item_index, raw_resource in enumerate(values):
+            if pim_budget.items >= MAX_PIM_ROLE_MANAGEMENT_ITEMS:
                 raise EffectiveAccessError(
-                    "active role-assignment schedule pages contain a duplicate"
+                    "PIM role-management items exceed their bound"
                 )
-            seen_instance_ids.add(normalized_instance_id)
-            if active_assignment is not None:
-                active_assignments.append(active_assignment)
+            pim_budget.items += 1
+            resource = _mapping(
+                raw_resource,
+                field=f"{resource_type} page {page_number} item {item_index}",
+            )
+            resource_id = _string(
+                resource.get("id"),
+                field=f"{resource_type} resource ID",
+            ).casefold()
+            if resource_id in seen_resource_ids:
+                raise EffectiveAccessError(
+                    "PIM role-management pages contain a duplicate resource"
+                )
+            seen_resource_ids.add(resource_id)
+            resources.append(resource)
         continuation = page.get("nextLink")
         if continuation is None:
-            return active_assignments
-        elif isinstance(continuation, str) and continuation:
-            next_url = continuation
-        else:
+            return resources
+        if not isinstance(continuation, str) or not continuation:
             raise EffectiveAccessError(
-                "active role-assignment schedule continuation is invalid"
+                "PIM role-management continuation is invalid"
             )
+        next_url = continuation
     raise EffectiveAccessError(
-        "active role-assignment schedule pagination exceeded its bound"
+        "PIM role-management pagination exceeded its bound"
     )
 
 
-def _validate_role_assignment_schedule_instances_url(
+def _validate_pim_role_management_url(
     url: str,
     *,
+    resource_type: str,
     subscription_id: str,
     principal_id: str,
     first_page: bool,
 ) -> None:
     if len(url) > 16_384:
         raise EffectiveAccessError(
-            "active role-assignment schedule continuation is oversized"
+            "PIM role-management continuation is oversized"
         )
     parsed = urlparse(url)
     expected_path = (
         f"/subscriptions/{subscription_id}/providers/"
-        "Microsoft.Authorization/roleAssignmentScheduleInstances"
+        f"Microsoft.Authorization/{resource_type}"
     )
     query = parse_qs(parsed.query, keep_blank_values=True)
     normalized_query: dict[str, list[str]] = {}
@@ -1204,14 +1342,9 @@ def _validate_role_assignment_schedule_instances_url(
         normalized_key = key.casefold()
         if normalized_key in normalized_query:
             raise EffectiveAccessError(
-                "active role-assignment schedule continuation is invalid"
+                "PIM role-management continuation is invalid"
             )
         normalized_query[normalized_key] = values
-    allowed_query_keys = {
-        "api-version",
-        "$filter",
-        "$skiptoken",
-    }
     continuation_keys = {"$skiptoken"} & normalized_query.keys()
     if (
         parsed.scheme != "https"
@@ -1220,46 +1353,48 @@ def _validate_role_assignment_schedule_instances_url(
         or parsed.fragment
         or parsed.username is not None
         or parsed.password is not None
-        or any(key not in allowed_query_keys for key in normalized_query)
+        or any(
+            key not in {"api-version", "$filter", "$skiptoken"}
+            for key in normalized_query
+        )
         or any(len(values) != 1 or not values[0] for values in normalized_query.values())
-        or normalized_query.get("api-version")
-        != [ROLE_ASSIGNMENT_SCHEDULE_API_VERSION]
+        or normalized_query.get("api-version") != [PIM_ROLE_MANAGEMENT_API_VERSION]
         or normalized_query.get("$filter") != [f"principalId eq {principal_id}"]
         or (first_page and continuation_keys)
-        or (not first_page and len(continuation_keys) != 1)
+        or (not first_page and continuation_keys != {"$skiptoken"})
     ):
         raise EffectiveAccessError(
-            "active role-assignment schedule continuation is invalid"
+            "PIM role-management continuation is invalid"
         )
 
 
-def _role_assignment_schedule_instance(
+def _role_management_resource(
     value: object,
     *,
+    resource_type: str,
     principal_id: str,
     principal_type: str,
     governed_subscription_ids: frozenset[str],
-    active_at: datetime,
     field: str,
-) -> tuple[str, dict[str, Any] | None]:
+) -> tuple[str, dict[str, Any], dict[str, Any]]:
     resource = _mapping(value, field=field)
-    instance_name = _canonical_uuid(
+    resource_name = _canonical_uuid(
         resource.get("name"),
         field=f"{field} name",
     )
     if str(resource.get("type", "")).casefold() != (
-        "Microsoft.Authorization/roleAssignmentScheduleInstances"
+        f"Microsoft.Authorization/{resource_type}"
     ).casefold():
         raise EffectiveAccessError(f"{field} type is invalid")
     properties = _mapping(
         resource.get("properties"),
         field=f"{field} properties",
     )
-    schedule_principal_id = _canonical_uuid(
+    resource_principal_id = _canonical_uuid(
         properties.get("principalId"),
         field=f"{field} principal ID",
     )
-    if schedule_principal_id != principal_id:
+    if resource_principal_id != principal_id:
         raise EffectiveAccessError(f"{field} principal does not match its query")
     if properties.get("principalType") != principal_type:
         raise EffectiveAccessError(f"{field} principal type does not match its query")
@@ -1268,32 +1403,60 @@ def _role_assignment_schedule_instance(
         governed_subscription_ids=governed_subscription_ids,
         field=f"{field} scope",
     )
-    instance_id = _string(
+    resource_id = _canonical_role_management_resource_id(
         resource.get("id"),
+        scope=scope,
+        resource_type=resource_type,
         field=f"{field} ID",
     )
-    scope_prefix = "" if scope == "/" else scope
-    expected_instance_id = (
-        f"{scope_prefix}/providers/Microsoft.Authorization/"
-        f"roleAssignmentScheduleInstances/{instance_name}"
+    if resource_id.rsplit("/", 1)[-1] != resource_name:
+        raise EffectiveAccessError(f"{field} name does not match its ID")
+    condition_version, condition = _role_management_condition(
+        properties,
+        field=field,
     )
-    if instance_id.casefold() != expected_instance_id.casefold():
-        raise EffectiveAccessError(f"{field} ID is not canonical for its scope")
-    origin_role_assignment_id = _canonical_role_assignment_origin_id(
-        properties.get("originRoleAssignmentId"),
-        scope=scope,
-        field=f"{field} origin role assignment ID",
+    grant = {
+        "id": resource_id,
+        "principalId": resource_principal_id,
+        "principalType": principal_type,
+        "roleDefinitionId": _string(
+            properties.get("roleDefinitionId"),
+            field=f"{field} role definition ID",
+        ),
+        "scope": scope,
+        "conditionVersion": condition_version,
+        "condition": condition,
+    }
+    return resource_id, properties, grant
+
+
+def _role_management_condition(
+    properties: Mapping[str, object],
+    *,
+    field: str,
+) -> tuple[str | None, str | None]:
+    condition_version = _optional_string(
+        properties.get("conditionVersion"),
+        field=f"{field} conditionVersion",
     )
-    role_definition_id = _string(
-        properties.get("roleDefinitionId"),
-        field=f"{field} role definition ID",
+    condition = _optional_string(
+        properties.get("condition"),
+        field=f"{field} condition",
     )
-    assignment_type = properties.get("assignmentType")
-    if assignment_type not in {"Activated", "Assigned"}:
-        raise EffectiveAccessError(f"{field} assignment type is invalid")
-    member_type = properties.get("memberType")
-    if member_type not in {"Direct", "Inherited", "Group"}:
-        raise EffectiveAccessError(f"{field} member type is invalid")
+    if condition_version is None and condition is None:
+        return None, None
+    if condition_version != "2.0" or condition is None or len(condition) > 4096:
+        raise EffectiveAccessError(f"{field} condition is invalid")
+    return condition_version, condition
+
+
+def _role_management_schedule_window(
+    properties: Mapping[str, object],
+    *,
+    active_at: datetime,
+    current_instance: bool,
+    field: str,
+) -> tuple[datetime, datetime | None, bool]:
     status = properties.get("status")
     if status not in _ROLE_ASSIGNMENT_SCHEDULE_STATUSES:
         raise EffectiveAccessError(f"{field} status is invalid")
@@ -1314,32 +1477,250 @@ def _role_assignment_schedule_instance(
     )
     if end_at is not None and end_at <= start_at:
         raise EffectiveAccessError(f"{field} time window is invalid")
-    condition_version = _optional_string(
-        properties.get("conditionVersion"),
-        field=f"{field} conditionVersion",
+    if status in _INACTIVE_ROLE_ASSIGNMENT_SCHEDULE_STATUSES:
+        return start_at, end_at, False
+    if end_at is not None and active_at >= end_at:
+        return start_at, end_at, False
+    if current_instance and start_at > active_at:
+        raise EffectiveAccessError(f"{field} cannot start in the future")
+    return start_at, end_at, True
+
+
+def _role_assignment_schedule_instance(
+    value: object,
+    *,
+    principal_id: str,
+    principal_type: str,
+    governed_subscription_ids: frozenset[str],
+    active_at: datetime,
+    field: str,
+) -> tuple[str, dict[str, Any] | None]:
+    _, properties, assignment = _role_management_resource(
+        value,
+        resource_type="roleAssignmentScheduleInstances",
+        principal_id=principal_id,
+        principal_type=principal_type,
+        governed_subscription_ids=governed_subscription_ids,
+        field=field,
     )
-    condition = _optional_string(
-        properties.get("condition"),
-        field=f"{field} condition",
+    assignment_type = properties.get("assignmentType")
+    if assignment_type not in {"Activated", "Assigned"}:
+        raise EffectiveAccessError(f"{field} assignment type is invalid")
+    member_type = properties.get("memberType")
+    if member_type not in {"Direct", "Inherited", "Group"}:
+        raise EffectiveAccessError(f"{field} member type is invalid")
+    scope = _string(assignment["scope"], field=f"{field} scope")
+    schedule_id = _canonical_role_management_resource_id(
+        properties.get("roleAssignmentScheduleId"),
+        scope=scope,
+        resource_type="roleAssignmentSchedules",
+        field=f"{field} role-assignment schedule ID",
+    )
+    origin_role_assignment_id = _canonical_role_assignment_origin_id(
+        properties.get("originRoleAssignmentId"),
+        scope=scope,
+        field=f"{field} origin role assignment ID",
+    )
+    _, _, current = _role_management_schedule_window(
+        properties,
+        active_at=active_at,
+        current_instance=True,
+        field=field,
+    )
+    if not current:
+        return schedule_id, None
+    assignment["id"] = origin_role_assignment_id
+    assignment["assignmentType"] = assignment_type
+    assignment["memberType"] = member_type
+    return schedule_id, assignment
+
+
+def _role_assignment_schedule(
+    value: object,
+    *,
+    principal_id: str,
+    principal_type: str,
+    governed_subscription_ids: frozenset[str],
+    active_at: datetime,
+    field: str,
+) -> tuple[str, dict[str, Any] | None]:
+    schedule_id, properties, assignment = _role_management_resource(
+        value,
+        resource_type="roleAssignmentSchedules",
+        principal_id=principal_id,
+        principal_type=principal_type,
+        governed_subscription_ids=governed_subscription_ids,
+        field=field,
+    )
+    assignment_type = properties.get("assignmentType")
+    if assignment_type not in {"Activated", "Assigned"}:
+        raise EffectiveAccessError(f"{field} assignment type is invalid")
+    member_type = properties.get("memberType")
+    if member_type not in {"Direct", "Inherited", "Group"}:
+        raise EffectiveAccessError(f"{field} member type is invalid")
+    _, _, relevant = _role_management_schedule_window(
+        properties,
+        active_at=active_at,
+        current_instance=False,
+        field=field,
+    )
+    if not relevant:
+        return schedule_id, None
+    assignment["assignmentType"] = assignment_type
+    assignment["memberType"] = member_type
+    return schedule_id, assignment
+
+
+def _role_eligibility_schedule(
+    value: object,
+    *,
+    resource_type: str,
+    principal_id: str,
+    principal_type: str,
+    governed_subscription_ids: frozenset[str],
+    active_at: datetime,
+    field: str,
+) -> dict[str, Any] | None:
+    resource_id, properties, assignment = _role_management_resource(
+        value,
+        resource_type=resource_type,
+        principal_id=principal_id,
+        principal_type=principal_type,
+        governed_subscription_ids=governed_subscription_ids,
+        field=field,
+    )
+    if properties.get("memberType") not in {"Direct", "Inherited", "Group"}:
+        raise EffectiveAccessError(f"{field} member type is invalid")
+    if resource_type == "roleEligibilityScheduleInstances":
+        _canonical_role_management_resource_id(
+            properties.get("roleEligibilityScheduleId"),
+            scope=_string(assignment["scope"], field=f"{field} scope"),
+            resource_type="roleEligibilitySchedules",
+            field=f"{field} role-eligibility schedule ID",
+        )
+    _, _, relevant = _role_management_schedule_window(
+        properties,
+        active_at=active_at,
+        current_instance=resource_type == "roleEligibilityScheduleInstances",
+        field=field,
+    )
+    if not relevant:
+        return None
+    assignment["id"] = resource_id
+    return assignment
+
+
+def _pending_role_management_request(
+    value: object,
+    *,
+    resource_type: str,
+    principal_id: str,
+    principal_type: str,
+    governed_subscription_ids: frozenset[str],
+    field: str,
+) -> dict[str, Any] | None:
+    resource_id, properties, assignment = _role_management_resource(
+        value,
+        resource_type=resource_type,
+        principal_id=principal_id,
+        principal_type=principal_type,
+        governed_subscription_ids=governed_subscription_ids,
+        field=field,
+    )
+    request_type = properties.get("requestType")
+    if request_type not in _ROLE_MANAGEMENT_REQUEST_TYPES:
+        raise EffectiveAccessError(f"{field} request type is invalid")
+    status = properties.get("status")
+    if status not in _ROLE_ASSIGNMENT_SCHEDULE_STATUSES:
+        raise EffectiveAccessError(f"{field} status is invalid")
+    _validate_role_management_request_schedule(
+        properties.get("scheduleInfo"),
+        field=f"{field} scheduleInfo",
     )
     if (
-        active_at < start_at
-        or (end_at is not None and active_at >= end_at)
+        request_type in _ROLE_MANAGEMENT_REMOVAL_REQUEST_TYPES
         or status in _INACTIVE_ROLE_ASSIGNMENT_SCHEDULE_STATUSES
+        or status in _RESOLVED_ROLE_MANAGEMENT_REQUEST_STATUSES
     ):
-        return instance_id, None
-    return (
-        instance_id,
-        {
-            "id": origin_role_assignment_id,
-            "principalId": schedule_principal_id,
-            "principalType": principal_type,
-            "roleDefinitionId": role_definition_id,
-            "scope": scope,
-            "conditionVersion": condition_version,
-            "condition": condition,
-        },
+        return None
+    assignment["id"] = resource_id
+    return assignment
+
+
+def _validate_role_management_request_schedule(
+    value: object,
+    *,
+    field: str,
+) -> None:
+    schedule = _mapping(value, field=field)
+    start_at = _utc_datetime(
+        schedule.get("startDateTime"),
+        field=f"{field} startDateTime",
     )
+    expiration = _mapping(
+        schedule.get("expiration"),
+        field=f"{field} expiration",
+    )
+    expiration_type = expiration.get("type")
+    if expiration_type not in {"AfterDuration", "AfterDateTime", "NoExpiration"}:
+        raise EffectiveAccessError(f"{field} expiration type is invalid")
+    raw_end_at = expiration.get("endDateTime")
+    raw_duration = expiration.get("duration")
+    if expiration_type == "AfterDateTime":
+        end_at = _utc_datetime(
+            raw_end_at,
+            field=f"{field} expiration endDateTime",
+        )
+        if end_at <= start_at or raw_duration is not None:
+            raise EffectiveAccessError(f"{field} expiration is invalid")
+    elif expiration_type == "AfterDuration":
+        duration = _string(
+            raw_duration,
+            field=f"{field} expiration duration",
+        )
+        if (
+            len(duration) > 64
+            or re.fullmatch(
+                r"P(?=.+)(?:\d+D)?(?:T(?=.+)(?:\d+H)?(?:\d+M)?(?:\d+(?:\.\d+)?S)?)?",
+                duration,
+            )
+            is None
+            or raw_end_at is not None
+        ):
+            raise EffectiveAccessError(f"{field} expiration is invalid")
+    elif raw_end_at is not None or raw_duration is not None:
+        raise EffectiveAccessError(f"{field} expiration is invalid")
+
+
+def _require_matching_role_management_grants(
+    current_assignment: Mapping[str, object],
+    schedule_assignment: Mapping[str, object],
+    *,
+    field: str,
+) -> None:
+    for property_name in (
+        "principalId",
+        "principalType",
+        "roleDefinitionId",
+        "scope",
+        "conditionVersion",
+        "condition",
+        "assignmentType",
+        "memberType",
+    ):
+        current_value = current_assignment.get(property_name)
+        schedule_value = schedule_assignment.get(property_name)
+        if property_name in {
+            "principalId",
+            "principalType",
+            "roleDefinitionId",
+            "scope",
+        }:
+            matches = str(current_value).casefold() == str(schedule_value).casefold()
+        else:
+            matches = current_value == schedule_value
+        if not matches:
+            raise EffectiveAccessError(f"{field} returned conflicting evidence")
 
 
 def _get_role_assignment(
@@ -1568,32 +1949,25 @@ def _merge_assignment_documents(
                 "conditionVersion",
                 "condition",
             ):
+                if property_name not in existing or property_name not in assignment:
+                    raise EffectiveAccessError(
+                        f"{field} returned incomplete duplicate assignment"
+                    )
                 existing_value = existing.get(property_name)
                 incoming_value = assignment.get(property_name)
-                if (
-                    existing_value not in (None, "")
-                    and incoming_value not in (None, "")
-                    and (
-                        (
-                            property_name
-                            in {
-                                "principalId",
-                                "principalType",
-                                "roleDefinitionId",
-                                "scope",
-                            }
-                            and str(existing_value).casefold()
-                            != str(incoming_value).casefold()
-                        )
-                        or (
-                            property_name in {"conditionVersion", "condition"}
-                            and existing_value != incoming_value
-                        )
-                    )
-                ):
+                if property_name in {
+                    "principalId",
+                    "principalType",
+                    "roleDefinitionId",
+                    "scope",
+                }:
+                    matches = str(existing_value).casefold() == str(
+                        incoming_value
+                    ).casefold()
+                else:
+                    matches = existing_value == incoming_value
+                if not matches:
                     raise EffectiveAccessError(f"{field} returned conflicting duplicate assignment")
-                if existing_value in (None, "") and incoming_value not in (None, ""):
-                    existing[property_name] = incoming_value
     return list(merged.values())
 
 
@@ -2101,6 +2475,30 @@ def _canonical_role_assignment_origin_id(
     if origin_role_assignment_id.casefold() != expected_id.casefold():
         raise EffectiveAccessError(f"{field} is not canonical for its scope")
     return origin_role_assignment_id
+
+
+def _canonical_role_management_resource_id(
+    value: object,
+    *,
+    scope: str,
+    resource_type: str,
+    field: str,
+) -> str:
+    if resource_type not in _PIM_ROLE_MANAGEMENT_RESOURCE_TYPES:
+        raise EffectiveAccessError(f"{field} resource type is invalid")
+    resource_id = _string(value, field=field)
+    resource_guid = _canonical_uuid(
+        resource_id.rsplit("/", 1)[-1],
+        field=f"{field} UUID",
+    )
+    scope_prefix = "" if scope == "/" else scope
+    expected_id = (
+        f"{scope_prefix}/providers/Microsoft.Authorization/"
+        f"{resource_type}/{resource_guid}"
+    )
+    if resource_id.casefold() != expected_id.casefold():
+        raise EffectiveAccessError(f"{field} is not canonical for its scope")
+    return resource_id
 
 
 def _canonical_uuid(value: object, *, field: str) -> str:

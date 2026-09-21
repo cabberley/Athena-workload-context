@@ -193,11 +193,19 @@ def _publisher_image_pull_evidence() -> tuple[
             "directMembershipTraversalComplete": True,
             "convergedMembershipReadbacks": True,
             "roleAssignmentScheduleInstancesComplete": True,
+            "roleAssignmentSchedulesComplete": True,
+            "roleEligibilityScheduleInstancesComplete": True,
+            "roleEligibilitySchedulesComplete": True,
+            "roleManagementPendingRequestsComplete": True,
             "siblingRegistriesChecked": True,
             "acrEscalationPathsChecked": True,
             "completeness": {
                 "classicRoleAssignments": True,
                 "pimRoleAssignmentScheduleInstances": True,
+                "pimRoleAssignmentSchedules": True,
+                "pimRoleEligibilityScheduleInstances": True,
+                "pimRoleEligibilitySchedules": True,
+                "pimPendingGrantRequests": True,
                 "transitiveGroups": True,
                 "siblingRegistries": True,
                 "acrEscalationPaths": True,
@@ -212,9 +220,9 @@ def _publisher_image_pull_evidence() -> tuple[
                 "classicRoleAssignmentMaxPagesPerQuery": 64,
                 "classicRoleAssignmentMaxApiCalls": 16_384,
                 "classicRoleAssignmentMaxItems": 65_536,
-                "roleAssignmentScheduleMaxPagesPerQuery": 64,
-                "roleAssignmentScheduleMaxApiCalls": 16_384,
-                "roleAssignmentScheduleMaxInstances": 65_536,
+                "pimRoleManagementMaxPagesPerQuery": 64,
+                "pimRoleManagementMaxApiCalls": 98_304,
+                "pimRoleManagementMaxItems": 262_144,
             },
             "evidenceDigest": "sha256:" + "d" * 64,
             "expectedAssignmentIds": assignment_ids,
@@ -306,7 +314,7 @@ def _evaluate_publisher_image_pull_evidence(
         "wc027PublisherImagePullIdentity!.properties.principalId",
         "wc027ParsedEffectiveAcrAccess.schemaVersion == "
         "'athena.wc027AcrEffectiveAccessEvidence.v1'",
-        "length(items(wc027ParsedEffectiveAcrAccess)) == 27",
+        "length(items(wc027ParsedEffectiveAcrAccess)) == 31",
         "wc027ParsedEffectiveAcrAccess.expectedAssignmentCount == 3",
         "wc027ParsedEffectiveAcrAccess.pullCapableAssignmentCount == 3",
         "wc027ParsedEffectiveAcrAccess.roleDefinitionsResolved == true",
@@ -316,14 +324,25 @@ def _evaluate_publisher_image_pull_evidence(
         "wc027ParsedEffectiveAcrAccess.directMembershipTraversalComplete == true",
         "wc027ParsedEffectiveAcrAccess.convergedMembershipReadbacks == true",
         "wc027ParsedEffectiveAcrAccess.roleAssignmentScheduleInstancesComplete == true",
+        "wc027ParsedEffectiveAcrAccess.roleAssignmentSchedulesComplete == true",
+        "wc027ParsedEffectiveAcrAccess.roleEligibilityScheduleInstancesComplete == true",
+        "wc027ParsedEffectiveAcrAccess.roleEligibilitySchedulesComplete == true",
+        "wc027ParsedEffectiveAcrAccess.roleManagementPendingRequestsComplete == true",
         "wc027ParsedEffectiveAcrAccess.siblingRegistriesChecked == true",
         "wc027ParsedEffectiveAcrAccess.acrEscalationPathsChecked == true",
-        "length(items(wc027ParsedEffectiveAcrAccess.completeness)) == 7",
+        "length(items(wc027ParsedEffectiveAcrAccess.completeness)) == 11",
         "wc027ParsedEffectiveAcrAccess.completeness.classicRoleAssignments == true",
         (
             "wc027ParsedEffectiveAcrAccess.completeness."
             "pimRoleAssignmentScheduleInstances == true"
         ),
+        "wc027ParsedEffectiveAcrAccess.completeness.pimRoleAssignmentSchedules == true",
+        (
+            "wc027ParsedEffectiveAcrAccess.completeness."
+            "pimRoleEligibilityScheduleInstances == true"
+        ),
+        "wc027ParsedEffectiveAcrAccess.completeness.pimRoleEligibilitySchedules == true",
+        "wc027ParsedEffectiveAcrAccess.completeness.pimPendingGrantRequests == true",
         "wc027ParsedEffectiveAcrAccess.completeness.transitiveGroups == true",
         "wc027ParsedEffectiveAcrAccess.completeness.siblingRegistries == true",
         "wc027ParsedEffectiveAcrAccess.completeness.acrEscalationPaths == true",
@@ -360,15 +379,15 @@ def _evaluate_publisher_image_pull_evidence(
         ),
         (
             "wc027ParsedEffectiveAcrAccess.paginationBudgets."
-            "roleAssignmentScheduleMaxPagesPerQuery == 64"
+            "pimRoleManagementMaxPagesPerQuery == 64"
         ),
         (
             "wc027ParsedEffectiveAcrAccess.paginationBudgets."
-            "roleAssignmentScheduleMaxApiCalls == 16384"
+            "pimRoleManagementMaxApiCalls == 98304"
         ),
         (
             "wc027ParsedEffectiveAcrAccess.paginationBudgets."
-            "roleAssignmentScheduleMaxInstances == 65536"
+            "pimRoleManagementMaxItems == 262144"
         ),
         "wc027ParsedEffectiveAcrAccess.tenantSubscriptionHierarchyComplete == true",
         "wc027EffectiveAcrEvidenceFresh",
@@ -416,6 +435,10 @@ def _evaluate_publisher_image_pull_evidence(
         "directMembershipTraversalComplete",
         "convergedMembershipReadbacks",
         "roleAssignmentScheduleInstancesComplete",
+        "roleAssignmentSchedulesComplete",
+        "roleEligibilityScheduleInstancesComplete",
+        "roleEligibilitySchedulesComplete",
+        "roleManagementPendingRequestsComplete",
         "siblingRegistriesChecked",
         "acrEscalationPathsChecked",
         "completeness",
@@ -610,12 +633,20 @@ def _evaluate_publisher_image_pull_evidence(
         and effective_access.get("directMembershipTraversalComplete") is True
         and effective_access.get("convergedMembershipReadbacks") is True
         and effective_access.get("roleAssignmentScheduleInstancesComplete") is True
+        and effective_access.get("roleAssignmentSchedulesComplete") is True
+        and effective_access.get("roleEligibilityScheduleInstancesComplete") is True
+        and effective_access.get("roleEligibilitySchedulesComplete") is True
+        and effective_access.get("roleManagementPendingRequestsComplete") is True
         and effective_access.get("siblingRegistriesChecked") is True
         and effective_access.get("acrEscalationPathsChecked") is True
         and completeness
         == {
             "classicRoleAssignments": True,
             "pimRoleAssignmentScheduleInstances": True,
+            "pimRoleAssignmentSchedules": True,
+            "pimRoleEligibilityScheduleInstances": True,
+            "pimRoleEligibilitySchedules": True,
+            "pimPendingGrantRequests": True,
             "transitiveGroups": True,
             "siblingRegistries": True,
             "acrEscalationPaths": True,
@@ -631,9 +662,9 @@ def _evaluate_publisher_image_pull_evidence(
             "classicRoleAssignmentMaxPagesPerQuery": 64,
             "classicRoleAssignmentMaxApiCalls": 16_384,
             "classicRoleAssignmentMaxItems": 65_536,
-            "roleAssignmentScheduleMaxPagesPerQuery": 64,
-            "roleAssignmentScheduleMaxApiCalls": 16_384,
-            "roleAssignmentScheduleMaxInstances": 65_536,
+            "pimRoleManagementMaxPagesPerQuery": 64,
+            "pimRoleManagementMaxApiCalls": 98_304,
+            "pimRoleManagementMaxItems": 262_144,
         }
         and str(effective_access.get("evidenceDigest", "")).startswith(
             "sha256:"
@@ -1000,7 +1031,7 @@ def test_pr103_readiness_requires_pr102_effective_acr_assignment_scan() -> None:
     for expected in (
         "wc027ParsedPublisherImagePullEvidence.effectiveAccess",
         "athena.wc027AcrEffectiveAccessEvidence.v1",
-        "length(items(wc027ParsedEffectiveAcrAccess)) == 27",
+        "length(items(wc027ParsedEffectiveAcrAccess)) == 31",
         "wc027ParsedEffectiveAcrAccess.anonymousPullEnabled == false",
         "wc027ParsedEffectiveAcrAccess.roleDefinitionsResolved == true",
         "wc027ParsedEffectiveAcrAccess.exactAssignmentReadbacksComplete == true",
@@ -1011,10 +1042,21 @@ def test_pr103_readiness_requires_pr102_effective_acr_assignment_scan() -> None:
         "wc027ParsedEffectiveAcrAccess.directMembershipTraversalComplete == true",
         "wc027ParsedEffectiveAcrAccess.convergedMembershipReadbacks == true",
         "wc027ParsedEffectiveAcrAccess.roleAssignmentScheduleInstancesComplete == true",
+        "wc027ParsedEffectiveAcrAccess.roleAssignmentSchedulesComplete == true",
+        "wc027ParsedEffectiveAcrAccess.roleEligibilityScheduleInstancesComplete == true",
+        "wc027ParsedEffectiveAcrAccess.roleEligibilitySchedulesComplete == true",
+        "wc027ParsedEffectiveAcrAccess.roleManagementPendingRequestsComplete == true",
         "wc027ParsedEffectiveAcrAccess.acrEscalationPathsChecked == true",
-        "length(items(wc027ParsedEffectiveAcrAccess.completeness)) == 7",
+        "length(items(wc027ParsedEffectiveAcrAccess.completeness)) == 11",
         "wc027ParsedEffectiveAcrAccess.completeness.classicRoleAssignments == true",
         "wc027ParsedEffectiveAcrAccess.completeness.pimRoleAssignmentScheduleInstances == true",
+        "wc027ParsedEffectiveAcrAccess.completeness.pimRoleAssignmentSchedules == true",
+        (
+            "wc027ParsedEffectiveAcrAccess.completeness."
+            "pimRoleEligibilityScheduleInstances == true"
+        ),
+        "wc027ParsedEffectiveAcrAccess.completeness.pimRoleEligibilitySchedules == true",
+        "wc027ParsedEffectiveAcrAccess.completeness.pimPendingGrantRequests == true",
         "wc027ParsedEffectiveAcrAccess.completeness.transitiveGroups == true",
         "wc027ParsedEffectiveAcrAccess.completeness.siblingRegistries == true",
         "wc027ParsedEffectiveAcrAccess.completeness.acrEscalationPaths == true",
@@ -1048,15 +1090,15 @@ def test_pr103_readiness_requires_pr102_effective_acr_assignment_scan() -> None:
         ),
         (
             "wc027ParsedEffectiveAcrAccess.paginationBudgets."
-            "roleAssignmentScheduleMaxPagesPerQuery == 64"
+            "pimRoleManagementMaxPagesPerQuery == 64"
         ),
         (
             "wc027ParsedEffectiveAcrAccess.paginationBudgets."
-            "roleAssignmentScheduleMaxApiCalls == 16384"
+            "pimRoleManagementMaxApiCalls == 98304"
         ),
         (
             "wc027ParsedEffectiveAcrAccess.paginationBudgets."
-            "roleAssignmentScheduleMaxInstances == 65536"
+            "pimRoleManagementMaxItems == 262144"
         ),
         "param wc027ReadinessEvaluationTimeUtc string = utcNow(",
         "dateTimeToEpoch(wc027ReadinessEvaluationTimeUtc)",
@@ -1124,16 +1166,24 @@ def test_publisher_digest_pull_readiness_is_bounded_and_activation_gated() -> No
         "directMembershipTraversalComplete",
         "convergedMembershipReadbacks",
         "roleAssignmentScheduleInstancesComplete",
+        "roleAssignmentSchedulesComplete",
+        "roleEligibilityScheduleInstancesComplete",
+        "roleEligibilitySchedulesComplete",
+        "roleManagementPendingRequestsComplete",
         "acrEscalationPathsChecked",
         "classicRoleAssignments",
         "pimRoleAssignmentScheduleInstances",
+        "pimRoleAssignmentSchedules",
+        "pimRoleEligibilityScheduleInstances",
+        "pimRoleEligibilitySchedules",
+        "pimPendingGrantRequests",
         "paginationBudgets",
         "classicRoleAssignmentMaxPagesPerQuery",
         "classicRoleAssignmentMaxApiCalls",
         "classicRoleAssignmentMaxItems",
-        "roleAssignmentScheduleMaxPagesPerQuery",
-        "roleAssignmentScheduleMaxApiCalls",
-        "roleAssignmentScheduleMaxInstances",
+        "pimRoleManagementMaxPagesPerQuery",
+        "pimRoleManagementMaxApiCalls",
+        "pimRoleManagementMaxItems",
         "evidenceDigest",
         "verify_wc027_acr_effective_access.py",
         "--expected-assignments-json $ExpectedPullAssignmentsJson",
@@ -1365,11 +1415,19 @@ function global:python {
         directMembershipTraversalComplete = $true
         convergedMembershipReadbacks = $true
         roleAssignmentScheduleInstancesComplete = $true
+        roleAssignmentSchedulesComplete = $true
+        roleEligibilityScheduleInstancesComplete = $true
+        roleEligibilitySchedulesComplete = $true
+        roleManagementPendingRequestsComplete = $true
         siblingRegistriesChecked = $true
         acrEscalationPathsChecked = $true
         completeness = [ordered]@{
             __CLASSIC_FLAG_NAME__ = __CLASSIC_COMPLETE__
             pimRoleAssignmentScheduleInstances = $true
+            pimRoleAssignmentSchedules = $true
+            pimRoleEligibilityScheduleInstances = $true
+            pimRoleEligibilitySchedules = $true
+            pimPendingGrantRequests = $true
             transitiveGroups = $true
             siblingRegistries = $true
             acrEscalationPaths = $true
@@ -1384,9 +1442,9 @@ function global:python {
             classicRoleAssignmentMaxPagesPerQuery = 64
             classicRoleAssignmentMaxApiCalls = __CLASSIC_MAX_CALLS__
             classicRoleAssignmentMaxItems = 65536
-            roleAssignmentScheduleMaxPagesPerQuery = 64
-            roleAssignmentScheduleMaxApiCalls = 16384
-            roleAssignmentScheduleMaxInstances = 65536
+            pimRoleManagementMaxPagesPerQuery = 64
+            pimRoleManagementMaxApiCalls = 98304
+            pimRoleManagementMaxItems = 262144
         }
         evidenceDigest = 'sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd'
         expectedAssignmentIds = @(
@@ -1601,9 +1659,17 @@ def test_legacy_digest_pull_evidence_uses_null_repository_conditions() -> None:
         "effective-direct-membership",
         "effective-convergence",
         "effective-schedules",
+        "effective-assignment-schedules",
+        "effective-eligibility-instances",
+        "effective-eligibility-schedules",
+        "effective-pending-requests",
         "effective-escalation",
         "effective-completeness-classic",
         "effective-completeness-pim",
+        "effective-completeness-assignment-schedules",
+        "effective-completeness-eligibility-instances",
+        "effective-completeness-eligibility-schedules",
+        "effective-completeness-pending-requests",
         "effective-completeness-groups",
         "effective-completeness-siblings",
         "effective-completeness-escalation",
@@ -1702,6 +1768,22 @@ def test_publisher_digest_pull_evidence_rejects_drift(mutation: str) -> None:
             "roleAssignmentScheduleInstancesComplete",
             False,
         ),
+        "effective-assignment-schedules": (
+            "roleAssignmentSchedulesComplete",
+            False,
+        ),
+        "effective-eligibility-instances": (
+            "roleEligibilityScheduleInstancesComplete",
+            False,
+        ),
+        "effective-eligibility-schedules": (
+            "roleEligibilitySchedulesComplete",
+            False,
+        ),
+        "effective-pending-requests": (
+            "roleManagementPendingRequestsComplete",
+            False,
+        ),
         "effective-escalation": ("acrEscalationPathsChecked", False),
         "effective-hierarchy": ("tenantSubscriptionHierarchyComplete", False),
         "effective-stale": ("verifiedAt", "2020-01-01T00:00:00.000Z"),
@@ -1714,6 +1796,12 @@ def test_publisher_digest_pull_evidence_rejects_drift(mutation: str) -> None:
     effective_completeness_mutations = {
         "effective-completeness-classic": "classicRoleAssignments",
         "effective-completeness-pim": "pimRoleAssignmentScheduleInstances",
+        "effective-completeness-assignment-schedules": "pimRoleAssignmentSchedules",
+        "effective-completeness-eligibility-instances": (
+            "pimRoleEligibilityScheduleInstances"
+        ),
+        "effective-completeness-eligibility-schedules": "pimRoleEligibilitySchedules",
+        "effective-completeness-pending-requests": "pimPendingGrantRequests",
         "effective-completeness-groups": "transitiveGroups",
         "effective-completeness-siblings": "siblingRegistries",
         "effective-completeness-escalation": "acrEscalationPaths",
@@ -1728,9 +1816,9 @@ def test_publisher_digest_pull_evidence_rejects_drift(mutation: str) -> None:
         "effective-budget-classic-pages": "classicRoleAssignmentMaxPagesPerQuery",
         "effective-budget-classic-calls": "classicRoleAssignmentMaxApiCalls",
         "effective-budget-classic-items": "classicRoleAssignmentMaxItems",
-        "effective-budget-pim-pages": "roleAssignmentScheduleMaxPagesPerQuery",
-        "effective-budget-pim-calls": "roleAssignmentScheduleMaxApiCalls",
-        "effective-budget-pim-items": "roleAssignmentScheduleMaxInstances",
+        "effective-budget-pim-pages": "pimRoleManagementMaxPagesPerQuery",
+        "effective-budget-pim-calls": "pimRoleManagementMaxApiCalls",
+        "effective-budget-pim-items": "pimRoleManagementMaxItems",
     }
     effective_access = selected["effectiveAccess"]
     assert isinstance(effective_access, dict)

@@ -211,9 +211,18 @@ membership is traversed recursively twice without the eventual transitive-member
 the two closures must converge. Full role definitions are then resolved for every direct,
 inherited, group-derived, and active time-bound/PIM assignment in every subscription. For each
 service principal and recursively discovered group, the scanner follows the bounded, canonical
-`roleAssignmentScheduleInstances` pages for the exact principal. Eligibility without an active
-assignment schedule is not effective. Persistent role-assignment schedule mirrors are reconciled
-through their canonical origin role-assignment ID and must match the underlying reviewed grant.
+stable `2020-10-01` pages for assignment instances, assignment schedules, eligibility instances,
+eligibility schedules, and both request collections. Assignment instances represent current
+privileges, eligibility instances represent latent activation rights, and the schedule collections
+are authoritative for future access; empty instance results therefore do not prove that no
+upcoming access exists. Persistent role-assignment schedule mirrors are reconciled through their
+canonical origin role-assignment ID and must match the underlying reviewed grant, including exact
+assignment/member types and exact condition fields where null is not interchangeable with a
+conditioned grant. Unresolved grant
+requests are rejected conservatively, but completed or removal requests are not used to reconstruct
+state absent from the canonical schedule collections. Every continuation is manually followed and
+validated because `az rest` retrieves one page. Unknown status, type, time, expiration, or
+condition semantics fail closed.
 Any extra pull grant or escalation path—including
 `roleAssignments/write`, role-assignment or eligibility schedule-request writes, role-management
 policy administration, tenant access elevation, role-definition mutation, ACR credential
@@ -229,14 +238,16 @@ normal pull is additionally gated by the live `roleAssignmentMode` returned by
 `az acr show` with exact `--name`, `--resource-group`, and `--subscription` arguments plus
 `--query roleAssignmentMode`. ABAC mode ignores legacy `AcrPull`, `AcrPush`, and `AcrDelete`;
 legacy mode does not infer Repository Reader data access, and lookup failure is terminal. The
-scanner verifies
+documented request-validation REST operation is not treated as an invented
+`Microsoft.Authorization/.../validate/action` permission. The scanner verifies
 every referenced registry's live permission mode, and the proof exact-matches each reviewed
 assignment's principal, registry scope, role, condition version, and canonical repository
 condition; legacy `AcrPull` accepts null condition fields only. The bounded publisher probe repeats
 the complete scan after the pull and requires an identical evidence digest. The digest covers a
 canonical completeness map for classic assignments, active PIM schedule instances, transitive
-groups, sibling registries, escalation paths, exact readbacks, and enforced pagination budgets,
-plus the exact numeric page, call, group, subscription, assignment, and schedule-instance limits.
+groups, assignment and eligibility schedules, pending grant requests, sibling registries,
+escalation paths, exact readbacks, and enforced pagination budgets, plus the exact numeric page,
+call, group, subscription, assignment, and PIM resource limits.
 Classic assignments use explicit bounded `roleAssignments@2022-04-01` REST pagination, so the
 published API-call budget counts service pages rather than wrapper-command invocations. Consumers
 require the exact case-sensitive property sets and summary sets derived from the three reviewed
