@@ -197,6 +197,8 @@ def _publisher_image_pull_evidence() -> tuple[
             "roleEligibilityScheduleInstancesComplete": True,
             "roleEligibilitySchedulesComplete": True,
             "roleManagementPendingRequestsComplete": True,
+            "convergedPimReadbacks": True,
+            "convergedRoleDefinitionReadbacks": True,
             "siblingRegistriesChecked": True,
             "acrEscalationPathsChecked": True,
             "completeness": {
@@ -206,6 +208,8 @@ def _publisher_image_pull_evidence() -> tuple[
                 "pimRoleEligibilityScheduleInstances": True,
                 "pimRoleEligibilitySchedules": True,
                 "pimPendingGrantRequests": True,
+                "pimConvergedReadbacks": True,
+                "roleDefinitionReadbacks": True,
                 "transitiveGroups": True,
                 "siblingRegistries": True,
                 "acrEscalationPaths": True,
@@ -314,7 +318,7 @@ def _evaluate_publisher_image_pull_evidence(
         "wc027PublisherImagePullIdentity!.properties.principalId",
         "wc027ParsedEffectiveAcrAccess.schemaVersion == "
         "'athena.wc027AcrEffectiveAccessEvidence.v1'",
-        "length(items(wc027ParsedEffectiveAcrAccess)) == 31",
+        "length(items(wc027ParsedEffectiveAcrAccess)) == 33",
         "wc027ParsedEffectiveAcrAccess.expectedAssignmentCount == 3",
         "wc027ParsedEffectiveAcrAccess.pullCapableAssignmentCount == 3",
         "wc027ParsedEffectiveAcrAccess.roleDefinitionsResolved == true",
@@ -328,9 +332,11 @@ def _evaluate_publisher_image_pull_evidence(
         "wc027ParsedEffectiveAcrAccess.roleEligibilityScheduleInstancesComplete == true",
         "wc027ParsedEffectiveAcrAccess.roleEligibilitySchedulesComplete == true",
         "wc027ParsedEffectiveAcrAccess.roleManagementPendingRequestsComplete == true",
+        "wc027ParsedEffectiveAcrAccess.convergedPimReadbacks == true",
+        "wc027ParsedEffectiveAcrAccess.convergedRoleDefinitionReadbacks == true",
         "wc027ParsedEffectiveAcrAccess.siblingRegistriesChecked == true",
         "wc027ParsedEffectiveAcrAccess.acrEscalationPathsChecked == true",
-        "length(items(wc027ParsedEffectiveAcrAccess.completeness)) == 11",
+        "length(items(wc027ParsedEffectiveAcrAccess.completeness)) == 13",
         "wc027ParsedEffectiveAcrAccess.completeness.classicRoleAssignments == true",
         (
             "wc027ParsedEffectiveAcrAccess.completeness."
@@ -343,6 +349,8 @@ def _evaluate_publisher_image_pull_evidence(
         ),
         "wc027ParsedEffectiveAcrAccess.completeness.pimRoleEligibilitySchedules == true",
         "wc027ParsedEffectiveAcrAccess.completeness.pimPendingGrantRequests == true",
+        "wc027ParsedEffectiveAcrAccess.completeness.pimConvergedReadbacks == true",
+        "wc027ParsedEffectiveAcrAccess.completeness.roleDefinitionReadbacks == true",
         "wc027ParsedEffectiveAcrAccess.completeness.transitiveGroups == true",
         "wc027ParsedEffectiveAcrAccess.completeness.siblingRegistries == true",
         "wc027ParsedEffectiveAcrAccess.completeness.acrEscalationPaths == true",
@@ -439,6 +447,8 @@ def _evaluate_publisher_image_pull_evidence(
         "roleEligibilityScheduleInstancesComplete",
         "roleEligibilitySchedulesComplete",
         "roleManagementPendingRequestsComplete",
+        "convergedPimReadbacks",
+        "convergedRoleDefinitionReadbacks",
         "siblingRegistriesChecked",
         "acrEscalationPathsChecked",
         "completeness",
@@ -637,6 +647,8 @@ def _evaluate_publisher_image_pull_evidence(
         and effective_access.get("roleEligibilityScheduleInstancesComplete") is True
         and effective_access.get("roleEligibilitySchedulesComplete") is True
         and effective_access.get("roleManagementPendingRequestsComplete") is True
+        and effective_access.get("convergedPimReadbacks") is True
+        and effective_access.get("convergedRoleDefinitionReadbacks") is True
         and effective_access.get("siblingRegistriesChecked") is True
         and effective_access.get("acrEscalationPathsChecked") is True
         and completeness
@@ -647,6 +659,8 @@ def _evaluate_publisher_image_pull_evidence(
             "pimRoleEligibilityScheduleInstances": True,
             "pimRoleEligibilitySchedules": True,
             "pimPendingGrantRequests": True,
+            "pimConvergedReadbacks": True,
+            "roleDefinitionReadbacks": True,
             "transitiveGroups": True,
             "siblingRegistries": True,
             "acrEscalationPaths": True,
@@ -1031,7 +1045,7 @@ def test_pr103_readiness_requires_pr102_effective_acr_assignment_scan() -> None:
     for expected in (
         "wc027ParsedPublisherImagePullEvidence.effectiveAccess",
         "athena.wc027AcrEffectiveAccessEvidence.v1",
-        "length(items(wc027ParsedEffectiveAcrAccess)) == 31",
+        "length(items(wc027ParsedEffectiveAcrAccess)) == 33",
         "wc027ParsedEffectiveAcrAccess.anonymousPullEnabled == false",
         "wc027ParsedEffectiveAcrAccess.roleDefinitionsResolved == true",
         "wc027ParsedEffectiveAcrAccess.exactAssignmentReadbacksComplete == true",
@@ -1046,8 +1060,10 @@ def test_pr103_readiness_requires_pr102_effective_acr_assignment_scan() -> None:
         "wc027ParsedEffectiveAcrAccess.roleEligibilityScheduleInstancesComplete == true",
         "wc027ParsedEffectiveAcrAccess.roleEligibilitySchedulesComplete == true",
         "wc027ParsedEffectiveAcrAccess.roleManagementPendingRequestsComplete == true",
+        "wc027ParsedEffectiveAcrAccess.convergedPimReadbacks == true",
+        "wc027ParsedEffectiveAcrAccess.convergedRoleDefinitionReadbacks == true",
         "wc027ParsedEffectiveAcrAccess.acrEscalationPathsChecked == true",
-        "length(items(wc027ParsedEffectiveAcrAccess.completeness)) == 11",
+        "length(items(wc027ParsedEffectiveAcrAccess.completeness)) == 13",
         "wc027ParsedEffectiveAcrAccess.completeness.classicRoleAssignments == true",
         "wc027ParsedEffectiveAcrAccess.completeness.pimRoleAssignmentScheduleInstances == true",
         "wc027ParsedEffectiveAcrAccess.completeness.pimRoleAssignmentSchedules == true",
@@ -1057,6 +1073,8 @@ def test_pr103_readiness_requires_pr102_effective_acr_assignment_scan() -> None:
         ),
         "wc027ParsedEffectiveAcrAccess.completeness.pimRoleEligibilitySchedules == true",
         "wc027ParsedEffectiveAcrAccess.completeness.pimPendingGrantRequests == true",
+        "wc027ParsedEffectiveAcrAccess.completeness.pimConvergedReadbacks == true",
+        "wc027ParsedEffectiveAcrAccess.completeness.roleDefinitionReadbacks == true",
         "wc027ParsedEffectiveAcrAccess.completeness.transitiveGroups == true",
         "wc027ParsedEffectiveAcrAccess.completeness.siblingRegistries == true",
         "wc027ParsedEffectiveAcrAccess.completeness.acrEscalationPaths == true",
@@ -1177,6 +1195,8 @@ def test_publisher_digest_pull_readiness_is_bounded_and_activation_gated() -> No
         "pimRoleEligibilityScheduleInstances",
         "pimRoleEligibilitySchedules",
         "pimPendingGrantRequests",
+        "pimConvergedReadbacks",
+        "roleDefinitionReadbacks",
         "paginationBudgets",
         "classicRoleAssignmentMaxPagesPerQuery",
         "classicRoleAssignmentMaxApiCalls",
@@ -1419,6 +1439,8 @@ function global:python {
         roleEligibilityScheduleInstancesComplete = $true
         roleEligibilitySchedulesComplete = $true
         roleManagementPendingRequestsComplete = $true
+        convergedPimReadbacks = $true
+        convergedRoleDefinitionReadbacks = $true
         siblingRegistriesChecked = $true
         acrEscalationPathsChecked = $true
         completeness = [ordered]@{
@@ -1428,6 +1450,8 @@ function global:python {
             pimRoleEligibilityScheduleInstances = $true
             pimRoleEligibilitySchedules = $true
             pimPendingGrantRequests = $true
+            pimConvergedReadbacks = $true
+            roleDefinitionReadbacks = $true
             transitiveGroups = $true
             siblingRegistries = $true
             acrEscalationPaths = $true
@@ -1663,6 +1687,8 @@ def test_legacy_digest_pull_evidence_uses_null_repository_conditions() -> None:
         "effective-eligibility-instances",
         "effective-eligibility-schedules",
         "effective-pending-requests",
+        "effective-pim-convergence",
+        "effective-role-definition-convergence",
         "effective-escalation",
         "effective-completeness-classic",
         "effective-completeness-pim",
@@ -1670,6 +1696,8 @@ def test_legacy_digest_pull_evidence_uses_null_repository_conditions() -> None:
         "effective-completeness-eligibility-instances",
         "effective-completeness-eligibility-schedules",
         "effective-completeness-pending-requests",
+        "effective-completeness-pim-convergence",
+        "effective-completeness-role-definitions",
         "effective-completeness-groups",
         "effective-completeness-siblings",
         "effective-completeness-escalation",
@@ -1784,6 +1812,11 @@ def test_publisher_digest_pull_evidence_rejects_drift(mutation: str) -> None:
             "roleManagementPendingRequestsComplete",
             False,
         ),
+        "effective-pim-convergence": ("convergedPimReadbacks", False),
+        "effective-role-definition-convergence": (
+            "convergedRoleDefinitionReadbacks",
+            False,
+        ),
         "effective-escalation": ("acrEscalationPathsChecked", False),
         "effective-hierarchy": ("tenantSubscriptionHierarchyComplete", False),
         "effective-stale": ("verifiedAt", "2020-01-01T00:00:00.000Z"),
@@ -1802,6 +1835,8 @@ def test_publisher_digest_pull_evidence_rejects_drift(mutation: str) -> None:
         ),
         "effective-completeness-eligibility-schedules": "pimRoleEligibilitySchedules",
         "effective-completeness-pending-requests": "pimPendingGrantRequests",
+        "effective-completeness-pim-convergence": "pimConvergedReadbacks",
+        "effective-completeness-role-definitions": "roleDefinitionReadbacks",
         "effective-completeness-groups": "transitiveGroups",
         "effective-completeness-siblings": "siblingRegistries",
         "effective-completeness-escalation": "acrEscalationPaths",

@@ -220,9 +220,18 @@ canonical origin role-assignment ID and must match the underlying reviewed grant
 assignment/member types and exact condition fields where null is not interchangeable with a
 conditioned grant. Unresolved grant
 requests are rejected conservatively, but completed or removal requests are not used to reconstruct
-state absent from the canonical schedule collections. Every continuation is manually followed and
-validated because `az rest` retrieves one page. Unknown status, type, time, expiration, or
-condition semantics fail closed.
+state absent from the canonical schedule collections. Schedule and instance reads combine
+exact-principal discovery with `assignedTo('<principal>') and atScope()` to include group-derived
+and inherited rows; request reads use the documented principal filter only. Every continuation is
+manually followed and validated because `az rest` retrieves one page. Unknown status, type, time,
+expiration, or condition semantics fail closed.
+
+The scan freezes one UTC instant. Null schedule ends are unbounded, ends strictly before that
+instant are expired, and equality is retained as potential access. Terminal statuses cannot
+suppress a current or future window. Two complete PIM reads, including `updatedOn`, must converge
+after canonical ordering, and every referenced role definition must converge across two exact
+readbacks. A condition that cannot be proven to exclude the reviewed repository remains
+applicable.
 Any extra pull grant or escalation path—including
 `roleAssignments/write`, role-assignment or eligibility schedule-request writes, role-management
 policy administration, tenant access elevation, role-definition mutation, ACR credential
@@ -246,8 +255,9 @@ condition; legacy `AcrPull` accepts null condition fields only. The bounded publ
 the complete scan after the pull and requires an identical evidence digest. The digest covers a
 canonical completeness map for classic assignments, active PIM schedule instances, transitive
 groups, assignment and eligibility schedules, pending grant requests, sibling registries,
-escalation paths, exact readbacks, and enforced pagination budgets, plus the exact numeric page,
-call, group, subscription, assignment, and PIM resource limits.
+escalation paths, converged PIM and role-definition readbacks, exact assignment readbacks, and
+enforced pagination budgets, plus the exact numeric page, call, group, subscription, assignment,
+and PIM resource limits.
 Classic assignments use explicit bounded `roleAssignments@2022-04-01` REST pagination, so the
 published API-call budget counts service pages rather than wrapper-command invocations. Consumers
 require the exact case-sensitive property sets and summary sets derived from the three reviewed

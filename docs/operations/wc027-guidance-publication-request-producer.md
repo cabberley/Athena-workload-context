@@ -291,11 +291,13 @@ parent group, it queries the stable `2020-10-01` ARM collections for
 `roleAssignmentScheduleInstances`, `roleAssignmentSchedules`,
 `roleEligibilityScheduleInstances`, `roleEligibilitySchedules`,
 `roleAssignmentScheduleRequests`, and `roleEligibilityScheduleRequests` at every governed
-subscription scope with the documented exact-principal filter. Request collections are never
-queried with undocumented `assignedTo(...)` filtering. Because `az rest` returns one page, the
-scanner follows each server-provided `nextLink` verbatim only after validating HTTPS, the ARM
-host, exact collection path, API version, principal filter, continuation token, cycle freedom,
-and shared page, item, and call limits.
+subscription scope. Schedule and instance collections combine documented exact-principal discovery
+with `assignedTo('<principal>') and atScope()` reads so direct, transitive-group, and inherited
+rows are included; request collections use only the documented `principalId` filter and never
+undocumented `assignedTo(...)` request filtering. Because `az rest` returns one page, the scanner
+follows each server-provided `nextLink` verbatim only after validating HTTPS, the ARM host, exact
+collection path, API version, exact filter, continuation token, cycle freedom, and shared page,
+item, and call limits.
 
 Assignment schedule instances represent current privileges only; a future-start instance is
 invalid evidence. Eligibility instances are current latent activation rights. Assignment and
@@ -307,6 +309,14 @@ supplementary: unresolved grant/activate/extend/renew requests fail closed, whil
 failed, canceled, remove, and deactivate requests do not recreate state that is absent from the
 schedule collections. Unknown status, resource type, assignment/member/request type, UTC interval,
 expiration shape, or condition/version pair is rejected.
+
+Every complete PIM collection read is repeated and must converge byte-for-byte after canonical
+resource-ID ordering, including `updatedOn`; each referenced role definition is also exact-read
+twice and must converge. Evaluation freezes one UTC instant. A null `endDateTime` is unbounded,
+`endDateTime < evaluationTime` is expired, and equality remains potentially effective because the
+boundary is undocumented. A terminal-looking status paired with a current or future interval is
+inconsistent and fails closed rather than suppressing the schedule. Conditions are never assumed
+to exclude the target repository unless they exactly match the reviewed assignment.
 
 Persistent-assignment schedule mirrors are joined through their canonical
 `originRoleAssignmentId`, must agree with the underlying role assignment, and do not double-count
@@ -342,7 +352,8 @@ incomplete hierarchy or PIM visibility fails closed.
 
 The effective-access JSON exposes a canonical `completeness` object for classic role assignments,
 PIM role-assignment schedule instances, transitive groups, sibling registries, ACR escalation
-paths, exact assignment readbacks, and pagination-budget enforcement. It also exposes the exact
+paths, assignment and eligibility schedules, pending grant requests, converged PIM and role
+definition readbacks, exact assignment readbacks, and pagination-budget enforcement. It also exposes the exact
 `paginationBudgets` contract: tenant-hierarchy pages and governed-subscription count; Graph pages
 per object and transitive groups per principal; classic-assignment pages per query, total API
 calls, and returned items; and shared PIM role-management pages per query, total API calls, and

@@ -258,6 +258,10 @@ class StubAzure:
             tuple[str, str],
             list[dict[str, object]],
         ] = {}
+        self.assigned_to_pim_pages: dict[
+            tuple[str, str, str],
+            list[dict[str, object]],
+        ] = {}
         self.assignment_readbacks: dict[str, dict[str, object]] = {
             item.assignment_resource_id.casefold(): {
                 "id": item.assignment_resource_id,
@@ -384,13 +388,27 @@ class StubAzure:
                 parsed = urlparse(url)
                 query = parse_qs(parsed.query)
                 schedule_filter = query["$filter"][0]
-                assert "assignedTo" not in schedule_filter
-                principal_id = schedule_filter.removeprefix("principalId eq ")
                 subscription_id = parsed.path.split("/subscriptions/", 1)[1].split("/", 1)[0]
-                pages = pim_page_sources[resource_type].get(
-                    (subscription_id, principal_id),
-                    [{"value": [], "nextLink": None}],
-                )
+                if schedule_filter.startswith("assignedTo('"):
+                    assert resource_type not in {
+                        "roleAssignmentScheduleRequests",
+                        "roleEligibilityScheduleRequests",
+                    }
+                    suffix = "') and atScope()"
+                    assert schedule_filter.endswith(suffix)
+                    principal_id = schedule_filter[
+                        len("assignedTo('") : -len(suffix)
+                    ]
+                    pages = self.assigned_to_pim_pages.get(
+                        (resource_type, subscription_id, principal_id),
+                        [{"value": [], "nextLink": None}],
+                    )
+                else:
+                    principal_id = schedule_filter.removeprefix("principalId eq ")
+                    pages = pim_page_sources[resource_type].get(
+                        (subscription_id, principal_id),
+                        [{"value": [], "nextLink": None}],
+                    )
                 page_index = 0
                 continuation = query.get("$skiptoken") or query.get("$skip")
                 if continuation is not None:
@@ -911,6 +929,12 @@ def test_effective_access_accepts_only_the_three_exact_direct_assignments() -> N
     assert evidence["directMembershipTraversalComplete"] is True
     assert evidence["convergedMembershipReadbacks"] is True
     assert evidence["roleAssignmentScheduleInstancesComplete"] is True
+    assert evidence["roleAssignmentSchedulesComplete"] is True
+    assert evidence["roleEligibilityScheduleInstancesComplete"] is True
+    assert evidence["roleEligibilitySchedulesComplete"] is True
+    assert evidence["roleManagementPendingRequestsComplete"] is True
+    assert evidence["convergedPimReadbacks"] is True
+    assert evidence["convergedRoleDefinitionReadbacks"] is True
     assert evidence["acrEscalationPathsChecked"] is True
     assert evidence["completeness"] == {
         "classicRoleAssignments": True,
@@ -919,6 +943,8 @@ def test_effective_access_accepts_only_the_three_exact_direct_assignments() -> N
         "pimRoleEligibilityScheduleInstances": True,
         "pimRoleEligibilitySchedules": True,
         "pimPendingGrantRequests": True,
+        "pimConvergedReadbacks": True,
+        "roleDefinitionReadbacks": True,
         "transitiveGroups": True,
         "siblingRegistries": True,
         "acrEscalationPaths": True,
@@ -961,13 +987,35 @@ def test_effective_access_accepts_only_the_three_exact_direct_assignments() -> N
                 in command[command.index("--url") + 1]
             )
         ]
-        assert len(resource_commands) == 3
+        expected_command_count = (
+            12
+            if resource_type
+            in {
+                "roleAssignmentScheduleInstances",
+                "roleAssignmentSchedules",
+                "roleEligibilityScheduleInstances",
+                "roleEligibilitySchedules",
+            }
+            else 6
+        )
+        assert len(resource_commands) == expected_command_count
         assert all(
             "api-version=2020-10-01" in command[command.index("--url") + 1]
-            and "principalId%20eq%20" in command[command.index("--url") + 1]
-            and "assignedTo" not in command[command.index("--url") + 1]
             for command in resource_commands
         )
+        if resource_type.endswith("Requests"):
+            assert all(
+                "principalId%20eq%20" in command[command.index("--url") + 1]
+                and "assignedTo" not in command[command.index("--url") + 1]
+                for command in resource_commands
+            )
+        else:
+            assert any(
+                "assignedTo%28%27" in command[command.index("--url") + 1]
+                and "%29%20and%20atScope%28%29"
+                in command[command.index("--url") + 1]
+                for command in resource_commands
+            )
     mode_commands = [
         command
         for command in stub.commands
@@ -1852,6 +1900,70 @@ def test_effective_access_rejects_upcoming_assignment_schedule_when_instances_em
         _verify(stub)
 
 
+@pytest.mark.parametrize(
+    "permission",
+    (
+        _permission(actions=(ACR_QUARANTINE_READ_ACTION,)),
+        _permission(
+            data_actions=(ACR_QUARANTINED_ARTIFACTS_READ_DATA_ACTION,)
+        ),
+    ),
+)
+def test_effective_access_rejects_future_quarantine_pull_schedule(
+    permission: dict[str, object],
+) -> None:
+    stub = StubAzure()
+    role_definition_id = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+        "Microsoft.Authorization/roleDefinitions/"
+        "85858585-8585-4585-8585-858585858585"
+    )
+    stub.roles[role_definition_id.casefold()] = _role_definition(
+        role_definition_id,
+        permission,
+    )
+    stub.assignment_schedule_pages[(SUBSCRIPTION_ID, PRINCIPAL_IDS[0])] = [
+        {
+            "value": [
+                _role_assignment_schedule(
+                    principal_id=PRINCIPAL_IDS[0],
+                    principal_type="ServicePrincipal",
+                    role_definition_id=role_definition_id,
+                    start_date_time="2026-09-17T03:00:00Z",
+                    end_date_time="2026-09-17T04:00:00Z",
+                )
+            ],
+            "nextLink": None,
+        }
+    ]
+
+    with pytest.raises(EffectiveAccessError, match="active-PIM"):
+        _verify(stub)
+
+
+def test_effective_access_treats_unproven_schedule_condition_as_applicable() -> None:
+    stub = StubAzure()
+    stub.assignment_schedule_pages[(SUBSCRIPTION_ID, PRINCIPAL_IDS[0])] = [
+        {
+            "value": [
+                _role_assignment_schedule(
+                    principal_id=PRINCIPAL_IDS[0],
+                    principal_type="ServicePrincipal",
+                    role_definition_id=REPOSITORY_READER_ROLE_DEFINITION_ID,
+                    start_date_time="2026-09-17T03:00:00Z",
+                    end_date_time="2026-09-17T04:00:00Z",
+                    condition_version="2.0",
+                    condition=_repository_condition("athena/other-repository"),
+                )
+            ],
+            "nextLink": None,
+        }
+    ]
+
+    with pytest.raises(EffectiveAccessError, match="active-PIM"):
+        _verify(stub)
+
+
 def test_effective_access_rejects_current_assignment_schedule_when_instances_empty() -> None:
     stub = StubAzure()
     stub.assignment_schedule_pages[(SUBSCRIPTION_ID, PRINCIPAL_IDS[0])] = [
@@ -1861,6 +1973,55 @@ def test_effective_access_rejects_current_assignment_schedule_when_instances_emp
                     principal_id=PRINCIPAL_IDS[0],
                     principal_type="ServicePrincipal",
                     role_definition_id=REPOSITORY_READER_ROLE_DEFINITION_ID,
+                )
+            ],
+            "nextLink": None,
+        }
+    ]
+
+    with pytest.raises(EffectiveAccessError, match="active-PIM"):
+        _verify(stub)
+
+
+def test_effective_access_ignores_expired_assignment_schedule() -> None:
+    stub = StubAzure()
+    stub.assignment_schedule_pages[(SUBSCRIPTION_ID, PRINCIPAL_IDS[0])] = [
+        {
+            "value": [
+                _role_assignment_schedule(
+                    principal_id=PRINCIPAL_IDS[0],
+                    principal_type="ServicePrincipal",
+                    role_definition_id=REPOSITORY_READER_ROLE_DEFINITION_ID,
+                    start_date_time="2026-09-17T01:00:00Z",
+                    end_date_time="2026-09-17T01:59:59Z",
+                )
+            ],
+            "nextLink": None,
+        }
+    ]
+
+    assert _verify(stub)["verified"] is True
+
+
+@pytest.mark.parametrize(
+    "end_date_time",
+    (
+        None,
+        "2026-09-17T02:00:00Z",
+    ),
+)
+def test_effective_access_counts_unbounded_and_boundary_end_schedules(
+    end_date_time: str | None,
+) -> None:
+    stub = StubAzure()
+    stub.assignment_schedule_pages[(SUBSCRIPTION_ID, PRINCIPAL_IDS[0])] = [
+        {
+            "value": [
+                _role_assignment_schedule(
+                    principal_id=PRINCIPAL_IDS[0],
+                    principal_type="ServicePrincipal",
+                    role_definition_id=REPOSITORY_READER_ROLE_DEFINITION_ID,
+                    end_date_time=end_date_time,
                 )
             ],
             "nextLink": None,
@@ -1910,6 +2071,78 @@ def test_effective_access_rejects_upcoming_eligibility_schedule_as_latent_access
     ]
 
     with pytest.raises(EffectiveAccessError, match="active-PIM"):
+        _verify(stub)
+
+
+def test_effective_access_rejects_group_derived_schedule_from_assigned_to_filter() -> None:
+    stub = StubAzure()
+    group_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    stub.group_pages[PRINCIPAL_IDS[0]] = [
+        {
+            "value": [
+                {
+                    "@odata.type": "#microsoft.graph.group",
+                    "id": group_id,
+                }
+            ]
+        }
+    ]
+    stub.assigned_to_pim_pages[
+        (
+            "roleAssignmentSchedules",
+            SUBSCRIPTION_ID,
+            PRINCIPAL_IDS[0],
+        )
+    ] = [
+        {
+            "value": [
+                _role_assignment_schedule(
+                    principal_id=group_id,
+                    principal_type="Group",
+                    role_definition_id=REPOSITORY_READER_ROLE_DEFINITION_ID,
+                    member_type="Group",
+                )
+            ],
+            "nextLink": None,
+        }
+    ]
+
+    with pytest.raises(EffectiveAccessError, match="group-derived"):
+        _verify(stub)
+
+
+def test_effective_access_rejects_parent_scope_inherited_schedule() -> None:
+    stub = StubAzure()
+    role_definition_id = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+        f"Microsoft.Authorization/roleDefinitions/{ACR_PULL_ROLE_ID}"
+    )
+    stub.roles[role_definition_id.casefold()] = _role_definition(
+        role_definition_id,
+        _permission(actions=(ACR_LEGACY_PULL_ACTION,)),
+    )
+    stub.assigned_to_pim_pages[
+        (
+            "roleAssignmentSchedules",
+            SUBSCRIPTION_ID,
+            PRINCIPAL_IDS[0],
+        )
+    ] = [
+        {
+            "value": [
+                _role_assignment_schedule(
+                    principal_id=PRINCIPAL_IDS[0],
+                    principal_type="ServicePrincipal",
+                    role_definition_id=role_definition_id,
+                    scope=f"/subscriptions/{SUBSCRIPTION_ID}",
+                    member_type="Inherited",
+                )
+            ],
+            "nextLink": None,
+        }
+    ]
+
+    with pytest.raises(EffectiveAccessError, match="inherited"):
         _verify(stub)
 
 
@@ -1995,6 +2228,27 @@ def test_effective_access_rejects_unknown_pim_schedule_status() -> None:
     ]
 
     with pytest.raises(EffectiveAccessError, match="status is invalid"):
+        _verify(stub)
+
+
+def test_effective_access_rejects_terminal_status_with_current_schedule_window() -> None:
+    stub = StubAzure()
+    stub.eligibility_schedule_pages[(SUBSCRIPTION_ID, PRINCIPAL_IDS[0])] = [
+        {
+            "value": [
+                _role_eligibility_resource(
+                    resource_type="roleEligibilitySchedules",
+                    principal_id=PRINCIPAL_IDS[0],
+                    principal_type="ServicePrincipal",
+                    role_definition_id=REPOSITORY_READER_ROLE_DEFINITION_ID,
+                    status="Revoked",
+                )
+            ],
+            "nextLink": None,
+        }
+    ]
+
+    with pytest.raises(EffectiveAccessError, match="terminal status conflicts"):
         _verify(stub)
 
 
@@ -2193,7 +2447,7 @@ def test_effective_access_rejects_schedule_instance_principal_mismatch() -> None
 
     with pytest.raises(
         EffectiveAccessError,
-        match="principal does not match its query",
+        match="principal is outside the reviewed transitive closure",
     ):
         _verify(stub)
 
@@ -2792,6 +3046,35 @@ def test_effective_access_follows_each_pim_collection_next_link(
     assert _verify(stub)["verified"] is True
 
 
+def test_effective_access_rejects_pull_schedule_on_second_page() -> None:
+    stub = StubAzure()
+    stub.assignment_schedule_pages[(SUBSCRIPTION_ID, PRINCIPAL_IDS[0])] = [
+        {
+            "value": [],
+            "nextLink": _pim_next_link(
+                "roleAssignmentSchedules",
+                PRINCIPAL_IDS[0],
+                2,
+            ),
+        },
+        {
+            "value": [
+                _role_assignment_schedule(
+                    principal_id=PRINCIPAL_IDS[0],
+                    principal_type="ServicePrincipal",
+                    role_definition_id=REPOSITORY_READER_ROLE_DEFINITION_ID,
+                    start_date_time="2026-09-17T03:00:00Z",
+                    end_date_time="2026-09-17T04:00:00Z",
+                )
+            ],
+            "nextLink": None,
+        },
+    ]
+
+    with pytest.raises(EffectiveAccessError, match="active-PIM"):
+        _verify(stub)
+
+
 def test_effective_access_follows_role_assignment_schedule_pagination() -> None:
     stub = StubAzure()
     stub.other_registry_role_assignment_modes[
@@ -2868,6 +3151,104 @@ def test_effective_access_rejects_pim_pagination_cycle() -> None:
 
     with pytest.raises(EffectiveAccessError, match="pagination contains a cycle"):
         _verify(stub)
+
+
+def test_effective_access_requires_converged_pim_updated_on_readbacks() -> None:
+    stub = StubAzure()
+    stub.assignment_schedule_pages[(SUBSCRIPTION_ID, PRINCIPAL_IDS[0])] = [
+        {
+            "value": [
+                _role_assignment_schedule(
+                    principal_id=PRINCIPAL_IDS[0],
+                    principal_type="ServicePrincipal",
+                    role_definition_id=REPOSITORY_READER_ROLE_DEFINITION_ID,
+                    start_date_time="2026-09-17T03:00:00Z",
+                    end_date_time="2026-09-17T04:00:00Z",
+                )
+            ],
+            "nextLink": None,
+        }
+    ]
+    schedule_reads = 0
+
+    def changing_schedule(command: Sequence[str], field: str) -> object:
+        nonlocal schedule_reads
+        command_tuple = tuple(command)
+        if command_tuple[1] == "rest":
+            url = command_tuple[command_tuple.index("--url") + 1]
+            if (
+                "/roleAssignmentSchedules?" in url
+                and "principalId%20eq%20" in url
+            ):
+                schedule_reads += 1
+                result = stub(command, field)
+                if schedule_reads == 2:
+                    changed = deepcopy(result)
+                    values = changed["value"]
+                    assert isinstance(values, list)
+                    resource = values[0]
+                    assert isinstance(resource, dict)
+                    properties = resource["properties"]
+                    assert isinstance(properties, dict)
+                    properties["updatedOn"] = "2026-09-17T02:00:01Z"
+                    return changed
+                return result
+        return stub(command, field)
+
+    with pytest.raises(
+        EffectiveAccessError,
+        match="PIM role-management readbacks did not converge",
+    ):
+        verify_effective_access(
+            _expected_assignments(),
+            subscription_id=SUBSCRIPTION_ID,
+            run_json=changing_schedule,
+            verified_at=datetime(2026, 9, 17, 2, tzinfo=UTC),
+        )
+
+
+def test_effective_access_requires_converged_role_definition_readbacks() -> None:
+    stub = StubAzure()
+    role_reads = 0
+
+    def changing_role(command: Sequence[str], field: str) -> object:
+        nonlocal role_reads
+        command_tuple = tuple(command)
+        if command_tuple[1] == "rest":
+            url = command_tuple[command_tuple.index("--url") + 1]
+            if (
+                url.removeprefix("https://management.azure.com").split("?", 1)[0].casefold()
+                == REPOSITORY_READER_ROLE_DEFINITION_ID.casefold()
+            ):
+                role_reads += 1
+                result = stub(command, field)
+                if role_reads == 2:
+                    changed = deepcopy(result)
+                    properties = changed["properties"]
+                    assert isinstance(properties, dict)
+                    permissions = properties["permissions"]
+                    assert isinstance(permissions, list)
+                    permission = permissions[0]
+                    assert isinstance(permission, dict)
+                    data_actions = permission["dataActions"]
+                    assert isinstance(data_actions, list)
+                    data_actions.append(
+                        "Microsoft.ContainerRegistry/registries/repositories/catalog/read"
+                    )
+                    return changed
+                return result
+        return stub(command, field)
+
+    with pytest.raises(
+        EffectiveAccessError,
+        match="role definition readbacks did not converge",
+    ):
+        verify_effective_access(
+            _expected_assignments(),
+            subscription_id=SUBSCRIPTION_ID,
+            run_json=changing_role,
+            verified_at=datetime(2026, 9, 17, 2, tzinfo=UTC),
+        )
 
 
 def test_effective_access_rejects_schedule_pagination_over_bound(

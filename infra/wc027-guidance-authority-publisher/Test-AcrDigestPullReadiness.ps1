@@ -362,6 +362,8 @@ function Get-EffectiveAccessEvidence {
             'roleEligibilityScheduleInstancesComplete'
             'roleEligibilitySchedulesComplete'
             'roleManagementPendingRequestsComplete'
+            'convergedPimReadbacks'
+            'convergedRoleDefinitionReadbacks'
             'siblingRegistriesChecked'
             'acrEscalationPathsChecked'
             'completeness'
@@ -384,6 +386,8 @@ function Get-EffectiveAccessEvidence {
             'pimRoleEligibilityScheduleInstances'
             'pimRoleEligibilitySchedules'
             'pimPendingGrantRequests'
+            'pimConvergedReadbacks'
+            'roleDefinitionReadbacks'
             'transitiveGroups'
             'siblingRegistries'
             'acrEscalationPaths'
@@ -495,6 +499,16 @@ function Get-EffectiveAccessEvidence {
                 -Value $evidence.roleManagementPendingRequestsComplete `
                 -Expected $true
         ) -or
+        -not (
+            Test-JsonBoolean `
+                -Value $evidence.convergedPimReadbacks `
+                -Expected $true
+        ) -or
+        -not (
+            Test-JsonBoolean `
+                -Value $evidence.convergedRoleDefinitionReadbacks `
+                -Expected $true
+        ) -or
         -not (Test-JsonBoolean -Value $evidence.siblingRegistriesChecked -Expected $true) -or
         -not (Test-JsonBoolean -Value $evidence.acrEscalationPathsChecked -Expected $true) -or
         -not (Test-JsonBoolean -Value $completeness.classicRoleAssignments -Expected $true) -or
@@ -521,6 +535,16 @@ function Get-EffectiveAccessEvidence {
         -not (
             Test-JsonBoolean `
                 -Value $completeness.pimPendingGrantRequests `
+                -Expected $true
+        ) -or
+        -not (
+            Test-JsonBoolean `
+                -Value $completeness.pimConvergedReadbacks `
+                -Expected $true
+        ) -or
+        -not (
+            Test-JsonBoolean `
+                -Value $completeness.roleDefinitionReadbacks `
                 -Expected $true
         ) -or
         -not (Test-JsonBoolean -Value $completeness.transitiveGroups -Expected $true) -or

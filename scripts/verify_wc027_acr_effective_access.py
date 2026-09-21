@@ -149,13 +149,19 @@ _ROLE_MANAGEMENT_REMOVAL_REQUEST_TYPES = frozenset(
         "SelfDeactivate",
     }
 )
-_PIM_ROLE_MANAGEMENT_RESOURCE_TYPES = (
+_PIM_SCHEDULE_RESOURCE_TYPES = (
     "roleAssignmentScheduleInstances",
     "roleAssignmentSchedules",
     "roleEligibilityScheduleInstances",
     "roleEligibilitySchedules",
+)
+_PIM_REQUEST_RESOURCE_TYPES = (
     "roleAssignmentScheduleRequests",
     "roleEligibilityScheduleRequests",
+)
+_PIM_ROLE_MANAGEMENT_RESOURCE_TYPES = (
+    *_PIM_SCHEDULE_RESOURCE_TYPES,
+    *_PIM_REQUEST_RESOURCE_TYPES,
 )
 type JsonRunner = Callable[[Sequence[str], str], object]
 
@@ -314,8 +320,14 @@ def verify_effective_access(
         (1 + len(group_ids)) * len(governed_subscription_ids)
         for group_ids in transitive_groups_by_principal.values()
     )
-    minimum_pim_calls = principal_subscription_queries * len(
-        _PIM_ROLE_MANAGEMENT_RESOURCE_TYPES
+    minimum_pim_calls = sum(
+        (
+            len(_PIM_SCHEDULE_RESOURCE_TYPES) * (2 + len(group_ids))
+            + len(_PIM_REQUEST_RESOURCE_TYPES) * (1 + len(group_ids))
+        )
+        * len(governed_subscription_ids)
+        * 2
+        for group_ids in transitive_groups_by_principal.values()
     )
     if minimum_pim_calls > MAX_PIM_ROLE_MANAGEMENT_API_CALLS:
         raise EffectiveAccessError(
@@ -414,6 +426,8 @@ def verify_effective_access(
         "roleEligibilityScheduleInstancesComplete": True,
         "roleEligibilitySchedulesComplete": True,
         "roleManagementPendingRequestsComplete": True,
+        "convergedPimReadbacks": True,
+        "convergedRoleDefinitionReadbacks": True,
         "siblingRegistriesChecked": True,
         "acrEscalationPathsChecked": True,
         "completeness": {
@@ -423,6 +437,8 @@ def verify_effective_access(
             "pimRoleEligibilityScheduleInstances": True,
             "pimRoleEligibilitySchedules": True,
             "pimPendingGrantRequests": True,
+            "pimConvergedReadbacks": True,
+            "roleDefinitionReadbacks": True,
             "transitiveGroups": True,
             "siblingRegistries": True,
             "acrEscalationPaths": True,
@@ -866,11 +882,11 @@ def _resolved_effective_role_assignments(
     run_json: JsonRunner,
 ) -> list[dict[str, Any]]:
     documents: list[object] = []
-    principal_types = (
-        (principal_id, "ServicePrincipal"),
-        *((group_id, "Group") for group_id in sorted(group_ids)),
-    )
-    for effective_principal_id, principal_type in principal_types:
+    principal_types = {
+        principal_id: "ServicePrincipal",
+        **{group_id: "Group" for group_id in sorted(group_ids)},
+    }
+    for effective_principal_id, principal_type in principal_types.items():
         for subscription_id in subscription_ids:
             documents.append(
                 _effective_role_assignments(
@@ -882,17 +898,18 @@ def _resolved_effective_role_assignments(
                     run_json=run_json,
                 )
             )
-            documents.append(
-                _effective_pim_role_assignments(
-                    effective_principal_id,
-                    principal_type=principal_type,
-                    subscription_id=subscription_id,
-                    governed_subscription_ids=governed_subscription_ids,
-                    active_at=active_at,
-                    pim_budget=pim_budget,
-                    run_json=run_json,
-                )
+    for subscription_id in subscription_ids:
+        documents.append(
+            _effective_pim_role_assignments(
+                principal_id,
+                principal_types=principal_types,
+                subscription_id=subscription_id,
+                governed_subscription_ids=governed_subscription_ids,
+                active_at=active_at,
+                pim_budget=pim_budget,
+                run_json=run_json,
             )
+        )
     return _merge_assignment_documents(
         documents,
         field=f"effective ACR assignments for {principal_id}",
@@ -1119,30 +1136,34 @@ def _classic_role_assignment(
 def _effective_pim_role_assignments(
     principal_id: str,
     *,
-    principal_type: str,
+    principal_types: Mapping[str, str],
     subscription_id: str,
     governed_subscription_ids: frozenset[str],
     active_at: datetime,
     pim_budget: _PimRoleManagementScanBudget,
     run_json: JsonRunner,
 ) -> list[dict[str, Any]]:
-    resources = {
-        resource_type: _pim_role_management_resources(
-            resource_type,
-            principal_id=principal_id,
+    readbacks = [
+        _pim_role_management_readback(
+            principal_id,
+            principal_types=principal_types,
             subscription_id=subscription_id,
             pim_budget=pim_budget,
             run_json=run_json,
         )
-        for resource_type in _PIM_ROLE_MANAGEMENT_RESOURCE_TYPES
-    }
+        for _ in range(2)
+    ]
+    if _canonical_json(readbacks[0]) != _canonical_json(readbacks[1]):
+        raise EffectiveAccessError(
+            "PIM role-management readbacks did not converge"
+        )
+    resources = readbacks[1]
     assignments: list[dict[str, Any]] = []
     current_assignments_by_schedule_id: dict[str, dict[str, Any]] = {}
     for index, resource in enumerate(resources["roleAssignmentScheduleInstances"]):
         schedule_id, assignment = _role_assignment_schedule_instance(
             resource,
-            principal_id=principal_id,
-            principal_type=principal_type,
+            principal_types=principal_types,
             governed_subscription_ids=governed_subscription_ids,
             active_at=active_at,
             field=f"role-assignment schedule instance {index}",
@@ -1160,8 +1181,7 @@ def _effective_pim_role_assignments(
     for index, resource in enumerate(resources["roleAssignmentSchedules"]):
         schedule_id, schedule_assignment = _role_assignment_schedule(
             resource,
-            principal_id=principal_id,
-            principal_type=principal_type,
+            principal_types=principal_types,
             governed_subscription_ids=governed_subscription_ids,
             active_at=active_at,
             field=f"role-assignment schedule {index}",
@@ -1188,8 +1208,7 @@ def _effective_pim_role_assignments(
             eligibility = _role_eligibility_schedule(
                 resource,
                 resource_type=resource_type,
-                principal_id=principal_id,
-                principal_type=principal_type,
+                principal_types=principal_types,
                 governed_subscription_ids=governed_subscription_ids,
                 active_at=active_at,
                 field=f"{resource_type} item {index}",
@@ -1205,8 +1224,7 @@ def _effective_pim_role_assignments(
             pending_request = _pending_role_management_request(
                 resource,
                 resource_type=resource_type,
-                principal_id=principal_id,
-                principal_type=principal_type,
+                principal_types=principal_types,
                 governed_subscription_ids=governed_subscription_ids,
                 field=f"{resource_type} item {index}",
             )
@@ -1215,10 +1233,56 @@ def _effective_pim_role_assignments(
     return assignments
 
 
+def _pim_role_management_readback(
+    principal_id: str,
+    *,
+    principal_types: Mapping[str, str],
+    subscription_id: str,
+    pim_budget: _PimRoleManagementScanBudget,
+    run_json: JsonRunner,
+) -> dict[str, list[dict[str, Any]]]:
+    readback: dict[str, list[dict[str, Any]]] = {}
+    for resource_type in _PIM_ROLE_MANAGEMENT_RESOURCE_TYPES:
+        filter_values = [
+            f"principalId eq {effective_principal_id}"
+            for effective_principal_id in sorted(principal_types)
+        ]
+        if resource_type in _PIM_SCHEDULE_RESOURCE_TYPES:
+            filter_values.insert(
+                0,
+                f"assignedTo('{principal_id}') and atScope()",
+            )
+        merged: dict[str, dict[str, Any]] = {}
+        for filter_value in filter_values:
+            for resource in _pim_role_management_resources(
+                resource_type,
+                principal_id=principal_id,
+                filter_value=filter_value,
+                subscription_id=subscription_id,
+                pim_budget=pim_budget,
+                run_json=run_json,
+            ):
+                resource_id = _string(
+                    resource.get("id"),
+                    field=f"{resource_type} resource ID",
+                ).casefold()
+                existing = merged.get(resource_id)
+                if existing is not None and _canonical_json(existing) != _canonical_json(
+                    resource
+                ):
+                    raise EffectiveAccessError(
+                        "PIM role-management filters returned conflicting resources"
+                    )
+                merged[resource_id] = resource
+        readback[resource_type] = [merged[key] for key in sorted(merged)]
+    return readback
+
+
 def _pim_role_management_resources(
     resource_type: str,
     *,
     principal_id: str,
+    filter_value: str,
     subscription_id: str,
     pim_budget: _PimRoleManagementScanBudget,
     run_json: JsonRunner,
@@ -1226,7 +1290,6 @@ def _pim_role_management_resources(
     if resource_type not in _PIM_ROLE_MANAGEMENT_RESOURCE_TYPES:
         raise EffectiveAccessError("PIM role-management resource type is invalid")
     subscription_scope = f"/subscriptions/{subscription_id}"
-    filter_value = f"principalId eq {principal_id}"
     query = urlencode(
         (
             ("api-version", PIM_ROLE_MANAGEMENT_API_VERSION),
@@ -1243,12 +1306,18 @@ def _pim_role_management_resources(
     seen_resource_ids: set[str] = set()
     for page_number in range(1, MAX_PIM_ROLE_MANAGEMENT_PAGES + 1):
         if next_url is None:
-            return resources
+            return sorted(
+                resources,
+                key=lambda item: _string(
+                    item.get("id"),
+                    field=f"{resource_type} resource ID",
+                ).casefold(),
+            )
         _validate_pim_role_management_url(
             next_url,
             resource_type=resource_type,
             subscription_id=subscription_id,
-            principal_id=principal_id,
+            filter_value=filter_value,
             first_page=page_number == 1,
         )
         if next_url in seen_urls:
@@ -1308,7 +1377,13 @@ def _pim_role_management_resources(
             resources.append(resource)
         continuation = page.get("nextLink")
         if continuation is None:
-            return resources
+            return sorted(
+                resources,
+                key=lambda item: _string(
+                    item.get("id"),
+                    field=f"{resource_type} resource ID",
+                ).casefold(),
+            )
         if not isinstance(continuation, str) or not continuation:
             raise EffectiveAccessError(
                 "PIM role-management continuation is invalid"
@@ -1324,7 +1399,7 @@ def _validate_pim_role_management_url(
     *,
     resource_type: str,
     subscription_id: str,
-    principal_id: str,
+    filter_value: str,
     first_page: bool,
 ) -> None:
     if len(url) > 16_384:
@@ -1359,7 +1434,7 @@ def _validate_pim_role_management_url(
         )
         or any(len(values) != 1 or not values[0] for values in normalized_query.values())
         or normalized_query.get("api-version") != [PIM_ROLE_MANAGEMENT_API_VERSION]
-        or normalized_query.get("$filter") != [f"principalId eq {principal_id}"]
+        or normalized_query.get("$filter") != [filter_value]
         or (first_page and continuation_keys)
         or (not first_page and continuation_keys != {"$skiptoken"})
     ):
@@ -1372,8 +1447,7 @@ def _role_management_resource(
     value: object,
     *,
     resource_type: str,
-    principal_id: str,
-    principal_type: str,
+    principal_types: Mapping[str, str],
     governed_subscription_ids: frozenset[str],
     field: str,
 ) -> tuple[str, dict[str, Any], dict[str, Any]]:
@@ -1394,9 +1468,12 @@ def _role_management_resource(
         properties.get("principalId"),
         field=f"{field} principal ID",
     )
-    if resource_principal_id != principal_id:
-        raise EffectiveAccessError(f"{field} principal does not match its query")
-    if properties.get("principalType") != principal_type:
+    expected_principal_type = principal_types.get(resource_principal_id)
+    if expected_principal_type is None:
+        raise EffectiveAccessError(
+            f"{field} principal is outside the reviewed transitive closure"
+        )
+    if properties.get("principalType") != expected_principal_type:
         raise EffectiveAccessError(f"{field} principal type does not match its query")
     scope = _canonical_governed_scope(
         properties.get("scope"),
@@ -1418,7 +1495,7 @@ def _role_management_resource(
     grant = {
         "id": resource_id,
         "principalId": resource_principal_id,
-        "principalType": principal_type,
+        "principalType": expected_principal_type,
         "roleDefinitionId": _string(
             properties.get("roleDefinitionId"),
             field=f"{field} role definition ID",
@@ -1477,10 +1554,12 @@ def _role_management_schedule_window(
     )
     if end_at is not None and end_at <= start_at:
         raise EffectiveAccessError(f"{field} time window is invalid")
+    if end_at is not None and active_at > end_at:
+        return start_at, end_at, False
     if status in _INACTIVE_ROLE_ASSIGNMENT_SCHEDULE_STATUSES:
-        return start_at, end_at, False
-    if end_at is not None and active_at >= end_at:
-        return start_at, end_at, False
+        raise EffectiveAccessError(
+            f"{field} terminal status conflicts with its current or future window"
+        )
     if current_instance and start_at > active_at:
         raise EffectiveAccessError(f"{field} cannot start in the future")
     return start_at, end_at, True
@@ -1489,8 +1568,7 @@ def _role_management_schedule_window(
 def _role_assignment_schedule_instance(
     value: object,
     *,
-    principal_id: str,
-    principal_type: str,
+    principal_types: Mapping[str, str],
     governed_subscription_ids: frozenset[str],
     active_at: datetime,
     field: str,
@@ -1498,8 +1576,7 @@ def _role_assignment_schedule_instance(
     _, properties, assignment = _role_management_resource(
         value,
         resource_type="roleAssignmentScheduleInstances",
-        principal_id=principal_id,
-        principal_type=principal_type,
+        principal_types=principal_types,
         governed_subscription_ids=governed_subscription_ids,
         field=field,
     )
@@ -1538,8 +1615,7 @@ def _role_assignment_schedule_instance(
 def _role_assignment_schedule(
     value: object,
     *,
-    principal_id: str,
-    principal_type: str,
+    principal_types: Mapping[str, str],
     governed_subscription_ids: frozenset[str],
     active_at: datetime,
     field: str,
@@ -1547,8 +1623,7 @@ def _role_assignment_schedule(
     schedule_id, properties, assignment = _role_management_resource(
         value,
         resource_type="roleAssignmentSchedules",
-        principal_id=principal_id,
-        principal_type=principal_type,
+        principal_types=principal_types,
         governed_subscription_ids=governed_subscription_ids,
         field=field,
     )
@@ -1575,8 +1650,7 @@ def _role_eligibility_schedule(
     value: object,
     *,
     resource_type: str,
-    principal_id: str,
-    principal_type: str,
+    principal_types: Mapping[str, str],
     governed_subscription_ids: frozenset[str],
     active_at: datetime,
     field: str,
@@ -1584,8 +1658,7 @@ def _role_eligibility_schedule(
     resource_id, properties, assignment = _role_management_resource(
         value,
         resource_type=resource_type,
-        principal_id=principal_id,
-        principal_type=principal_type,
+        principal_types=principal_types,
         governed_subscription_ids=governed_subscription_ids,
         field=field,
     )
@@ -1614,16 +1687,14 @@ def _pending_role_management_request(
     value: object,
     *,
     resource_type: str,
-    principal_id: str,
-    principal_type: str,
+    principal_types: Mapping[str, str],
     governed_subscription_ids: frozenset[str],
     field: str,
 ) -> dict[str, Any] | None:
     resource_id, properties, assignment = _role_management_resource(
         value,
         resource_type=resource_type,
-        principal_id=principal_id,
-        principal_type=principal_type,
+        principal_types=principal_types,
         governed_subscription_ids=governed_subscription_ids,
         field=field,
     )
@@ -1981,28 +2052,35 @@ def _get_role_definition(
         role_definition_id,
         governed_subscription_ids=governed_subscription_ids,
     )
-    role = _mapping(
-        run_json(
-            [
-                "az",
-                "rest",
-                "--method",
-                "get",
-                "--url",
-                f"https://{ARM_HOST}{canonical_id}?api-version=2022-04-01",
-                "--only-show-errors",
-                "--output",
-                "json",
-            ],
-            f"effective ACR role definition {canonical_id}",
-        ),
-        field="effective ACR role definition",
-    )
-    if str(role.get("id", "")).casefold() != canonical_id.casefold():
-        raise EffectiveAccessError(
-            "effective ACR role definition readback does not match its assignment"
+    readbacks: list[dict[str, Any]] = []
+    for read_number in (1, 2):
+        role = _mapping(
+            run_json(
+                [
+                    "az",
+                    "rest",
+                    "--method",
+                    "get",
+                    "--url",
+                    f"https://{ARM_HOST}{canonical_id}?api-version=2022-04-01",
+                    "--only-show-errors",
+                    "--output",
+                    "json",
+                ],
+                f"effective ACR role definition {canonical_id} read {read_number}",
+            ),
+            field="effective ACR role definition",
         )
-    return role
+        if str(role.get("id", "")).casefold() != canonical_id.casefold():
+            raise EffectiveAccessError(
+                "effective ACR role definition readback does not match its assignment"
+            )
+        readbacks.append(role)
+    if _canonical_json(readbacks[0]) != _canonical_json(readbacks[1]):
+        raise EffectiveAccessError(
+            "effective ACR role definition readbacks did not converge"
+        )
+    return readbacks[1]
 
 
 def _role_definition_grants_acr_pull(
@@ -2517,6 +2595,15 @@ def _mapping(value: object, *, field: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise EffectiveAccessError(f"{field} must be an object")
     return value
+
+
+def _canonical_json(value: object) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
 
 
 def _string(value: object, *, field: str) -> str:
