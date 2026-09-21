@@ -304,7 +304,13 @@ another effective role assignment that grants one of the four permissions still 
 Repository metadata or catalog reads, registry management reads, and login/control-plane
 management alone are not image-pull permission. `AcrQuarantineReader` and
 `AcrQuarantineWriter` remain pull-capable because they include the exact quarantine control read
-and quarantined-artifact data read. Role-assignment and role-eligibility schedule request writes,
+and quarantined-artifact data read. For a registry-scoped normal-pull grant, the scanner parses the
+canonical registry ARM ID and resolves it with `az acr show`, supplying exact `--name`,
+`--resource-group`, and `--subscription` values plus `--query roleAssignmentMode`.
+ABAC mode ignores legacy `AcrPull`, `AcrPush`, and `AcrDelete`, while legacy RBAC mode does not
+assume repository `content/read` is effective. A failed, missing, or unknown mode lookup fails
+closed. Broader-scope normal-pull grants remain conservatively pull-capable because they can govern
+registries in either mode. Role-assignment and role-eligibility schedule request writes,
 approval-required eligibility writes, and role-management policy administration are escalation
 paths at scopes that can govern ACR. The same classification rejects tenant access elevation plus
 ACR quarantine mutation, task execution/administration, update-policy mutation, and

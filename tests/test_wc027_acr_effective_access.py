@@ -12,6 +12,7 @@ from scripts.verify_wc027_acr_effective_access import (
     ABAC_ROLE_ASSIGNMENT_MODE,
     ACR_ESCALATION_ACTIONS,
     ACR_ESCALATION_DATA_ACTIONS,
+    ACR_LEGACY_PULL_ACTION,
     ACR_PULL_ACTIONS,
     ACR_PULL_DATA_ACTIONS,
     ACR_PULL_ROLE_ID,
@@ -19,6 +20,7 @@ from scripts.verify_wc027_acr_effective_access import (
     ACR_QUARANTINED_ARTIFACTS_READ_DATA_ACTION,
     ACR_REPOSITORY_CONTENT_READ_DATA_ACTION,
     ACR_REPOSITORY_READER_ROLE_ID,
+    LEGACY_ROLE_ASSIGNMENT_MODE,
     EffectiveAccessError,
     ExpectedAssignment,
     _repository_condition,
@@ -151,7 +153,11 @@ def _role_definition(
     }
 
 
-def _grants_acr_pull(permission: dict[str, object]) -> bool:
+def _grants_acr_pull(
+    permission: dict[str, object],
+    *,
+    role_assignment_mode: str | None = None,
+) -> bool:
     return _role_definition_grants_acr_pull(
         _role_definition(
             (
@@ -160,7 +166,8 @@ def _grants_acr_pull(permission: dict[str, object]) -> bool:
                 "98989898-9898-4898-8898-989898989898"
             ),
             permission,
-        )
+        ),
+        role_assignment_mode=role_assignment_mode,
     )
 
 
@@ -204,6 +211,7 @@ class StubAzure:
         expected = _expected_assignments()
         self.anonymous_pull_enabled: object = False
         self.registry_role_assignment_mode: object = ABAC_ROLE_ASSIGNMENT_MODE
+        self.other_registry_role_assignment_modes: dict[str, object] = {}
         self.tenant_subscription_ids = [SUBSCRIPTION_ID]
         self.direct: dict[str, object] = {
             item.principal_id: [_assignment(item)] for item in expected
@@ -253,6 +261,26 @@ class StubAzure:
                 "id": SUBSCRIPTION_ID,
                 "tenantId": TENANT_ID,
             }
+        if command_tuple[1:3] == ("acr", "show"):
+            subscription_id = command_tuple[command_tuple.index("--subscription") + 1]
+            resource_group_name = command_tuple[
+                command_tuple.index("--resource-group") + 1
+            ]
+            registry_name = command_tuple[command_tuple.index("--name") + 1]
+            resource_id = (
+                f"/subscriptions/{subscription_id}/resourceGroups/"
+                f"{resource_group_name}/providers/Microsoft.ContainerRegistry/"
+                f"registries/{registry_name}"
+            )
+            assert command_tuple[command_tuple.index("--query") + 1] == (
+                "roleAssignmentMode"
+            )
+            if resource_id.casefold() == REGISTRY_ID.casefold():
+                return self.registry_role_assignment_mode
+            return self.other_registry_role_assignment_modes.get(
+                resource_id.casefold(),
+                ABAC_ROLE_ASSIGNMENT_MODE,
+            )
         if command_tuple[1:3] == ("resource", "show"):
             resource_id = command_tuple[command_tuple.index("--ids") + 1]
             return {
@@ -356,6 +384,50 @@ def _verify(stub: StubAzure) -> dict[str, object]:
         run_json=stub,
         verified_at=datetime(2026, 9, 17, 2, tzinfo=UTC),
     )
+
+
+def _configure_legacy_mode(
+    stub: StubAzure,
+) -> tuple[ExpectedAssignment, ...]:
+    expected = tuple(
+        replace(item, role_assignment_mode=LEGACY_ROLE_ASSIGNMENT_MODE)
+        for item in _expected_assignments()
+    )
+    stub.registry_role_assignment_mode = LEGACY_ROLE_ASSIGNMENT_MODE
+    role_definition_id = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+        f"Microsoft.Authorization/roleDefinitions/{ACR_PULL_ROLE_ID}"
+    )
+    stub.roles[role_definition_id.casefold()] = _role_definition(
+        role_definition_id,
+        _permission(actions=(ACR_LEGACY_PULL_ACTION,)),
+    )
+    stub.direct = {
+        item.principal_id: [
+            {
+                "id": item.assignment_resource_id,
+                "principalId": item.principal_id,
+                "principalType": "ServicePrincipal",
+                "roleDefinitionId": role_definition_id,
+                "scope": REGISTRY_ID,
+                "conditionVersion": None,
+                "condition": None,
+            }
+        ]
+        for item in expected
+    }
+    stub.assignment_readbacks = {
+        item.assignment_resource_id.casefold(): {
+            "id": item.assignment_resource_id,
+            "properties": {
+                key: value
+                for key, value in stub.direct[item.principal_id][0].items()
+                if key != "id"
+            },
+        }
+        for item in expected
+    }
+    return expected
 
 
 def _extra_assignment(
@@ -549,14 +621,16 @@ def test_acr_pull_classifier_rejects_non_pull_registry_permissions(
 
 
 @pytest.mark.parametrize(
-    ("role_name", "permission"),
+    ("role_name", "role_assignment_mode", "permission"),
     (
         (
             "AcrPull",
+            LEGACY_ROLE_ASSIGNMENT_MODE,
             _permission(actions=(ACR_PULL_ACTIONS[0],)),
         ),
         (
             "Container Registry Repository Reader",
+            ABAC_ROLE_ASSIGNMENT_MODE,
             _permission(
                 data_actions=(
                     ACR_REPOSITORY_CONTENT_READ_DATA_ACTION,
@@ -566,6 +640,7 @@ def test_acr_pull_classifier_rejects_non_pull_registry_permissions(
         ),
         (
             "AcrQuarantineReader",
+            ABAC_ROLE_ASSIGNMENT_MODE,
             _permission(
                 actions=(ACR_QUARANTINE_READ_ACTION,),
                 data_actions=(ACR_QUARANTINED_ARTIFACTS_READ_DATA_ACTION,),
@@ -573,6 +648,7 @@ def test_acr_pull_classifier_rejects_non_pull_registry_permissions(
         ),
         (
             "AcrQuarantineWriter",
+            LEGACY_ROLE_ASSIGNMENT_MODE,
             _permission(
                 actions=(
                     ACR_QUARANTINE_READ_ACTION,
@@ -588,10 +664,45 @@ def test_acr_pull_classifier_rejects_non_pull_registry_permissions(
 )
 def test_acr_pull_classifier_recognizes_pull_capable_built_in_role_shapes(
     role_name: str,
+    role_assignment_mode: str,
     permission: dict[str, object],
 ) -> None:
     assert role_name
-    assert _grants_acr_pull(permission)
+    assert _grants_acr_pull(
+        permission,
+        role_assignment_mode=role_assignment_mode,
+    )
+
+
+@pytest.mark.parametrize(
+    "permission",
+    (
+        _permission(actions=(ACR_LEGACY_PULL_ACTION,)),
+        _permission(
+            actions=(
+                ACR_LEGACY_PULL_ACTION,
+                "Microsoft.ContainerRegistry/registries/push/write",
+            )
+        ),
+        _permission(
+            actions=("Microsoft.ContainerRegistry/registries/artifacts/delete",)
+        ),
+    ),
+)
+def test_abac_mode_does_not_honor_legacy_acr_roles(
+    permission: dict[str, object],
+) -> None:
+    assert not _grants_acr_pull(
+        permission,
+        role_assignment_mode=ABAC_ROLE_ASSIGNMENT_MODE,
+    )
+
+
+def test_legacy_mode_does_not_honor_repository_reader_data_action() -> None:
+    assert not _grants_acr_pull(
+        _permission(data_actions=(ACR_REPOSITORY_CONTENT_READ_DATA_ACTION,)),
+        role_assignment_mode=LEGACY_ROLE_ASSIGNMENT_MODE,
+    )
 
 
 def test_effective_access_accepts_only_the_three_exact_direct_assignments() -> None:
@@ -651,6 +762,23 @@ def test_effective_access_accepts_only_the_three_exact_direct_assignments() -> N
         and "/roleAssignmentScheduleInstances?" in command[command.index("--url") + 1]
         for command in stub.commands
     ) == 3
+    mode_commands = [
+        command
+        for command in stub.commands
+        if command[1:3] == ("acr", "show")
+    ]
+    assert len(mode_commands) == 1
+    assert mode_commands[0][mode_commands[0].index("--query") + 1] == (
+        "roleAssignmentMode"
+    )
+    assert mode_commands[0][mode_commands[0].index("--name") + 1] == "athenashared"
+    assert mode_commands[0][mode_commands[0].index("--resource-group") + 1] == (
+        "rg-shared-acr"
+    )
+    assert mode_commands[0][mode_commands[0].index("--subscription") + 1] == (
+        SUBSCRIPTION_ID
+    )
+    assert "--ids" not in mode_commands[0]
 
 
 def test_effective_access_accepts_expected_assignment_schedule_mirrors() -> None:
@@ -689,44 +817,7 @@ def test_effective_access_accepts_expected_assignment_schedule_mirrors() -> None
 
 def test_effective_access_accepts_legacy_acr_pull_only_with_null_conditions() -> None:
     stub = StubAzure()
-    expected = tuple(
-        replace(item, role_assignment_mode="LegacyRegistryPermissions")
-        for item in _expected_assignments()
-    )
-    stub.registry_role_assignment_mode = "LegacyRegistryPermissions"
-    role_definition_id = (
-        f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
-        f"Microsoft.Authorization/roleDefinitions/{ACR_PULL_ROLE_ID}"
-    )
-    stub.roles[role_definition_id.casefold()] = _role_definition(
-        role_definition_id,
-        _permission(actions=("Microsoft.ContainerRegistry/registries/pull/read",)),
-    )
-    stub.direct = {
-        item.principal_id: [
-            {
-                "id": item.assignment_resource_id,
-                "principalId": item.principal_id,
-                "principalType": "ServicePrincipal",
-                "roleDefinitionId": role_definition_id,
-                "scope": REGISTRY_ID,
-                "conditionVersion": None,
-                "condition": None,
-            }
-        ]
-        for item in expected
-    }
-    stub.assignment_readbacks = {
-        item.assignment_resource_id.casefold(): {
-            "id": item.assignment_resource_id,
-            "properties": {
-                key: value
-                for key, value in stub.direct[item.principal_id][0].items()
-                if key != "id"
-            },
-        }
-        for item in expected
-    }
+    expected = _configure_legacy_mode(stub)
 
     evidence = verify_effective_access(
         expected,
@@ -740,6 +831,138 @@ def test_effective_access_accepts_legacy_acr_pull_only_with_null_conditions() ->
     assert all(item["roleDefinitionId"] == ACR_PULL_ROLE_ID for item in reviewed)
     assert all(item["conditionVersion"] is None for item in reviewed)
     assert all(item["condition"] is None for item in reviewed)
+
+
+@pytest.mark.parametrize(
+    ("role_guid", "assignment_guid", "permission"),
+    (
+        (
+            ACR_PULL_ROLE_ID,
+            "41414141-4141-4141-8141-414141414141",
+            _permission(actions=(ACR_LEGACY_PULL_ACTION,)),
+        ),
+        (
+            "8311e382-0749-4cb8-b61a-304f252e45ec",
+            "43434343-4343-4343-8343-434343434343",
+            _permission(
+                actions=(
+                    ACR_LEGACY_PULL_ACTION,
+                    "Microsoft.ContainerRegistry/registries/push/write",
+                )
+            ),
+        ),
+        (
+            "c2f4ef07-c644-48eb-af81-4b1b4947fb11",
+            "45454545-4545-4545-8545-454545454545",
+            _permission(
+                actions=(
+                    "Microsoft.ContainerRegistry/registries/artifacts/delete",
+                )
+            ),
+        ),
+    ),
+)
+def test_effective_access_ignores_legacy_acr_roles_in_abac_mode(
+    role_guid: str,
+    assignment_guid: str,
+    permission: dict[str, object],
+) -> None:
+    stub = StubAzure()
+    role_definition_id = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+        f"Microsoft.Authorization/roleDefinitions/{role_guid}"
+    )
+    stub.roles[role_definition_id.casefold()] = _role_definition(
+        role_definition_id,
+        permission,
+    )
+    direct = stub.direct[PRINCIPAL_IDS[0]]
+    assert isinstance(direct, list)
+    direct.append(
+        _extra_assignment(
+            principal_id=PRINCIPAL_IDS[0],
+            role_definition_id=role_definition_id,
+            assignment_guid=assignment_guid,
+            scope=REGISTRY_ID,
+        )
+    )
+
+    evidence = _verify(stub)
+
+    assert evidence["verified"] is True
+    assert evidence["pullCapableAssignmentCount"] == 3
+
+
+def test_effective_access_ignores_repository_reader_in_legacy_mode() -> None:
+    stub = StubAzure()
+    expected = _configure_legacy_mode(stub)
+    role_definition_id = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+        f"Microsoft.Authorization/roleDefinitions/{ACR_REPOSITORY_READER_ROLE_ID}"
+    )
+    stub.roles[role_definition_id.casefold()] = _role_definition(
+        role_definition_id,
+        _permission(data_actions=(ACR_REPOSITORY_CONTENT_READ_DATA_ACTION,)),
+    )
+    direct = stub.direct[PRINCIPAL_IDS[0]]
+    assert isinstance(direct, list)
+    direct.append(
+        _extra_assignment(
+            principal_id=PRINCIPAL_IDS[0],
+            role_definition_id=role_definition_id,
+            assignment_guid="42424242-4242-4242-8242-424242424242",
+            scope=REGISTRY_ID,
+        )
+    )
+
+    evidence = verify_effective_access(
+        expected,
+        subscription_id=SUBSCRIPTION_ID,
+        run_json=stub,
+        verified_at=datetime(2026, 9, 17, 2, tzinfo=UTC),
+    )
+
+    assert evidence["verified"] is True
+    assert evidence["pullCapableAssignmentCount"] == 3
+
+
+def test_effective_access_fails_closed_when_registry_mode_lookup_fails() -> None:
+    stub = StubAzure()
+    role_definition_id = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+        f"Microsoft.Authorization/roleDefinitions/{ACR_PULL_ROLE_ID}"
+    )
+    stub.roles[role_definition_id.casefold()] = _role_definition(
+        role_definition_id,
+        _permission(actions=(ACR_LEGACY_PULL_ACTION,)),
+    )
+    direct = stub.direct[PRINCIPAL_IDS[0]]
+    assert isinstance(direct, list)
+    direct.append(
+        _extra_assignment(
+            principal_id=PRINCIPAL_IDS[0],
+            role_definition_id=role_definition_id,
+        )
+    )
+
+    def failing_mode_lookup(command: Sequence[str], field: str) -> object:
+        command_tuple = tuple(command)
+        if command_tuple[1:3] == ("acr", "show"):
+            registry_name = command_tuple[command_tuple.index("--name") + 1]
+            if registry_name.casefold() == "athenasibling":
+                raise EffectiveAccessError("synthetic registry mode lookup failed")
+        return stub(command, field)
+
+    with pytest.raises(
+        EffectiveAccessError,
+        match="synthetic registry mode lookup failed",
+    ):
+        verify_effective_access(
+            _expected_assignments(),
+            subscription_id=SUBSCRIPTION_ID,
+            run_json=failing_mode_lookup,
+            verified_at=datetime(2026, 9, 17, 2, tzinfo=UTC),
+        )
 
 
 @pytest.mark.parametrize("anonymous_pull_enabled", (True, None))
@@ -814,11 +1037,7 @@ def test_effective_access_rejects_mixed_modes_across_different_registries() -> N
     ("case_name", "permission"),
     (
         (
-            "acr-pull",
-            _permission(actions=("Microsoft.ContainerRegistry/registries/pull/read",)),
-        ),
-        (
-            "acr-push",
+            "repository-content-wildcard",
             _permission(
                 data_actions=("Microsoft.ContainerRegistry/registries/repositories/content/*",)
             ),
@@ -870,8 +1089,7 @@ def test_effective_access_rejects_extra_sibling_registry_pull_roles(
 ) -> None:
     stub = StubAzure()
     role_guid = {
-        "acr-pull": ACR_PULL_ROLE_ID,
-        "acr-push": "8311e382-0749-4cb8-b61a-304f252e45ec",
+        "repository-content-wildcard": "99999999-9999-4999-8999-999999999987",
         "repository-writer": "2a1e307c-b015-4ebd-883e-5b7698d27924",
         "repository-contributor": "41077137-e803-4205-871c-5a86e6a753b4",
         "custom-wildcard": "99999999-9999-4999-8999-999999999991",
@@ -906,6 +1124,9 @@ def test_effective_access_rejects_extra_sibling_registry_pull_roles(
 def test_effective_access_rejects_cross_subscription_sibling_registry_pull() -> None:
     stub = StubAzure()
     stub.tenant_subscription_ids.append(CROSS_SUBSCRIPTION_ID)
+    stub.other_registry_role_assignment_modes[
+        CROSS_SUBSCRIPTION_REGISTRY_ID.casefold()
+    ] = LEGACY_ROLE_ASSIGNMENT_MODE
     role_definition_id = (
         f"/subscriptions/{CROSS_SUBSCRIPTION_ID}/providers/"
         f"Microsoft.Authorization/roleDefinitions/{ACR_PULL_ROLE_ID}"
@@ -1045,6 +1266,9 @@ def test_effective_access_rejects_every_data_plane_escalation_action(
 
 def test_effective_access_rejects_inherited_pull_assignment() -> None:
     stub = StubAzure()
+    stub.other_registry_role_assignment_modes[
+        SIBLING_REGISTRY_ID.casefold()
+    ] = LEGACY_ROLE_ASSIGNMENT_MODE
     role_definition_id = (
         f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
         f"Microsoft.Authorization/roleDefinitions/{ACR_PULL_ROLE_ID}"
@@ -1068,6 +1292,9 @@ def test_effective_access_rejects_inherited_pull_assignment() -> None:
 
 def test_effective_access_rejects_transitive_group_pull_assignment() -> None:
     stub = StubAzure()
+    stub.other_registry_role_assignment_modes[
+        SIBLING_REGISTRY_ID.casefold()
+    ] = LEGACY_ROLE_ASSIGNMENT_MODE
     group_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
     role_definition_id = (
         f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
@@ -1106,6 +1333,9 @@ def test_effective_access_rejects_unreviewed_active_schedule_assignment(
     assignment_type: str,
 ) -> None:
     stub = StubAzure()
+    stub.other_registry_role_assignment_modes[
+        SIBLING_REGISTRY_ID.casefold()
+    ] = LEGACY_ROLE_ASSIGNMENT_MODE
     role_definition_id = (
         f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
         f"Microsoft.Authorization/roleDefinitions/{ACR_PULL_ROLE_ID}"
@@ -1193,6 +1423,9 @@ def test_effective_access_rejects_expected_schedule_mirror_condition_drift() -> 
 def test_effective_access_rejects_cross_subscription_active_pim_assignment() -> None:
     stub = StubAzure()
     stub.tenant_subscription_ids.append(CROSS_SUBSCRIPTION_ID)
+    stub.other_registry_role_assignment_modes[
+        CROSS_SUBSCRIPTION_REGISTRY_ID.casefold()
+    ] = LEGACY_ROLE_ASSIGNMENT_MODE
     role_definition_id = (
         f"/subscriptions/{CROSS_SUBSCRIPTION_ID}/providers/"
         f"Microsoft.Authorization/roleDefinitions/{ACR_PULL_ROLE_ID}"
@@ -1344,6 +1577,9 @@ def test_effective_access_rejects_active_pim_schedule_administration_role() -> N
 
 def test_effective_access_rejects_transitive_group_active_pim_assignment() -> None:
     stub = StubAzure()
+    stub.other_registry_role_assignment_modes[
+        SIBLING_REGISTRY_ID.casefold()
+    ] = LEGACY_ROLE_ASSIGNMENT_MODE
     group_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
     role_definition_id = (
         f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
@@ -1570,9 +1806,10 @@ def test_effective_access_honors_not_actions_and_not_data_actions(
 
 
 @pytest.mark.parametrize(
-    ("excluded_permission", "regrant_permission"),
+    ("role_assignment_mode", "excluded_permission", "regrant_permission"),
     (
         (
+            LEGACY_ROLE_ASSIGNMENT_MODE,
             _permission(
                 actions=("*",),
                 not_actions=EXPECTED_PULL_ACTIONS + EXPECTED_ESCALATION_ACTIONS,
@@ -1580,6 +1817,7 @@ def test_effective_access_honors_not_actions_and_not_data_actions(
             _permission(actions=(EXPECTED_PULL_ACTIONS[0],)),
         ),
         (
+            ABAC_ROLE_ASSIGNMENT_MODE,
             _permission(
                 data_actions=("*",),
                 not_data_actions=(
@@ -1591,10 +1829,14 @@ def test_effective_access_honors_not_actions_and_not_data_actions(
     ),
 )
 def test_effective_access_second_role_regrant_wins_over_other_role_exclusion(
+    role_assignment_mode: str,
     excluded_permission: dict[str, object],
     regrant_permission: dict[str, object],
 ) -> None:
     stub = StubAzure()
+    stub.other_registry_role_assignment_modes[
+        SIBLING_REGISTRY_ID.casefold()
+    ] = role_assignment_mode
     excluded_role_id = (
         f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
         "Microsoft.Authorization/roleDefinitions/"
@@ -1669,7 +1911,10 @@ def test_effective_access_rejects_expected_assignment_profile_drift(
 
     with pytest.raises(
         EffectiveAccessError,
-        match="not exact|exact registry|principal type|canonical for its scope",
+        match=(
+            "not exact|exact registry|principal type|canonical for its scope|"
+            "missing an exact reviewed"
+        ),
     ):
         _verify(stub)
 
@@ -1822,6 +2067,9 @@ def test_effective_access_accepts_terminal_pages_at_exact_page_limits(
 
 def test_effective_access_follows_role_assignment_schedule_pagination() -> None:
     stub = StubAzure()
+    stub.other_registry_role_assignment_modes[
+        SIBLING_REGISTRY_ID.casefold()
+    ] = LEGACY_ROLE_ASSIGNMENT_MODE
     role_definition_id = (
         f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
         f"Microsoft.Authorization/roleDefinitions/{ACR_PULL_ROLE_ID}"

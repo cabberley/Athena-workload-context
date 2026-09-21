@@ -205,11 +205,12 @@ def verify_effective_access(
             "expected ACR assignments must use one reviewed role-assignment mode"
         )
     registry_ids: dict[str, str] = {}
-    registry_modes: dict[str, str] = {}
+    expected_registry_modes: dict[str, str] = {}
+    live_registry_modes: dict[str, str] = {}
     for item in normalized:
         normalized_registry_id = item.registry_resource_id.casefold()
         registry_ids[normalized_registry_id] = item.registry_resource_id
-        previous_mode = registry_modes.setdefault(
+        previous_mode = expected_registry_modes.setdefault(
             normalized_registry_id,
             item.role_assignment_mode,
         )
@@ -218,9 +219,9 @@ def verify_effective_access(
                 "expected ACR assignments disagree on one registry role-assignment mode"
             )
     for normalized_registry_id in sorted(registry_ids):
-        _require_registry_posture(
+        live_registry_modes[normalized_registry_id] = _require_registry_posture(
             registry_ids[normalized_registry_id],
-            expected_role_assignment_mode=registry_modes[normalized_registry_id],
+            expected_role_assignment_mode=expected_registry_modes[normalized_registry_id],
             subscription_id=canonical_subscription_id,
             run_json=run_json,
         )
@@ -253,7 +254,10 @@ def verify_effective_access(
                 run_json=run_json,
             )
             role_definitions[normalized_role_id] = role_definition
-        if not _role_definition_grants_acr_pull(role_definition):
+        if not _role_definition_grants_acr_pull(
+            role_definition,
+            role_assignment_mode=expected_assignment.role_assignment_mode,
+        ):
             raise EffectiveAccessError(
                 f"{expected_assignment.label} exact assignment is not pull-capable"
             )
@@ -318,6 +322,9 @@ def verify_effective_access(
             if not _role_assignment_grants_acr_pull_or_escalation(
                 observed_assignment,
                 role_definition,
+                governed_subscription_ids=governed_subscription_id_set,
+                registry_modes=live_registry_modes,
+                run_json=run_json,
             ):
                 continue
             assignment_id = _string(
@@ -714,7 +721,16 @@ def _require_registry_posture(
     expected_role_assignment_mode: str,
     subscription_id: str,
     run_json: JsonRunner,
-) -> None:
+) -> str:
+    role_assignment_mode = _registry_role_assignment_mode(
+        registry_id,
+        subscription_id=subscription_id,
+        run_json=run_json,
+    )
+    if role_assignment_mode != expected_role_assignment_mode:
+        raise EffectiveAccessError(
+            "live ACR roleAssignmentMode does not match the reviewed mode"
+        )
     registry = _mapping(
         run_json(
             [
@@ -741,10 +757,56 @@ def _require_registry_posture(
         registry.get("properties"),
         field="live ACR properties",
     )
-    if properties.get("roleAssignmentMode") != expected_role_assignment_mode:
-        raise EffectiveAccessError("live ACR roleAssignmentMode does not match the reviewed mode")
+    if properties.get("roleAssignmentMode") != role_assignment_mode:
+        raise EffectiveAccessError(
+            "live ACR roleAssignmentMode readbacks do not match"
+        )
     if properties.get("anonymousPullEnabled") is not False:
         raise EffectiveAccessError("live ACR anonymousPullEnabled must be explicitly false")
+    return role_assignment_mode
+
+
+def _registry_role_assignment_mode(
+    registry_id: str,
+    *,
+    subscription_id: str,
+    run_json: JsonRunner,
+) -> str:
+    canonical_registry_id = _canonical_registry_id(
+        registry_id,
+        subscription_id=subscription_id,
+        field="live ACR role-assignment mode registry ID",
+    )
+    registry_segments = canonical_registry_id.split("/")
+    resource_group_name = registry_segments[4]
+    registry_name = registry_segments[8]
+    role_assignment_mode = run_json(
+        [
+            "az",
+            "acr",
+            "show",
+            "--name",
+            registry_name,
+            "--resource-group",
+            resource_group_name,
+            "--subscription",
+            subscription_id,
+            "--query",
+            "roleAssignmentMode",
+            "--only-show-errors",
+            "--output",
+            "json",
+        ],
+        f"live ACR role-assignment mode for {canonical_registry_id}",
+    )
+    if role_assignment_mode not in {
+        LEGACY_ROLE_ASSIGNMENT_MODE,
+        ABAC_ROLE_ASSIGNMENT_MODE,
+    }:
+        raise EffectiveAccessError(
+            "live ACR roleAssignmentMode lookup returned an invalid value"
+        )
+    return role_assignment_mode
 
 
 def _resolved_effective_role_assignments(
@@ -1571,38 +1633,136 @@ def _get_role_definition(
 
 def _role_definition_grants_acr_pull(
     resource: Mapping[str, object],
+    *,
+    role_assignment_mode: str | None = None,
 ) -> bool:
     profiles = _role_permission_profiles(resource)
-    return any(
+    if any(
         _permission_profile_grants_action(
             profile,
-            action,
+            ACR_QUARANTINE_READ_ACTION,
             is_data_action=False,
         )
         for profile in profiles
-        for action in ACR_PULL_ACTIONS
     ) or any(
         _permission_profile_grants_action(
             profile,
-            action,
+            ACR_QUARANTINED_ARTIFACTS_READ_DATA_ACTION,
             is_data_action=True,
         )
         for profile in profiles
-        for action in ACR_PULL_DATA_ACTIONS
-    )
+    ):
+        return True
+    if role_assignment_mode is None:
+        return any(
+            _permission_profile_grants_action(
+                profile,
+                ACR_LEGACY_PULL_ACTION,
+                is_data_action=False,
+            )
+            or _permission_profile_grants_action(
+                profile,
+                ACR_REPOSITORY_CONTENT_READ_DATA_ACTION,
+                is_data_action=True,
+            )
+            for profile in profiles
+        )
+    if role_assignment_mode == LEGACY_ROLE_ASSIGNMENT_MODE:
+        return any(
+            _permission_profile_grants_action(
+                profile,
+                ACR_LEGACY_PULL_ACTION,
+                is_data_action=False,
+            )
+            for profile in profiles
+        )
+    if role_assignment_mode == ABAC_ROLE_ASSIGNMENT_MODE:
+        return any(
+            _permission_profile_grants_action(
+                profile,
+                ACR_REPOSITORY_CONTENT_READ_DATA_ACTION,
+                is_data_action=True,
+            )
+            for profile in profiles
+        )
+    raise EffectiveAccessError("ACR role-assignment mode is invalid")
 
 
 def _role_assignment_grants_acr_pull_or_escalation(
     assignment: Mapping[str, object],
     role_definition: Mapping[str, object],
+    *,
+    governed_subscription_ids: frozenset[str],
+    registry_modes: dict[str, str],
+    run_json: JsonRunner,
 ) -> bool:
-    if _role_definition_grants_acr_pull(role_definition):
-        return True
     scope = _string(
         assignment.get("scope"),
         field="effective ACR assignment scope",
     )
+    if _role_definition_grants_acr_pull(
+        role_definition,
+        role_assignment_mode=None,
+    ):
+        registry_id = _registry_id_from_assignment_scope(
+            scope,
+            governed_subscription_ids=governed_subscription_ids,
+        )
+        if registry_id is None:
+            return True
+        normalized_registry_id = registry_id.casefold()
+        role_assignment_mode = registry_modes.get(normalized_registry_id)
+        if role_assignment_mode is None:
+            registry_subscription_id = _canonical_uuid(
+                registry_id.split("/")[2],
+                field="effective ACR registry subscription ID",
+            )
+            role_assignment_mode = _registry_role_assignment_mode(
+                registry_id,
+                subscription_id=registry_subscription_id,
+                run_json=run_json,
+            )
+            registry_modes[normalized_registry_id] = role_assignment_mode
+        if _role_definition_grants_acr_pull(
+            role_definition,
+            role_assignment_mode=role_assignment_mode,
+        ):
+            return True
     return _scope_can_govern_acr(scope) and _role_definition_grants_acr_escalation(role_definition)
+
+
+def _registry_id_from_assignment_scope(
+    scope: str,
+    *,
+    governed_subscription_ids: frozenset[str],
+) -> str | None:
+    segments = scope.split("/")
+    if (
+        len(segments) < 9
+        or segments[0] != ""
+        or segments[1].casefold() != "subscriptions"
+        or segments[3].casefold() != "resourcegroups"
+        or not segments[4]
+        or segments[5].casefold() != "providers"
+        or segments[6].casefold() != "microsoft.containerregistry"
+        or segments[7].casefold() != "registries"
+        or not segments[8]
+    ):
+        return None
+    subscription_id = _canonical_uuid(
+        segments[2],
+        field="effective ACR registry subscription ID",
+    )
+    if subscription_id not in governed_subscription_ids:
+        raise EffectiveAccessError(
+            "effective ACR registry scope is outside the governed subscriptions"
+        )
+    registry_id = "/".join(segments[:9])
+    return _canonical_registry_id(
+        registry_id,
+        subscription_id=subscription_id,
+        field="effective ACR registry scope",
+    )
 
 
 def _role_definition_grants_acr_escalation(

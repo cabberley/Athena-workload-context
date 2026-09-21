@@ -224,7 +224,12 @@ legacy pull and quarantine read are control-plane `actions`; repository-content 
 quarantined-artifact reads are `dataActions`. Wrong-plane strings, metadata/catalog reads, and
 registry login or management reads do not count as pull. Wildcards and same-role exclusions use
 normal role-definition semantics, while a separate effective role can re-grant an excluded
-permission because `NotActions` and `NotDataActions` are not deny assignments. The scanner verifies
+permission because `NotActions` and `NotDataActions` are not deny assignments. Registry-scoped
+normal pull is additionally gated by the live `roleAssignmentMode` returned by
+`az acr show` with exact `--name`, `--resource-group`, and `--subscription` arguments plus
+`--query roleAssignmentMode`. ABAC mode ignores legacy `AcrPull`, `AcrPush`, and `AcrDelete`;
+legacy mode does not infer Repository Reader data access, and lookup failure is terminal. The
+scanner verifies
 every referenced registry's live permission mode, and the proof exact-matches each reviewed
 assignment's principal, registry scope, role, condition version, and canonical repository
 condition; legacy `AcrPull` accepts null condition fields only. The bounded publisher probe repeats
