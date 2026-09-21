@@ -246,6 +246,10 @@ def _authorization_resource(
     assignment_type: str = "Assigned",
     request_type: str = "AdminAssign",
     schedule_info: dict[str, object] | None = None,
+    condition: str | None = None,
+    condition_version: str | None = None,
+    created_on: str = "2026-01-01T00:00:00Z",
+    updated_on: str = "2026-01-02T00:00:00Z",
 ) -> dict[str, object]:
     properties: dict[str, object] = {
         "principalId": principal_id,
@@ -260,8 +264,23 @@ def _authorization_resource(
                 "startDateTime": start_date_time,
                 "endDateTime": end_date_time,
                 "memberType": member_type,
+                "condition": condition,
+                "conditionVersion": condition_version,
+                "createdOn": created_on,
             }
         )
+    if resource_type in orchestration.PIM_SCHEDULE_RESOURCE_TYPES:
+        properties["updatedOn"] = updated_on
+        if resource_type == "roleAssignmentSchedules":
+            properties["roleAssignmentScheduleRequestId"] = (
+                f"{scope}/providers/Microsoft.Authorization/"
+                "roleAssignmentScheduleRequests/10101010-1111-4111-8111-111111111111"
+            )
+        else:
+            properties["roleEligibilityScheduleRequestId"] = (
+                f"{scope}/providers/Microsoft.Authorization/"
+                "roleEligibilityScheduleRequests/20202020-2222-4222-8222-222222222222"
+            )
     if resource_type in {
         "roleAssignmentScheduleInstances",
         "roleAssignmentSchedules",
@@ -272,6 +291,8 @@ def _authorization_resource(
             {
                 "status": status,
                 "requestType": request_type,
+                "condition": condition,
+                "conditionVersion": condition_version,
                 "scheduleInfo": (
                     {
                         "startDateTime": start_date_time,
@@ -5665,7 +5686,7 @@ def test_trigger_queue_scope_scan_pages_classic_and_pim_at_scope(
             for resource_type, (scope, resource_name) in pim_resources.items()
         },
     }
-    assert filters == ["atScope()"] * 8
+    assert filters == ["atScope()"] * 12
 
 
 def test_trigger_queue_rejects_active_pim_assignment_at_exact_scope(
@@ -8788,11 +8809,21 @@ def test_effective_assignment_pages_merge_classic_active_and_eligible_pim(
     }
     assert requested_types == [
         "roleAssignments",
-        *orchestration.EFFECTIVE_AUTHORIZATION_RESOURCE_TYPES,
+        "roleAssignments",
+        "roleAssignmentScheduleInstances",
+        "roleEligibilityScheduleInstances",
+        "roleAssignmentScheduleRequests",
+        "roleAssignmentSchedules",
+        "roleEligibilityScheduleRequests",
+        "roleEligibilitySchedules",
+        "roleAssignmentScheduleRequests",
+        "roleAssignmentSchedules",
+        "roleEligibilityScheduleRequests",
+        "roleEligibilitySchedules",
     ]
 
 
-def test_pim_resources_use_ga_api_and_assigned_to_only_for_instances(
+def test_pim_resources_use_ga_api_and_assigned_to_for_instances_and_schedules(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     principal_id = "56565656-7777-4777-8777-777777777777"
@@ -8867,6 +8898,22 @@ def test_pim_resources_use_ga_api_and_assigned_to_only_for_instances(
         ),
         (
             "roleEligibilityScheduleInstances",
+            f"assignedTo('{principal_id}') and atScope()",
+        ),
+        (
+            "roleAssignmentSchedules",
+            f"assignedTo('{principal_id}') and atScope()",
+        ),
+        (
+            "roleEligibilitySchedules",
+            f"assignedTo('{principal_id}') and atScope()",
+        ),
+        (
+            "roleAssignmentSchedules",
+            f"assignedTo('{principal_id}') and atScope()",
+        ),
+        (
+            "roleEligibilitySchedules",
             f"assignedTo('{principal_id}') and atScope()",
         ),
     ]
@@ -9026,32 +9073,398 @@ def test_future_assignment_and_eligibility_schedules_are_detected() -> None:
 
 
 @pytest.mark.parametrize("status", ("Revoked", "Canceled", "Denied"))
-def test_terminal_assignment_or_eligibility_schedule_is_ignored(status: str) -> None:
+def test_terminal_schedule_with_current_or_future_window_fails_closed(
+    status: str,
+) -> None:
     principal_id = "57575757-abab-4bab-8bab-abababababab"
+    scope = f"/subscriptions/{SUBSCRIPTION_ID}"
+    with pytest.raises(orchestration.OrchestrationError, match="terminal status"):
+        orchestration._authorization_assignment_from_resource(
+            _authorization_resource(
+                resource_type="roleAssignmentSchedules",
+                resource_id=(
+                    f"{scope}/providers/Microsoft.Authorization/"
+                    "roleAssignmentSchedules/57575757-acac-4cac-8cac-acacacacacac"
+                ),
+                principal_id=principal_id,
+                role_definition_id=(
+                    f"{scope}/providers/Microsoft.Authorization/roleDefinitions/"
+                    f"{orchestration.SERVICE_BUS_DATA_RECEIVER_ROLE_ID}"
+                ),
+                scope=scope,
+                status=status,
+                start_date_time="2026-10-01T00:00:00Z",
+                end_date_time="2026-11-01T00:00:00Z",
+            ),
+            resource_type="roleAssignmentSchedules",
+            subscription_id=SUBSCRIPTION_ID,
+            field="synthetic terminal schedule",
+            as_of=datetime(2026, 9, 21, tzinfo=UTC),
+        )
+
+
+def test_expired_terminal_schedule_is_ignored() -> None:
     scope = f"/subscriptions/{SUBSCRIPTION_ID}"
     normalized = orchestration._authorization_assignment_from_resource(
         _authorization_resource(
             resource_type="roleAssignmentSchedules",
             resource_id=(
                 f"{scope}/providers/Microsoft.Authorization/"
-                "roleAssignmentSchedules/57575757-acac-4cac-8cac-acacacacacac"
+                "roleAssignmentSchedules/57575757-adad-4dad-8dad-adadadadadad"
             ),
-            principal_id=principal_id,
+            principal_id="57575757-aeae-4eae-8eae-aeaeaeaeaeae",
             role_definition_id=(
                 f"{scope}/providers/Microsoft.Authorization/roleDefinitions/"
                 f"{orchestration.SERVICE_BUS_DATA_RECEIVER_ROLE_ID}"
             ),
             scope=scope,
-            status=status,
-            start_date_time="2026-10-01T00:00:00Z",
-            end_date_time="2026-11-01T00:00:00Z",
+            status="Revoked",
+            start_date_time="2026-09-01T00:00:00Z",
+            end_date_time="2026-09-20T23:59:59.999Z",
         ),
         resource_type="roleAssignmentSchedules",
         subscription_id=SUBSCRIPTION_ID,
-        field="synthetic terminal schedule",
+        field="synthetic expired terminal schedule",
         as_of=datetime(2026, 9, 21, tzinfo=UTC),
     )
     assert normalized is None
+
+
+@pytest.mark.parametrize(
+    ("start", "end", "expected_present"),
+    (
+        ("2026-09-21T00:00:00Z", "2026-09-22T00:00:00Z", True),
+        ("2026-09-20T00:00:00Z", "2026-09-21T00:00:00Z", True),
+        ("2026-09-20T00:00:00Z", "2026-09-20T23:59:59.999Z", False),
+        ("2026-09-21T00:00:00.001Z", "2026-09-22T00:00:00Z", True),
+        ("2026-09-21T10:00:00+10:00", None, True),
+    ),
+)
+def test_schedule_time_boundaries_are_conservative(
+    start: str,
+    end: str | None,
+    expected_present: bool,
+) -> None:
+    scope = f"/subscriptions/{SUBSCRIPTION_ID}"
+    normalized = orchestration._authorization_assignment_from_resource(
+        _authorization_resource(
+            resource_type="roleEligibilitySchedules",
+            resource_id=(
+                f"{scope}/providers/Microsoft.Authorization/"
+                "roleEligibilitySchedules/57575757-afaf-4faf-8faf-afafafafafaf"
+            ),
+            principal_id="57575757-b0b0-40b0-80b0-b0b0b0b0b0b0",
+            role_definition_id=(
+                f"{scope}/providers/Microsoft.Authorization/roleDefinitions/"
+                f"{orchestration.SERVICE_BUS_DATA_RECEIVER_ROLE_ID}"
+            ),
+            scope=scope,
+            status="Provisioned",
+            start_date_time=start,
+            end_date_time=end,
+        ),
+        resource_type="roleEligibilitySchedules",
+        subscription_id=SUBSCRIPTION_ID,
+        field="synthetic schedule boundary",
+        as_of=datetime(2026, 9, 21, tzinfo=UTC),
+    )
+    assert (normalized is not None) is expected_present
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ({"startDateTime": "not-a-time"}, "ISO-8601"),
+        ({"startDateTime": None}, "startDateTime"),
+        ({"endDateTime": "__missing__"}, "explicitly contain"),
+        (
+            {
+                "startDateTime": "2026-09-22T00:00:00Z",
+                "endDateTime": "2026-09-21T00:00:00Z",
+            },
+            "interval",
+        ),
+    ),
+)
+def test_schedule_missing_or_invalid_dates_fail_closed(
+    mutation: dict[str, str | None],
+    message: str,
+) -> None:
+    scope = f"/subscriptions/{SUBSCRIPTION_ID}"
+    resource = _authorization_resource(
+        resource_type="roleAssignmentSchedules",
+        resource_id=(
+            f"{scope}/providers/Microsoft.Authorization/"
+            "roleAssignmentSchedules/57575757-b1b1-41b1-81b1-b1b1b1b1b1b1"
+        ),
+        principal_id="57575757-b2b2-42b2-82b2-b2b2b2b2b2b2",
+        role_definition_id=(
+            f"{scope}/providers/Microsoft.Authorization/roleDefinitions/"
+            f"{orchestration.SERVICE_BUS_DATA_RECEIVER_ROLE_ID}"
+        ),
+        scope=scope,
+    )
+    properties = resource["properties"]
+    assert isinstance(properties, dict)
+    for key, value in mutation.items():
+        if value == "__missing__":
+            properties.pop(key)
+        else:
+            properties[key] = value
+    with pytest.raises(orchestration.OrchestrationError, match=message):
+        orchestration._authorization_assignment_from_resource(
+            resource,
+            resource_type="roleAssignmentSchedules",
+            subscription_id=SUBSCRIPTION_ID,
+            field="synthetic invalid schedule",
+            as_of=datetime(2026, 9, 21, tzinfo=UTC),
+        )
+
+
+def test_schedule_missing_condition_evidence_fails_closed() -> None:
+    scope = f"/subscriptions/{SUBSCRIPTION_ID}"
+    resource = _authorization_resource(
+        resource_type="roleAssignmentSchedules",
+        resource_id=(
+            f"{scope}/providers/Microsoft.Authorization/"
+            "roleAssignmentSchedules/57575757-b3b3-43b3-83b3-b3b3b3b3b3b3"
+        ),
+        principal_id="57575757-b4b4-44b4-84b4-b4b4b4b4b4b4",
+        role_definition_id=(
+            f"{scope}/providers/Microsoft.Authorization/roleDefinitions/"
+            f"{orchestration.SERVICE_BUS_DATA_RECEIVER_ROLE_ID}"
+        ),
+        scope=scope,
+    )
+    properties = resource["properties"]
+    assert isinstance(properties, dict)
+    properties.pop("condition")
+    with pytest.raises(
+        orchestration.OrchestrationError,
+        match="condition and conditionVersion",
+    ):
+        orchestration._authorization_assignment_from_resource(
+            resource,
+            resource_type="roleAssignmentSchedules",
+            subscription_id=SUBSCRIPTION_ID,
+            field="synthetic missing condition",
+            as_of=datetime(2026, 9, 21, tzinfo=UTC),
+        )
+
+
+def test_unknown_schedule_condition_remains_blocking() -> None:
+    principal_id = "57575757-b5b5-45b5-85b5-b5b5b5b5b5b5"
+    scope = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
+        "Microsoft.ServiceBus/namespaces/athena/queues/requests"
+    )
+    expected_assignment = (
+        f"{scope}/providers/Microsoft.Authorization/roleAssignments/"
+        "57575757-b6b6-46b6-86b6-b6b6b6b6b6b6"
+    )
+    schedule = orchestration._authorization_assignment_from_resource(
+        _authorization_resource(
+            resource_type="roleAssignmentSchedules",
+            resource_id=(
+                f"{scope}/providers/Microsoft.Authorization/"
+                "roleAssignmentSchedules/57575757-b7b7-47b7-87b7-b7b7b7b7b7b7"
+            ),
+            principal_id=principal_id,
+            role_definition_id=(
+                f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+                "Microsoft.Authorization/roleDefinitions/"
+                f"{orchestration.SERVICE_BUS_DATA_RECEIVER_ROLE_ID}"
+            ),
+            scope=scope,
+            condition="@Resource[synthetic:unknown] StringEquals 'value'",
+            condition_version="2.0",
+        ),
+        resource_type="roleAssignmentSchedules",
+        subscription_id=SUBSCRIPTION_ID,
+        field="synthetic unknown condition",
+        as_of=datetime(2026, 9, 21, tzinfo=UTC),
+    )
+    assert schedule is not None
+    with pytest.raises(
+        orchestration.OrchestrationError,
+        match="unreviewed effective role assignment",
+    ):
+        orchestration._verify_exact_effective_assignments(
+            {principal_id: {expected_assignment.casefold()}},
+            additional_allowed_assignments_by_principal={},
+            subscription_id=SUBSCRIPTION_ID,
+            effective_assignments_by_principal={principal_id: [schedule]},
+        )
+
+
+def test_schedule_duplicate_ids_dedupe_only_when_security_evidence_matches() -> None:
+    assignment_id = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/providers/Microsoft.Authorization/"
+        "roleAssignmentSchedules/57575757-b8b8-48b8-88b8-b8b8b8b8b8b8"
+    )
+    first = {
+        "id": assignment_id,
+        "principalId": "57575757-b9b9-49b9-89b9-b9b9b9b9b9b9",
+        "roleDefinitionId": (
+            f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+            "Microsoft.Authorization/roleDefinitions/"
+            f"{orchestration.SERVICE_BUS_DATA_RECEIVER_ROLE_ID}"
+        ),
+        "scope": f"/subscriptions/{SUBSCRIPTION_ID}",
+        "status": "Provisioned",
+        "startDateTime": "2026-09-01T00:00:00Z",
+        "endDateTime": None,
+        "memberType": "Direct",
+        "assignmentType": "Assigned",
+        "condition": None,
+        "conditionVersion": None,
+        "updatedOn": "2026-09-01T00:00:00Z",
+    }
+    assert orchestration._merge_effective_role_assignment_documents(
+        [[first], [dict(first)]],
+        field="synthetic duplicate schedules",
+    ) == [first]
+    changed = dict(first)
+    changed["updatedOn"] = "2026-09-02T00:00:00Z"
+    with pytest.raises(orchestration.OrchestrationError, match="conflicting duplicate"):
+        orchestration._merge_effective_role_assignment_documents(
+            [[first], [changed]],
+            field="synthetic duplicate schedules",
+        )
+
+
+def test_schedule_double_read_updated_on_change_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    assignment = {
+        "id": (
+            f"/subscriptions/{SUBSCRIPTION_ID}/providers/Microsoft.Authorization/"
+            "roleAssignmentSchedules/57575757-baba-4aba-8aba-babababababa"
+        ),
+        "principalId": "57575757-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        "roleDefinitionId": (
+            f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+            "Microsoft.Authorization/roleDefinitions/"
+            f"{orchestration.SERVICE_BUS_DATA_RECEIVER_ROLE_ID}"
+        ),
+        "scope": f"/subscriptions/{SUBSCRIPTION_ID}",
+        "updatedOn": "2026-09-01T00:00:00Z",
+    }
+
+    def assignments(**_kwargs: object) -> list[dict[str, object]]:
+        nonlocal calls
+        calls += 1
+        current = dict(assignment)
+        if calls % 2 == 0:
+            current["updatedOn"] = "2026-09-02T00:00:00Z"
+        return [current]
+
+    monkeypatch.setattr(orchestration, "_authorization_assignments", assignments)
+    monkeypatch.setattr(orchestration, "READBACK_MAX_ATTEMPTS", 2)
+    monkeypatch.setattr(orchestration.time, "sleep", lambda _seconds: None)
+    with pytest.raises(orchestration.OrchestrationError, match="did not converge"):
+        orchestration._stable_authorization_assignments(
+            scope=f"/subscriptions/{SUBSCRIPTION_ID}",
+            filter_value="atScope()",
+            subscription_id=SUBSCRIPTION_ID,
+            field="synthetic stable schedules",
+            resource_types=("roleAssignmentSchedules",),
+            budget=orchestration._AuthorizationScanBudget.bounded(),
+            as_of=datetime(2026, 9, 21, tzinfo=UTC),
+        )
+    assert calls == 4
+
+
+def test_pending_request_appearing_between_future_state_reads_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    request = {
+        "id": (
+            f"/subscriptions/{SUBSCRIPTION_ID}/providers/Microsoft.Authorization/"
+            "roleAssignmentScheduleRequests/57575757-bebe-4ebe-8ebe-bebebebebebe"
+        ),
+        "principalId": "57575757-bfbf-4fbf-8fbf-bfbfbfbfbfbf",
+        "roleDefinitionId": (
+            f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+            "Microsoft.Authorization/roleDefinitions/"
+            f"{orchestration.SERVICE_BUS_DATA_RECEIVER_ROLE_ID}"
+        ),
+        "scope": f"/subscriptions/{SUBSCRIPTION_ID}",
+        "requestType": "AdminAssign",
+        "status": "PendingApproval",
+        "scheduleInfo": {
+            "startDateTime": "2026-10-01T00:00:00Z",
+            "expiration": {"type": "NoExpiration"},
+        },
+    }
+
+    def assignments(**_kwargs: object) -> list[dict[str, object]]:
+        nonlocal calls
+        calls += 1
+        return [] if calls % 2 == 1 else [request]
+
+    monkeypatch.setattr(orchestration, "_authorization_assignments", assignments)
+    monkeypatch.setattr(orchestration, "READBACK_MAX_ATTEMPTS", 2)
+    monkeypatch.setattr(orchestration.time, "sleep", lambda _seconds: None)
+    with pytest.raises(orchestration.OrchestrationError, match="did not converge"):
+        orchestration._stable_authorization_assignments(
+            scope=f"/subscriptions/{SUBSCRIPTION_ID}",
+            filter_value="atScope()",
+            subscription_id=SUBSCRIPTION_ID,
+            field="synthetic future state",
+            resource_types=tuple(sorted(orchestration.PIM_FUTURE_STATE_RESOURCE_TYPES)),
+            budget=orchestration._AuthorizationScanBudget.bounded(),
+            as_of=datetime(2026, 9, 21, tzinfo=UTC),
+        )
+    assert calls == 4
+
+
+def test_assigned_to_scope_rejects_unexpected_child_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    principal_id = "57575757-bcbc-4cbc-8cbc-bcbcbcbcbcbc"
+    queue_scope = (
+        f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/rg/providers/"
+        "Microsoft.ServiceBus/namespaces/athena/queues/requests"
+    )
+    child_scope = f"{queue_scope}/authorizationRules/synthetic"
+    monkeypatch.setattr(
+        orchestration,
+        "_authorization_assignments",
+        lambda **_kwargs: [
+            {
+                "id": (
+                    f"{child_scope}/providers/Microsoft.Authorization/"
+                    "roleAssignmentScheduleInstances/"
+                    "57575757-bdbd-4dbd-8dbd-bdbdbdbdbdbd"
+                ),
+                "principalId": principal_id,
+                "roleDefinitionId": (
+                    f"/subscriptions/{SUBSCRIPTION_ID}/providers/"
+                    "Microsoft.Authorization/roleDefinitions/"
+                    f"{orchestration.SERVICE_BUS_DATA_RECEIVER_ROLE_ID}"
+                ),
+                "scope": child_scope,
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        orchestration,
+        "_stable_authorization_assignments",
+        lambda **_kwargs: [],
+    )
+    with pytest.raises(orchestration.OrchestrationError, match="child-scope"):
+        orchestration._assigned_instance_role_assignments(
+            principal_id,
+            principal_ids={principal_id},
+            governed_scopes={queue_scope},
+            subscription_id=SUBSCRIPTION_ID,
+            field="synthetic assignedTo scope",
+            budget=orchestration._AuthorizationScanBudget.bounded(),
+            as_of=datetime(2026, 9, 21, tzinfo=UTC),
+        )
 
 
 @pytest.mark.parametrize(

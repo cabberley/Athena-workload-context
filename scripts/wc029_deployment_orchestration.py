@@ -7138,6 +7138,12 @@ PIM_ASSIGNMENT_RESOURCE_TYPES = frozenset(
         *PIM_SCHEDULE_RESOURCE_TYPES,
     }
 )
+PIM_FUTURE_STATE_RESOURCE_TYPES = frozenset(
+    {
+        *PIM_SCHEDULE_RESOURCE_TYPES,
+        *PIM_REQUEST_RESOURCE_TYPES,
+    }
+)
 EFFECTIVE_AUTHORIZATION_RESOURCE_TYPES = (
     "roleAssignments",
     "roleAssignmentScheduleInstances",
@@ -10874,6 +10880,8 @@ def _authorization_schedule_interval(
     *,
     field: str,
 ) -> tuple[datetime, datetime | None]:
+    if "startDateTime" not in properties or "endDateTime" not in properties:
+        raise OrchestrationError(f"{field} must explicitly contain startDateTime and endDateTime")
     start = _parse_authorization_schedule_time(
         properties.get("startDateTime"),
         field=f"{field} startDateTime",
@@ -10886,9 +10894,35 @@ def _authorization_schedule_interval(
     )
     if start is None:
         raise OrchestrationError(f"{field} startDateTime is missing")
-    if end is not None and end <= start:
+    if end is not None and end < start:
         raise OrchestrationError(f"{field} schedule interval is invalid")
     return start, end
+
+
+def _validated_pim_condition(
+    properties: Mapping[str, object],
+    *,
+    field: str,
+) -> tuple[str | None, str | None]:
+    if "condition" not in properties or "conditionVersion" not in properties:
+        raise OrchestrationError(f"{field} must explicitly contain condition and conditionVersion")
+    condition = properties.get("condition")
+    condition_version = properties.get("conditionVersion")
+    if condition is None and condition_version is None:
+        return None, None
+    if condition is None or condition_version is None:
+        raise OrchestrationError(f"{field} condition evidence is incomplete")
+    canonical_condition = _string(
+        condition,
+        field=f"{field} condition",
+    )
+    canonical_version = _string(
+        condition_version,
+        field=f"{field} conditionVersion",
+    )
+    if canonical_version != "2.0":
+        raise OrchestrationError(f"{field} conditionVersion is unknown")
+    return canonical_condition, canonical_version
 
 
 def _authorization_duration(value: object, *, field: str) -> timedelta:
@@ -10968,9 +11002,9 @@ def _pim_request_blocks_future_privilege(
         )
         if end is None:
             raise OrchestrationError(f"{field} request endDateTime is missing")
-        if start is not None and end <= start:
+        if start is not None and end < start:
             raise OrchestrationError(f"{field} request schedule interval is invalid")
-        return end > as_of
+        return end >= as_of
     if expiration_type == "AfterDuration":
         duration = _authorization_duration(
             expiration.get("duration"),
@@ -10978,7 +11012,7 @@ def _pim_request_blocks_future_privilege(
         )
         if start is None:
             return True
-        return start + duration > as_of
+        return start + duration >= as_of
     raise OrchestrationError(f"{field} scheduleInfo expiration type is unknown")
 
 
@@ -11041,6 +11075,13 @@ def _authorization_assignment_from_resource(
         or any(character in role_definition_id for character in ("\\", "?", "#"))
     ):
         raise OrchestrationError(f"{field} role definition ID is not canonical")
+    pim_condition: str | None = None
+    pim_condition_version: str | None = None
+    if resource_type != "roleAssignments":
+        pim_condition, pim_condition_version = _validated_pim_condition(
+            properties,
+            field=field,
+        )
     if resource_type in PIM_ASSIGNMENT_RESOURCE_TYPES:
         member_type = _string(
             properties.get("memberType"),
@@ -11061,10 +11102,24 @@ def _authorization_assignment_from_resource(
         status = _authorization_schedule_status(properties, field=field)
         _, end = _authorization_schedule_interval(properties, field=field)
         if resource_type in PIM_SCHEDULE_RESOURCE_TYPES:
+            created_on = _parse_authorization_schedule_time(
+                properties.get("createdOn"),
+                field=f"{field} createdOn",
+                required=True,
+            )
+            updated_on = _parse_authorization_schedule_time(
+                properties.get("updatedOn"),
+                field=f"{field} updatedOn",
+                required=True,
+            )
+            if created_on is None or updated_on is None or updated_on < created_on:
+                raise OrchestrationError(f"{field} schedule update chronology is invalid")
+            if end is not None and end < as_of:
+                return None
             if status.casefold() in PIM_TERMINAL_NEGATIVE_REQUEST_STATUSES:
-                return None
-            if end is not None and end <= as_of:
-                return None
+                raise OrchestrationError(
+                    f"{field} has terminal status with a current or future schedule window"
+                )
     elif resource_type in PIM_REQUEST_RESOURCE_TYPES:
         if not _pim_request_blocks_future_privilege(
             properties,
@@ -11094,10 +11149,11 @@ def _authorization_assignment_from_resource(
         "scope": scope,
         "authorizationEvidenceKinds": [resource_type],
     }
+    if resource_type != "roleAssignments":
+        normalized["condition"] = pim_condition
+        normalized["conditionVersion"] = pim_condition_version
     for property_name in (
         "principalType",
-        "conditionVersion",
-        "condition",
         "status",
         "startDateTime",
         "endDateTime",
@@ -11105,6 +11161,13 @@ def _authorization_assignment_from_resource(
         "assignmentType",
         "requestType",
         "scheduleInfo",
+        "createdOn",
+        "updatedOn",
+        "roleAssignmentScheduleRequestId",
+        "roleEligibilityScheduleRequestId",
+        "linkedRoleEligibilityScheduleId",
+        "targetRoleAssignmentScheduleId",
+        "targetRoleEligibilityScheduleId",
     ):
         if property_name in properties:
             normalized[property_name] = properties[property_name]
@@ -11298,6 +11361,45 @@ def _authorization_assignments(
     )
 
 
+def _stable_authorization_assignments(
+    *,
+    scope: str,
+    filter_value: str,
+    subscription_id: str,
+    field: str,
+    resource_types: Sequence[str],
+    budget: _AuthorizationScanBudget,
+    as_of: datetime,
+) -> list[dict[str, Any]]:
+    def read_stable_pair() -> list[dict[str, Any]]:
+        first = _authorization_assignments(
+            scope=scope,
+            filter_value=filter_value,
+            subscription_id=subscription_id,
+            field=f"{field} first read",
+            resource_types=resource_types,
+            budget=budget,
+            as_of=as_of,
+        )
+        second = _authorization_assignments(
+            scope=scope,
+            filter_value=filter_value,
+            subscription_id=subscription_id,
+            field=f"{field} second read",
+            resource_types=resource_types,
+            budget=budget,
+            as_of=as_of,
+        )
+        if _canonical_json_bytes(first) != _canonical_json_bytes(second):
+            raise OrchestrationError(f"{field} changed between complete bounded reads")
+        return second
+
+    return _retry_eventually_consistent(
+        read_stable_pair,
+        field=f"{field} stable schedule evidence",
+    )
+
+
 def _merge_effective_role_assignment_documents(
     documents: Sequence[object],
     *,
@@ -11335,6 +11437,13 @@ def _merge_effective_role_assignment_documents(
                 "assignmentType",
                 "requestType",
                 "scheduleInfo",
+                "createdOn",
+                "updatedOn",
+                "roleAssignmentScheduleRequestId",
+                "roleEligibilityScheduleRequestId",
+                "linkedRoleEligibilityScheduleId",
+                "targetRoleAssignmentScheduleId",
+                "targetRoleEligibilityScheduleId",
             ):
                 existing_value = existing.get(property_name)
                 incoming_value = assignment.get(property_name)
@@ -11403,14 +11512,33 @@ def _effective_role_assignments(
     subscription_scope = f"/subscriptions/{subscription_id}"
     scan_budget = _AuthorizationScanBudget.bounded() if budget is None else budget
     observed_at = datetime.now(UTC) if as_of is None else as_of.astimezone(UTC)
-    assignments = _authorization_assignments(
-        scope=subscription_scope,
-        filter_value=f"principalId eq '{canonical_principal_id}'",
-        subscription_id=subscription_id,
+    filter_value = f"principalId eq '{canonical_principal_id}'"
+    assignments = _merge_effective_role_assignment_documents(
+        [
+            _authorization_assignments(
+                scope=subscription_scope,
+                filter_value=filter_value,
+                subscription_id=subscription_id,
+                field=field,
+                resource_types=tuple(
+                    resource_type
+                    for resource_type in EFFECTIVE_AUTHORIZATION_RESOURCE_TYPES
+                    if resource_type not in PIM_FUTURE_STATE_RESOURCE_TYPES
+                ),
+                budget=scan_budget,
+                as_of=observed_at,
+            ),
+            _stable_authorization_assignments(
+                scope=subscription_scope,
+                filter_value=filter_value,
+                subscription_id=subscription_id,
+                field=f"{field} future state",
+                resource_types=tuple(sorted(PIM_FUTURE_STATE_RESOURCE_TYPES)),
+                budget=scan_budget,
+                as_of=observed_at,
+            ),
+        ],
         field=field,
-        resource_types=EFFECTIVE_AUTHORIZATION_RESOURCE_TYPES,
-        budget=scan_budget,
-        as_of=observed_at,
     )
     for assignment in assignments:
         if (
@@ -11457,15 +11585,38 @@ def _assigned_instance_role_assignments(
             subscription_id=subscription_id,
             field=f"{field} assignedTo governed scope",
         )
-        documents.append(
-            _authorization_assignments(
-                scope=canonical_scope,
-                filter_value=f"assignedTo('{canonical_principal_id}') and atScope()",
+        instance_assignments = _authorization_assignments(
+            scope=canonical_scope,
+            filter_value=f"assignedTo('{canonical_principal_id}') and atScope()",
+            subscription_id=subscription_id,
+            field=f"{field} assignedTo {canonical_scope} instances",
+            resource_types=tuple(sorted(PIM_INSTANCE_RESOURCE_TYPES)),
+            budget=budget,
+            as_of=as_of,
+        )
+        schedule_assignments = _stable_authorization_assignments(
+            scope=canonical_scope,
+            filter_value=f"assignedTo('{canonical_principal_id}') and atScope()",
+            subscription_id=subscription_id,
+            field=f"{field} assignedTo {canonical_scope} schedules",
+            resource_types=tuple(sorted(PIM_SCHEDULE_RESOURCE_TYPES)),
+            budget=budget,
+            as_of=as_of,
+        )
+        for assignment in [*instance_assignments, *schedule_assignments]:
+            assignment_scope = _canonical_authorization_assignment_scope(
+                assignment.get("scope"),
                 subscription_id=subscription_id,
-                field=f"{field} assignedTo {canonical_scope}",
-                resource_types=tuple(sorted(PIM_INSTANCE_RESOURCE_TYPES)),
-                budget=budget,
-                as_of=as_of,
+                field=f"{field} assignedTo returned scope",
+            )
+            if not _scope_contains_resource(assignment_scope, canonical_scope):
+                raise OrchestrationError(
+                    f"{field} assignedTo returned an unexpected child-scope assignment"
+                )
+        documents.extend(
+            (
+                instance_assignments,
+                schedule_assignments,
             )
         )
     assignments = _merge_effective_role_assignment_documents(
@@ -11493,14 +11644,34 @@ def _authorization_assignments_at_or_above_scope(
         subscription_id=subscription_id,
         field=f"{field} scope",
     )
-    return _authorization_assignments(
-        scope=canonical_scope,
-        filter_value="atScope()",
-        subscription_id=subscription_id,
+    budget = _AuthorizationScanBudget.bounded()
+    as_of = datetime.now(UTC)
+    return _merge_effective_role_assignment_documents(
+        [
+            _authorization_assignments(
+                scope=canonical_scope,
+                filter_value="atScope()",
+                subscription_id=subscription_id,
+                field=field,
+                resource_types=tuple(
+                    resource_type
+                    for resource_type in EFFECTIVE_AUTHORIZATION_RESOURCE_TYPES
+                    if resource_type not in PIM_FUTURE_STATE_RESOURCE_TYPES
+                ),
+                budget=budget,
+                as_of=as_of,
+            ),
+            _stable_authorization_assignments(
+                scope=canonical_scope,
+                filter_value="atScope()",
+                subscription_id=subscription_id,
+                field=f"{field} future state",
+                resource_types=tuple(sorted(PIM_FUTURE_STATE_RESOURCE_TYPES)),
+                budget=budget,
+                as_of=as_of,
+            ),
+        ],
         field=field,
-        resource_types=EFFECTIVE_AUTHORIZATION_RESOURCE_TYPES,
-        budget=_AuthorizationScanBudget.bounded(),
-        as_of=datetime.now(UTC),
     )
 
 

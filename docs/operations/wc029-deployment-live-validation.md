@@ -250,9 +250,10 @@ Schedule-instance presence is current authority; it is not filtered down to only
 `assignmentType=Assigned`, and instance `memberType` values `Direct`, `Group`, or `Inherited`, are
 all security-relevant. Because schedule instances do not prove future absence, the corresponding
 schedule collections are queried separately. Eligibility instances and schedules are retained
-because latent activation is prohibited for these governed runtime identities. Expired or
-terminal-negative schedules are ignored; terminal status does not suppress a returned schedule
-instance because instance presence is the authoritative current-state signal.
+because latent activation is prohibited for these governed runtime identities. A schedule whose
+end is strictly before the frozen scan instant is expired. A terminal-looking status on a current
+or future schedule is inconsistent evidence and fails closed; terminal status never suppresses a
+returned schedule instance because instance presence is the authoritative current-state signal.
 
 Instance scans also use the documented
 `assignedTo('<service-principal-id>') and atScope()` filter at every governed scope, while explicit
@@ -271,7 +272,10 @@ One shared page and item budget covers every Authorization resource type and eve
 principal/group in one effective-assignment scan. Each raw `az rest` call retrieves exactly one
 page. `nextLink` is treated as an opaque continuation after validating HTTPS and the current ARM
 host; cycles, foreign hosts, malformed JSON or `value`, nonzero responses, and a remaining
-continuation at the page/item bound fail closed.
+continuation at the page/item bound fail closed. The assignment/eligibility schedules and
+grant-bearing request projections are read twice under one frozen UTC instant and canonicalized
+over IDs, `updatedOn`, and security-relevant fields. Any mid-read set or field change is retried
+only within the bounded evidence budget and otherwise fails closed.
 
 Required separation:
 
