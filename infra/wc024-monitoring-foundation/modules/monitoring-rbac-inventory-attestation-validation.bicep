@@ -1,5 +1,11 @@
 targetScope = 'resourceGroup'
 
+@description('Reviewer attestation schema version.')
+@allowed([
+  'athena.wc028MonitoringEffectiveRbacInventoryAttestation.v2'
+])
+param attestationSchemaVersion string
+
 @description('Reviewer signature algorithm.')
 @allowed([
   'RS256'
@@ -23,6 +29,9 @@ param verifierIdentityResourceId string
 
 @description('Separately governed reviewer principal.')
 param reviewerPrincipalId string
+
+@description('Runtime-support principal that must remain separate from the reviewer.')
+param runtimeSupportIdentityPrincipalId string
 
 @description('Exact versioned reviewer key identifier.')
 param reviewerKeyId string
@@ -81,12 +90,14 @@ param effectiveRbacInventoryJson string
 
 var verifierSourceBase64 = base64(loadTextContent('../scripts/verify-rbac-inventory-attestation.py'))
 var callerEnvironmentPayload = join([
+  'ATHENA_ATTESTATION_SCHEMA_VERSION=${attestationSchemaVersion}'
   'ATHENA_SIGNATURE_ALGORITHM=${signatureAlgorithm}'
   'ATHENA_BOOTSTRAP_HANDOFF_ID=${bootstrapHandoffId}'
   'ATHENA_BOOTSTRAP_DEPLOYMENT_ID=${bootstrapDeploymentId}'
   'ATHENA_BOOTSTRAP_TEMPLATE_HASH=${bootstrapTemplateHash}'
   'ATHENA_BOOTSTRAP_CONTRACT_INPUTS_BINDING_ID=${bootstrapContractInputsBindingId}'
   'ATHENA_REVIEWER_PRINCIPAL_ID=${reviewerPrincipalId}'
+  'ATHENA_RUNTIME_SUPPORT_PRINCIPAL_ID=${runtimeSupportIdentityPrincipalId}'
   'ATHENA_REVIEWER_KEY_ID=${reviewerKeyId}'
   'ATHENA_PUBLIC_KEY_MODULUS=${publicKeyModulus}'
   'ATHENA_PUBLIC_KEY_EXPONENT=${publicKeyExponent}'
@@ -101,7 +112,7 @@ var callerEnvironmentPayload = join([
 ], '\n')
 var validatedEffectiveRbacInventoryJson = length(callerEnvironmentPayload) <= 64000
   ? effectiveRbacInventoryJson
-  : fail('monitoring RBAC attestation verification limits caller-supplied environment data to 60,000 characters')
+  : fail('monitoring RBAC attestation verification limits caller-supplied environment data to 64,000 characters')
 
 resource attestationVerifier 'Microsoft.Resources/deploymentScripts@2023-08-01' = {
   name: 'verify-monitoring-rbac-${substring(signedPreimageDigest, 7, 12)}'
@@ -117,6 +128,10 @@ resource attestationVerifier 'Microsoft.Resources/deploymentScripts@2023-08-01' 
     azCliVersion: '2.88.0'
     cleanupPreference: 'Always'
     environmentVariables: [
+      {
+        name: 'ATHENA_ATTESTATION_SCHEMA_VERSION'
+        value: attestationSchemaVersion
+      }
       {
         name: 'ATHENA_SIGNATURE_ALGORITHM'
         value: signatureAlgorithm
@@ -140,6 +155,10 @@ resource attestationVerifier 'Microsoft.Resources/deploymentScripts@2023-08-01' 
       {
         name: 'ATHENA_REVIEWER_PRINCIPAL_ID'
         value: reviewerPrincipalId
+      }
+      {
+        name: 'ATHENA_RUNTIME_SUPPORT_PRINCIPAL_ID'
+        value: runtimeSupportIdentityPrincipalId
       }
       {
         name: 'ATHENA_REVIEWER_KEY_ID'

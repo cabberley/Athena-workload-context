@@ -1041,7 +1041,11 @@ class ResourceHealthQueryRequest(_AcquisitionRequest):
         min_length=1,
         max_length=4,
     )
-    reason_types: tuple[str, ...] = Field(alias="reasonTypes", min_length=1, max_length=3)
+    reason_types: tuple[Literal["Unknown"], ...] = Field(
+        alias="reasonTypes",
+        min_length=1,
+        max_length=1,
+    )
     expected_columns: tuple[str, ...] = Field(alias="expectedColumns")
 
     @field_validator("resource_ids")
@@ -1351,9 +1355,7 @@ class ResourceHealthRow(_WindowedRow):
     previous_status: Literal["Available", "Degraded", "Unavailable", "Unknown"] = Field(
         alias="previousStatus"
     )
-    reason_type: Literal["PlatformInitiated", "UserInitiated", "Unknown"] = Field(
-        alias="reasonType"
-    )
+    reason_type: Literal["Unknown"] = Field(alias="reasonType")
 
     @field_validator("resource_id")
     @classmethod
@@ -1892,25 +1894,6 @@ def _azure_health_status(
         raise MonitoringAcquisitionError(
             "Azure Resource Health status was outside the reviewed values"
         ) from exc
-
-
-def _azure_reason_type(
-    value: object | None,
-) -> Literal["PlatformInitiated", "UserInitiated", "Unknown"]:
-    if value is None or (isinstance(value, str) and not value.strip()):
-        return "Unknown"
-    normalized = _azure_text(value, "Azure Resource Health reason", maximum=64).casefold()
-    if normalized in {
-        "outage",
-        "planned",
-        "platform initiated",
-        "platforminitiated",
-        "unplanned",
-    }:
-        return "PlatformInitiated"
-    if normalized in {"user initiated", "userinitiated"}:
-        return "UserInitiated"
-    return "Unknown"
 
 
 def _resource_health_event_status(
@@ -2729,7 +2712,7 @@ def _normalize_resource_health_row(
         "Resource Health previousStatus",
     )
     event_status = _resource_health_event_status(current_status, previous_status)
-    reason_type = _azure_reason_type(row.get("reasonType"))
+    reason_type: Literal["Unknown"] = "Unknown"
     if (
         _selected_value(event_status, request.event_statuses) is None
         or _selected_value(current_status, request.current_statuses) is None
@@ -2767,7 +2750,7 @@ def _resource_health_query(request: ResourceHealthQueryRequest) -> str:
                 "occurredAt=todatetime(properties.occurredTime), "
                 "previousStatus=tostring(properties.previousAvailabilityState), "
                 "currentStatus=tostring(properties.availabilityState), "
-                "reasonType=tostring(properties.reasonType)"
+                "reasonType='Unknown'"
             ),
             f"| where resourceId in~ ({resource_ids})",
             (
@@ -3963,7 +3946,7 @@ def _control_binding_matches(
                 and scope.endpoint_test_digest is not None
             )
         return (
-            table == "NTANetAnalytics"
+            table in _UNSUPPORTED_FLOW_QUERY_TABLES
             and scope.path_id is not None
             and scope.direction is not None
             and scope.five_tuple_digest is not None

@@ -171,6 +171,9 @@ RESOURCE_HEALTH_OPERATIONS = (
     *RESOURCE_GRAPH_QUERY_OPERATIONS,
     *RESOURCE_HEALTH_ROLE_OPERATIONS,
 )
+CURRENT_RBAC_TARGET_QUERY_MODE = (
+    "assignedToPrincipalIncludingInheritedGroupsAndDescendants"
+)
 PREVIOUS_RESOURCE_LOG_OPERATIONS = (
     "Microsoft.Insights/logs/Heartbeat/read",
     "Microsoft.Insights/logs/NTANetAnalytics/read",
@@ -894,9 +897,16 @@ def _effective_rbac_inventory_attestation(
     private_key: rsa.RSAPrivateKey = _RBAC_INVENTORY_REVIEWER_PRIVATE_KEY,
     reviewer_principal_id: str = RBAC_INVENTORY_REVIEWER_PRINCIPAL_ID,
     reviewer_key_id: str = RBAC_INVENTORY_REVIEWER_KEY_ID,
+    schema_version: str | None = None,
 ) -> MonitoringEffectiveRbacInventoryAttestation:
     modulus, exponent, fingerprint = _rbac_inventory_reviewer_public_material(private_key)
+    attestation_schema_version = schema_version or (
+        "athena.wc028MonitoringEffectiveRbacInventoryAttestation.v2"
+        if inventory.schema_version == MONITORING_EFFECTIVE_RBAC_INVENTORY_SCHEMA_VERSION
+        else "athena.wc028MonitoringEffectiveRbacInventoryAttestation.v1"
+    )
     preimage = monitoring_effective_rbac_inventory_attestation_preimage(
+        schema_version=attestation_schema_version,
         bootstrap_handoff_id=RBAC_INVENTORY_BOOTSTRAP_HANDOFF_ID,
         bootstrap_deployment_id=RBAC_INVENTORY_BOOTSTRAP_DEPLOYMENT_ID.casefold(),
         bootstrap_template_hash=RBAC_INVENTORY_BOOTSTRAP_TEMPLATE_HASH,
@@ -917,7 +927,7 @@ def _effective_rbac_inventory_attestation(
         )
     ).decode("ascii")
     return MonitoringEffectiveRbacInventoryAttestation(
-        schemaVersion="athena.wc028MonitoringEffectiveRbacInventoryAttestation.v1",
+        schemaVersion=attestation_schema_version,
         signatureAlgorithm="RS256",
         bootstrapHandoffId=RBAC_INVENTORY_BOOTSTRAP_HANDOFF_ID,
         bootstrapDeploymentId=RBAC_INVENTORY_BOOTSTRAP_DEPLOYMENT_ID,
@@ -1214,34 +1224,78 @@ def _effective_rbac_principal_evidence(
     transitive_group_ids: tuple[str, ...] = (),
     query_filter: str = "assignedTo(principalId)",
     include_inherited: bool = False,
+    target_bound: bool = True,
 ) -> dict[str, object]:
     targets = tuple(sorted(item.casefold() for item in target_scope_ids))
-    target_digests = tuple(
-        compute_artifact_digest(
-            {
-                "principalId": principal_id.casefold(),
-                "targetScopeId": target,
-                "queryFilter": query_filter,
-            }
+    target_reads: tuple[dict[str, object], ...] = ()
+    target_digests: tuple[str, ...] = ()
+    first_role_assignment_pages: tuple[str, ...] = ()
+    second_role_assignment_pages: tuple[str, ...] = ()
+    if target_bound:
+        target_read_items = []
+        for target in targets:
+            raw_page_digest = compute_artifact_digest(
+                {
+                    "principalId": principal_id.casefold(),
+                    "targetScopeId": target,
+                    "page": "roleAssignments",
+                }
+            )
+            target_digest = compute_artifact_digest(
+                {
+                    "principalId": principal_id.casefold(),
+                    "targetScopeId": target,
+                    "queryMode": CURRENT_RBAC_TARGET_QUERY_MODE,
+                    "rawPageDigests": [raw_page_digest],
+                }
+            )
+            target_read_items.append(
+                {
+                    "targetScopeId": target,
+                    "queryMode": CURRENT_RBAC_TARGET_QUERY_MODE,
+                    "targetDigest": target_digest,
+                    "rawPageDigests": (raw_page_digest,),
+                    "readCount": 2,
+                    "allPagesRetrieved": True,
+                    "bindingId": str(
+                        uuid5(
+                            _ARM_TEMPLATE_GUID_NAMESPACE,
+                            "-".join(
+                                (
+                                    principal_id.casefold(),
+                                    target,
+                                    CURRENT_RBAC_TARGET_QUERY_MODE,
+                                    target_digest,
+                                    raw_page_digest,
+                                    "2",
+                                    "true",
+                                )
+                            ),
+                        )
+                    ),
+                }
+            )
+        target_reads = tuple(target_read_items)
+    else:
+        target_digests = tuple(
+            compute_artifact_digest(
+                {
+                    "principalId": principal_id.casefold(),
+                    "targetScopeId": target,
+                    "queryFilter": query_filter,
+                }
+            )
+            for target in targets
         )
-        for target in targets
-    )
-    first_role_assignment_pages = (
-        compute_artifact_digest(
-            {
-                "principalId": principal_id.casefold(),
-                "page": "roleAssignments",
-            }
-        ),
-    )
-    second_role_assignment_pages = (
-        compute_artifact_digest(
-            {
-                "principalId": principal_id.casefold(),
-                "page": "roleAssignments",
-            }
-        ),
-    )
+        first_role_assignment_pages = (
+            compute_artifact_digest(
+                {
+                    "principalId": principal_id.casefold(),
+                    "page": "roleAssignments",
+                }
+            ),
+        )
+        second_role_assignment_pages = first_role_assignment_pages
     first_transitive_group_pages = (
         compute_artifact_digest(
             {
@@ -1260,29 +1314,67 @@ def _effective_rbac_principal_evidence(
     )
     payload: dict[str, object] = {
         "principalId": principal_id.casefold(),
-        "queryFilter": query_filter,
-        "targetScopeIds": targets,
-        "firstReadTargetDigests": target_digests,
-        "secondReadTargetDigests": target_digests,
-        "firstRoleAssignmentRawPageDigests": first_role_assignment_pages,
-        "secondRoleAssignmentRawPageDigests": second_role_assignment_pages,
         "transitiveGroupIds": tuple(sorted(item.casefold() for item in transitive_group_ids)),
         "firstTransitiveGroupRawPageDigests": first_transitive_group_pages,
         "secondTransitiveGroupRawPageDigests": second_transitive_group_pages,
         "allPagesRetrieved": True,
     }
-    if include_inherited:
+    if target_bound:
+        payload["targetReadEvidence"] = target_reads
+    else:
         payload.update(
             {
-                "includeInherited": True,
-                "includeGroups": True,
-                "includeAllDescendantScopes": True,
+                "queryFilter": query_filter,
+                "targetScopeIds": targets,
+                "firstReadTargetDigests": target_digests,
+                "secondReadTargetDigests": target_digests,
+                "firstRoleAssignmentRawPageDigests": first_role_assignment_pages,
+                "secondRoleAssignmentRawPageDigests": second_role_assignment_pages,
             }
         )
+        if include_inherited:
+            payload.update(
+                {
+                    "includeInherited": True,
+                    "includeGroups": True,
+                    "includeAllDescendantScopes": True,
+                }
+            )
     return {
         **payload,
         "evidenceDigest": compute_artifact_digest(_json_value(payload)),
     }
+
+
+def _principal_snapshot_fields(
+    prefix: str,
+    evidence: dict[str, object],
+    *,
+    first_read: bool,
+) -> dict[str, object]:
+    target_reads = evidence.get("targetReadEvidence")
+    payload: dict[str, object] = {
+        f"{prefix}PrincipalId": evidence["principalId"],
+        f"{prefix}TransitiveGroupRawPageDigests": evidence[
+            "firstTransitiveGroupRawPageDigests"
+            if first_read
+            else "secondTransitiveGroupRawPageDigests"
+        ],
+    }
+    if target_reads is not None:
+        payload[f"{prefix}TargetReadBindingIds"] = tuple(
+            item["bindingId"] for item in tuple(target_reads)
+        )
+        return payload
+    payload[f"{prefix}TargetReadDigests"] = evidence[
+        "firstReadTargetDigests" if first_read else "secondReadTargetDigests"
+    ]
+    payload[f"{prefix}RoleAssignmentRawPageDigests"] = evidence[
+        "firstRoleAssignmentRawPageDigests"
+        if first_read
+        else "secondRoleAssignmentRawPageDigests"
+    ]
+    return payload
 
 
 def _management_group_hierarchy_evidence(
@@ -1636,35 +1728,20 @@ def _effective_rbac_inventory(payload: dict[str, object]) -> dict[str, object]:
     first_raw_snapshot_digest = compute_artifact_digest(
         _json_value(
             {
-                "collectorPrincipalId": collector_principal_evidence["principalId"],
-                "collectorTargetReadDigests": collector_principal_evidence[
-                    "firstReadTargetDigests"
-                ],
-                "athenaContextPrincipalId": context_principal_evidence["principalId"],
-                "athenaContextTargetReadDigests": context_principal_evidence[
-                    "firstReadTargetDigests"
-                ],
-                "collectorRoleAssignmentRawPageDigests": (
-                    collector_principal_evidence["firstRoleAssignmentRawPageDigests"]
+                **_principal_snapshot_fields(
+                    "collector",
+                    collector_principal_evidence,
+                    first_read=True,
                 ),
-                "collectorTransitiveGroupRawPageDigests": (
-                    collector_principal_evidence["firstTransitiveGroupRawPageDigests"]
+                **_principal_snapshot_fields(
+                    "athenaContext",
+                    context_principal_evidence,
+                    first_read=True,
                 ),
-                "athenaContextRoleAssignmentRawPageDigests": (
-                    context_principal_evidence["firstRoleAssignmentRawPageDigests"]
-                ),
-                "athenaContextTransitiveGroupRawPageDigests": (
-                    context_principal_evidence["firstTransitiveGroupRawPageDigests"]
-                ),
-                "runtimeSupportPrincipalId": runtime_support_principal_evidence["principalId"],
-                "runtimeSupportTargetReadDigests": runtime_support_principal_evidence[
-                    "firstReadTargetDigests"
-                ],
-                "runtimeSupportRoleAssignmentRawPageDigests": (
-                    runtime_support_principal_evidence["firstRoleAssignmentRawPageDigests"]
-                ),
-                "runtimeSupportTransitiveGroupRawPageDigests": (
-                    runtime_support_principal_evidence["firstTransitiveGroupRawPageDigests"]
+                **_principal_snapshot_fields(
+                    "runtimeSupport",
+                    runtime_support_principal_evidence,
+                    first_read=True,
                 ),
                 "roleDefinitionRawPageDigests": (role_definition_page_digest,),
                 "denyAssignmentRawPageDigests": (deny_page_digest,),
@@ -1676,35 +1753,20 @@ def _effective_rbac_inventory(payload: dict[str, object]) -> dict[str, object]:
     second_raw_snapshot_digest = compute_artifact_digest(
         _json_value(
             {
-                "collectorPrincipalId": collector_principal_evidence["principalId"],
-                "collectorTargetReadDigests": collector_principal_evidence[
-                    "secondReadTargetDigests"
-                ],
-                "athenaContextPrincipalId": context_principal_evidence["principalId"],
-                "athenaContextTargetReadDigests": context_principal_evidence[
-                    "secondReadTargetDigests"
-                ],
-                "collectorRoleAssignmentRawPageDigests": (
-                    collector_principal_evidence["secondRoleAssignmentRawPageDigests"]
+                **_principal_snapshot_fields(
+                    "collector",
+                    collector_principal_evidence,
+                    first_read=False,
                 ),
-                "collectorTransitiveGroupRawPageDigests": (
-                    collector_principal_evidence["secondTransitiveGroupRawPageDigests"]
+                **_principal_snapshot_fields(
+                    "athenaContext",
+                    context_principal_evidence,
+                    first_read=False,
                 ),
-                "athenaContextRoleAssignmentRawPageDigests": (
-                    context_principal_evidence["secondRoleAssignmentRawPageDigests"]
-                ),
-                "athenaContextTransitiveGroupRawPageDigests": (
-                    context_principal_evidence["secondTransitiveGroupRawPageDigests"]
-                ),
-                "runtimeSupportPrincipalId": runtime_support_principal_evidence["principalId"],
-                "runtimeSupportTargetReadDigests": runtime_support_principal_evidence[
-                    "secondReadTargetDigests"
-                ],
-                "runtimeSupportRoleAssignmentRawPageDigests": (
-                    runtime_support_principal_evidence["secondRoleAssignmentRawPageDigests"]
-                ),
-                "runtimeSupportTransitiveGroupRawPageDigests": (
-                    runtime_support_principal_evidence["secondTransitiveGroupRawPageDigests"]
+                **_principal_snapshot_fields(
+                    "runtimeSupport",
+                    runtime_support_principal_evidence,
+                    first_read=False,
                 ),
                 "roleDefinitionRawPageDigests": (role_definition_page_digest,),
                 "denyAssignmentRawPageDigests": (deny_page_digest,),
@@ -1840,6 +1902,7 @@ def _recompute_effective_rbac_inventory(
         "athena.wc028MonitoringEffectiveRbacInventory.v2",
         "athena.wc028MonitoringEffectiveRbacInventory.v3",
         "athena.wc028MonitoringEffectiveRbacInventory.v4",
+        "athena.wc028MonitoringEffectiveRbacInventory.v5",
         MONITORING_EFFECTIVE_RBAC_INVENTORY_SCHEMA_VERSION,
     }:
         collector_evidence = inventory["collectorPrincipalEvidence"]
@@ -1859,6 +1922,7 @@ def _recompute_effective_rbac_inventory(
         }
         if inventory["schemaVersion"] in {
             "athena.wc028MonitoringEffectiveRbacInventory.v4",
+            "athena.wc028MonitoringEffectiveRbacInventory.v5",
             MONITORING_EFFECTIVE_RBAC_INVENTORY_SCHEMA_VERSION,
         }:
             runtime_support_evidence = inventory["runtimeSupportPrincipalEvidence"]
@@ -1905,22 +1969,16 @@ def _recompute_effective_rbac_inventory(
             inventory["secondRawSnapshotDigest"] = raw_snapshot_digest
         else:
             first_snapshot_payload = {
-                "collectorPrincipalId": collector_evidence["principalId"],
-                "collectorTargetReadDigests": collector_evidence["firstReadTargetDigests"],
-                "athenaContextPrincipalId": context_evidence["principalId"],
-                "athenaContextTargetReadDigests": context_evidence["firstReadTargetDigests"],
-                "collectorRoleAssignmentRawPageDigests": collector_evidence[
-                    "firstRoleAssignmentRawPageDigests"
-                ],
-                "collectorTransitiveGroupRawPageDigests": collector_evidence[
-                    "firstTransitiveGroupRawPageDigests"
-                ],
-                "athenaContextRoleAssignmentRawPageDigests": context_evidence[
-                    "firstRoleAssignmentRawPageDigests"
-                ],
-                "athenaContextTransitiveGroupRawPageDigests": context_evidence[
-                    "firstTransitiveGroupRawPageDigests"
-                ],
+                **_principal_snapshot_fields(
+                    "collector",
+                    collector_evidence,
+                    first_read=True,
+                ),
+                **_principal_snapshot_fields(
+                    "athenaContext",
+                    context_evidence,
+                    first_read=True,
+                ),
                 "roleDefinitionRawPageDigests": inventory["firstRoleDefinitionRawPageDigests"],
                 "denyAssignmentRawPageDigests": inventory["firstDenyAssignmentRawPageDigests"],
                 "pimScheduleInstanceRawPageDigests": inventory[
@@ -1929,22 +1987,16 @@ def _recompute_effective_rbac_inventory(
                 **normalized_record_digests,
             }
             second_snapshot_payload = {
-                "collectorPrincipalId": collector_evidence["principalId"],
-                "collectorTargetReadDigests": collector_evidence["secondReadTargetDigests"],
-                "athenaContextPrincipalId": context_evidence["principalId"],
-                "athenaContextTargetReadDigests": context_evidence["secondReadTargetDigests"],
-                "collectorRoleAssignmentRawPageDigests": collector_evidence[
-                    "secondRoleAssignmentRawPageDigests"
-                ],
-                "collectorTransitiveGroupRawPageDigests": collector_evidence[
-                    "secondTransitiveGroupRawPageDigests"
-                ],
-                "athenaContextRoleAssignmentRawPageDigests": context_evidence[
-                    "secondRoleAssignmentRawPageDigests"
-                ],
-                "athenaContextTransitiveGroupRawPageDigests": context_evidence[
-                    "secondTransitiveGroupRawPageDigests"
-                ],
+                **_principal_snapshot_fields(
+                    "collector",
+                    collector_evidence,
+                    first_read=False,
+                ),
+                **_principal_snapshot_fields(
+                    "athenaContext",
+                    context_evidence,
+                    first_read=False,
+                ),
                 "roleDefinitionRawPageDigests": inventory["secondRoleDefinitionRawPageDigests"],
                 "denyAssignmentRawPageDigests": inventory["secondDenyAssignmentRawPageDigests"],
                 "pimScheduleInstanceRawPageDigests": inventory[
@@ -1954,36 +2006,23 @@ def _recompute_effective_rbac_inventory(
             }
             if inventory["schemaVersion"] in {
                 "athena.wc028MonitoringEffectiveRbacInventory.v4",
+                "athena.wc028MonitoringEffectiveRbacInventory.v5",
                 MONITORING_EFFECTIVE_RBAC_INVENTORY_SCHEMA_VERSION,
             }:
                 runtime_support_evidence = inventory["runtimeSupportPrincipalEvidence"]
                 first_snapshot_payload.update(
-                    {
-                        "runtimeSupportPrincipalId": runtime_support_evidence["principalId"],
-                        "runtimeSupportTargetReadDigests": runtime_support_evidence[
-                            "firstReadTargetDigests"
-                        ],
-                        "runtimeSupportRoleAssignmentRawPageDigests": runtime_support_evidence[
-                            "firstRoleAssignmentRawPageDigests"
-                        ],
-                        "runtimeSupportTransitiveGroupRawPageDigests": runtime_support_evidence[
-                            "firstTransitiveGroupRawPageDigests"
-                        ],
-                    }
+                    _principal_snapshot_fields(
+                        "runtimeSupport",
+                        runtime_support_evidence,
+                        first_read=True,
+                    )
                 )
                 second_snapshot_payload.update(
-                    {
-                        "runtimeSupportPrincipalId": runtime_support_evidence["principalId"],
-                        "runtimeSupportTargetReadDigests": runtime_support_evidence[
-                            "secondReadTargetDigests"
-                        ],
-                        "runtimeSupportRoleAssignmentRawPageDigests": runtime_support_evidence[
-                            "secondRoleAssignmentRawPageDigests"
-                        ],
-                        "runtimeSupportTransitiveGroupRawPageDigests": runtime_support_evidence[
-                            "secondTransitiveGroupRawPageDigests"
-                        ],
-                    }
+                    _principal_snapshot_fields(
+                        "runtimeSupport",
+                        runtime_support_evidence,
+                        first_read=False,
+                    )
                 )
             inventory["firstRawSnapshotDigest"] = compute_artifact_digest(
                 _json_value(first_snapshot_payload)
@@ -1998,6 +2037,29 @@ def _recompute_effective_rbac_inventory(
 def _recompute_principal_evidence(evidence: dict[str, object]) -> None:
     evidence.pop("evidenceDigest", None)
     evidence["evidenceDigest"] = compute_artifact_digest(_json_value(evidence))
+
+
+def _recompute_target_read_binding(
+    evidence: dict[str, object],
+    target_read: dict[str, object],
+) -> None:
+    raw_page_digests = tuple(str(item) for item in target_read["rawPageDigests"])
+    target_read["bindingId"] = str(
+        uuid5(
+            _ARM_TEMPLATE_GUID_NAMESPACE,
+            "-".join(
+                (
+                    str(evidence["principalId"]).casefold(),
+                    str(target_read["targetScopeId"]).casefold(),
+                    str(target_read["queryMode"]),
+                    str(target_read["targetDigest"]),
+                    ",".join(raw_page_digests),
+                    str(target_read["readCount"]),
+                    str(target_read["allPagesRetrieved"]).lower(),
+                )
+            ),
+        )
+    )
 
 
 def _recompute_nested_evidence(evidence: dict[str, object]) -> None:
@@ -2188,11 +2250,13 @@ def _previous_permission_attested_effective_rbac_inventory(
         principal_id=str(payload["monitoringReaderPrincipalId"]),
         target_scope_ids=previous_targets,
         query_filter="atScope() and assignedTo(principalId)",
+        target_bound=False,
     )
     context_evidence = _effective_rbac_principal_evidence(
         principal_id=str(payload["athenaContextPrincipalId"]),
         target_scope_ids=previous_targets,
         query_filter="atScope() and assignedTo(principalId)",
+        target_bound=False,
     )
     role_definitions = tuple(
         item
@@ -2241,8 +2305,70 @@ def _previous_trust_hardened_effective_rbac_inventory(
     payload: dict[str, object],
 ) -> dict[str, object]:
     inventory = _effective_rbac_inventory(payload)
+    _downgrade_target_read_evidence(inventory)
     inventory["schemaVersion"] = "athena.wc028MonitoringEffectiveRbacInventory.v4"
     inventory.pop("resourceGraphQueryRoleActions", None)
+    _recompute_effective_rbac_inventory(inventory)
+    return inventory
+
+
+def _downgrade_principal_target_read_evidence(
+    evidence: dict[str, object],
+) -> dict[str, object]:
+    target_reads = tuple(evidence.pop("targetReadEvidence"))
+    legacy_payload: dict[str, object] = {
+        **evidence,
+        "queryFilter": "assignedTo(principalId)",
+        "includeInherited": True,
+        "includeGroups": True,
+        "includeAllDescendantScopes": True,
+        "targetScopeIds": tuple(item["targetScopeId"] for item in target_reads),
+        "firstReadTargetDigests": tuple(item["targetDigest"] for item in target_reads),
+        "secondReadTargetDigests": tuple(item["targetDigest"] for item in target_reads),
+        "firstRoleAssignmentRawPageDigests": tuple(
+            sorted(
+                digest
+                for item in target_reads
+                for digest in tuple(item["rawPageDigests"])
+            )
+        ),
+        "secondRoleAssignmentRawPageDigests": tuple(
+            sorted(
+                digest
+                for item in target_reads
+                for digest in tuple(item["rawPageDigests"])
+            )
+        ),
+    }
+    _recompute_principal_evidence(legacy_payload)
+    return legacy_payload
+
+
+def _downgrade_target_read_evidence(inventory: dict[str, object]) -> None:
+    for field in (
+        "collectorPrincipalEvidence",
+        "athenaContextPrincipalEvidence",
+        "runtimeSupportPrincipalEvidence",
+    ):
+        evidence = inventory[field]
+        assert isinstance(evidence, dict)
+        inventory[field] = _downgrade_principal_target_read_evidence(evidence)
+    verifier = inventory["reviewerKeyVerifierEvidence"]
+    assert isinstance(verifier, dict)
+    principal_evidence = verifier["principalEvidence"]
+    assert isinstance(principal_evidence, dict)
+    verifier["principalEvidence"] = _downgrade_principal_target_read_evidence(
+        principal_evidence
+    )
+    _recompute_nested_evidence(verifier)
+
+
+def _previous_target_unbound_effective_rbac_inventory(
+    payload: dict[str, object],
+) -> dict[str, object]:
+    inventory = _effective_rbac_inventory(payload)
+    _downgrade_target_read_evidence(inventory)
+    inventory["schemaVersion"] = "athena.wc028MonitoringEffectiveRbacInventory.v5"
     _recompute_effective_rbac_inventory(inventory)
     return inventory
 
@@ -2524,11 +2650,14 @@ def test_acquisition_collector_contract_authorizes_receipt_handoff() -> None:
         == MONITORING_EFFECTIVE_RBAC_INVENTORY_SCHEMA_VERSION
     )
     assert contract.effective_rbac_inventory.protected_scope_ids
-    assert (
-        contract.effective_rbac_inventory.collector_principal_evidence.query_filter
-        == "assignedTo(principalId)"
+    collector_target_reads = (
+        contract.effective_rbac_inventory.collector_principal_evidence.target_read_evidence
     )
-    assert contract.effective_rbac_inventory.collector_principal_evidence.target_scope_ids == tuple(
+    assert collector_target_reads is not None
+    assert all(
+        item.query_mode == CURRENT_RBAC_TARGET_QUERY_MODE for item in collector_target_reads
+    )
+    assert tuple(item.target_scope_id for item in collector_target_reads) == tuple(
         sorted(
             (
                 f"/subscriptions/{SUBSCRIPTION_ID}",
@@ -2603,6 +2732,26 @@ def test_current_contract_rejects_broad_or_untruthful_persistence(
     payload[field_name] = value
 
     with pytest.raises(ValidationError, match=message):
+        MonitoringCollectorContract(**payload)
+
+
+def test_current_contract_rejects_runtime_support_as_inventory_reviewer() -> None:
+    payload = _acquisition_collector_contract().model_dump(
+        mode="python",
+        by_alias=True,
+    )
+    inventory = _acquisition_collector_contract().effective_rbac_inventory
+    assert inventory is not None
+    payload["rbacInventoryReviewerPrincipalId"] = RUNTIME_SUPPORT_PRINCIPAL_ID
+    payload["effectiveRbacInventoryAttestation"] = _effective_rbac_inventory_attestation(
+        inventory,
+        reviewer_principal_id=RUNTIME_SUPPORT_PRINCIPAL_ID,
+    )
+
+    with pytest.raises(
+        ValidationError,
+        match="attestation does not match its reviewed authority",
+    ):
         MonitoringCollectorContract(**payload)
 
 
@@ -2995,6 +3144,66 @@ def test_v10_contract_rejects_v9_graph_only_inventory_topology() -> None:
     with pytest.raises(
         ValidationError,
         match="does not match exact deployed assignments|version-bound effective RBAC inventory",
+    ):
+        MonitoringCollectorContract(**payload)
+
+
+def test_v10_contract_rejects_v5_unbound_ancestor_evidence() -> None:
+    payload = _acquisition_collector_contract().model_dump(
+        mode="python",
+        by_alias=True,
+        exclude_none=True,
+    )
+    previous_inventory = MonitoringEffectiveRbacInventory(
+        **_previous_target_unbound_effective_rbac_inventory(payload)
+    )
+    assert (
+        previous_inventory.schema_version
+        == "athena.wc028MonitoringEffectiveRbacInventory.v5"
+    )
+    payload["effectiveRbacInventory"] = previous_inventory
+
+    with pytest.raises(
+        ValidationError,
+        match="version-bound effective RBAC inventory",
+    ):
+        MonitoringCollectorContract(**payload)
+
+
+def test_v10_contract_rejects_v1_inventory_attestation_domain() -> None:
+    payload = _acquisition_collector_contract().model_dump(
+        mode="python",
+        by_alias=True,
+        exclude_none=True,
+    )
+    inventory = MonitoringEffectiveRbacInventory(**payload["effectiveRbacInventory"])
+    payload["effectiveRbacInventoryAttestation"] = _effective_rbac_inventory_attestation(
+        inventory,
+        schema_version="athena.wc028MonitoringEffectiveRbacInventoryAttestation.v1",
+    )
+
+    with pytest.raises(
+        ValidationError,
+        match="attestation does not match its reviewed authority",
+    ):
+        MonitoringCollectorContract(**payload)
+
+
+def test_v9_contract_rejects_v2_inventory_attestation_domain() -> None:
+    payload = _legacy_v9_trust_hardened_contract().model_dump(
+        mode="python",
+        by_alias=True,
+        exclude_none=True,
+    )
+    inventory = MonitoringEffectiveRbacInventory(**payload["effectiveRbacInventory"])
+    payload["effectiveRbacInventoryAttestation"] = _effective_rbac_inventory_attestation(
+        inventory,
+        schema_version="athena.wc028MonitoringEffectiveRbacInventoryAttestation.v2",
+    )
+
+    with pytest.raises(
+        ValidationError,
+        match="attestation does not match its reviewed authority",
     ):
         MonitoringCollectorContract(**payload)
 
@@ -3466,7 +3675,7 @@ def test_current_rbac_attestation_requires_every_exact_target() -> None:
         MonitoringCollectorContract(**payload)
 
 
-def test_current_rbac_attestation_requires_subscription_wide_principal_query() -> None:
+def test_current_rbac_attestation_requires_exact_target_query_mode() -> None:
     payload = _acquisition_collector_contract().model_dump(
         mode="python",
         by_alias=True,
@@ -3475,18 +3684,43 @@ def test_current_rbac_attestation_requires_subscription_wide_principal_query() -
     assert isinstance(inventory, dict)
     evidence = inventory["collectorPrincipalEvidence"]
     assert isinstance(evidence, dict)
-    evidence["queryFilter"] = "atScope() and assignedTo(principalId)"
+    target_reads = tuple(evidence["targetReadEvidence"])
+    target_reads[0]["queryMode"] = "atScopeOnly"
+
+    with pytest.raises(
+        ValidationError,
+        match="queryMode",
+    ):
+        MonitoringCollectorContract(**payload)
+
+
+def test_current_rbac_attestation_rejects_legacy_unbound_target_fields() -> None:
+    payload = _acquisition_collector_contract().model_dump(
+        mode="python",
+        by_alias=True,
+    )
+    inventory = payload["effectiveRbacInventory"]
+    assert isinstance(inventory, dict)
+    evidence = inventory["collectorPrincipalEvidence"]
+    assert isinstance(evidence, dict)
+    evidence["queryFilter"] = "assignedTo(principalId)"
     _recompute_principal_evidence(evidence)
     _recompute_effective_rbac_inventory(inventory)
 
     with pytest.raises(
         ValidationError,
-        match="runtime and subscription-wide evidence is invalid",
+        match="uniquely bind target, query mode, and page evidence",
     ):
         MonitoringCollectorContract(**payload)
 
 
-def test_current_rbac_attestation_requires_inherited_and_group_expansion() -> None:
+@pytest.mark.parametrize(
+    "reused_field",
+    ("targetScopeId", "targetDigest", "rawPageDigests", "bindingId"),
+)
+def test_current_rbac_attestation_rejects_reused_target_binding_material(
+    reused_field: str,
+) -> None:
     payload = _acquisition_collector_contract().model_dump(
         mode="python",
         by_alias=True,
@@ -3495,7 +3729,87 @@ def test_current_rbac_attestation_requires_inherited_and_group_expansion() -> No
     assert isinstance(inventory, dict)
     evidence = inventory["collectorPrincipalEvidence"]
     assert isinstance(evidence, dict)
-    evidence.pop("includeInherited")
+    target_reads = list(evidence["targetReadEvidence"])
+    target_reads[1][reused_field] = target_reads[0][reused_field]
+    evidence["targetReadEvidence"] = tuple(target_reads)
+    _recompute_principal_evidence(evidence)
+    _recompute_effective_rbac_inventory(inventory)
+
+    with pytest.raises(
+        ValidationError,
+        match="uniquely bind target, query mode, and page evidence",
+    ):
+        MonitoringCollectorContract(**payload)
+
+
+def test_current_rbac_attestation_rejects_incorrect_target_binding_id() -> None:
+    payload = _acquisition_collector_contract().model_dump(
+        mode="python",
+        by_alias=True,
+    )
+    inventory = payload["effectiveRbacInventory"]
+    assert isinstance(inventory, dict)
+    evidence = inventory["collectorPrincipalEvidence"]
+    assert isinstance(evidence, dict)
+    target_reads = list(evidence["targetReadEvidence"])
+    target_reads[0]["bindingId"] = "00000000-0000-0000-0000-000000000000"
+    evidence["targetReadEvidence"] = tuple(target_reads)
+    _recompute_principal_evidence(evidence)
+    _recompute_effective_rbac_inventory(inventory)
+
+    with pytest.raises(
+        ValidationError,
+        match="uniquely bind target, query mode, and page evidence",
+    ):
+        MonitoringCollectorContract(**payload)
+
+
+@pytest.mark.parametrize("scope_mutation", ("missing", "extra"))
+def test_current_rbac_attestation_requires_exact_principal_target_set(
+    scope_mutation: str,
+) -> None:
+    payload = _acquisition_collector_contract().model_dump(
+        mode="python",
+        by_alias=True,
+    )
+    inventory = payload["effectiveRbacInventory"]
+    assert isinstance(inventory, dict)
+    evidence = inventory["collectorPrincipalEvidence"]
+    assert isinstance(evidence, dict)
+    target_reads = list(evidence["targetReadEvidence"])
+    if scope_mutation == "missing":
+        target_reads = target_reads[1:]
+    else:
+        target_scope_id = (
+            "/providers/microsoft.management/managementgroups/"
+            "11111111-1111-1111-1111-111111111111"
+        )
+        raw_page_digest = compute_artifact_digest(
+            {
+                "principalId": evidence["principalId"],
+                "targetScopeId": target_scope_id,
+                "page": "roleAssignments",
+            }
+        )
+        target_read: dict[str, object] = {
+            "targetScopeId": target_scope_id,
+            "queryMode": CURRENT_RBAC_TARGET_QUERY_MODE,
+            "targetDigest": compute_artifact_digest(
+                {
+                    "principalId": evidence["principalId"],
+                    "targetScopeId": target_scope_id,
+                    "queryMode": CURRENT_RBAC_TARGET_QUERY_MODE,
+                    "rawPageDigests": [raw_page_digest],
+                }
+            ),
+            "rawPageDigests": (raw_page_digest,),
+            "readCount": 2,
+            "allPagesRetrieved": True,
+        }
+        _recompute_target_read_binding(evidence, target_read)
+        target_reads.append(target_read)
+        target_reads.sort(key=lambda item: str(item["targetScopeId"]))
+    evidence["targetReadEvidence"] = tuple(target_reads)
     _recompute_principal_evidence(evidence)
     _recompute_effective_rbac_inventory(inventory)
 
@@ -3863,7 +4177,7 @@ def test_current_rbac_attestation_rejects_second_global_read_page_drift() -> Non
         MonitoringCollectorContract(**payload)
 
 
-def test_current_rbac_attestation_rejects_second_principal_read_page_drift() -> None:
+def test_current_rbac_attestation_rejects_reused_principal_target_page_digest() -> None:
     payload = _acquisition_collector_contract().model_dump(
         mode="python",
         by_alias=True,
@@ -3872,11 +4186,15 @@ def test_current_rbac_attestation_rejects_second_principal_read_page_drift() -> 
     assert isinstance(inventory, dict)
     collector_evidence = inventory["collectorPrincipalEvidence"]
     assert isinstance(collector_evidence, dict)
-    collector_evidence["secondRoleAssignmentRawPageDigests"] = ("sha256:" + "f" * 64,)
+    target_reads = tuple(collector_evidence["targetReadEvidence"])
+    target_reads[1]["rawPageDigests"] = target_reads[0]["rawPageDigests"]
     _recompute_principal_evidence(collector_evidence)
     _recompute_effective_rbac_inventory(inventory)
 
-    with pytest.raises(ValidationError, match="complete stable evidence shape"):
+    with pytest.raises(
+        ValidationError,
+        match="uniquely bind target, query mode, and page evidence",
+    ):
         MonitoringCollectorContract(**payload)
 
 

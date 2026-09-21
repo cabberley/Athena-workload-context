@@ -27,6 +27,7 @@ from athena_context.monitoring_acquisition import (
     MonitoringAcquisitionError,
     ResourceGraphChangeQueryRequest,
     ResourceHealthQueryRequest,
+    ResourceHealthRow,
 )
 from test_wc024_monitoring_contract import _acquisition_collector_contract
 from test_wc026_correlation_contract import NOW
@@ -299,7 +300,7 @@ def _resource_graph_request(
 def _resource_health_request(
     *,
     resource_id: str = PRODUCTION_WEB_ID,
-    reason_types: tuple[str, ...] = ("PlatformInitiated",),
+    reason_types: tuple[str, ...] = ("Unknown",),
 ) -> ResourceHealthQueryRequest:
     resource_id = resource_id.casefold()
     return monitoring_acquisition_module._build_request(
@@ -699,6 +700,7 @@ def test_resource_health_client_reads_documented_healthresources_transition() ->
     assert len(result.rows) == 1
     assert result.rows[0].event_status == "Active"
     assert result.rows[0].current_status == "Unavailable"
+    assert result.rows[0].reason_type == "Unknown"
     sent = transport.requests[0]
     assert sent.url.endswith("/providers/Microsoft.ResourceGraph/resources?api-version=2022-10-01")
     body = json.loads(sent.body)
@@ -706,6 +708,8 @@ def test_resource_health_client_reads_documented_healthresources_transition() ->
     assert body["options"] == {"$top": 501, "resultFormat": "ObjectArray"}
     assert "HealthResources" in body["query"]
     assert "previousAvailabilityState" in body["query"]
+    assert "properties.reasonType" not in body["query"]
+    assert "reasonType='Unknown'" in body["query"]
     assert PRODUCTION_WEB_ID.casefold() in body["query"]
     assert UNAPPROVED_PEER_VM_ID.casefold() not in body["query"]
 
@@ -771,6 +775,24 @@ def test_resource_health_missing_reason_normalizes_to_unknown() -> None:
     assert result.rows[0].reason_type == "Unknown"
 
 
+def test_resource_health_request_rejects_unsupported_reason_filter() -> None:
+    with pytest.raises(ValidationError):
+        _resource_health_request(reason_types=("PlatformInitiated",))
+
+
+def test_resource_health_result_row_rejects_unsupported_reason_value() -> None:
+    with pytest.raises(ValidationError):
+        ResourceHealthRow(
+            resourceId=PRODUCTION_WEB_ID,
+            eventStatus="Active",
+            currentStatus="Unavailable",
+            previousStatus="Available",
+            reasonType="PlatformInitiated",
+            observedStart=NOW - timedelta(minutes=2),
+            observedEnd=NOW,
+        )
+
+
 def test_resource_health_graph_retains_resolved_transition() -> None:
     request = _resource_health_request()
     transport = _MockTransport(
@@ -782,7 +804,7 @@ def test_resource_health_graph_retains_resolved_transition() -> None:
                         "occurredAt": (NOW - timedelta(minutes=2)).isoformat(),
                         "previousStatus": "Unavailable",
                         "currentStatus": "Available",
-                        "reasonType": "PlatformInitiated",
+                        "reasonType": "UserInitiated",
                     }
                 ],
                 "resultTruncated": False,
@@ -801,6 +823,7 @@ def test_resource_health_graph_retains_resolved_transition() -> None:
     assert result.rows[0].event_status == "Resolved"
     assert result.rows[0].previous_status == "Unavailable"
     assert result.rows[0].current_status == "Available"
+    assert result.rows[0].reason_type == "Unknown"
 
 
 def test_ip_flow_client_is_unsupported_before_transport() -> None:

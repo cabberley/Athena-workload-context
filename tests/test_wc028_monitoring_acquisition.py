@@ -938,7 +938,7 @@ class _AcquisitionPort:
                 eventStatus="Active" if self.recovered else "Resolved",
                 currentStatus="Unavailable" if self.recovered else "Available",
                 previousStatus="Available" if self.recovered else "Unavailable",
-                reasonType="PlatformInitiated",
+                reasonType="Unknown",
                 observedStart=NOW - timedelta(minutes=10),
                 observedEnd=NOW - timedelta(minutes=5),
             ),
@@ -947,7 +947,7 @@ class _AcquisitionPort:
                 eventStatus="Resolved" if self.recovered else "Active",
                 currentStatus="Available" if self.recovered else "Unavailable",
                 previousStatus="Unavailable" if self.recovered else "Available",
-                reasonType="PlatformInitiated",
+                reasonType="Unknown",
                 observedStart=NOW - timedelta(minutes=5),
                 observedEnd=NOW,
             ),
@@ -2307,7 +2307,7 @@ def test_resource_health_previous_status_filter_cannot_replace_prior_evidence() 
             eventStatuses=("Active",),
             currentStatuses=("Unavailable",),
             previousStatuses=("Available",),
-            reasonTypes=("PlatformInitiated",),
+            reasonTypes=("Unknown",),
         ),
     )
     authority = _authority(controls)
@@ -3598,10 +3598,26 @@ def test_empty_traffic_analytics_emits_no_ip_flow_exchange_or_orphan_proof() -> 
     assert receipt.canonical_json() == second_receipt.canonical_json()
 
 
-def test_flow_table_unavailable_has_no_exchange_or_retained_network_record() -> None:
-    outcome, commit, _ = _execute(_AcquisitionPort())
+@pytest.mark.parametrize("flow_table", ("NTANetAnalytics", "AzureNetworkAnalytics_CL"))
+def test_flow_table_unavailable_has_no_exchange_or_retained_network_record(
+    flow_table: str,
+) -> None:
+    controls = _controls(flow_table=flow_table)
+    authority = _authority(controls)
+    port = _AcquisitionPort()
+    outcome, commit, _ = _execute(port, authority=authority)
 
     assert commit.calls == 1
+    assert port.ip_flow_calls == 0
+    assert not any(
+        isinstance(item, LogAnalyticsQueryRequest) and item.table == flow_table
+        for item in port.requests
+    )
+    flow_coverage = next(
+        item for item in outcome.batch.coverage if item.family == "networkFlow"
+    )
+    assert flow_coverage.status == "unavailable"
+    assert flow_coverage.query_execution_digests == ()
     retained = tuple(
         item for item in outcome.batch.records if isinstance(item, NetworkWatcherFlowRecord)
     )

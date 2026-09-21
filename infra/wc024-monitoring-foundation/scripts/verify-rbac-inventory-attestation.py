@@ -15,11 +15,13 @@ import unicodedata
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import NoReturn
+from uuid import UUID, uuid5
 
-_ATTESTATION_DOMAIN = "athena.wc028-effective-rbac-inventory-attestation-v1"
+_ATTESTATION_DOMAIN = "athena.wc028-effective-rbac-inventory-attestation-v2"
 _VALIDATION_DOMAIN = "athena.wc028-effective-rbac-inventory-validation-v1"
 _SHA256_DIGEST_INFO_PREFIX = bytes.fromhex("3031300d060960864801650304020105000420")
 _BASE64URL_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+_STANDARD_BASE64_PATTERN = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
 _SHA256_PATTERN = re.compile(r"^sha256:[a-f0-9]{64}$")
 _REVIEWER_PRINCIPAL_PATTERN = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
@@ -40,6 +42,8 @@ _ISO_DATETIME_PATTERN = re.compile(
 _ISO_DATETIME_PREFIX_PATTERN = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}")
 _MAX_SAFE_INTEGER = 9_007_199_254_740_991
 _MAX_INVENTORY_JSON_BYTES = 62_000
+_ARM_TEMPLATE_GUID_NAMESPACE = UUID("11fb06fb-712d-4ddd-98c7-e71bbd588830")
+_TARGET_QUERY_MODE = "assignedToPrincipalIncludingInheritedGroupsAndDescendants"
 
 
 def _fail(message: str) -> NoReturn:
@@ -148,6 +152,12 @@ def _artifact_digest(value: object) -> str:
     return "sha256:" + hashlib.sha256(_canonical_json(value)).hexdigest()
 
 
+def _arm_template_guid(*values: str) -> str:
+    if not values or any(not value for value in values):
+        _fail("ARM guid inputs must be non-empty strings")
+    return str(uuid5(_ARM_TEMPLATE_GUID_NAMESPACE, "-".join(values)))
+
+
 def _base64url_decode_integer(value: str, *, field_name: str) -> int:
     if _BASE64URL_PATTERN.fullmatch(value) is None:
         _fail(f"{field_name} is not canonical base64url")
@@ -155,6 +165,28 @@ def _base64url_decode_integer(value: str, *, field_name: str) -> int:
         decoded = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
     except (binascii.Error, ValueError) as exc:
         raise ValueError(f"{field_name} is not valid base64url") from exc
+    if not decoded:
+        _fail(f"{field_name} is empty")
+    if base64.urlsafe_b64encode(decoded).decode("ascii").rstrip("=") != value:
+        _fail(f"{field_name} is not canonical base64url")
+    return int.from_bytes(decoded, "big")
+
+
+def _jwk_decode_integer(value: object, *, field_name: str) -> int:
+    if not isinstance(value, str) or not value:
+        _fail(f"{field_name} is missing or malformed")
+    try:
+        if _BASE64URL_PATTERN.fullmatch(value) is not None:
+            decoded = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+        elif _STANDARD_BASE64_PATTERN.fullmatch(value) is not None:
+            unpadded = value.rstrip("=")
+            decoded = base64.b64decode(value + "=" * (-len(value) % 4), validate=True)
+            if base64.b64encode(decoded).decode("ascii").rstrip("=") != unpadded:
+                _fail(f"{field_name} is not canonical base64")
+        else:
+            _fail(f"{field_name} is not valid base64 or base64url")
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError(f"{field_name} is not valid base64 or base64url") from exc
     if not decoded:
         _fail(f"{field_name} is empty")
     return int.from_bytes(decoded, "big")
@@ -233,8 +265,8 @@ def _load_and_validate_inventory(
     digest_payload.pop("inventoryDigest", None)
     if _artifact_digest(digest_payload) != claimed_inventory_digest:
         _fail("effective-RBAC inventory digest is invalid")
-    if inventory.get("schemaVersion") != "athena.wc028MonitoringEffectiveRbacInventory.v5":
-        _fail("effective-RBAC inventory must use schema v5")
+    if inventory.get("schemaVersion") != "athena.wc028MonitoringEffectiveRbacInventory.v6":
+        _fail("effective-RBAC inventory must use schema v6")
     if inventory.get("resourceGraphQueryRoleActions") != [
         "microsoft.resourcegraph/resources/read"
     ]:
@@ -243,10 +275,157 @@ def _load_and_validate_inventory(
         "microsoft.resourcehealth/availabilitystatuses/read"
     ]:
         _fail("effective-RBAC inventory omits the exact Resource Health availability permission")
+    subscription_id = inventory.get("subscriptionId")
+    ancestry = inventory.get("managementGroupAncestry")
+    if (
+        not isinstance(subscription_id, str)
+        or _REVIEWER_PRINCIPAL_PATTERN.fullmatch(subscription_id) is None
+        or not isinstance(ancestry, list)
+        or not ancestry
+        or any(not isinstance(item, str) for item in ancestry)
+    ):
+        _fail("effective-RBAC inventory target hierarchy is malformed")
+    expected_principal_targets = sorted(
+        [f"/subscriptions/{subscription_id.casefold()}", *(item.casefold() for item in ancestry)]
+    )
+    for field_name in (
+        "collectorPrincipalEvidence",
+        "athenaContextPrincipalEvidence",
+        "runtimeSupportPrincipalEvidence",
+    ):
+        _validate_target_read_evidence(
+            inventory.get(field_name),
+            expected_target_scope_ids=expected_principal_targets,
+            field_name=field_name,
+        )
+    verifier_evidence = inventory.get("reviewerKeyVerifierEvidence")
+    if not isinstance(verifier_evidence, dict):
+        _fail("reviewer-key verifier evidence is missing")
+    _validate_target_read_evidence(
+        verifier_evidence.get("principalEvidence"),
+        expected_target_scope_ids=[f"/subscriptions/{subscription_id.casefold()}"],
+        field_name="reviewerKeyVerifierEvidence.principalEvidence",
+    )
     return inventory
 
 
+def _validate_target_read_evidence(
+    value: object,
+    *,
+    expected_target_scope_ids: list[str],
+    field_name: str,
+) -> None:
+    if not isinstance(value, dict):
+        _fail(f"{field_name} is missing")
+    forbidden_legacy_fields = {
+        "queryFilter",
+        "includeInherited",
+        "includeGroups",
+        "includeAllDescendantScopes",
+        "targetScopeIds",
+        "firstReadTargetDigests",
+        "secondReadTargetDigests",
+        "roleAssignmentRawPageDigests",
+        "transitiveGroupRawPageDigests",
+        "firstRoleAssignmentRawPageDigests",
+        "secondRoleAssignmentRawPageDigests",
+    }
+    if forbidden_legacy_fields.intersection(value):
+        _fail(f"{field_name} contains legacy unbound target evidence")
+    principal_id = value.get("principalId")
+    target_reads = value.get("targetReadEvidence")
+    first_group_pages = value.get("firstTransitiveGroupRawPageDigests")
+    second_group_pages = value.get("secondTransitiveGroupRawPageDigests")
+    if (
+        not isinstance(principal_id, str)
+        or _REVIEWER_PRINCIPAL_PATTERN.fullmatch(principal_id) is None
+        or not isinstance(target_reads, list)
+        or not target_reads
+        or value.get("allPagesRetrieved") is not True
+        or not isinstance(first_group_pages, list)
+        or not first_group_pages
+        or first_group_pages != second_group_pages
+    ):
+        _fail(f"{field_name} target-read evidence is incomplete")
+    targets: list[str] = []
+    target_digests: list[str] = []
+    page_digests: list[str] = []
+    binding_ids: list[str] = []
+    required_keys = {
+        "targetScopeId",
+        "queryMode",
+        "targetDigest",
+        "rawPageDigests",
+        "readCount",
+        "allPagesRetrieved",
+        "bindingId",
+    }
+    for target_read in target_reads:
+        if not isinstance(target_read, dict) or set(target_read) != required_keys:
+            _fail(f"{field_name} target read has an invalid shape")
+        target_scope_id = target_read.get("targetScopeId")
+        query_mode = target_read.get("queryMode")
+        target_digest = target_read.get("targetDigest")
+        raw_page_digests = target_read.get("rawPageDigests")
+        binding_id = target_read.get("bindingId")
+        if (
+            not isinstance(target_scope_id, str)
+            or target_scope_id != target_scope_id.casefold().rstrip("/")
+            or query_mode != _TARGET_QUERY_MODE
+            or not isinstance(target_digest, str)
+            or _SHA256_PATTERN.fullmatch(target_digest) is None
+            or not isinstance(raw_page_digests, list)
+            or not raw_page_digests
+            or raw_page_digests != sorted(raw_page_digests)
+            or len(raw_page_digests) != len(set(raw_page_digests))
+            or any(
+                not isinstance(item, str) or _SHA256_PATTERN.fullmatch(item) is None
+                for item in raw_page_digests
+            )
+            or target_read.get("readCount") != 2
+            or target_read.get("allPagesRetrieved") is not True
+            or not isinstance(binding_id, str)
+            or _REVIEWER_PRINCIPAL_PATTERN.fullmatch(binding_id) is None
+        ):
+            _fail(f"{field_name} target read is malformed")
+        expected_binding_id = _arm_template_guid(
+            principal_id.casefold(),
+            target_scope_id,
+            _TARGET_QUERY_MODE,
+            target_digest,
+            ",".join(raw_page_digests),
+            "2",
+            "true",
+        )
+        if binding_id != expected_binding_id:
+            _fail(f"{field_name} target read binding is invalid")
+        targets.append(target_scope_id)
+        target_digests.append(target_digest)
+        page_digests.extend(raw_page_digests)
+        binding_ids.append(binding_id)
+    if (
+        targets != sorted(expected_target_scope_ids)
+        or len(targets) != len(set(targets))
+        or len(target_digests) != len(set(target_digests))
+        or len(page_digests) != len(set(page_digests))
+        or len(binding_ids) != len(set(binding_ids))
+    ):
+        _fail(f"{field_name} target reads are duplicated or incomplete")
+    evidence_digest = value.get("evidenceDigest")
+    if not isinstance(evidence_digest, str) or _SHA256_PATTERN.fullmatch(evidence_digest) is None:
+        _fail(f"{field_name} evidence digest is malformed")
+    digest_payload = dict(value)
+    digest_payload.pop("evidenceDigest", None)
+    if _artifact_digest(digest_payload) != evidence_digest:
+        _fail(f"{field_name} evidence digest is invalid")
+
+
 def _validate() -> dict[str, object]:
+    if (
+        _required_environment("ATHENA_ATTESTATION_SCHEMA_VERSION")
+        != "athena.wc028MonitoringEffectiveRbacInventoryAttestation.v2"
+    ):
+        _fail("effective-RBAC inventory attestation must use schema v2")
     if _required_environment("ATHENA_SIGNATURE_ALGORITHM") != "RS256":
         _fail("effective-RBAC inventory attestation must use RS256")
     bootstrap_handoff_id = _required_environment("ATHENA_BOOTSTRAP_HANDOFF_ID")
@@ -258,6 +437,9 @@ def _validate() -> dict[str, object]:
         "ATHENA_BOOTSTRAP_CONTRACT_INPUTS_BINDING_ID"
     )
     reviewer_principal_id = _required_environment("ATHENA_REVIEWER_PRINCIPAL_ID")
+    runtime_support_principal_id = _required_environment(
+        "ATHENA_RUNTIME_SUPPORT_PRINCIPAL_ID"
+    )
     reviewer_key_id = _required_environment("ATHENA_REVIEWER_KEY_ID")
     public_key_modulus = _required_environment("ATHENA_PUBLIC_KEY_MODULUS")
     public_key_exponent = _required_environment("ATHENA_PUBLIC_KEY_EXPONENT")
@@ -288,6 +470,12 @@ def _validate() -> dict[str, object]:
         or reviewer_principal_id == "00000000-0000-0000-0000-000000000000"
     ):
         _fail("reviewer principal is not a nonzero canonical UUID")
+    if (
+        _REVIEWER_PRINCIPAL_PATTERN.fullmatch(runtime_support_principal_id) is None
+        or runtime_support_principal_id == "00000000-0000-0000-0000-000000000000"
+        or reviewer_principal_id == runtime_support_principal_id
+    ):
+        _fail("reviewer principal must be separate from the runtime-support principal")
     if _REVIEWER_KEY_ID_PATTERN.fullmatch(
         reviewer_key_id
     ) is None or not reviewer_key_id.startswith(
@@ -298,13 +486,14 @@ def _validate() -> dict[str, object]:
         reviewer_jwk = json.loads(reviewer_jwk_json)
     except json.JSONDecodeError as exc:
         raise ValueError("reviewer Key Vault JWK is not valid JSON") from exc
+    if not isinstance(reviewer_jwk, dict):
+        _fail("reviewer public key does not match the exact versioned Key Vault key")
+    key_operations = reviewer_jwk.get("key_ops")
     if (
-        not isinstance(reviewer_jwk, dict)
-        or reviewer_jwk.get("kid") != reviewer_key_id
+        reviewer_jwk.get("kid") != reviewer_key_id
         or reviewer_jwk.get("kty") not in {"RSA", "RSA-HSM"}
-        or reviewer_jwk.get("n") != public_key_modulus
-        or reviewer_jwk.get("e") != public_key_exponent
-        or not {"sign", "verify"}.issubset(set(reviewer_jwk.get("key_ops", ())))
+        or not isinstance(key_operations, list)
+        or not {"sign", "verify"}.issubset(set(key_operations))
     ):
         _fail("reviewer public key does not match the exact versioned Key Vault key")
     for name, value in (
@@ -330,6 +519,16 @@ def _validate() -> dict[str, object]:
         public_key_exponent,
         field_name="ATHENA_PUBLIC_KEY_EXPONENT",
     )
+    jwk_modulus = _jwk_decode_integer(
+        reviewer_jwk.get("n"),
+        field_name="reviewer JWK modulus",
+    )
+    jwk_exponent = _jwk_decode_integer(
+        reviewer_jwk.get("e"),
+        field_name="reviewer JWK exponent",
+    )
+    if jwk_modulus != modulus or jwk_exponent != exponent:
+        _fail("reviewer public key does not match the exact versioned Key Vault key")
     if modulus.bit_length() < 2048 or exponent != 65537:
         _fail("reviewer key must be RSA-2048 or stronger with exponent 65537")
 

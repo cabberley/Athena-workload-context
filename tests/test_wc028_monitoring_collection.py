@@ -203,6 +203,7 @@ def _controls(
     *,
     dry_run_only: bool = False,
     health_evidence_resources: tuple[str, ...] = (),
+    flow_table: str = "NTANetAnalytics",
 ) -> dict[str, PublishedMonitoringIntentControl]:
     path_resources = (
         WEB_ID,
@@ -255,7 +256,7 @@ def _controls(
             resources=path_resources,
             dry_run_only=dry_run_only,
             signal=_query_signal(
-                "NTANetAnalytics | summarize count()",
+                f"{flow_table} | summarize count()",
                 operator="greaterThan",
                 threshold=0,
             ),
@@ -283,7 +284,7 @@ def _controls(
                 eventStatuses=("Active", "Resolved"),
                 currentStatuses=("Available", "Unavailable"),
                 previousStatuses=("Available", "Unavailable"),
-                reasonTypes=("PlatformInitiated",),
+                reasonTypes=("Unknown",),
             ),
         ),
     }
@@ -302,6 +303,24 @@ def _five_tuple_digest() -> str:
             "destinationPort": 1433,
         }
     )
+
+
+def test_resource_health_record_rejects_unsupported_reason_value() -> None:
+    controls = _controls()
+
+    with pytest.raises(ValidationError):
+        ResourceHealthRecord(
+            recordKind="resourceHealth",
+            controlId=controls["health"].control_id,
+            sourceRecordId="unsupported-resource-health-reason",
+            resourceId=WEB_ID,
+            observedStart=NOW - timedelta(minutes=5),
+            observedEnd=NOW,
+            eventStatus="Active",
+            currentStatus="Unavailable",
+            previousStatus="Available",
+            reasonType="UserInitiated",
+        )
 
 
 def _coverage_scope_digest(
@@ -680,7 +699,7 @@ def _batch(
             eventStatus="Resolved",
             currentStatus="Available",
             previousStatus="Unavailable",
-            reasonType="PlatformInitiated",
+            reasonType="Unknown",
         ),
         ResourceHealthRecord(
             recordKind="resourceHealth",
@@ -692,7 +711,7 @@ def _batch(
             eventStatus="Active",
             currentStatus="Unavailable",
             previousStatus="Available",
-            reasonType="PlatformInitiated",
+            reasonType="Unknown",
         ),
     )
     records_by_id = {item.source_record_id: item for item in records}

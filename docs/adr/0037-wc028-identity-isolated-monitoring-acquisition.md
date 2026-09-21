@@ -183,10 +183,12 @@ The coordinator:
   for resources on which that second permission is effective; an unapproved peer VM remains
   invisible. The production client additionally queries only those approved VM IDs and rejects
   any returned row outside them. It binds documented `previousAvailabilityState`,
-  `availabilityState`, `occurredTime`, and `reasonType`. A missing or empty `reasonType` is
-  normalized to `Unknown` rather than aborting the source, and remains usable only when the signed
-  monitoring control explicitly allows `Unknown`; built-in Reader remains limited to the already
-  reviewed DCR/DCE-association and flow-log child resources.
+  `availabilityState`, and `occurredTime`. `HealthResources` does not expose a documented
+  `properties.reasonType` field for this projection, so the query never reads or filters that
+  property. The compatibility `reasonType` evidence field is always normalized to `Unknown`, and
+  the signed monitoring control accepts only `Unknown`; platform- or user-initiated reason filters
+  fail closed. Built-in Reader remains limited to the already reviewed DCR/DCE-association and
+  flow-log child resources.
 - provisions a separate WC-028 resource-log role with only
   `Microsoft.Insights/Logs/Heartbeat/Read`, `Perf/Read`, `InsightsMetrics/Read`, `Syslog/Read`, and
   `VMConnection/Read`, assigns it only at the 11 exact approved VMs, and includes no invented NTA
@@ -204,14 +206,17 @@ The coordinator:
   inherited and all-descendant principal-query modes, exact collector-contract inputs, all
   protected target
   scopes, non-zero legacy-RBAC cleanup evidence, and a separately governed reviewer public-key
-  anchor. Effective RBAC inventory v5 then
-  binds subscription-wide inherited/group-expanded results for collector and context principals,
-  an unfiltered all-principal subscription scan, approved runtime attachments, absence of
-  federated credentials, exclusive writer/signer derivation, secure data-plane authentication
-  modes, Blob versioning, container immutability state/retention, complete role definitions,
-  applicable denies, active PIM instances, Graph transitive groups, separate raw page hashes for
-  two independently timed reads, freshness, and repeated-read stability. V2 and v3 inventories
-  are historical and parse-only.
+  anchor. Effective RBAC inventory v6 then binds each collector, context, runtime-support, and
+  verifier role-assignment result to one exact target scope, the canonical inherited/group/
+  descendant query mode, the target digest, the complete page-digest set, a two-read count, and a
+  deterministic binding ID. Target scopes, target digests, page digests, and binding IDs must be
+  unique, and the target set must equal the subscription plus every proven management-group
+  ancestor (subscription only for the verifier). The inventory also binds the unfiltered
+  all-principal subscription scan, approved runtime attachments, absence of federated credentials,
+  exclusive writer/signer derivation, secure data-plane authentication modes, Blob versioning,
+  container immutability state/retention, complete role definitions, applicable denies, active PIM
+  instances, Graph transitive groups, freshness, and repeated-read stability. V1 through v5
+  inventories are historical and parse-only.
 
   The collector persistence role is the deterministic
   `Athena WC028 Monitoring Evidence Create-Only Writer`: only known-name Blob read and
@@ -225,15 +230,18 @@ The coordinator:
   rejects caller-supplied key substitutions, verifies the phase-one deployment ID, template hash,
   and complete contract-input binding ID, recomputes the canonical inventory digest, and
   cryptographically verifies the detached RS256 reviewer signature with the resolved
-  RSA-2048-or-stronger public key. It rejects a changed deployment, duplicate or
-  out-of-scope targets, a reviewer that overlaps a runtime identity, same-vault reviewer and
-  receipt-signing keys, incomplete principal or attachment evidence, additional writers/signers,
-  insecure authorization modes, unexpected grants or roles, wrong Blob condition, missing
-  versioning/immutability, zero cleanup evidence, expired evidence, digest/signature mismatch,
-  and unproved inherited parent-scope completeness before publishing a sealed v10 attestation
-  object containing only the validated fields.
+  RSA-2048-or-stronger public key. Azure CLI standard Base64 JWK integers and the contract's
+  unpadded Base64URL integers are decoded before comparison. The v2 attestation domain is required
+  for inventory v6; the historical v1 domain remains valid only for historical inventory v4. The
+  verifier rejects a changed deployment, duplicate or out-of-scope targets, reused target/page
+  digests or binding IDs, a reviewer that overlaps the runtime-support or any other runtime
+  principal, same-vault reviewer and receipt-signing keys, incomplete principal or attachment
+  evidence, additional writers/signers, insecure authorization modes, unexpected grants or roles,
+  wrong Blob condition, missing versioning/immutability, zero cleanup evidence, expired evidence,
+  digest/signature mismatch, and unproved inherited parent-scope completeness before publishing a
+  sealed v10 attestation object containing only the validated fields.
 
-  The verifier identity is itself included in inventory v5: exact
+  The verifier identity is itself included in inventory v6: exact
   resource/client/principal/tenant IDs, one deterministic direct keys/get-only grant at the
   reviewer key, inherited/group-expanded principal evidence, no transitive groups, no PIM, no
   federated credential, and no persistent associated resource. Its principal must differ from the

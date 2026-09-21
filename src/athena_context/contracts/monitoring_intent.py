@@ -354,10 +354,11 @@ class ResourceHealthMonitoringSignal(_StrictMonitoringIntentModel):
         Literal["Available", "Degraded", "Unavailable", "Unknown"],
         ...,
     ] = Field(alias="previousStatuses", min_length=1, max_length=4)
-    reason_types: tuple[
-        Literal["PlatformInitiated", "UserInitiated", "Unknown"],
-        ...,
-    ] = Field(alias="reasonTypes", min_length=1, max_length=3)
+    reason_types: tuple[Literal["Unknown"], ...] = Field(
+        alias="reasonTypes",
+        min_length=1,
+        max_length=1,
+    )
 
     @field_validator(
         "event_statuses",

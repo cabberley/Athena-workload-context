@@ -217,6 +217,14 @@ synthetic unapproved peer VM in the KQL filter. The approved VM may be returned;
 be returned. The production adapter must also reject the response if Azure returns any row whose
 `properties.targetResourceId` is outside the contract's exact approved VM list. KQL filtering is
 defense in depth and is not accepted as a substitute for the per-VM Resource Health assignments.
+Do not read or filter `properties.reasonType`: that field is not documented for this
+`HealthResources` projection. The normalized compatibility value is always `Unknown`, and the
+signed Resource Health control must reject any other reason filter.
+
+For flow coverage, both declared legacy table names, `NTANetAnalytics` and
+`AzureNetworkAnalytics_CL`, are unsupported under the same exact path, direction, and five-tuple
+scope. Either name must produce deterministic `unavailable` coverage without issuing a Log
+Analytics or IP Flow Verify request and without retaining a network-flow record.
 
 For the WC-028 monitoring collector, do not substitute the generic CLI listing above for the
 phase-two contract-publication evidence. Use the phase-one handoff's exact requests and perform
@@ -226,8 +234,11 @@ two complete reads:
   with exact `--all --include-inherited --include-groups --assignee-object-id` semantics,
   plus two complete `Microsoft.Management/getEntities` reads proving the subscription entity's
   exact ordered parent edges through the tenant-root management group, and stable principal reads
-  at every proven ancestor, including every ancestor, subscription, descendant, and transitive-
-  group page;
+  at every proven ancestor. Inventory v6 represents each read as a `targetReadEvidence` item bound
+  to the exact target scope, canonical query mode, target digest, complete page-digest set,
+  `readCount=2`, `allPagesRetrieved=true`, and deterministic ARM `guid()` binding. Require the
+  exact subscription-plus-ancestor target set and reject duplicate target scopes, target digests,
+  page digests, or binding IDs;
 - an unfiltered `--all --include-inherited` role-assignment read from which every principal
   capable of Blob evidence writes or Key Vault signing is derived;
 - exact unfiltered `listAssociatedResources` and federated-credential reads for the collector and
@@ -258,11 +269,15 @@ hash, and complete contract-input binding ID. A separate verifier UAMI must have
 direct keys/get-only assignment at that key, no groups, PIM, federated credential, or persistent
 attachment, and a principal distinct from the reviewer and every runtime identity. It lets the
 phase-two AzureCLI script resolve that Key Vault JWK; caller-supplied modulus/fingerprint values
-are not a trust root.
+are not a trust root. The reviewer principal must be explicitly distinct from the
+runtime-support principal as well as the collector, context, attestor, and verifier principals.
+Compare Azure CLI standard Base64 JWK modulus/exponent values to the configured unpadded Base64URL
+values only after decoding both to the same integer representation.
 `publish-monitoring-contract.bicep` must report
 `effectiveRbacCryptographicReviewVerified=true`; a caller-supplied digest without a valid detached
-signature is not acceptance evidence. Publication requires collector contract v10 and effective
-RBAC inventory v5; v9/v4 artifacts are historical parse-only evidence. The canonical inventory
+signature is not acceptance evidence. Publication requires collector contract v10, effective
+RBAC inventory v6, and effective-RBAC inventory attestation v2. Inventory v5 is the historical
+unbound-target shape; v9/v4 artifacts are also historical parse-only evidence. The canonical inventory
 must remain at or below 62,000 bytes, and the complete deployment-script environment payload must
 remain at or below 64,000 characters.
 

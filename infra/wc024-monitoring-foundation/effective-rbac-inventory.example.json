@@ -5,35 +5,37 @@
   "athenaContextGrants": [],
   "athenaContextPrincipalEvidence": {
     "allPagesRetrieved": true,
-    "evidenceDigest": "sha256:0803fba85b913b368de256723dbe967c2b7f5d0e538bf04a19a354b4761290b1",
-    "firstReadTargetDigests": [
-      "sha256:a97acec9ab1b169fcff9215b125bf6eddb50fdbf1341ddb80a82a2be495f6e87",
-      "sha256:d8daafd65eb2020463bd59910905bc34bf903228d095538ec85e1717551dd3f5"
-    ],
-    "firstRoleAssignmentRawPageDigests": [
-      "sha256:69b6e27a8929fe94e802ab8f77ecf3552396365262b9b806ee6d7d458a112064"
-    ],
+    "evidenceDigest": "sha256:1d88fa4c9c70d45ba42eb08dbfa679e6764903fa75b22af2782a98dda2e57797",
     "firstTransitiveGroupRawPageDigests": [
       "sha256:43c5c2b431ea59aef001805586dfedbddae1e20178b748d94897ba1cf9dca9ff"
     ],
-    "includeAllDescendantScopes": true,
-    "includeGroups": true,
-    "includeInherited": true,
     "principalId": "22222222-2222-2222-2222-222222222222",
-    "queryFilter": "assignedTo(principalId)",
-    "secondReadTargetDigests": [
-      "sha256:a97acec9ab1b169fcff9215b125bf6eddb50fdbf1341ddb80a82a2be495f6e87",
-      "sha256:d8daafd65eb2020463bd59910905bc34bf903228d095538ec85e1717551dd3f5"
-    ],
-    "secondRoleAssignmentRawPageDigests": [
-      "sha256:69b6e27a8929fe94e802ab8f77ecf3552396365262b9b806ee6d7d458a112064"
-    ],
     "secondTransitiveGroupRawPageDigests": [
       "sha256:43c5c2b431ea59aef001805586dfedbddae1e20178b748d94897ba1cf9dca9ff"
     ],
-    "targetScopeIds": [
-      "/providers/microsoft.management/managementgroups/00000000-0000-0000-0000-000000000003",
-      "/subscriptions/00000000-0000-0000-0000-000000000000"
+    "targetReadEvidence": [
+      {
+        "allPagesRetrieved": true,
+        "bindingId": "fca076ea-c33a-5d0a-a911-33ab0aadbb98",
+        "queryMode": "assignedToPrincipalIncludingInheritedGroupsAndDescendants",
+        "rawPageDigests": [
+          "sha256:6bc6481a344233c828f04d8598a975a192594dfa973940998e40e73bdd222d59"
+        ],
+        "readCount": 2,
+        "targetDigest": "sha256:c5d173f0f8b431c8999774744af9c2235c63f67cf8b1b58dbe97e3ca6010895b",
+        "targetScopeId": "/providers/microsoft.management/managementgroups/00000000-0000-0000-0000-000000000003"
+      },
+      {
+        "allPagesRetrieved": true,
+        "bindingId": "ae3261e1-d0fd-5077-8c23-27168c86dd8d",
+        "queryMode": "assignedToPrincipalIncludingInheritedGroupsAndDescendants",
+        "rawPageDigests": [
+          "sha256:b43e90262a46138fd82909d185baa78a262e1c4f1d5ebfe33e73a5a30fb46747"
+        ],
+        "readCount": 2,
+        "targetDigest": "sha256:368499da58d2a0a906a73f1042da2a14d75ecbd2fc3b2126fe3c9dfe8eea7c3b",
+        "targetScopeId": "/subscriptions/00000000-0000-0000-0000-000000000000"
+      }
     ],
     "transitiveGroupIds": []
   },
@@ -246,35 +248,37 @@
   },
   "collectorPrincipalEvidence": {
     "allPagesRetrieved": true,
-    "evidenceDigest": "sha256:a9eaf0cc5fd8c36b9cf92945d847414b72e729d7bf44cefdea7a7144bf463de7",
-    "firstReadTargetDigests": [
-      "sha256:3cc81b8e0e88ccd8a6271b3b018739c93afb231cc87776787e6657b6f48f61d8",
-      "sha256:1a6a00391a238ef9d5d9848aa85f6395a2d678f8bc1ddf1ce5722118c604eeb9"
-    ],
-    "firstRoleAssignmentRawPageDigests": [
-      "sha256:4f383eacac3efd7630af7681f04f6e3137d1c733a7b4d3b321eff10e27c264c8"
-    ],
+    "evidenceDigest": "sha256:86506e01c18679a7271ed939e89ebcc153ef4bc391d0347e4b4508e7ea35e8cc",
     "firstTransitiveGroupRawPageDigests": [
       "sha256:8c41d5a42ef7a9e00541080bee87b59536d562bdbbd77935deaa1036adf35a01"
     ],
-    "includeAllDescendantScopes": true,
-    "includeGroups": true,
-    "includeInherited": true,
     "principalId": "11111111-1111-1111-1111-111111111111",
-    "queryFilter": "assignedTo(principalId)",
-    "secondReadTargetDigests": [
-      "sha256:3cc81b8e0e88ccd8a6271b3b018739c93afb231cc87776787e6657b6f48f61d8",
-      "sha256:1a6a00391a238ef9d5d9848aa85f6395a2d678f8bc1ddf1ce5722118c604eeb9"
-    ],
-    "secondRoleAssignmentRawPageDigests": [
-      "sha256:4f383eacac3efd7630af7681f04f6e3137d1c733a7b4d3b321eff10e27c264c8"
-    ],
     "secondTransitiveGroupRawPageDigests": [
       "sha256:8c41d5a42ef7a9e00541080bee87b59536d562bdbbd77935deaa1036adf35a01"
     ],
-    "targetScopeIds": [
-      "/providers/microsoft.management/managementgroups/00000000-0000-0000-0000-000000000003",
-      "/subscriptions/00000000-0000-0000-0000-000000000000"
+    "targetReadEvidence": [
+      {
+        "allPagesRetrieved": true,
+        "bindingId": "dd3533ec-c65a-50b9-8c7a-aef22a495002",
+        "queryMode": "assignedToPrincipalIncludingInheritedGroupsAndDescendants",
+        "rawPageDigests": [
+          "sha256:d22be9ed9f51a6bb5ca7ddf18ed1ea937459cf9020e881934c009b61c1fe968b"
+        ],
+        "readCount": 2,
+        "targetDigest": "sha256:5689c42142259c396cfa032572807962d8daf0a8e8a42a8da26d41c3c115d04f",
+        "targetScopeId": "/providers/microsoft.management/managementgroups/00000000-0000-0000-0000-000000000003"
+      },
+      {
+        "allPagesRetrieved": true,
+        "bindingId": "ce7eeab8-fade-5255-a494-086acaed4106",
+        "queryMode": "assignedToPrincipalIncludingInheritedGroupsAndDescendants",
+        "rawPageDigests": [
+          "sha256:76f0c6a79ecce85a3d5a0ba5120fe120d481d8313ab77b738d9ef0408af26f9a"
+        ],
+        "readCount": 2,
+        "targetDigest": "sha256:06ea27d426677fb41f1f4b1ef5a35ce42a70ae331f63e6735f46ee5369a81bb5",
+        "targetScopeId": "/subscriptions/00000000-0000-0000-0000-000000000000"
+      }
     ],
     "transitiveGroupIds": []
   },
@@ -351,13 +355,13 @@
   "firstPimScheduleInstanceRawPageDigests": [
     "sha256:8959f9366f36fe82895ee188994b77fe18ec6cf00b06532747ed2462fb817320"
   ],
-  "firstRawSnapshotDigest": "sha256:2e59ca094f3834693fb935b45d74d8847e9cd2d1da6f892bac258f621a10918a",
+  "firstRawSnapshotDigest": "sha256:e5aa0b372aca306e7ff04fecdaa08c4b12a2a65a246352bef0c9590bd95301fa",
   "firstReadCompletedAt": "2026-09-10T01:54:00Z",
   "firstRoleDefinitionRawPageDigests": [
     "sha256:9b08b1ce948dc2c7a96f9c74cc24bc616f0c30a5bd23a2781829267af47a55b4"
   ],
   "groupMembershipCollectionComplete": true,
-  "inventoryDigest": "sha256:f299d601bb3601c963d5ab52c642fd1c4285ba020a4ff164c6ec7c5ccd2ecac2",
+  "inventoryDigest": "sha256:4c1f71dc16e6cf62e1df8b33596858588943f551b9fe84c15005725a8f8b9293",
   "managementGroupAncestry": [
     "/providers/microsoft.management/managementgroups/00000000-0000-0000-0000-000000000003"
   ],
@@ -549,7 +553,7 @@
       ],
       "secondReadCompletedAt": "2026-09-10T01:53:00Z"
     },
-    "evidenceDigest": "sha256:4947083123a9ac76f1de8bca00cecdec2e45e1cf78864eb0d748f685466c5bf4",
+    "evidenceDigest": "sha256:03c22e66f685c97192aec8477d4aa10ae998494b036972eb8b99d84a4494fbbe",
     "grant": {
       "assignedPrincipalId": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
       "assignedPrincipalType": "ServicePrincipal",
@@ -569,32 +573,26 @@
     "identityTenantId": "00000000-0000-0000-0000-000000000003",
     "principalEvidence": {
       "allPagesRetrieved": true,
-      "evidenceDigest": "sha256:7256617d41f78b50777766b8bb86bbc08334f9da078f701f1a527bc3ba8ca1e1",
-      "firstReadTargetDigests": [
-        "sha256:17bd779bff631a9695d9f73bf7352e968cabbf806e99b28e7197240134e755a7"
-      ],
-      "firstRoleAssignmentRawPageDigests": [
-        "sha256:d0babc165267ffe84c4d66bd7b7378f2a672fd5aefb12fbfa606e6a5fb7679fe"
-      ],
+      "evidenceDigest": "sha256:5688f85e7b2cf3771bcdb3a68fa30eaafa9ef2217f6a1b680bb1dd7fc614c235",
       "firstTransitiveGroupRawPageDigests": [
         "sha256:0e2a99aade0e182321f9fef500c687266388cc96f9db80a90d6a5331cd9ac36f"
       ],
-      "includeAllDescendantScopes": true,
-      "includeGroups": true,
-      "includeInherited": true,
       "principalId": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
-      "queryFilter": "assignedTo(principalId)",
-      "secondReadTargetDigests": [
-        "sha256:17bd779bff631a9695d9f73bf7352e968cabbf806e99b28e7197240134e755a7"
-      ],
-      "secondRoleAssignmentRawPageDigests": [
-        "sha256:d0babc165267ffe84c4d66bd7b7378f2a672fd5aefb12fbfa606e6a5fb7679fe"
-      ],
       "secondTransitiveGroupRawPageDigests": [
         "sha256:0e2a99aade0e182321f9fef500c687266388cc96f9db80a90d6a5331cd9ac36f"
       ],
-      "targetScopeIds": [
-        "/subscriptions/00000000-0000-0000-0000-000000000000"
+      "targetReadEvidence": [
+        {
+          "allPagesRetrieved": true,
+          "bindingId": "6d4e9cd0-a1f0-5a88-b0d5-c770a69d3480",
+          "queryMode": "assignedToPrincipalIncludingInheritedGroupsAndDescendants",
+          "rawPageDigests": [
+            "sha256:f4633fccecc6125d5ff4ef25aa5e9bedc52802b5097cd4f38503b8a8c04368aa"
+          ],
+          "readCount": 2,
+          "targetDigest": "sha256:bce5fe2a7cdcbb20defffa283919358ec38eefccdbe2563faa575b7e56201060",
+          "targetScopeId": "/subscriptions/00000000-0000-0000-0000-000000000000"
+        }
       ],
       "transitiveGroupIds": []
     },
@@ -766,40 +764,42 @@
   ],
   "runtimeSupportPrincipalEvidence": {
     "allPagesRetrieved": true,
-    "evidenceDigest": "sha256:54c6374692fa2714bb34deb964ee3da22aaccdc1f0e053e7b674e98e675f0183",
-    "firstReadTargetDigests": [
-      "sha256:4f430354f9f95c37785dcdae9f67fe0ad1f7c7ae8de79665730ce1968903ab6e",
-      "sha256:f558e2e77403689db3fc64bbec0654b235dd9f0eb94115eea04ba25ce828c9d5"
-    ],
-    "firstRoleAssignmentRawPageDigests": [
-      "sha256:cd4609877980cdaf0f54d498b989b97a6b2238a26b40228d7960259a8719d806"
-    ],
+    "evidenceDigest": "sha256:06290a8ed948164ddcef10eddb984cac99d4e89db805606b845d82171b46d036",
     "firstTransitiveGroupRawPageDigests": [
       "sha256:3c4bd36fbde1d9f682efe8a2e718dd6e5992099741718ac1f5e00884b816c2b2"
     ],
-    "includeAllDescendantScopes": true,
-    "includeGroups": true,
-    "includeInherited": true,
     "principalId": "66666666-6666-6666-6666-666666666670",
-    "queryFilter": "assignedTo(principalId)",
-    "secondReadTargetDigests": [
-      "sha256:4f430354f9f95c37785dcdae9f67fe0ad1f7c7ae8de79665730ce1968903ab6e",
-      "sha256:f558e2e77403689db3fc64bbec0654b235dd9f0eb94115eea04ba25ce828c9d5"
-    ],
-    "secondRoleAssignmentRawPageDigests": [
-      "sha256:cd4609877980cdaf0f54d498b989b97a6b2238a26b40228d7960259a8719d806"
-    ],
     "secondTransitiveGroupRawPageDigests": [
       "sha256:3c4bd36fbde1d9f682efe8a2e718dd6e5992099741718ac1f5e00884b816c2b2"
     ],
-    "targetScopeIds": [
-      "/providers/microsoft.management/managementgroups/00000000-0000-0000-0000-000000000003",
-      "/subscriptions/00000000-0000-0000-0000-000000000000"
+    "targetReadEvidence": [
+      {
+        "allPagesRetrieved": true,
+        "bindingId": "7f828d8c-a69d-5548-9763-2e724f6014f6",
+        "queryMode": "assignedToPrincipalIncludingInheritedGroupsAndDescendants",
+        "rawPageDigests": [
+          "sha256:05a6da2d4211051d966d743383adbcca02424532c64a66222357d3e1fec8ab6b"
+        ],
+        "readCount": 2,
+        "targetDigest": "sha256:653c3d4a57ad22072e48f71c4bbe9c284e1ba0f4a9ccff04fc80462c042ee86a",
+        "targetScopeId": "/providers/microsoft.management/managementgroups/00000000-0000-0000-0000-000000000003"
+      },
+      {
+        "allPagesRetrieved": true,
+        "bindingId": "46f8d808-9775-5585-be78-6661826ad70a",
+        "queryMode": "assignedToPrincipalIncludingInheritedGroupsAndDescendants",
+        "rawPageDigests": [
+          "sha256:71faa1002da099fd5196186ce000f9830625fbdd3e26af722ede2ff92b233826"
+        ],
+        "readCount": 2,
+        "targetDigest": "sha256:11a1b6e204c46a927bdda921fc3a011fcdcfb6a861c20eaeefb4d93106d5cd75",
+        "targetScopeId": "/subscriptions/00000000-0000-0000-0000-000000000000"
+      }
     ],
     "transitiveGroupIds": []
   },
   "runtimeSupportPrincipalId": "66666666-6666-6666-6666-666666666670",
-  "schemaVersion": "athena.wc028MonitoringEffectiveRbacInventory.v5",
+  "schemaVersion": "athena.wc028MonitoringEffectiveRbacInventory.v6",
   "scopeCollectionMode": "subscriptionAssignedToAllInheritedAndUnfilteredWithProtectedScopes",
   "secondDenyAssignmentRawPageDigests": [
     "sha256:0594ae3648fdbbec62d39aba86a3ba20a849f088b70e92f13c367da9ee9bc95c"
@@ -807,7 +807,7 @@
   "secondPimScheduleInstanceRawPageDigests": [
     "sha256:8959f9366f36fe82895ee188994b77fe18ec6cf00b06532747ed2462fb817320"
   ],
-  "secondRawSnapshotDigest": "sha256:2e59ca094f3834693fb935b45d74d8847e9cd2d1da6f892bac258f621a10918a",
+  "secondRawSnapshotDigest": "sha256:e5aa0b372aca306e7ff04fecdaa08c4b12a2a65a246352bef0c9590bd95301fa",
   "secondReadCompletedAt": "2026-09-10T01:55:00Z",
   "secondRoleDefinitionRawPageDigests": [
     "sha256:9b08b1ce948dc2c7a96f9c74cc24bc616f0c30a5bd23a2781829267af47a55b4"

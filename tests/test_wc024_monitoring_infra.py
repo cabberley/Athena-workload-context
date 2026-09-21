@@ -896,6 +896,9 @@ def test_wc024_collector_contract_is_signed_handoff_ready_and_generic_only() -> 
     assert "signingKeyVaultConfigurationRequestPath" in MAIN
     assert "legacyCollectorRbacCleanupDigest" in MAIN
     assert "reviewAuthoritySeparationEnforced" in MAIN
+    assert "toLower(runtimeSupportIdentity.properties.principalId)" in MAIN
+    assert "collectorContractInputs.runtimeSupportIdentityPrincipalId" in RBAC_BOOTSTRAP_HANDOFF
+    assert "contractInputs.runtimeSupportIdentityPrincipalId" in PUBLISH_CONTRACT
     assert "validatedRbacInventoryReviewAuthority" in MAIN
     assert "reviewedRbacInventoryReviewerVaultHost" in MAIN
     assert "athenarbacevidencekv.${environment().suffixes.keyvaultDns}" in MAIN
@@ -925,7 +928,8 @@ def test_wc024_collector_contract_is_signed_handoff_ready_and_generic_only() -> 
     assert "Microsoft.Resources/deployments@2025-04-01" in PUBLISH_CONTRACT
     assert "monitoringRbacBootstrapDeployment.properties.outputs" in PUBLISH_CONTRACT
     assert "athena.wc024MonitoringContractPublicationHandoff.v1" in PUBLISH_CONTRACT
-    assert "athena.wc028MonitoringEffectiveRbacInventory.v5" in PUBLISH_CONTRACT
+    assert "athena.wc028MonitoringEffectiveRbacInventory.v6" in PUBLISH_CONTRACT
+    assert "athena.wc028MonitoringEffectiveRbacInventoryAttestation.v2" in PUBLISH_CONTRACT
     assert "resourceGraphQueryRoleActions" in PUBLISH_CONTRACT
     assert "resourceHealthRoleActions" in PUBLISH_CONTRACT
     assert "resourceGraphQueryScopeIsExact" in PUBLISH_CONTRACT
@@ -938,6 +942,14 @@ def test_wc024_collector_contract_is_signed_handoff_ready_and_generic_only() -> 
     assert "handoffTargetsAreUnique" in PUBLISH_CONTRACT
     assert "collectorTargetsAreUnique" in PUBLISH_CONTRACT
     assert "contextTargetsAreUnique" in PUBLISH_CONTRACT
+    assert "targetReadEvidence" in PUBLISH_CONTRACT
+    assert "assignedToPrincipalIncludingInheritedGroupsAndDescendants" in PUBLISH_CONTRACT
+    assert "collectorTargetBindingsAreValid" in PUBLISH_CONTRACT
+    assert "contextTargetBindingsAreValid" in PUBLISH_CONTRACT
+    assert "runtimeSupportTargetBindingsAreValid" in PUBLISH_CONTRACT
+    assert "targetRead.bindingId != guid(" in PUBLISH_CONTRACT
+    assert "contains(evidence, 'roleAssignmentRawPageDigests')" in PUBLISH_CONTRACT
+    assert "contains(evidence, 'transitiveGroupRawPageDigests')" in PUBLISH_CONTRACT
     assert "module publicationClock 'modules/deployment-timestamp.bicep'" in PUBLISH_CONTRACT
     assert "publicationClock.outputs.deploymentTimestamp" in PUBLISH_CONTRACT
     assert "inventoryIsFresh" in PUBLISH_CONTRACT
@@ -1176,6 +1188,12 @@ def test_wc024_phase_two_cryptographically_verifies_external_rbac_review() -> No
     assert "'${verifierIdentityResourceId}': {}" in (RBAC_INVENTORY_ATTESTATION_VALIDATION)
     assert "az keyvault key show --id" in RBAC_INVENTORY_ATTESTATION_VALIDATION
     assert "ATHENA_REVIEWER_JWK_JSON" in RBAC_INVENTORY_ATTESTATION_VALIDATION
+    assert "ATHENA_ATTESTATION_SCHEMA_VERSION" in (
+        RBAC_INVENTORY_ATTESTATION_VALIDATION
+    )
+    assert "ATHENA_RUNTIME_SUPPORT_PRINCIPAL_ID" in (
+        RBAC_INVENTORY_ATTESTATION_VALIDATION
+    )
     assert "ATHENA_INVENTORY_JSON" in RBAC_INVENTORY_ATTESTATION_VALIDATION
     assert "@maxLength(62000)" in RBAC_INVENTORY_ATTESTATION_VALIDATION
     assert "length(callerEnvironmentPayload) <= 64000" in (RBAC_INVENTORY_ATTESTATION_VALIDATION)

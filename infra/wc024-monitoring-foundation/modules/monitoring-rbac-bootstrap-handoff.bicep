@@ -20,6 +20,19 @@ param managementGroupHierarchyCollection object
 param legacyCollectorRbacCleanupDigest string
 
 var collectorContractInputsBindingId = guid(string(collectorContractInputs))
+var reviewerPrincipalIsSeparated = !contains(
+  [
+    toLower(monitoringReaderPrincipalId)
+    toLower(athenaContextPrincipalId)
+    toLower(collectorContractInputs.rbacAttestorPrincipalId)
+    toLower(collectorContractInputs.runtimeSupportIdentityPrincipalId)
+    toLower(reviewAuthority.verifierIdentityPrincipalId)
+  ],
+  toLower(reviewAuthority.reviewerPrincipalId)
+)
+var validatedReviewAuthoritySeparationEnforced = reviewAuthoritySeparationEnforced && reviewerPrincipalIsSeparated
+  ? true
+  : fail('phase-one handoff requires the reviewer principal to be separate from every runtime and verifier principal')
 var handoffId = guid(
   subscription().id,
   collectorContractInputs.collectorIdentityResourceId,
@@ -61,7 +74,7 @@ output handoff object = {
   athenaContextIdentityId: athenaContextIdentityId
   athenaContextPrincipalId: athenaContextPrincipalId
   physicalIdentitySeparationEnforced: physicalIdentitySeparationEnforced
-  reviewAuthoritySeparationEnforced: reviewAuthoritySeparationEnforced
+  reviewAuthoritySeparationEnforced: validatedReviewAuthoritySeparationEnforced
   legacyCollectorRbacCleanupSchemaVersion: 'athena.wc028LegacyCollectorRbacCleanup.v3'
   legacyCollectorRbacCleanupDigest: legacyCollectorRbacCleanupDigest
   effectiveRbacTargetScopeIds: effectiveRbacTargetScopeIds

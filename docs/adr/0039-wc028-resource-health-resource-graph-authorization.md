@@ -45,14 +45,21 @@ binds each role definition, role name, and assignment scope. Its
 `resourceHealthAllowedOperations` field is the exact ordered tuple
 `Microsoft.ResourceGraph/resources/read`,
 `Microsoft.ResourceHealth/availabilityStatuses/read`. The effective RBAC inventory advances to
-`athena.wc028MonitoringEffectiveRbacInventory.v5` and separately records both action fingerprints,
-both grants, and both full role definitions. Contract v9 and inventory v4 remain parseable only as
-historical evidence and cannot execute current production acquisition.
+`athena.wc028MonitoringEffectiveRbacInventory.v6` and separately records both action fingerprints,
+both grants, both full role definitions, and target-bound ancestor read evidence. Every principal
+read binds one exact target scope, query mode, target digest, page-digest set, repeated-read count,
+and deterministic binding ID. Contract v9, inventory v4, and the unbound inventory v5 shape remain
+parseable only as historical evidence and cannot execute current production acquisition.
 
 The acquisition receipt remains v6. Its verifier requires the reviewed collector contract to be
-v10, recomputes that exact contract digest, and binds the v5 inventory digest and source-manifest
+v10, recomputes that exact contract digest, and binds the v6 inventory digest and source-manifest
 digest carried by every exchange and wire attempt. A v9 reviewed contract, a v9 contract digest in
 a v6 receipt, or a v9 Graph-only inventory topology is rejected after migration.
+
+The detached inventory attestation advances to
+`athena.wc028MonitoringEffectiveRbacInventoryAttestation.v2`, which uses a distinct signed
+preimage domain for inventory v6. Attestation v1 remains historical for the v9/v4 pairing; a v1/v6
+or v2/v4 pairing is rejected.
 
 The signed inventory verifier and publication template reject a missing or altered query action, a
 missing or altered availability action, a query assignment outside the exact workload resource
@@ -60,6 +67,9 @@ group, a
 Resource Health assignment outside the exact approved VM set, an unreferenced role, an extra
 grant, or a deny assignment that removes either required action. The bounded query still includes
 only approved VM IDs, and the client rejects any returned peer or otherwise unapproved VM row.
+The selected `HealthResources` projection does not expose a documented
+`properties.reasonType`; the query therefore projects the compatibility reason as `Unknown`, the
+control accepts only `Unknown`, and platform- or user-initiated reason filters fail closed.
 
 Adding the extra exact grant and role definition increases the canonical inventory size. The
 inventory remains bounded to 62,000 bytes and the complete deployment-script environment payload
@@ -78,7 +88,7 @@ limit. Oversized evidence fails before the verifier runs.
 - Existing identity separation, group and ancestor expansion, inherited deny evaluation, active
   PIM rejection, attachment evidence, conditioned persistence, and `noAutoRemediation` behavior
   are unchanged.
-- Operators must recollect and independently sign a v5 effective RBAC inventory before publishing
+- Operators must recollect and independently sign a v6 effective RBAC inventory before publishing
   the v10 contract.
 
 ## Alternatives considered
@@ -101,7 +111,7 @@ limit. Oversized evidence fails before the verifier runs.
   `main.json` with a fresh Bicep build.
 - Verify the query role has exactly one workload-resource-group assignment and exactly one action.
 - Verify the Resource Health role has exactly 11 direct VM assignments and exactly one action.
-- Validate v10/v5 contracts and reject missing permissions, wrong role fingerprints, subscription-
+- Validate v10/v6 contracts and reject missing permissions, wrong role fingerprints, subscription-
   scoped Resource Health, subscription- or VM-scoped query authorization, extra grants, and an
   unapproved peer VM scope.
 - Run the production client test that injects an unapproved peer row and requires a fail-closed

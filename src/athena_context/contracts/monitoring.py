@@ -59,15 +59,27 @@ MONITORING_PREVIOUS_INCIDENT_BOUND_ACQUISITION_RECEIPT_SCHEMA_VERSION = (
 )
 MONITORING_ACQUISITION_RECEIPT_SCHEMA_VERSION = "athena.wc028MonitoringAcquisitionReceipt.v6"
 MONITORING_ACQUISITION_HANDOFF_SCHEMA_VERSION = "athena.wc028MonitoringEvidenceHandoff.v2"
-MONITORING_PREVIOUS_EFFECTIVE_RBAC_INVENTORY_SCHEMA_VERSION = (
+MONITORING_TRUST_HARDENED_EFFECTIVE_RBAC_INVENTORY_SCHEMA_VERSION = (
     "athena.wc028MonitoringEffectiveRbacInventory.v4"
 )
-MONITORING_EFFECTIVE_RBAC_INVENTORY_SCHEMA_VERSION = (
+MONITORING_PREVIOUS_EFFECTIVE_RBAC_INVENTORY_SCHEMA_VERSION = (
     "athena.wc028MonitoringEffectiveRbacInventory.v5"
+)
+MONITORING_EFFECTIVE_RBAC_INVENTORY_SCHEMA_VERSION = (
+    "athena.wc028MonitoringEffectiveRbacInventory.v6"
+)
+MONITORING_PREVIOUS_EFFECTIVE_RBAC_INVENTORY_ATTESTATION_SCHEMA_VERSION = (
+    "athena.wc028MonitoringEffectiveRbacInventoryAttestation.v1"
+)
+MONITORING_EFFECTIVE_RBAC_INVENTORY_ATTESTATION_SCHEMA_VERSION = (
+    "athena.wc028MonitoringEffectiveRbacInventoryAttestation.v2"
 )
 MONITORING_RUNTIME_REPLAY_BINDING_SCHEMA_VERSION = "athena.wc028MonitoringPersistenceReplay.v3"
 _LEGACY_MONITORING_IDENTITY_PROOF_AUDIENCE = "api://athena-monitoring-identity-proof"
 _MONITORING_IDENTITY_PROOF_AUDIENCE_SUFFIX = "/athena-monitoring-identity-proof"
+_CURRENT_RBAC_TARGET_QUERY_MODE = (
+    "assignedToPrincipalIncludingInheritedGroupsAndDescendants"
+)
 MONITORING_IDENTITY_PROOF_AUDIENCE = (
     f"api://00000000-0000-0000-0000-000000000003{_MONITORING_IDENTITY_PROOF_AUDIENCE_SUFFIX}"
 )
@@ -877,6 +889,51 @@ class MonitoringEffectiveRbacRoleDefinition(_StrictMonitoringContract):
         return self
 
 
+class MonitoringEffectiveRbacTargetReadEvidence(_StrictMonitoringContract):
+    """One stable repeated role-assignment read bound to its exact target and query mode."""
+
+    target_scope_id: str = Field(
+        alias="targetScopeId",
+        min_length=1,
+        max_length=2048,
+    )
+    query_mode: Literal["assignedToPrincipalIncludingInheritedGroupsAndDescendants"] = Field(
+        alias="queryMode"
+    )
+    target_digest: Sha256Digest = Field(alias="targetDigest")
+    raw_page_digests: tuple[Sha256Digest, ...] = Field(
+        alias="rawPageDigests",
+        min_length=1,
+        max_length=1024,
+    )
+    read_count: Literal[2] = Field(alias="readCount")
+    all_pages_retrieved: Literal[True] = Field(alias="allPagesRetrieved")
+    binding_id: str = Field(
+        alias="bindingId",
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    )
+
+    @field_validator("target_scope_id")
+    @classmethod
+    def normalize_target_scope(cls, value: str) -> str:
+        return _canonical_rbac_scope(value)
+
+    @field_validator("raw_page_digests")
+    @classmethod
+    def validate_raw_page_digests(
+        cls,
+        values: tuple[Sha256Digest, ...],
+    ) -> tuple[Sha256Digest, ...]:
+        if values != tuple(sorted(values)) or len(values) != len(set(values)):
+            raise ValueError("target-read raw page digests must be sorted and unique")
+        return values
+
+    @field_validator("binding_id")
+    @classmethod
+    def normalize_binding_id(cls, value: str) -> str:
+        return value.casefold()
+
+
 class MonitoringEffectiveRbacPrincipalEvidence(_StrictMonitoringContract):
     """Stable repeated exact-target role-assignment and group collection."""
 
@@ -887,7 +944,7 @@ class MonitoringEffectiveRbacPrincipalEvidence(_StrictMonitoringContract):
     query_filter: Literal[
         "atScope() and assignedTo(principalId)",
         "assignedTo(principalId)",
-    ] = Field(alias="queryFilter")
+    ] | None = Field(default=None, alias="queryFilter")
     include_inherited: Literal[True] | None = Field(
         default=None,
         alias="includeInherited",
@@ -900,18 +957,27 @@ class MonitoringEffectiveRbacPrincipalEvidence(_StrictMonitoringContract):
         default=None,
         alias="includeAllDescendantScopes",
     )
-    target_scope_ids: tuple[str, ...] = Field(
+    target_scope_ids: tuple[str, ...] | None = Field(
+        default=None,
         alias="targetScopeIds",
         min_length=1,
         max_length=256,
     )
-    first_read_target_digests: tuple[Sha256Digest, ...] = Field(
+    first_read_target_digests: tuple[Sha256Digest, ...] | None = Field(
+        default=None,
         alias="firstReadTargetDigests",
         min_length=1,
         max_length=256,
     )
-    second_read_target_digests: tuple[Sha256Digest, ...] = Field(
+    second_read_target_digests: tuple[Sha256Digest, ...] | None = Field(
+        default=None,
         alias="secondReadTargetDigests",
+        min_length=1,
+        max_length=256,
+    )
+    target_read_evidence: tuple[MonitoringEffectiveRbacTargetReadEvidence, ...] | None = Field(
+        default=None,
+        alias="targetReadEvidence",
         min_length=1,
         max_length=256,
     )
@@ -966,7 +1032,12 @@ class MonitoringEffectiveRbacPrincipalEvidence(_StrictMonitoringContract):
 
     @field_validator("target_scope_ids")
     @classmethod
-    def normalize_target_scopes(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+    def normalize_target_scopes(
+        cls,
+        values: tuple[str, ...] | None,
+    ) -> tuple[str, ...] | None:
+        if values is None:
+            return None
         normalized = tuple(sorted(_canonical_rbac_scope(item) for item in values))
         if len(normalized) != len(set(normalized)):
             raise ValueError("RBAC target scopes must be sorted and unique")
@@ -1013,35 +1084,88 @@ class MonitoringEffectiveRbacPrincipalEvidence(_StrictMonitoringContract):
             self.first_transitive_group_raw_page_digests,
             self.second_transitive_group_raw_page_digests,
         )
-        if (
-            len(self.first_read_target_digests) != len(self.target_scope_ids)
-            or self.first_read_target_digests != self.second_read_target_digests
-            or (
-                any(item is None for item in legacy_page_fields)
-                and any(item is None for item in independent_page_fields)
+        if self.target_read_evidence is not None:
+            target_reads = self.target_read_evidence
+            target_scope_ids = tuple(item.target_scope_id for item in target_reads)
+            target_digests = tuple(item.target_digest for item in target_reads)
+            raw_page_digests = tuple(
+                digest for item in target_reads for digest in item.raw_page_digests
             )
-            or (
-                all(item is not None for item in legacy_page_fields)
-                and any(item is not None for item in independent_page_fields)
+            legacy_target_fields = (
+                self.query_filter,
+                self.include_inherited,
+                self.include_groups,
+                self.include_all_descendant_scopes,
+                self.target_scope_ids,
+                self.first_read_target_digests,
+                self.second_read_target_digests,
+                self.role_assignment_raw_page_digests,
+                self.transitive_group_raw_page_digests,
+                self.first_role_assignment_raw_page_digests,
+                self.second_role_assignment_raw_page_digests,
             )
-            or (
-                all(item is not None for item in independent_page_fields)
-                and any(item is not None for item in legacy_page_fields)
-            )
-            or (
-                self.first_role_assignment_raw_page_digests is not None
-                and self.first_role_assignment_raw_page_digests
-                != self.second_role_assignment_raw_page_digests
-            )
-            or (
-                self.first_transitive_group_raw_page_digests is not None
-                and self.first_transitive_group_raw_page_digests
+            if (
+                any(item is not None for item in legacy_target_fields)
+                or self.first_transitive_group_raw_page_digests is None
+                or self.second_transitive_group_raw_page_digests is None
+                or self.first_transitive_group_raw_page_digests
                 != self.second_transitive_group_raw_page_digests
-            )
-        ):
-            raise ValueError(
-                "RBAC exact-target repeated reads must use one complete stable evidence shape"
-            )
+                or target_scope_ids != tuple(sorted(target_scope_ids))
+                or len(target_scope_ids) != len(set(target_scope_ids))
+                or len(target_digests) != len(set(target_digests))
+                or len(raw_page_digests) != len(set(raw_page_digests))
+                or len({item.binding_id for item in target_reads}) != len(target_reads)
+                or any(
+                    item.binding_id
+                    != _arm_template_guid(
+                        self.principal_id,
+                        item.target_scope_id,
+                        item.query_mode,
+                        item.target_digest,
+                        ",".join(item.raw_page_digests),
+                        str(item.read_count),
+                        str(item.all_pages_retrieved).lower(),
+                    )
+                    for item in target_reads
+                )
+            ):
+                raise ValueError(
+                    "RBAC target reads must uniquely bind target, query mode, and page evidence"
+                )
+        else:
+            if (
+                self.query_filter is None
+                or self.target_scope_ids is None
+                or self.first_read_target_digests is None
+                or self.second_read_target_digests is None
+                or len(self.first_read_target_digests) != len(self.target_scope_ids)
+                or self.first_read_target_digests != self.second_read_target_digests
+                or (
+                    any(item is None for item in legacy_page_fields)
+                    and any(item is None for item in independent_page_fields)
+                )
+                or (
+                    all(item is not None for item in legacy_page_fields)
+                    and any(item is not None for item in independent_page_fields)
+                )
+                or (
+                    all(item is not None for item in independent_page_fields)
+                    and any(item is not None for item in legacy_page_fields)
+                )
+                or (
+                    self.first_role_assignment_raw_page_digests is not None
+                    and self.first_role_assignment_raw_page_digests
+                    != self.second_role_assignment_raw_page_digests
+                )
+                or (
+                    self.first_transitive_group_raw_page_digests is not None
+                    and self.first_transitive_group_raw_page_digests
+                    != self.second_transitive_group_raw_page_digests
+                )
+            ):
+                raise ValueError(
+                    "RBAC exact-target repeated reads must use one complete stable evidence shape"
+                )
         expected = compute_artifact_digest(
             self.model_dump(
                 mode="json",
@@ -1053,6 +1177,29 @@ class MonitoringEffectiveRbacPrincipalEvidence(_StrictMonitoringContract):
         if self.evidence_digest != expected:
             raise ValueError("evidenceDigest does not bind exact-target RBAC evidence")
         return self
+
+    def resolved_target_scope_ids(self) -> tuple[str, ...]:
+        if self.target_read_evidence is not None:
+            return tuple(item.target_scope_id for item in self.target_read_evidence)
+        return cast(tuple[str, ...], self.target_scope_ids)
+
+    def target_read_binding_ids(self) -> tuple[str, ...]:
+        if self.target_read_evidence is None:
+            return ()
+        return tuple(item.binding_id for item in self.target_read_evidence)
+
+    def uses_complete_assigned_to_query(self) -> bool:
+        if self.target_read_evidence is not None:
+            return all(
+                item.query_mode == _CURRENT_RBAC_TARGET_QUERY_MODE
+                for item in self.target_read_evidence
+            )
+        return (
+            self.query_filter == "assignedTo(principalId)"
+            and self.include_inherited is True
+            and self.include_groups is True
+            and self.include_all_descendant_scopes is True
+        )
 
 
 class MonitoringRuntimeIdentityLifecycleBinding(_StrictMonitoringContract):
@@ -1400,11 +1547,9 @@ class MonitoringReviewerKeyVerifierEvidence(_StrictMonitoringContract):
             or self.grant.group_derived
             or self.grant.condition is not None
             or self.principal_evidence.principal_id != self.identity_principal_id
-            or self.principal_evidence.query_filter != "assignedTo(principalId)"
-            or self.principal_evidence.include_inherited is not True
-            or self.principal_evidence.include_groups is not True
-            or self.principal_evidence.include_all_descendant_scopes is not True
-            or self.principal_evidence.target_scope_ids != (expected_subscription_scope,)
+            or not self.principal_evidence.uses_complete_assigned_to_query()
+            or self.principal_evidence.resolved_target_scope_ids()
+            != (expected_subscription_scope,)
             or self.principal_evidence.transitive_group_ids
             or self.attachment_evidence.identity_resource_id != self.identity_resource_id
             or self.attachment_evidence.associated_resource_ids
@@ -1887,6 +2032,55 @@ class MonitoringManagementGroupHierarchyEvidence(_StrictMonitoringContract):
         return self
 
 
+def _principal_snapshot_fields(
+    prefix: str,
+    evidence: MonitoringEffectiveRbacPrincipalEvidence,
+    *,
+    first_read: bool,
+    target_bound: bool,
+) -> dict[str, object]:
+    transitive_group_page_digests = cast(
+        tuple[Sha256Digest, ...],
+        (
+            evidence.first_transitive_group_raw_page_digests
+            if first_read
+            else evidence.second_transitive_group_raw_page_digests
+        ),
+    )
+    payload: dict[str, object] = {
+        f"{prefix}PrincipalId": evidence.principal_id,
+        f"{prefix}TransitiveGroupRawPageDigests": list(
+            transitive_group_page_digests
+        ),
+    }
+    if target_bound:
+        payload[f"{prefix}TargetReadBindingIds"] = list(
+            evidence.target_read_binding_ids()
+        )
+        return payload
+    target_digests = cast(
+        tuple[Sha256Digest, ...],
+        (
+            evidence.first_read_target_digests
+            if first_read
+            else evidence.second_read_target_digests
+        ),
+    )
+    role_assignment_page_digests = cast(
+        tuple[Sha256Digest, ...],
+        (
+            evidence.first_role_assignment_raw_page_digests
+            if first_read
+            else evidence.second_role_assignment_raw_page_digests
+        ),
+    )
+    payload[f"{prefix}TargetReadDigests"] = list(target_digests)
+    payload[f"{prefix}RoleAssignmentRawPageDigests"] = list(
+        role_assignment_page_digests
+    )
+    return payload
+
+
 class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
     """Measured effective assignments from the explicitly collectable RBAC scopes."""
 
@@ -1896,6 +2090,7 @@ class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
         "athena.wc028MonitoringEffectiveRbacInventory.v3",
         "athena.wc028MonitoringEffectiveRbacInventory.v4",
         "athena.wc028MonitoringEffectiveRbacInventory.v5",
+        "athena.wc028MonitoringEffectiveRbacInventory.v6",
     ] = Field(alias="schemaVersion")
     collection_run_id: str = Field(
         alias="collectionRunId",
@@ -2464,12 +2659,15 @@ class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
             self.runtime_support_grants,
             self.runtime_support_principal_evidence,
         )
-        if self.schema_version == MONITORING_EFFECTIVE_RBAC_INVENTORY_SCHEMA_VERSION:
+        if self.schema_version in {
+            MONITORING_PREVIOUS_EFFECTIVE_RBAC_INVENTORY_SCHEMA_VERSION,
+            MONITORING_EFFECTIVE_RBAC_INVENTORY_SCHEMA_VERSION,
+        }:
             if self.resource_graph_query_role_actions != tuple(
                 item.casefold() for item in _EXPECTED_RESOURCE_GRAPH_QUERY_OPERATIONS
             ):
                 raise ValueError(
-                    "effective RBAC inventory v5 requires the exact Resource Graph query action"
+                    "effective RBAC inventory v5+ requires the exact Resource Graph query action"
                 )
         elif self.resource_graph_query_role_actions is not None:
             raise ValueError(
@@ -2543,6 +2741,7 @@ class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
                 or (
                     self.schema_version
                     not in {
+                        MONITORING_TRUST_HARDENED_EFFECTIVE_RBAC_INVENTORY_SCHEMA_VERSION,
                         MONITORING_PREVIOUS_EFFECTIVE_RBAC_INVENTORY_SCHEMA_VERSION,
                         MONITORING_EFFECTIVE_RBAC_INVENTORY_SCHEMA_VERSION,
                     }
@@ -2615,6 +2814,8 @@ class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
                     or context_evidence.include_inherited is not None
                     or context_evidence.include_groups is not None
                     or context_evidence.include_all_descendant_scopes is not None
+                    or collector_evidence.target_read_evidence is not None
+                    or context_evidence.target_read_evidence is not None
                 ):
                     raise ValueError(
                         "effective RBAC inventory v2 cannot contain independent read receipts"
@@ -2669,6 +2870,8 @@ class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
                         or context_evidence.include_inherited is not None
                         or context_evidence.include_groups is not None
                         or context_evidence.include_all_descendant_scopes is not None
+                        or collector_evidence.target_read_evidence is not None
+                        or context_evidence.target_read_evidence is not None
                     ):
                         raise ValueError(
                             "effective RBAC inventory v3 requires exact collectable scope evidence"
@@ -2724,27 +2927,43 @@ class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
                         MonitoringReviewerKeyVerifierEvidence,
                         self.reviewer_key_verifier_evidence,
                     )
+                    principal_evidence_records = (
+                        collector_evidence,
+                        context_evidence,
+                        runtime_support_evidence,
+                        verifier_evidence.principal_evidence,
+                    )
+                    if (
+                        self.schema_version == MONITORING_EFFECTIVE_RBAC_INVENTORY_SCHEMA_VERSION
+                        and any(
+                            item.target_read_evidence is None
+                            for item in principal_evidence_records
+                        )
+                    ) or (
+                        self.schema_version != MONITORING_EFFECTIVE_RBAC_INVENTORY_SCHEMA_VERSION
+                        and any(
+                            item.target_read_evidence is not None
+                            for item in principal_evidence_records
+                        )
+                    ):
+                        raise ValueError(
+                            "effective RBAC inventory version does not match target-read evidence"
+                        )
                     exclusive_principals = cast(
                         MonitoringExclusiveDataPlanePrincipalEvidence,
                         self.exclusive_data_plane_principal_evidence,
                     )
                     subscription_scope = f"/subscriptions/{self.subscription_id}"
                     if (
-                        collector_evidence.query_filter != "assignedTo(principalId)"
-                        or context_evidence.query_filter != "assignedTo(principalId)"
-                        or collector_evidence.include_inherited is not True
-                        or collector_evidence.include_groups is not True
-                        or collector_evidence.include_all_descendant_scopes is not True
-                        or context_evidence.include_inherited is not True
-                        or context_evidence.include_groups is not True
-                        or context_evidence.include_all_descendant_scopes is not True
-                        or collector_evidence.target_scope_ids != principal_target_scopes
-                        or context_evidence.target_scope_ids != principal_target_scopes
-                        or runtime_support_evidence.query_filter != "assignedTo(principalId)"
-                        or runtime_support_evidence.include_inherited is not True
-                        or runtime_support_evidence.include_groups is not True
-                        or runtime_support_evidence.include_all_descendant_scopes is not True
-                        or runtime_support_evidence.target_scope_ids != principal_target_scopes
+                        not collector_evidence.uses_complete_assigned_to_query()
+                        or not context_evidence.uses_complete_assigned_to_query()
+                        or not runtime_support_evidence.uses_complete_assigned_to_query()
+                        or collector_evidence.resolved_target_scope_ids()
+                        != principal_target_scopes
+                        or context_evidence.resolved_target_scope_ids()
+                        != principal_target_scopes
+                        or runtime_support_evidence.resolved_target_scope_ids()
+                        != principal_target_scopes
                         or len(runtime_support_grants) != 1
                         or exclusive_principals.assignment_collection_scope_id != subscription_scope
                         or exclusive_principals.include_inherited is not True
@@ -2792,6 +3011,61 @@ class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
                             ),
                         }
                     )
+                current_target_read_shape_is_invalid = (
+                    self.schema_version == MONITORING_EFFECTIVE_RBAC_INVENTORY_SCHEMA_VERSION
+                    and (
+                        collector_evidence.target_read_evidence is None
+                        or context_evidence.target_read_evidence is None
+                        or runtime_support_evidence is None
+                        or runtime_support_evidence.target_read_evidence is None
+                        or any(
+                            item is not None
+                            for item in (
+                                collector_evidence.first_role_assignment_raw_page_digests,
+                                collector_evidence.second_role_assignment_raw_page_digests,
+                                context_evidence.first_role_assignment_raw_page_digests,
+                                context_evidence.second_role_assignment_raw_page_digests,
+                                runtime_support_evidence.first_role_assignment_raw_page_digests,
+                                runtime_support_evidence.second_role_assignment_raw_page_digests,
+                            )
+                        )
+                    )
+                )
+                legacy_target_read_shape_is_invalid = (
+                    self.schema_version != MONITORING_EFFECTIVE_RBAC_INVENTORY_SCHEMA_VERSION
+                    and (
+                        collector_evidence.target_read_evidence is not None
+                        or context_evidence.target_read_evidence is not None
+                        or any(
+                            item is None
+                            for item in (
+                                collector_evidence.first_role_assignment_raw_page_digests,
+                                collector_evidence.second_role_assignment_raw_page_digests,
+                                collector_evidence.first_transitive_group_raw_page_digests,
+                                collector_evidence.second_transitive_group_raw_page_digests,
+                                context_evidence.first_role_assignment_raw_page_digests,
+                                context_evidence.second_role_assignment_raw_page_digests,
+                                context_evidence.first_transitive_group_raw_page_digests,
+                                context_evidence.second_transitive_group_raw_page_digests,
+                            )
+                        )
+                        or (
+                            runtime_support_evidence is not None
+                            and (
+                                runtime_support_evidence.target_read_evidence is not None
+                                or any(
+                                    item is None
+                                    for item in (
+                                        runtime_support_evidence.first_role_assignment_raw_page_digests,
+                                        runtime_support_evidence.second_role_assignment_raw_page_digests,
+                                        runtime_support_evidence.first_transitive_group_raw_page_digests,
+                                        runtime_support_evidence.second_transitive_group_raw_page_digests,
+                                    )
+                                )
+                            )
+                        )
+                    )
+                )
                 if (
                     any(item is not None for item in legacy_repeated_read_fields)
                     or any(item is None for item in repeated_read_v3_fields)
@@ -2799,41 +3073,8 @@ class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
                     or collector_evidence.transitive_group_raw_page_digests is not None
                     or context_evidence.role_assignment_raw_page_digests is not None
                     or context_evidence.transitive_group_raw_page_digests is not None
-                    or any(
-                        item is None
-                        for item in (
-                            collector_evidence.first_role_assignment_raw_page_digests,
-                            collector_evidence.second_role_assignment_raw_page_digests,
-                            collector_evidence.first_transitive_group_raw_page_digests,
-                            collector_evidence.second_transitive_group_raw_page_digests,
-                            context_evidence.first_role_assignment_raw_page_digests,
-                            context_evidence.second_role_assignment_raw_page_digests,
-                            context_evidence.first_transitive_group_raw_page_digests,
-                            context_evidence.second_transitive_group_raw_page_digests,
-                        )
-                    )
-                    or (
-                        self.schema_version
-                        in {
-                            MONITORING_PREVIOUS_EFFECTIVE_RBAC_INVENTORY_SCHEMA_VERSION,
-                            MONITORING_EFFECTIVE_RBAC_INVENTORY_SCHEMA_VERSION,
-                        }
-                        and (
-                            runtime_support_evidence is None
-                            or runtime_support_evidence.role_assignment_raw_page_digests is not None
-                            or runtime_support_evidence.transitive_group_raw_page_digests
-                            is not None
-                            or any(
-                                item is None
-                                for item in (
-                                    runtime_support_evidence.first_role_assignment_raw_page_digests,
-                                    runtime_support_evidence.second_role_assignment_raw_page_digests,
-                                    runtime_support_evidence.first_transitive_group_raw_page_digests,
-                                    runtime_support_evidence.second_transitive_group_raw_page_digests,
-                                )
-                            )
-                        )
-                    )
+                    or current_target_read_shape_is_invalid
+                    or legacy_target_read_shape_is_invalid
                 ):
                     raise ValueError(
                         "effective RBAC inventory v3+ requires independent read receipts"
@@ -2848,77 +3089,36 @@ class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
                 )
                 if not first_read_completed_at < second_read_completed_at <= self.collected_at:
                     raise ValueError("effective RBAC inventory read receipts are not distinct")
+                target_bound = (
+                    self.schema_version == MONITORING_EFFECTIVE_RBAC_INVENTORY_SCHEMA_VERSION
+                )
                 runtime_first_snapshot: dict[str, object] = {}
                 runtime_second_snapshot: dict[str, object] = {}
                 if runtime_support_evidence is not None:
-                    runtime_first_snapshot = {
-                        "runtimeSupportPrincipalId": runtime_support_evidence.principal_id,
-                        "runtimeSupportTargetReadDigests": list(
-                            runtime_support_evidence.first_read_target_digests
-                        ),
-                        "runtimeSupportRoleAssignmentRawPageDigests": list(
-                            cast(
-                                tuple[Sha256Digest, ...],
-                                runtime_support_evidence.first_role_assignment_raw_page_digests,
-                            )
-                        ),
-                        "runtimeSupportTransitiveGroupRawPageDigests": list(
-                            cast(
-                                tuple[Sha256Digest, ...],
-                                runtime_support_evidence.first_transitive_group_raw_page_digests,
-                            )
-                        ),
-                    }
-                    runtime_second_snapshot = {
-                        "runtimeSupportPrincipalId": runtime_support_evidence.principal_id,
-                        "runtimeSupportTargetReadDigests": list(
-                            runtime_support_evidence.second_read_target_digests
-                        ),
-                        "runtimeSupportRoleAssignmentRawPageDigests": list(
-                            cast(
-                                tuple[Sha256Digest, ...],
-                                runtime_support_evidence.second_role_assignment_raw_page_digests,
-                            )
-                        ),
-                        "runtimeSupportTransitiveGroupRawPageDigests": list(
-                            cast(
-                                tuple[Sha256Digest, ...],
-                                runtime_support_evidence.second_transitive_group_raw_page_digests,
-                            )
-                        ),
-                    }
+                    runtime_first_snapshot = _principal_snapshot_fields(
+                        "runtimeSupport",
+                        runtime_support_evidence,
+                        first_read=True,
+                        target_bound=target_bound,
+                    )
+                    runtime_second_snapshot = _principal_snapshot_fields(
+                        "runtimeSupport",
+                        runtime_support_evidence,
+                        first_read=False,
+                        target_bound=target_bound,
+                    )
                 first_snapshot_payload = {
-                    "collectorPrincipalId": collector_evidence.principal_id,
-                    "collectorTargetReadDigests": list(
-                        collector_evidence.first_read_target_digests
+                    **_principal_snapshot_fields(
+                        "collector",
+                        collector_evidence,
+                        first_read=True,
+                        target_bound=target_bound,
                     ),
-                    "athenaContextPrincipalId": context_evidence.principal_id,
-                    "athenaContextTargetReadDigests": list(
-                        context_evidence.first_read_target_digests
-                    ),
-                    "collectorRoleAssignmentRawPageDigests": list(
-                        cast(
-                            tuple[Sha256Digest, ...],
-                            collector_evidence.first_role_assignment_raw_page_digests,
-                        )
-                    ),
-                    "collectorTransitiveGroupRawPageDigests": list(
-                        cast(
-                            tuple[Sha256Digest, ...],
-                            collector_evidence.first_transitive_group_raw_page_digests,
-                        )
-                    ),
-                    "athenaContextRoleAssignmentRawPageDigests": list(
-                        cast(
-                            tuple[Sha256Digest, ...],
-                            context_evidence.first_role_assignment_raw_page_digests,
-                        )
-                    ),
-                    "athenaContextTransitiveGroupRawPageDigests": list(
-                        cast(
-                            tuple[Sha256Digest, ...],
-                            context_evidence.first_transitive_group_raw_page_digests,
-                        )
+                    **_principal_snapshot_fields(
+                        "athenaContext",
+                        context_evidence,
+                        first_read=True,
+                        target_bound=target_bound,
                     ),
                     "roleDefinitionRawPageDigests": list(
                         cast(
@@ -2942,37 +3142,17 @@ class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
                     **normalized_record_digests,
                 }
                 second_snapshot_payload = {
-                    "collectorPrincipalId": collector_evidence.principal_id,
-                    "collectorTargetReadDigests": list(
-                        collector_evidence.second_read_target_digests
+                    **_principal_snapshot_fields(
+                        "collector",
+                        collector_evidence,
+                        first_read=False,
+                        target_bound=target_bound,
                     ),
-                    "athenaContextPrincipalId": context_evidence.principal_id,
-                    "athenaContextTargetReadDigests": list(
-                        context_evidence.second_read_target_digests
-                    ),
-                    "collectorRoleAssignmentRawPageDigests": list(
-                        cast(
-                            tuple[Sha256Digest, ...],
-                            collector_evidence.second_role_assignment_raw_page_digests,
-                        )
-                    ),
-                    "collectorTransitiveGroupRawPageDigests": list(
-                        cast(
-                            tuple[Sha256Digest, ...],
-                            collector_evidence.second_transitive_group_raw_page_digests,
-                        )
-                    ),
-                    "athenaContextRoleAssignmentRawPageDigests": list(
-                        cast(
-                            tuple[Sha256Digest, ...],
-                            context_evidence.second_role_assignment_raw_page_digests,
-                        )
-                    ),
-                    "athenaContextTransitiveGroupRawPageDigests": list(
-                        cast(
-                            tuple[Sha256Digest, ...],
-                            context_evidence.second_transitive_group_raw_page_digests,
-                        )
+                    **_principal_snapshot_fields(
+                        "athenaContext",
+                        context_evidence,
+                        first_read=False,
+                        target_bound=target_bound,
                     ),
                     "roleDefinitionRawPageDigests": list(
                         cast(
@@ -3020,6 +3200,7 @@ class MonitoringEffectiveRbacInventory(_StrictMonitoringContract):
 
 def monitoring_effective_rbac_inventory_attestation_preimage(
     *,
+    schema_version: str = MONITORING_EFFECTIVE_RBAC_INVENTORY_ATTESTATION_SCHEMA_VERSION,
     bootstrap_handoff_id: str,
     bootstrap_deployment_id: str,
     bootstrap_template_hash: str,
@@ -3032,8 +3213,14 @@ def monitoring_effective_rbac_inventory_attestation_preimage(
     legacy_collector_rbac_cleanup_schema_version: str,
     legacy_collector_rbac_cleanup_digest: str,
 ) -> dict[str, object]:
+    if schema_version == MONITORING_PREVIOUS_EFFECTIVE_RBAC_INVENTORY_ATTESTATION_SCHEMA_VERSION:
+        domain = "athena.wc028-effective-rbac-inventory-attestation-v1"
+    elif schema_version == MONITORING_EFFECTIVE_RBAC_INVENTORY_ATTESTATION_SCHEMA_VERSION:
+        domain = "athena.wc028-effective-rbac-inventory-attestation-v2"
+    else:
+        raise ValueError("effective RBAC inventory attestation schema is unsupported")
     return {
-        "domain": "athena.wc028-effective-rbac-inventory-attestation-v1",
+        "domain": domain,
         "bootstrapHandoffId": bootstrap_handoff_id,
         "bootstrapDeploymentId": bootstrap_deployment_id,
         "bootstrapTemplateHash": bootstrap_template_hash,
@@ -3051,9 +3238,10 @@ def monitoring_effective_rbac_inventory_attestation_preimage(
 class MonitoringEffectiveRbacInventoryAttestation(_StrictMonitoringContract):
     """Detached reviewer signature over one complete effective-RBAC inventory."""
 
-    schema_version: Literal["athena.wc028MonitoringEffectiveRbacInventoryAttestation.v1"] = Field(
-        alias="schemaVersion"
-    )
+    schema_version: Literal[
+        "athena.wc028MonitoringEffectiveRbacInventoryAttestation.v1",
+        "athena.wc028MonitoringEffectiveRbacInventoryAttestation.v2",
+    ] = Field(alias="schemaVersion")
     signature_algorithm: Literal["RS256"] = Field(alias="signatureAlgorithm")
     bootstrap_handoff_id: str = Field(
         alias="bootstrapHandoffId",
@@ -3163,6 +3351,7 @@ class MonitoringEffectiveRbacInventoryAttestation(_StrictMonitoringContract):
         if self.public_key_fingerprint != ("sha256:" + hashlib.sha256(encoded_key).hexdigest()):
             raise ValueError("effective RBAC inventory attestation key fingerprint is invalid")
         preimage = monitoring_effective_rbac_inventory_attestation_preimage(
+            schema_version=self.schema_version,
             bootstrap_handoff_id=self.bootstrap_handoff_id,
             bootstrap_deployment_id=self.bootstrap_deployment_id,
             bootstrap_template_hash=self.bootstrap_template_hash,
@@ -5233,7 +5422,7 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
                 expected_inventory_schema_version = (
                     MONITORING_EFFECTIVE_RBAC_INVENTORY_SCHEMA_VERSION
                     if current_resource_health_authorization
-                    else MONITORING_PREVIOUS_EFFECTIVE_RBAC_INVENTORY_SCHEMA_VERSION
+                    else MONITORING_TRUST_HARDENED_EFFECTIVE_RBAC_INVENTORY_SCHEMA_VERSION
                 )
                 expected_resource_health_role_actions = (
                     _EXPECTED_RESOURCE_HEALTH_ROLE_OPERATIONS
@@ -5274,6 +5463,11 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
                     MonitoringEffectiveRbacInventoryAttestation,
                     self.effective_rbac_inventory_attestation,
                 )
+                expected_attestation_schema_version = (
+                    MONITORING_EFFECTIVE_RBAC_INVENTORY_ATTESTATION_SCHEMA_VERSION
+                    if current_resource_health_authorization
+                    else MONITORING_PREVIOUS_EFFECTIVE_RBAC_INVENTORY_ATTESTATION_SCHEMA_VERSION
+                )
                 reviewer_key_segments = cast(
                     str,
                     self.rbac_inventory_reviewer_key_id,
@@ -5283,7 +5477,8 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
                     self.rbac_inventory_reviewer_key_arm_resource_id,
                 ).split("/")
                 if (
-                    self.rbac_inventory_verifier_identity_resource_id
+                    attestation.schema_version != expected_attestation_schema_version
+                    or self.rbac_inventory_verifier_identity_resource_id
                     in {
                         self.collector_identity_resource_id.casefold().rstrip("/"),
                         cast(str, self.athena_context_identity_id).casefold().rstrip("/"),
@@ -5298,6 +5493,7 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
                         self.monitoring_reader_principal_id,
                         self.athena_context_principal_id,
                         self.rbac_attestor_principal_id,
+                        self.runtime_support_identity_principal_id,
                     }
                     or attestation.reviewer_principal_id
                     != self.rbac_inventory_reviewer_principal_id
@@ -5919,7 +6115,7 @@ def _validate_current_effective_rbac_evidence(
     expected_inventory_schema_version = (
         MONITORING_EFFECTIVE_RBAC_INVENTORY_SCHEMA_VERSION
         if is_current_resource_health_authorization
-        else MONITORING_PREVIOUS_EFFECTIVE_RBAC_INVENTORY_SCHEMA_VERSION
+        else MONITORING_TRUST_HARDENED_EFFECTIVE_RBAC_INVENTORY_SCHEMA_VERSION
     )
     if inventory.schema_version != expected_inventory_schema_version:
         raise ValueError(
@@ -6005,9 +6201,12 @@ def _validate_current_effective_rbac_evidence(
     )
     if (
         inventory.protected_scope_ids != expected_targets
-        or collector_evidence.target_scope_ids != expected_principal_target_scopes
-        or context_evidence.target_scope_ids != expected_principal_target_scopes
-        or runtime_support_evidence.target_scope_ids != expected_principal_target_scopes
+        or collector_evidence.resolved_target_scope_ids()
+        != expected_principal_target_scopes
+        or context_evidence.resolved_target_scope_ids()
+        != expected_principal_target_scopes
+        or runtime_support_evidence.resolved_target_scope_ids()
+        != expected_principal_target_scopes
         or inventory.runtime_support_principal_id != contract.runtime_support_identity_principal_id
         or runtime_support_evidence.principal_id != contract.runtime_support_identity_principal_id
         or runtime_support_grants != (_expected_runtime_support_storage_grant(contract),)
@@ -7807,6 +8006,7 @@ __all__ = [
     "MonitoringEffectiveRbacPimScheduleInstance",
     "MonitoringEffectiveRbacPrincipalEvidence",
     "MonitoringEffectiveRbacRoleDefinition",
+    "MonitoringEffectiveRbacTargetReadEvidence",
     "MonitoringExclusiveDataPlanePrincipalEvidence",
     "MonitoringManagedIdentityAttachmentEvidence",
     "MonitoringEvidenceAttestation",

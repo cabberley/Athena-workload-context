@@ -440,9 +440,7 @@ class ResourceHealthRecord(_WindowedCollectionRecord):
     previous_status: Literal["Available", "Degraded", "Unavailable", "Unknown"] = Field(
         alias="previousStatus"
     )
-    reason_type: Literal["PlatformInitiated", "UserInitiated", "Unknown"] = Field(
-        alias="reasonType"
-    )
+    reason_type: Literal["Unknown"] = Field(alias="reasonType")
 
 
 class ResourceChangeRecord(_CollectionRecord):
@@ -896,6 +894,7 @@ def _coverage_family(
         "vmconnection": "endpointHealth",
         "nwconnectionmonitortestresult": "connectionMonitor",
         "ntanetanalytics": "networkFlow",
+        "azurenetworkanalytics_cl": "networkFlow",
     }
     family = family_by_table.get(_query_source_table(control.signal))
     if family is None:

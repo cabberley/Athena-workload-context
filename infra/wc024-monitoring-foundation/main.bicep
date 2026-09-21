@@ -671,6 +671,7 @@ var reviewAuthoritySeparation = !contains(
       toLower(monitoringEvidenceSeams.outputs.collectorIdentityPrincipalId)
       toLower(athenaContextIdentity.properties.principalId)
       toLower(monitoringEvidenceSeams.outputs.rbacAttestorIdentityPrincipalId)
+      toLower(runtimeSupportIdentity.properties.principalId)
     ],
     validatedRbacInventoryReviewAuthority.reviewerPrincipalId
   ) && validatedRbacInventoryReviewAuthority.reviewerPrincipalId != toLower(
@@ -685,7 +686,7 @@ var reviewAuthoritySeparation = !contains(
     validatedRbacInventoryReviewAuthority.verifierIdentityResourceId
   )
   ? true
-  : fail('the effective-RBAC inventory reviewer principal must be separate from the collector, Athena context, and RBAC attestor principals')
+  : fail('the effective-RBAC inventory reviewer principal must be separate from the collector, Athena context, RBAC attestor, and runtime-support principals')
 var resourceReadScopeIds = concat(
   monitoringEvidenceReaderAssignments.outputs.resourceReadScopeIds,
   workloadEvidenceReaderAssignments.outputs.resourceReadScopeIds,
