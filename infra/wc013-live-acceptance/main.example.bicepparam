@@ -47,6 +47,7 @@ param wc008PinnedAssertionDigest = 'sha256:0000000000000000000000000000000000000
 param acceptanceImage = 'athenasynth.azurecr.io/athena/wc013-live@sha256:0000000000000000000000000000000000000000000000000000000000000000'
 param acceptanceImageRegistryServer = 'athenasynth.azurecr.io'
 param acceptanceImageRegistryResourceId = '/subscriptions/33333333-3333-3333-3333-333333333333/resourceGroups/athena-synth-shared-rg/providers/Microsoft.ContainerRegistry/registries/athenasynth'
+param acceptanceImageRegistryRoleAssignmentMode = 'LegacyRegistryPermissions'
 // Synthetic controller image shape; replace with the reviewed ACR RepoDigest before validation.
 param collectorControllerImage = 'athenasynth.azurecr.io/athena/wc013-controller@sha256:2222222222222222222222222222222222222222222222222222222222222222'
 // Synthetic non-placeholder digest shape; replace with a real ACR manifest digest before deployment.
@@ -54,6 +55,7 @@ param collectorControllerImage = 'athenasynth.azurecr.io/athena/wc013-controller
 param presentationImage = 'athenasynth.azurecr.io/athena/presentation-web@sha256:1111111111111111111111111111111111111111111111111111111111111111'
 param presentationImageRegistryServer = 'athenasynth.azurecr.io'
 param presentationImageRegistryResourceId = '/subscriptions/33333333-3333-3333-3333-333333333333/resourceGroups/athena-synth-shared-rg/providers/Microsoft.ContainerRegistry/registries/athenasynth'
+param presentationImageRegistryRoleAssignmentMode = 'LegacyRegistryPermissions'
 
 // WC-016 images deliberately use rejected all-zero digests until the deployer supplies RepoDigests.
 param wc016DetectorImage = 'athenasynth.azurecr.io/athena/wc016-detector@sha256:0000000000000000000000000000000000000000000000000000000000000000'
@@ -70,6 +72,16 @@ param wc016NotificationStatePartitionKey = 'wc016-notification-delivery'
 param wc016NotificationStateTableName = 'Wc016NotificationState'
 param incidentSigningKeyName = 'wc016-incident-signing'
 param incidentSigningKeyId = 'synthetic-key://athena-argus-demo/wc016-incidents-rs256-v1'
+param incidentFeedV2SigningKeyId = 'synthetic-key://athena-argus-demo/wc027-feed-v2-rs256-v1'
+param incidentFeedV2SigningKeyFingerprint = 'sha256:1111111111111111111111111111111111111111111111111111111111111111'
+param incidentReportSigningKeyId = 'synthetic-key://athena-argus-demo/wc027-report-rs256-v1'
+param incidentReportSigningKeyFingerprint = 'sha256:2222222222222222222222222222222222222222222222222222222222222222'
+param incidentGuidanceSigningKeyId = 'synthetic-key://athena-argus-demo/wc027-guidance-rs256-v1'
+param incidentGuidanceSigningKeyFingerprint = 'sha256:3333333333333333333333333333333333333333333333333333333333333333'
+param incidentEnrichmentSigningKeyId = 'synthetic-key://athena-argus-demo/wc027-enrichment-rs256-v1'
+param incidentEnrichmentSigningKeyFingerprint = 'sha256:4444444444444444444444444444444444444444444444444444444444444444'
+param incidentNotificationSigningKeyId = 'synthetic-key://athena-argus-demo/wc027-notification-rs256-v1'
+param incidentNotificationSigningKeyFingerprint = 'sha256:5555555555555555555555555555555555555555555555555555555555555555'
 param wc016RuntimeEnabled = false
 param wc016LegacyCleanupConfirmed = false
 param signingKeyFingerprint = 'sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'

@@ -606,6 +606,7 @@ class NotificationV2PublicationService(NotificationV2SourceVerifier):
         *,
         incident_id: str,
         verified_at: datetime,
+        before_irreversible_write: Callable[[], None] | None = None,
     ) -> IncidentNotificationEnvelopeV2:
         notification = self.build(
             incident_id=incident_id,
@@ -630,6 +631,8 @@ class NotificationV2PublicationService(NotificationV2SourceVerifier):
                 detachedSignature=signature,
             ),
         )
+        if before_irreversible_write is not None:
+            before_irreversible_write()
         self.outbox.enqueue_v2(envelope)
         return envelope
 

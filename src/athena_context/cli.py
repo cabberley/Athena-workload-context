@@ -39,7 +39,10 @@ from athena_context.eventing import (
 from athena_context.guidance.production import (
     load_wc027_guidance_authority_publisher_configuration,
     run_wc027_guidance_authority_publisher_worker,
-    submit_wc027_guidance_authority_request,
+)
+from athena_context.guidance.request_production import (
+    load_wc027_guidance_publication_request_producer_configuration,
+    run_wc027_guidance_publication_request_producer_worker,
 )
 from athena_context.live_acceptance import (
     Wc013LiveAcceptanceError,
@@ -382,26 +385,20 @@ def build_parser() -> argparse.ArgumentParser:
         default=30,
         choices=range(1, 301),
     )
-    wc027_authority_submit_parser = subparsers.add_parser(
-        "wc027-guidance-authority-submit",
-        help="enqueue one signed bounded guidance-authority publication request",
+    wc027_request_producer_parser = subparsers.add_parser(
+        "wc027-guidance-publication-request-producer",
+        help=(
+            "verify one incident-bound request and publish one immutable "
+            "guidance-authority request"
+        ),
     )
-    wc027_authority_submit_parser.add_argument(
-        "--request",
-        required=True,
-        type=Path,
-    )
-    wc027_authority_submit_parser.add_argument(
-        "--service-bus-namespace",
-        required=True,
-    )
-    wc027_authority_submit_parser.add_argument(
-        "--request-queue",
-        default="wc027-guidance-authority-requests",
-    )
-    wc027_authority_submit_parser.add_argument(
-        "--managed-identity-client-id",
-        required=True,
+    wc027_request_producer_parser.add_argument("--config", type=Path)
+    wc027_request_producer_parser.add_argument("--config-json")
+    wc027_request_producer_parser.add_argument(
+        "--max-wait-time-seconds",
+        type=int,
+        default=30,
+        choices=range(1, 301),
     )
     wc027_authority_worker_parser = subparsers.add_parser(
         "wc027-guidance-authority-publisher",
@@ -1014,15 +1011,29 @@ def main(
                 else "WC-027 enrichment trigger queue was empty or deferred\n"
             )
             return 0
-        if args.command == "wc027-guidance-authority-submit":
-            request_id = submit_wc027_guidance_authority_request(
-                request_path=args.request,
-                fully_qualified_namespace=args.service_bus_namespace,
-                queue_name=args.request_queue,
-                managed_identity_client_id=args.managed_identity_client_id,
+        if args.command == "wc027-guidance-publication-request-producer":
+            configuration_json = (
+                args.config_json
+                or os.environ.get(
+                    "ATHENA_WC027_GUIDANCE_REQUEST_PRODUCER_CONFIG_JSON"
+                )
+            )
+            request_producer_configuration = (
+                load_wc027_guidance_publication_request_producer_configuration(
+                    path=args.config,
+                    environment_json=configuration_json,
+                )
+            )
+            processed = (
+                run_wc027_guidance_publication_request_producer_worker(
+                    configuration=request_producer_configuration,
+                    max_wait_time_seconds=args.max_wait_time_seconds,
+                )
             )
             output.write(
-                f"WC-027 guidance authority request queued: {request_id}\n"
+                "WC-027 guidance publication request persisted and queued\n"
+                if processed
+                else "WC-027 guidance request input queue was empty or deferred\n"
             )
             return 0
         if args.command == "wc027-guidance-authority-publisher":
@@ -1129,7 +1140,7 @@ def main(
             "wc016-notification-dispatcher",
             "wc027-enrichment-feed-submit",
             "wc027-enrichment-feed-producer",
-            "wc027-guidance-authority-submit",
+            "wc027-guidance-publication-request-producer",
             "wc027-guidance-authority-publisher",
             "wc025-change-event-ingester",
             "wc025-change-dead-letter-purge",

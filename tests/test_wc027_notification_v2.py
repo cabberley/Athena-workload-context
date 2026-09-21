@@ -217,6 +217,22 @@ def test_notification_v2_binds_verified_assets_and_incident_deep_link() -> None:
     assert len(notification.message) < 512
 
 
+def test_notification_deadline_guard_runs_before_outbox_send() -> None:
+    fixture, service, outbox = _service()
+
+    def reject_write() -> None:
+        raise RuntimeError("synthetic deadline expired")
+
+    with pytest.raises(RuntimeError, match="deadline expired"):
+        service.publish(
+            incident_id=fixture["state"].incident_id,
+            verified_at=fixture["feed_index"].published_at,
+            before_irreversible_write=reject_write,
+        )
+
+    assert outbox.envelopes == []
+
+
 def test_notification_v2_trusts_existing_wc016_lifecycle_logical_key_id() -> None:
     lifecycle_key_id = (
         "synthetic-key://athena-argus-demo/wc016-incidents-rs256-v1"

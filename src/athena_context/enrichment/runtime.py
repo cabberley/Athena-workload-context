@@ -9,7 +9,9 @@ from pydantic import ValidationError
 
 from athena_context.contracts import (
     CorrelationRequest,
+    GuidancePublicationRequestDeliveryBudget,
     IncidentNotificationEnvelopeV2,
+    PublishedGuidanceAuthorityActivation,
     PublishedGuidanceAuthorityBinding,
     UtcDateTime,
     canonicalize_json,
@@ -22,7 +24,9 @@ from athena_context.enrichment.publication import (
     IncidentEnrichmentPublicationReceipt,
 )
 from athena_context.guidance.publication import (
+    GuidanceAuthorityActivationConflictError,
     GuidanceAuthorityActivationSnapshot,
+    guidance_authority_effective_finish_before,
     verify_guidance_authority_activation,
 )
 from athena_context.presentation_assets import (
@@ -52,12 +56,19 @@ class IncidentPublicationAuthorityReaderPort(Protocol):
     ) -> CurrentIncidentStateSnapshot | None: ...
 
 
-class GuidanceAuthorityActivationReaderPort(Protocol):
+class GuidanceAuthorityActivationPort(Protocol):
     def read_current(
         self,
         *,
         incident_id: str,
     ) -> GuidanceAuthorityActivationSnapshot | None: ...
+
+    def mark_feed_materialized(
+        self,
+        activation: PublishedGuidanceAuthorityActivation,
+        *,
+        expected_etag: str,
+    ) -> GuidanceAuthorityActivationSnapshot: ...
 
 
 class IncidentEnrichmentPublicationPort(Protocol):
@@ -67,6 +78,7 @@ class IncidentEnrichmentPublicationPort(Protocol):
         incident_publication: IncidentPublicationReceipt,
         verified_report: VerifiedCorrelationReport,
         guidance_binding: PublishedGuidanceAuthorityBinding,
+        before_irreversible_write: Callable[[], None] | None = None,
     ) -> IncidentEnrichmentPublicationReceipt: ...
 
 
@@ -76,6 +88,7 @@ class IncidentEnrichmentFeedPublicationPort(Protocol):
         enrichment_publication: IncidentEnrichmentPublicationReceipt,
         *,
         published_at: UtcDateTime,
+        before_irreversible_write: Callable[[], None] | None = None,
     ) -> IncidentEnrichmentFeedPublicationReceipt: ...
 
 
@@ -85,6 +98,7 @@ class NotificationV2PublicationPort(Protocol):
         *,
         incident_id: str,
         verified_at: datetime,
+        before_irreversible_write: Callable[[], None] | None = None,
     ) -> IncidentNotificationEnvelopeV2: ...
 
 
@@ -112,10 +126,22 @@ class Wc027EnrichmentFeedRuntime:
     guidance_binding_signature_verifier: SignatureVerifier
     correlation: CorrelationRuntimePort
     incident_authority: IncidentPublicationAuthorityReaderPort
-    guidance_activation: GuidanceAuthorityActivationReaderPort
+    guidance_activation: GuidanceAuthorityActivationPort
     enrichment_publication: IncidentEnrichmentPublicationPort
     feed_publication: IncidentEnrichmentFeedPublicationPort
     notification_publication: NotificationV2PublicationPort
+    delivery_budget: GuidancePublicationRequestDeliveryBudget
+    clock: Callable[[], datetime] | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.delivery_budget)
+            is not GuidancePublicationRequestDeliveryBudget
+        ):
+            raise TypeError(
+                "delivery_budget must be an exact "
+                "GuidancePublicationRequestDeliveryBudget"
+            )
 
     def publish(
         self,
@@ -153,13 +179,22 @@ class Wc027EnrichmentFeedRuntime:
             raise Wc027EnrichmentSourceNotReadyError(
                 "current guidance authority activation is required"
             )
+        effective_finish_before = guidance_authority_effective_finish_before(
+            activation.activation,
+            binding,
+        )
         verify_guidance_authority_activation(
             activation.activation,
             binding,
             trusted_key_id=self.guidance_binding_key_id,
             signature_verifier=self.guidance_binding_signature_verifier,
+            expected_delivery_budget=self.delivery_budget,
             verified_at=published_at,
         )
+        if effective_finish_before - published_at < self.delivery_budget.feed_processing_budget:
+            raise Wc027EnrichmentSourceNotReadyError(
+                "guidance activation lacks the reviewed feed processing window"
+            )
         subject = request.incident_subject
         if (
             current.state != subject.incident_state
@@ -179,24 +214,75 @@ class Wc027EnrichmentFeedRuntime:
             occurrence=current.occurrence,
         )
         verified_report = self.correlation.correlate(request.correlation_request)
+
+        def before_irreversible_write() -> None:
+            self._require_irreversible_write_window(
+                effective_finish_before,
+                fallback=published_at,
+            )
+
         enrichment = self.enrichment_publication.publish(
             incident_publication=incident_publication,
             verified_report=verified_report,
             guidance_binding=binding,
+            before_irreversible_write=before_irreversible_write,
         )
         feed = self.feed_publication.publish(
             enrichment,
             published_at=published_at,
+            before_irreversible_write=before_irreversible_write,
         )
         notification = self.notification_publication.publish(
             incident_id=incident_id,
             verified_at=published_at,
+            before_irreversible_write=before_irreversible_write,
         )
+        before_irreversible_write()
+        self._mark_feed_materialized(activation)
         return Wc027EnrichmentFeedRuntimeReceipt(
             binding_id=binding.binding_id,
             enrichment_feed_publication=feed,
             notification=notification,
         )
+
+    def _mark_feed_materialized(
+        self,
+        snapshot: GuidanceAuthorityActivationSnapshot,
+    ) -> GuidanceAuthorityActivationSnapshot:
+        if snapshot.trigger_delivery_status == "materialized":
+            return snapshot
+        try:
+            return self.guidance_activation.mark_feed_materialized(
+                snapshot.activation,
+                expected_etag=snapshot.etag,
+            )
+        except GuidanceAuthorityActivationConflictError:
+            current = self.guidance_activation.read_current(
+                incident_id=snapshot.activation.incident_id
+            )
+            if (
+                current is None
+                or current.activation != snapshot.activation
+                or current.trigger_delivery_status != "materialized"
+            ):
+                raise
+            return current
+
+    def _require_irreversible_write_window(
+        self,
+        finish_before: datetime,
+        *,
+        fallback: datetime,
+    ) -> None:
+        current = fallback if self.clock is None else self.clock()
+        _require_canonical_timestamp(current)
+        if (
+            finish_before - current
+            < self.delivery_budget.feed_irreversible_write_margin
+        ):
+            raise Wc027EnrichmentSourceNotReadyError(
+                "guidance activation lacks the reviewed irreversible-write margin"
+            )
 
 
 def parse_wc027_enrichment_trigger(
@@ -250,6 +336,8 @@ def verify_wc027_guidance_binding_signature(
 def validate_wc027_enrichment_broker_metadata(
     message: object,
     binding: PublishedGuidanceAuthorityBinding,
+    *,
+    expected_delivery_budget: GuidancePublicationRequestDeliveryBudget,
 ) -> None:
     properties = getattr(message, "application_properties", None)
     if type(properties) is not dict:
@@ -266,16 +354,18 @@ def validate_wc027_enrichment_broker_metadata(
         )
         for key, value in properties.items()
     }
+    expected_properties: dict[str, object] = {
+        "schemaVersion": WC027_ENRICHMENT_TRIGGER_SCHEMA_VERSION,
+        "bindingDigest": binding.binding_digest,
+    }
+    legacy_properties = dict(expected_properties)
+    expected_properties.update(expected_delivery_budget.broker_properties())
     if (
         getattr(message, "content_type", None) != "application/json"
         or str(getattr(message, "message_id", "")) != binding.binding_id
         or str(getattr(message, "session_id", ""))
         != binding.incident_bound_request.incident_subject.incident_id
-        or normalized
-        != {
-            "schemaVersion": WC027_ENRICHMENT_TRIGGER_SCHEMA_VERSION,
-            "bindingDigest": binding.binding_digest,
-        }
+        or normalized not in (legacy_properties, expected_properties)
     ):
         raise ValueError("WC-027 enrichment trigger broker metadata is invalid")
 

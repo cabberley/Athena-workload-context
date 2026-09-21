@@ -5,7 +5,7 @@ import binascii
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Protocol
+from typing import Literal, Protocol
 
 from pydantic import BaseModel, ValidationError
 
@@ -21,6 +21,9 @@ from athena_context.contracts import (
     CorrelationReport,
     CorrelationRequest,
     GuidanceAuthorityPublicationRequest,
+    GuidancePublicationRequestDeliveryBudget,
+    IncidentBoundCorrelationRequest,
+    IncidentOccurrenceReceipt,
     NoRunbookGuidanceSelection,
     PublishedGuidanceAuthority,
     PublishedGuidanceAuthorityActivation,
@@ -55,15 +58,23 @@ class GuidanceAuthorityArtifactWriterPort(Protocol):
         request: ArtifactWriteRequest,
     ) -> VersionPinnedBlobReference: ...
 
+    def read_reference(
+        self,
+        reference: VersionPinnedBlobReference,
+    ) -> bytes: ...
+
 
 @dataclass(frozen=True, slots=True)
 class GuidanceAuthorityActivationSnapshot:
     activation: PublishedGuidanceAuthorityActivation
     etag: str
+    trigger_delivery_status: Literal["pending", "materialized"] = "pending"
 
     def __post_init__(self) -> None:
         if type(self.etag) is not str or not self.etag:
             raise ValueError("activation etag must be a non-empty opaque value")
+        if self.trigger_delivery_status not in {"pending", "materialized"}:
+            raise ValueError("activation trigger delivery status is invalid")
 
 
 class GuidanceAuthorityActivationStorePort(Protocol):
@@ -80,6 +91,13 @@ class GuidanceAuthorityActivationStorePort(Protocol):
         expected_etag: str | None,
     ) -> GuidanceAuthorityActivationSnapshot: ...
 
+    def mark_feed_materialized(
+        self,
+        activation: PublishedGuidanceAuthorityActivation,
+        *,
+        expected_etag: str,
+    ) -> GuidanceAuthorityActivationSnapshot: ...
+
 
 class GuidanceAuthorityTriggerPort(Protocol):
     def enqueue(
@@ -87,6 +105,7 @@ class GuidanceAuthorityTriggerPort(Protocol):
         binding: PublishedGuidanceAuthorityBinding,
         *,
         time_to_live_seconds: int,
+        delivery_budget: GuidancePublicationRequestDeliveryBudget,
     ) -> None: ...
 
 
@@ -106,12 +125,193 @@ class GuidanceAuthorityIncidentReaderPort(Protocol):
     ) -> CurrentIncidentStateSnapshot | None: ...
 
 
+@dataclass(frozen=True, slots=True)
+class GuidanceIncidentAuthoritySnapshot:
+    current: CurrentIncidentStateSnapshot
+    active: ActiveIncidentIndexSnapshot
+
+
+def verify_incident_bound_request_signatures(
+    request: IncidentBoundCorrelationRequest,
+    *,
+    incident_key_vault_key_id: str,
+    incident_signature_verifier: SignatureVerifier,
+    correlation_binding_key_id: str,
+    correlation_binding_signature_verifier: SignatureVerifier,
+) -> None:
+    """Verify all nested signatures before any guidance output write."""
+
+    if type(request) is not IncidentBoundCorrelationRequest:
+        raise TypeError(
+            "request must be an exact IncidentBoundCorrelationRequest"
+        )
+    request = IncidentBoundCorrelationRequest.model_validate_json(
+        request.canonical_bytes()
+    )
+    subject = request.incident_subject
+    state = subject.incident_state
+    if (
+        type(incident_key_vault_key_id) is not str
+        or not incident_key_vault_key_id
+        or type(correlation_binding_key_id) is not str
+        or not correlation_binding_key_id
+        or subject.incident_state_attestation.key_vault_key_id
+        != incident_key_vault_key_id
+        or subject.incident_state_attestation.result_digest
+        != state.result_digest
+        or incident_signature_verifier(
+            incident_state_signature_preimage(state),
+            subject.incident_state_attestation.detached_signature,
+        )
+        is not True
+        or subject.subject_attestation.key_vault_key_id
+        != incident_key_vault_key_id
+        or incident_signature_verifier(
+            incident_correlation_subject_signature_preimage(subject),
+            subject.subject_attestation.detached_signature,
+        )
+        is not True
+        or request.binding_attestation.key_vault_key_id
+        != correlation_binding_key_id
+        or correlation_binding_signature_verifier(
+            incident_bound_correlation_request_signature_preimage(request),
+            request.binding_attestation.detached_signature,
+        )
+        is not True
+    ):
+        raise ValueError("nested authority signature is invalid")
+
+
+def read_current_guidance_incident_authority(
+    request: IncidentBoundCorrelationRequest,
+    *,
+    incident_key_id: str,
+    incident_authority: GuidanceAuthorityIncidentReaderPort,
+    expected_occurrence: IncidentOccurrenceReceipt | None = None,
+) -> GuidanceIncidentAuthoritySnapshot:
+    """Read and bind the current signed occurrence and active incident index."""
+
+    if type(request) is not IncidentBoundCorrelationRequest:
+        raise TypeError(
+            "request must be an exact IncidentBoundCorrelationRequest"
+        )
+    if type(incident_key_id) is not str or not incident_key_id:
+        raise ValueError("incident logical key ID is invalid")
+    if (
+        expected_occurrence is not None
+        and type(expected_occurrence) is not IncidentOccurrenceReceipt
+    ):
+        raise TypeError(
+            "expected_occurrence must be an exact IncidentOccurrenceReceipt"
+        )
+    subject = request.incident_subject
+    current = incident_authority.read_current_incident_state(
+        incident_id=subject.incident_id
+    )
+    active = incident_authority.read_active_incident_index()
+    confirmed_current = incident_authority.read_current_incident_state(
+        incident_id=subject.incident_id
+    )
+    confirmed_active = incident_authority.read_active_incident_index()
+    if (
+        current is None
+        or current.occurrence is None
+        or active is None
+        or confirmed_current is None
+        or confirmed_current.occurrence is None
+        or confirmed_active is None
+    ):
+        raise GuidanceAuthoritySourceNotReadyError(
+            "current signed incident occurrence is unavailable"
+        )
+    if current != confirmed_current or active != confirmed_active:
+        raise GuidanceAuthoritySourceNotReadyError(
+            "signed incident authority changed during snapshot read"
+        )
+    occurrence = current.occurrence
+    entry = next(
+        (
+            item
+            for item in active.index.incidents
+            if item.incident_id == subject.incident_id
+        ),
+        None,
+    )
+    if (
+        current.state != subject.incident_state
+        or current.pointer.incident_id != subject.incident_id
+        or current.pointer.key_id != incident_key_id
+        or active.index.key_id != incident_key_id
+        or occurrence.incident_id != subject.incident_id
+        or occurrence.transition_id != subject.incident_transition_id
+        or occurrence.state_result_digest != subject.incident_state_digest
+        or occurrence.state_reference != subject.state_reference
+        or occurrence.state_attestation_reference
+        != subject.attestation_reference
+        or (
+            expected_occurrence is not None
+            and occurrence != expected_occurrence
+        )
+    ):
+        raise ValueError(
+            "incident request is stale for current signed incident authority"
+        )
+    if (
+        current.pointer.key_fingerprint != active.index.key_fingerprint
+        or current.pointer_sha256
+        != occurrence.pointer_reference.content_digest
+        or entry is None
+        or entry.lifecycle != "active"
+        or entry.pointer_path != f"./{occurrence.pointer_reference.name}"
+        or entry.pointer_sha256 != current.pointer_sha256
+    ):
+        raise GuidanceAuthoritySourceNotReadyError(
+            "current incident pointer and active index are not coherent"
+        )
+    return GuidanceIncidentAuthoritySnapshot(
+        current=current,
+        active=active,
+    )
+
+
+def require_unchanged_guidance_incident_authority(
+    request: IncidentBoundCorrelationRequest,
+    *,
+    expected: GuidanceIncidentAuthoritySnapshot,
+    incident_key_id: str,
+    incident_authority: GuidanceAuthorityIncidentReaderPort,
+    expected_occurrence: IncidentOccurrenceReceipt | None = None,
+) -> None:
+    if type(expected) is not GuidanceIncidentAuthoritySnapshot:
+        raise TypeError(
+            "expected must be an exact GuidanceIncidentAuthoritySnapshot"
+        )
+    current = read_current_guidance_incident_authority(
+        request,
+        incident_key_id=incident_key_id,
+        incident_authority=incident_authority,
+        expected_occurrence=expected_occurrence,
+    )
+    if current != expected:
+        raise GuidanceAuthoritySourceNotReadyError(
+            "signed incident authority changed during guidance publication"
+        )
+
+
 class GuidanceAuthorityActivationConflictError(RuntimeError):
     """The active guidance authority changed during compare-and-swap."""
 
 
 class GuidanceAuthoritySourceNotReadyError(RuntimeError):
     """A required signed source changed or was temporarily unavailable."""
+
+
+class GuidanceAuthorityOccurrenceConflictError(GuidanceAuthorityActivationConflictError):
+    """A different immutable request already owns the signed occurrence."""
+
+
+class GuidanceAuthorityDeliveryExpiredError(GuidanceAuthoritySourceNotReadyError):
+    """The signed effective delivery deadline has irreversibly expired."""
 
 
 def parse_guidance_authority_publication_request(
@@ -157,6 +357,7 @@ class GuidanceAuthorityPublisher:
     artifact_writer: GuidanceAuthorityArtifactWriterPort
     activation_store: GuidanceAuthorityActivationStorePort
     trigger: GuidanceAuthorityTriggerPort
+    delivery_budget: GuidancePublicationRequestDeliveryBudget
     clock: Callable[[], datetime] | None = None
 
     def __post_init__(self) -> None:
@@ -173,6 +374,14 @@ class GuidanceAuthorityPublisher:
             raise ValueError("guidance publisher key IDs must be non-empty strings")
         if len(set(key_ids)) != len(key_ids):
             raise ValueError("guidance publisher trust-domain key IDs must be distinct")
+        if (
+            type(self.delivery_budget)
+            is not GuidancePublicationRequestDeliveryBudget
+        ):
+            raise TypeError(
+                "delivery_budget must be an exact "
+                "GuidancePublicationRequestDeliveryBudget"
+            )
 
     def publish(
         self,
@@ -198,15 +407,26 @@ class GuidanceAuthorityPublisher:
         self._verify_request_signatures(request)
 
         current, active = self._read_current_authority(request)
+        self._require_remaining_window(
+            request,
+            at=now,
+            required=timedelta(
+                seconds=self.delivery_budget.publisher_processing_seconds
+            ),
+            phase="publisher processing",
+        )
         verified = self.correlation.correlate(
             request.incident_bound_request.correlation_request
         )
         report = self.correlation.validate_result(verified)
 
         authority = _build_zero_option_authority(request)
-        authority_reference = self._write_json(
+        authority_reference, operation_now = self._write_json(
             f"guidance-authority/{authority.authority_id}/authority.json",
             authority.canonical_bytes(),
+            request=request,
+            fallback=now,
+            phase="authority artifact write",
         )
         binding = self._build_binding(
             request,
@@ -214,9 +434,12 @@ class GuidanceAuthorityPublisher:
             authority=authority,
             authority_reference=authority_reference,
         )
-        binding_reference = self._write_json(
+        binding_reference, operation_now = self._write_json(
             f"guidance-bindings/{binding.binding_id}/binding.json",
             binding.canonical_bytes(),
+            request=request,
+            fallback=operation_now,
+            phase="binding artifact write",
         )
         activation = self._build_activation(
             request,
@@ -234,9 +457,6 @@ class GuidanceAuthorityPublisher:
                 "correlation authority changed before activation"
             )
 
-        operation_now = self._operation_time(now)
-        if operation_now >= request.expires_at:
-            raise ValueError("guidance publication request expired before activation")
         previous = self.activation_store.read_current(
             incident_id=current.state.incident_id
         )
@@ -246,15 +466,31 @@ class GuidanceAuthorityPublisher:
             and previous.activation != activation
             and previous.activation.incident_state_digest
             == activation.incident_state_digest
-            and previous.activation.expires_at > operation_now
         ):
-            raise GuidanceAuthorityActivationConflictError(
-                "a different guidance authority is already active for this occurrence"
+            raise GuidanceAuthorityOccurrenceConflictError(
+                "a different guidance authority already owns this occurrence"
             )
         if previous is not None and previous.activation == activation:
             committed = previous
             replayed = True
         else:
+            self._require_unchanged_authority(
+                request,
+                current=current,
+                active=active,
+            )
+            operation_now = self._operation_time(operation_now)
+            self._require_remaining_window(
+                request,
+                at=operation_now,
+                required=self.delivery_budget.publisher_cas_margin,
+                phase="authority CAS",
+            )
+            self._require_trigger_delivery_window(
+                request,
+                at=operation_now,
+                phase="authority CAS",
+            )
             try:
                 committed = self.activation_store.compare_and_swap(
                     activation,
@@ -273,23 +509,17 @@ class GuidanceAuthorityPublisher:
                 "activation store committed a different guidance authority"
             )
 
-        self._require_unchanged_authority(request, current=current, active=active)
         final_activation = self.activation_store.read_current(
             incident_id=current.state.incident_id
         )
         if final_activation is None or final_activation.activation != activation:
             raise GuidanceAuthorityActivationConflictError(
-                "guidance authority activation changed before enqueue"
+                "guidance authority activation changed after commit"
             )
-        operation_now = self._operation_time(operation_now)
-        remaining_seconds = int(
-            (request.expires_at - operation_now).total_seconds()
-        )
-        if remaining_seconds < 1:
-            raise ValueError("guidance publication request expired before enqueue")
-        self.trigger.enqueue(
+        self._submit_pending_trigger(
+            final_activation,
             binding,
-            time_to_live_seconds=remaining_seconds,
+            at=operation_now,
         )
         return GuidanceAuthorityPublicationReceipt(
             request_id=request.request_id,
@@ -298,6 +528,237 @@ class GuidanceAuthorityPublisher:
             activation=activation,
             replayed=replayed,
         )
+
+    def recover_trigger_delivery(
+        self,
+        request: GuidanceAuthorityPublicationRequest,
+        *,
+        now: UtcDateTime,
+    ) -> bool:
+        if type(request) is not GuidanceAuthorityPublicationRequest:
+            raise TypeError(
+                "request must be an exact GuidanceAuthorityPublicationRequest"
+            )
+        request = GuidanceAuthorityPublicationRequest.model_validate_json(
+            request.canonical_bytes()
+        )
+        if (
+            not isinstance(now, datetime)
+            or now.tzinfo is None
+            or now.utcoffset() != timedelta(0)
+            or now.microsecond % 1000
+        ):
+            raise ValueError(
+                "guidance publisher recovery time must be millisecond UTC"
+            )
+        self._verify_request_signatures(request)
+        snapshot = self.activation_store.read_current(
+            incident_id=request.incident_bound_request.incident_subject.incident_id
+        )
+        if snapshot is None or not self._activation_commits_request(
+            snapshot.activation,
+            request,
+        ):
+            return False
+        if snapshot.trigger_delivery_status == "materialized":
+            return True
+        binding = self._read_committed_binding(
+            snapshot.activation,
+            request=request,
+        )
+        self._submit_pending_trigger(
+            snapshot,
+            binding,
+            at=now,
+        )
+        return True
+
+    def _submit_pending_trigger(
+        self,
+        snapshot: GuidanceAuthorityActivationSnapshot,
+        binding: PublishedGuidanceAuthorityBinding,
+        *,
+        at: datetime,
+    ) -> GuidanceAuthorityActivationSnapshot:
+        if snapshot.trigger_delivery_status == "materialized":
+            return snapshot
+        self._enqueue_committed_trigger(
+            snapshot.activation,
+            binding,
+            at=at,
+        )
+        return snapshot
+
+    def _read_committed_binding(
+        self,
+        activation: PublishedGuidanceAuthorityActivation,
+        *,
+        request: GuidanceAuthorityPublicationRequest,
+    ) -> PublishedGuidanceAuthorityBinding:
+        binding = self._read_activation_binding(activation)
+        if (
+            binding.incident_bound_request != request.incident_bound_request
+            or binding.requested_actions != request.requested_actions
+            or binding.evaluated_at != request.evaluated_at
+        ):
+            raise ValueError(
+                "committed guidance binding outbox is not canonical or trusted"
+            )
+        return binding
+
+    def _read_activation_binding(
+        self,
+        activation: PublishedGuidanceAuthorityActivation,
+    ) -> PublishedGuidanceAuthorityBinding:
+        payload = self.artifact_writer.read_reference(
+            activation.binding_reference
+        )
+        try:
+            binding = PublishedGuidanceAuthorityBinding.model_validate_json(
+                payload
+            )
+        except (ValidationError, ValueError) as exc:
+            raise ValueError(
+                "committed guidance binding outbox is invalid"
+            ) from exc
+        if (
+            payload != binding.canonical_bytes()
+            or not _guidance_authority_activation_matches_binding(
+                activation,
+                binding,
+                trusted_key_id=self.binding_key_id,
+                signature_verifier=self.binding_signature_verifier,
+                expected_delivery_budget=self.delivery_budget,
+            )
+        ):
+            raise ValueError(
+                "committed guidance binding outbox is not canonical or trusted"
+            )
+        return binding
+
+    def _enqueue_committed_trigger(
+        self,
+        activation: PublishedGuidanceAuthorityActivation,
+        binding: PublishedGuidanceAuthorityBinding,
+        *,
+        at: datetime,
+    ) -> None:
+        effective_finish_before = guidance_authority_effective_finish_before(
+            activation,
+            binding,
+        )
+        trigger_send_deadline = (
+            effective_finish_before
+            - self.delivery_budget.feed_minimum_remaining_lifetime
+            - timedelta(seconds=self.delivery_budget.feed_delivery_jitter_seconds)
+        )
+        if at > trigger_send_deadline:
+            raise GuidanceAuthorityDeliveryExpiredError(
+                "committed guidance trigger recovery deadline expired"
+            )
+        verify_guidance_authority_activation(
+            activation,
+            binding,
+            trusted_key_id=self.binding_key_id,
+            signature_verifier=self.binding_signature_verifier,
+            expected_delivery_budget=self.delivery_budget,
+            verified_at=at,
+        )
+        send_at = self._operation_time(at)
+        if send_at > trigger_send_deadline:
+            raise GuidanceAuthorityDeliveryExpiredError(
+                "committed guidance trigger recovery deadline expired"
+            )
+        if (
+            effective_finish_before - send_at
+            < self.delivery_budget.feed_minimum_remaining_lifetime
+            + timedelta(
+                seconds=self.delivery_budget.feed_delivery_jitter_seconds
+            )
+        ):
+            raise GuidanceAuthorityDeliveryExpiredError(
+                "committed guidance trigger lacks the reviewed feed window"
+            )
+        time_to_live_seconds = (
+            self.delivery_budget.feed_trigger_time_to_live_seconds(
+                finish_before=effective_finish_before,
+                at=send_at,
+            )
+        )
+        if time_to_live_seconds < 1:
+            raise GuidanceAuthorityDeliveryExpiredError(
+                "committed guidance trigger TTL is exhausted"
+            )
+        self.trigger.enqueue(
+            binding,
+            time_to_live_seconds=time_to_live_seconds,
+            delivery_budget=self.delivery_budget,
+        )
+
+    def _activation_commits_request(
+        self,
+        activation: PublishedGuidanceAuthorityActivation,
+        request: GuidanceAuthorityPublicationRequest,
+    ) -> bool:
+        return (
+            activation.incident_id
+            == request.incident_bound_request.incident_subject.incident_id
+            and activation.incident_state_digest
+            == request.incident_bound_request.incident_subject.incident_state.result_digest
+            and activation.occurrence_digest
+            == request.incident_occurrence.occurrence_digest
+            and activation.publication_request_id == request.request_id
+            and activation.publication_request_digest == request.request_digest
+            and activation.activated_at == request.evaluated_at
+            and activation.request_expires_at == request.expires_at
+            and activation.delivery_finish_before == request.delivery_finish_before
+            and (
+                not activation.has_extended_delivery_binding
+                or (
+                    activation.delivery_budget == self.delivery_budget
+                    and activation.trigger_message_id == activation.binding_id
+                )
+            )
+            and activation.activation_attestation.key_id == self.binding_key_id
+            and self.binding_signature_verifier(
+                guidance_authority_activation_signature_preimage(activation),
+                activation.activation_attestation.detached_signature,
+            )
+            is True
+        )
+
+    @staticmethod
+    def _require_remaining_window(
+        request: GuidanceAuthorityPublicationRequest,
+        *,
+        at: datetime,
+        required: timedelta,
+        phase: str,
+    ) -> timedelta:
+        remaining = request.expires_at - at
+        if remaining < required:
+            raise GuidanceAuthoritySourceNotReadyError(
+                f"guidance publication request lacks the reviewed {phase} window"
+            )
+        return remaining
+
+    def _require_trigger_delivery_window(
+        self,
+        request: GuidanceAuthorityPublicationRequest,
+        *,
+        at: datetime,
+        phase: str,
+    ) -> None:
+        required = (
+            self.delivery_budget.feed_minimum_remaining_lifetime
+            + timedelta(seconds=self.delivery_budget.feed_delivery_jitter_seconds)
+            + self.delivery_budget.publisher_cas_margin
+        )
+        if request.effective_finish_before - at < required:
+            raise GuidanceAuthorityDeliveryExpiredError(
+                f"guidance publication request lacks the reviewed {phase} "
+                "trigger-delivery window"
+            )
 
     def _operation_time(self, fallback: UtcDateTime) -> datetime:
         current = fallback if self.clock is None else self.clock()
@@ -314,9 +775,6 @@ class GuidanceAuthorityPublisher:
         self,
         request: GuidanceAuthorityPublicationRequest,
     ) -> None:
-        bound = request.incident_bound_request
-        subject = bound.incident_subject
-        state = subject.incident_state
         if (
             request.request_attestation.key_id != self.request_key_id
             or self.request_signature_verifier(
@@ -326,84 +784,37 @@ class GuidanceAuthorityPublisher:
                 request.request_attestation.detached_signature,
             )
             is not True
-            or subject.incident_state_attestation.key_vault_key_id
-            != self.incident_key_vault_key_id
-            or subject.incident_state_attestation.result_digest
-            != state.result_digest
-            or self.incident_signature_verifier(
-                incident_state_signature_preimage(state),
-                subject.incident_state_attestation.detached_signature,
-            )
-            is not True
-            or subject.subject_attestation.key_vault_key_id
-            != self.incident_key_vault_key_id
-            or self.incident_signature_verifier(
-                incident_correlation_subject_signature_preimage(subject),
-                subject.subject_attestation.detached_signature,
-            )
-            is not True
-            or bound.binding_attestation.key_vault_key_id
-            != self.correlation_binding_key_id
-            or self.correlation_binding_signature_verifier(
-                incident_bound_correlation_request_signature_preimage(bound),
-                bound.binding_attestation.detached_signature,
-            )
-            is not True
         ):
             raise ValueError(
                 "guidance publication request or nested authority signature is invalid"
             )
+        verify_incident_bound_request_signatures(
+            request.incident_bound_request,
+            incident_key_vault_key_id=self.incident_key_vault_key_id,
+            incident_signature_verifier=self.incident_signature_verifier,
+            correlation_binding_key_id=self.correlation_binding_key_id,
+            correlation_binding_signature_verifier=(
+                self.correlation_binding_signature_verifier
+            ),
+        )
+
+    def _read_incident_authority_snapshot(
+        self,
+        request: GuidanceAuthorityPublicationRequest,
+    ) -> GuidanceIncidentAuthoritySnapshot:
+        return read_current_guidance_incident_authority(
+            request.incident_bound_request,
+            incident_key_id=self.incident_key_id,
+            incident_authority=self.incident_authority,
+            expected_occurrence=request.incident_occurrence,
+        )
 
     def _read_current_authority(
         self,
         request: GuidanceAuthorityPublicationRequest,
     ) -> tuple[CurrentIncidentStateSnapshot, ActiveIncidentIndexSnapshot]:
-        incident_id = request.incident_bound_request.incident_subject.incident_id
-        current = self.incident_authority.read_current_incident_state(
-            incident_id=incident_id
-        )
-        active = self.incident_authority.read_active_incident_index()
-        if current is None or current.occurrence is None or active is None:
-            raise GuidanceAuthoritySourceNotReadyError(
-                "current signed incident occurrence is unavailable"
-            )
-        self._validate_current_authority(request, current=current, active=active)
-        return current, active
-
-    @staticmethod
-    def _validate_current_authority(
-        request: GuidanceAuthorityPublicationRequest,
-        *,
-        current: CurrentIncidentStateSnapshot,
-        active: ActiveIncidentIndexSnapshot,
-    ) -> None:
-        subject = request.incident_bound_request.incident_subject
-        occurrence = current.occurrence
-        if occurrence is None:
-            raise ValueError("current signed incident occurrence is unavailable")
-        entry = next(
-            (
-                item
-                for item in active.index.incidents
-                if item.incident_id == subject.incident_id
-            ),
-            None,
-        )
-        if (
-            current.state != subject.incident_state
-            or occurrence.state_reference != subject.state_reference
-            or occurrence.state_attestation_reference
-            != subject.attestation_reference
-            or occurrence != request.incident_occurrence
-            or current.pointer_sha256 != occurrence.pointer_reference.content_digest
-            or entry is None
-            or entry.lifecycle != "active"
-            or entry.pointer_path != f"./{occurrence.pointer_reference.name}"
-            or entry.pointer_sha256 != current.pointer_sha256
-        ):
-            raise ValueError(
-                "guidance publication request is stale for current signed incident authority"
-            )
+        snapshot = self._read_incident_authority_snapshot(request)
+        return snapshot.current, snapshot.active
 
     def _require_unchanged_authority(
         self,
@@ -412,11 +823,16 @@ class GuidanceAuthorityPublisher:
         current: CurrentIncidentStateSnapshot,
         active: ActiveIncidentIndexSnapshot,
     ) -> None:
-        reread, reindex = self._read_current_authority(request)
-        if reread != current or reindex != active:
-            raise GuidanceAuthoritySourceNotReadyError(
-                "signed incident authority changed during publication"
-            )
+        require_unchanged_guidance_incident_authority(
+            request.incident_bound_request,
+            expected=GuidanceIncidentAuthoritySnapshot(
+                current=current,
+                active=active,
+            ),
+            incident_key_id=self.incident_key_id,
+            incident_authority=self.incident_authority,
+            expected_occurrence=request.incident_occurrence,
+        )
 
     def _build_binding(
         self,
@@ -462,7 +878,9 @@ class GuidanceAuthorityPublisher:
         }
         preimage_digest = compute_artifact_digest(_json_payload(unsigned_payload))
         preimage = _canonical_payload(unsigned_payload)
-        signature = _base64url_signature(self.binding_signer.sign_preimage(preimage))
+        signature = normalize_guidance_detached_signature(
+            self.binding_signer.sign_preimage(preimage)
+        )
         if self.binding_signature_verifier(preimage, signature) is not True:
             raise ValueError("guidance authority binding signer failed verification")
         attestation = PublishedGuidanceAuthorityBindingAttestation.model_validate(
@@ -506,9 +924,7 @@ class GuidanceAuthorityPublisher:
         if occurrence is None:
             raise ValueError("current signed incident occurrence is unavailable")
         unsigned_payload: dict[str, object] = {
-            "schemaVersion": (
-                "athena.wc027PublishedGuidanceAuthorityActivation.v1"
-            ),
+            "schemaVersion": "athena.wc027PublishedGuidanceAuthorityActivation.v2",
             "incidentId": current.state.incident_id,
             "incidentStateDigest": current.state.result_digest,
             "occurrenceDigest": occurrence.occurrence_digest,
@@ -517,11 +933,18 @@ class GuidanceAuthorityPublisher:
             "bindingId": binding.binding_id,
             "bindingDigest": binding.binding_digest,
             "bindingReference": binding_reference,
+            "triggerMessageId": binding.binding_id,
+            "triggerDeliveryPending": True,
+            "deliveryBudget": self.delivery_budget,
             "activatedAt": request.evaluated_at,
-            "expiresAt": request.expires_at,
+            "publicationRequestExpiresAt": request.expires_at,
+            "finishBefore": request.delivery_finish_before,
+            "expiresAt": request.delivery_finish_before,
         }
         preimage = _canonical_payload(unsigned_payload)
-        signature = _base64url_signature(self.binding_signer.sign_preimage(preimage))
+        signature = normalize_guidance_detached_signature(
+            self.binding_signer.sign_preimage(preimage)
+        )
         if self.binding_signature_verifier(preimage, signature) is not True:
             raise ValueError("guidance activation signer failed verification")
         attestation = PublishedGuidanceAuthorityActivationAttestation(
@@ -559,7 +982,23 @@ class GuidanceAuthorityPublisher:
         self,
         blob_name: str,
         payload: bytes,
-    ) -> VersionPinnedBlobReference:
+        *,
+        request: GuidanceAuthorityPublicationRequest,
+        fallback: datetime,
+        phase: str,
+    ) -> tuple[VersionPinnedBlobReference, datetime]:
+        operation_now = self._operation_time(fallback)
+        self._require_remaining_window(
+            request,
+            at=operation_now,
+            required=self.delivery_budget.publisher_cas_margin,
+            phase=phase,
+        )
+        self._require_trigger_delivery_window(
+            request,
+            at=operation_now,
+            phase=phase,
+        )
         reference = self.artifact_writer.create_or_recover(
             ArtifactWriteRequest(
                 blob_name=blob_name,
@@ -574,7 +1013,7 @@ class GuidanceAuthorityPublisher:
             or reference.content_digest != sha256_hex(payload)
         ):
             raise ValueError("guidance artifact writer returned a mismatched reference")
-        return reference
+        return reference, operation_now
 
 
 def _build_zero_option_authority(
@@ -638,7 +1077,7 @@ def _json_payload(value: object) -> object:
     return value
 
 
-def _base64url_signature(value: str) -> str:
+def normalize_guidance_detached_signature(value: str) -> str:
     try:
         raw = base64.b64decode(value, validate=True)
     except (TypeError, ValueError, binascii.Error):
@@ -651,36 +1090,79 @@ def _base64url_signature(value: str) -> str:
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
 
+def guidance_authority_effective_finish_before(
+    activation: PublishedGuidanceAuthorityActivation,
+    binding: PublishedGuidanceAuthorityBinding,
+) -> datetime:
+    return min(
+        activation.delivery_finish_before,
+        binding.incident_bound_request.correlation_request.expires_at,
+    )
+
+
+def _guidance_authority_activation_matches_binding(
+    activation: PublishedGuidanceAuthorityActivation,
+    binding: PublishedGuidanceAuthorityBinding,
+    *,
+    trusted_key_id: str,
+    signature_verifier: SignatureVerifier,
+    expected_delivery_budget: GuidancePublicationRequestDeliveryBudget,
+) -> bool:
+    extended_delivery_binding_matches = not activation.has_extended_delivery_binding or (
+        activation.trigger_message_id == binding.binding_id
+        and activation.delivery_budget == expected_delivery_budget
+    )
+    return (
+        activation.activation_attestation.key_id == trusted_key_id
+        and activation.incident_id == binding.incident_bound_request.incident_subject.incident_id
+        and activation.incident_state_digest
+        == binding.incident_bound_request.incident_subject.incident_state_digest
+        and activation.binding_id == binding.binding_id
+        and extended_delivery_binding_matches
+        and activation.binding_digest == binding.binding_digest
+        and activation.binding_reference.name
+        == f"guidance-bindings/{binding.binding_id}/binding.json"
+        and activation.binding_reference.content_digest == sha256_hex(binding.canonical_bytes())
+        and binding.binding_attestation.key_id == trusted_key_id
+        and signature_verifier(
+            guidance_authority_binding_signature_preimage(binding),
+            binding.binding_attestation.detached_signature,
+        )
+        is True
+        and signature_verifier(
+            guidance_authority_activation_signature_preimage(activation),
+            activation.activation_attestation.detached_signature,
+        )
+        is True
+    )
+
+
 def verify_guidance_authority_activation(
     activation: PublishedGuidanceAuthorityActivation,
     binding: PublishedGuidanceAuthorityBinding,
     *,
     trusted_key_id: str,
     signature_verifier: SignatureVerifier,
+    expected_delivery_budget: GuidancePublicationRequestDeliveryBudget,
     verified_at: datetime,
 ) -> None:
     activation = PublishedGuidanceAuthorityActivation.model_validate_json(
         activation.canonical_bytes()
     )
+    effective_finish_before = guidance_authority_effective_finish_before(
+        activation,
+        binding,
+    )
     if (
-        activation.activation_attestation.key_id != trusted_key_id
-        or activation.incident_id
-        != binding.incident_bound_request.incident_subject.incident_id
-        or activation.incident_state_digest
-        != binding.incident_bound_request.incident_subject.incident_state_digest
-        or activation.binding_id != binding.binding_id
-        or activation.binding_digest != binding.binding_digest
-        or activation.binding_reference.name
-        != f"guidance-bindings/{binding.binding_id}/binding.json"
-        or activation.binding_reference.content_digest
-        != sha256_hex(binding.canonical_bytes())
-        or verified_at < activation.activated_at
-        or verified_at >= activation.expires_at
-        or signature_verifier(
-            guidance_authority_activation_signature_preimage(activation),
-            activation.activation_attestation.detached_signature,
+        not _guidance_authority_activation_matches_binding(
+            activation,
+            binding,
+            trusted_key_id=trusted_key_id,
+            signature_verifier=signature_verifier,
+            expected_delivery_budget=expected_delivery_budget,
         )
-        is not True
+        or verified_at < activation.activated_at
+        or verified_at >= effective_finish_before
     ):
         raise ValueError("guidance authority activation is invalid or stale")
 
@@ -688,9 +1170,17 @@ def verify_guidance_authority_activation(
 __all__ = [
     "GuidanceAuthorityActivationConflictError",
     "GuidanceAuthorityActivationSnapshot",
+    "GuidanceAuthorityDeliveryExpiredError",
+    "GuidanceIncidentAuthoritySnapshot",
+    "GuidanceAuthorityOccurrenceConflictError",
     "GuidanceAuthorityPublisher",
     "GuidanceAuthorityPublicationReceipt",
     "GuidanceAuthoritySourceNotReadyError",
+    "guidance_authority_effective_finish_before",
+    "normalize_guidance_detached_signature",
     "parse_guidance_authority_publication_request",
+    "read_current_guidance_incident_authority",
+    "require_unchanged_guidance_incident_authority",
+    "verify_incident_bound_request_signatures",
     "verify_guidance_authority_activation",
 ]

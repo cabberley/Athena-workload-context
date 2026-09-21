@@ -23,6 +23,13 @@ param registryServer string
 @description('Existing Azure Container Registry resource ID.')
 param registryResourceId string
 
+@allowed([
+  'LegacyRegistryPermissions'
+  'AbacRepositoryPermissions'
+])
+@description('Reviewed ACR role assignment mode.')
+param registryRoleAssignmentMode string
+
 @description('Existing private Premium Service Bus namespace name.')
 param serviceBusNamespaceName string
 
@@ -36,6 +43,9 @@ param triggerSubmitterIdentityResourceIds array
 
 @description('Broker identity resource ID attached to the Job and used by the scaler, ACR pull, and queue RBAC.')
 param brokerIdentityResourceId string
+
+@description('Exact broker identity principal object ID used for deterministic ACR role assignment.')
+param brokerIdentityPrincipalId string
 
 @description('Producer identity resource ID that reads v1 incident-assets read-only without list access.')
 param incidentReaderIdentityResourceId string
@@ -52,7 +62,7 @@ param feedV2ReaderIdentityResourceId string
 @description('Feed registry Table writer identity resource ID.')
 param registryWriterIdentityResourceId string
 
-@description('Read-only identity resource ID for the current guidance-authority activation row.')
+@description('Identity resource ID that reads the current guidance activation and CAS-marks feed materialization.')
 param guidanceActivationReaderIdentityResourceId string
 
 @description('Trust/public-key reader identity resource ID used for Key Vault Reader and all verification keys.')
@@ -221,11 +231,57 @@ var jobNamePrefix = take(namePrefix, 18)
 var triggerQueueName = 'wc027-enrichment-feed-requests'
 var serviceBusDataReceiverRoleDefinitionId = '4f6c0938-94ea-4d52-8e5a-2e02b7ef8e7d'
 var serviceBusDataSenderRoleDefinitionId = '69a216fc-b8fb-44d8-bc22-1f3c2cd27a39'
-var acrPullRoleDefinitionId = '7f951dda-4ed3-4680-a7ca-43fe172d538d'
 var storageBlobDataReaderRoleDefinitionId = '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1'
 var storageTableDataContributorRoleDefinitionId = '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3'
-var storageTableDataReaderRoleDefinitionId = '76199698-9eea-4c19-bc75-cec21354c6b6'
 var keyVaultCryptoUserRoleDefinitionId = '12338af0-0e69-4776-bea7-57ae8d297424'
+var acrPullRoleDefinitionId = '7f951dda-4ed3-4680-a7ca-43fe172d538d'
+var acrRepositoryReaderRoleDefinitionId = 'b93aa761-3e63-49ed-ac28-beffa264f7ac'
+var registryScopedResourceId = resourceId(
+  split(registryResourceId, '/')[2],
+  split(registryResourceId, '/')[4],
+  'Microsoft.ContainerRegistry/registries',
+  last(split(registryResourceId, '/'))
+)
+var registryPullRoleDefinitionGuid = registryRoleAssignmentMode == 'LegacyRegistryPermissions'
+  ? acrPullRoleDefinitionId
+  : acrRepositoryReaderRoleDefinitionId
+var registryPullRoleDefinitionId = subscriptionResourceId(
+  split(registryResourceId, '/')[2],
+  'Microsoft.Authorization/roleDefinitions',
+  registryPullRoleDefinitionGuid
+)
+var guidancePublisherKedaPollingIntervalSeconds = 30
+var guidancePublisherColdStartSeconds = 30
+var guidancePublisherConnectionSetupSeconds = 30
+var guidancePublisherProcessingSeconds = 60
+var guidancePublisherCasMarginSeconds = 5
+var guidancePublisherMinimumRemainingLifetimeSeconds = guidancePublisherKedaPollingIntervalSeconds + guidancePublisherColdStartSeconds + guidancePublisherConnectionSetupSeconds + guidancePublisherProcessingSeconds
+var guidanceFeedKedaPollingIntervalSeconds = 30
+var guidanceFeedColdStartSeconds = 30
+var guidanceFeedConnectionSetupSeconds = 30
+var guidanceFeedProcessingSeconds = 60
+var guidanceFeedDeliveryJitterSeconds = 30
+var guidanceFeedIrreversibleWriteMarginSeconds = 15
+var guidanceFeedMinimumRemainingLifetimeSeconds = guidanceFeedKedaPollingIntervalSeconds + guidanceFeedColdStartSeconds + guidanceFeedConnectionSetupSeconds + guidanceFeedProcessingSeconds
+var guidanceFeedTriggerRecoverySeconds = 300
+var guidanceMinimumRemainingLifetimeSeconds = guidancePublisherMinimumRemainingLifetimeSeconds
+var guidancePublicationDeliveryBudget = {
+  publisherKedaPollingIntervalSeconds: guidancePublisherKedaPollingIntervalSeconds
+  publisherColdStartSeconds: guidancePublisherColdStartSeconds
+  publisherConnectionSetupSeconds: guidancePublisherConnectionSetupSeconds
+  publisherProcessingSeconds: guidancePublisherProcessingSeconds
+  publisherCasMarginSeconds: guidancePublisherCasMarginSeconds
+  publisherMinimumRemainingLifetimeSeconds: guidancePublisherMinimumRemainingLifetimeSeconds
+  feedKedaPollingIntervalSeconds: guidanceFeedKedaPollingIntervalSeconds
+  feedColdStartSeconds: guidanceFeedColdStartSeconds
+  feedConnectionSetupSeconds: guidanceFeedConnectionSetupSeconds
+  feedProcessingSeconds: guidanceFeedProcessingSeconds
+  feedDeliveryJitterSeconds: guidanceFeedDeliveryJitterSeconds
+  feedIrreversibleWriteMarginSeconds: guidanceFeedIrreversibleWriteMarginSeconds
+  feedMinimumRemainingLifetimeSeconds: guidanceFeedMinimumRemainingLifetimeSeconds
+  feedTriggerRecoverySeconds: guidanceFeedTriggerRecoverySeconds
+  minimumRemainingLifetimeSeconds: guidanceMinimumRemainingLifetimeSeconds
+}
 
 var expectedRegistryServer = '${toLower(registry.name)}.azurecr.io'
 var imagePrefix = '${expectedRegistryServer}/athena/wc027-enrichment-feed-producer@sha256:'
@@ -246,8 +302,25 @@ var validatedProducerImage = registryServer == expectedRegistryServer && produce
 ) && length(imageDigest) == 64 && empty(imageDigestInvalidCharacters) && imageDigest != '0000000000000000000000000000000000000000000000000000000000000000'
   ? producerImage
   : fail('producerImage must be a real digest-pinned image in the supplied registry')
+var producerImageRepositoryName = replace(
+  first(split(validatedProducerImage, '@sha256:')),
+  '${expectedRegistryServer}/',
+  ''
+)
+var registryPullRoleAssignmentId = extensionResourceId(
+  registryScopedResourceId,
+  'Microsoft.Authorization/roleAssignments',
+  registryRoleAssignmentMode == 'AbacRepositoryPermissions'
+    ? guid(
+        registryScopedResourceId,
+      brokerIdentityPrincipalId,
+        registryPullRoleDefinitionId,
+        producerImageRepositoryName
+      )
+    : guid(registryScopedResourceId, brokerIdentityPrincipalId, registryPullRoleDefinitionId)
+)
 
-resource registry 'Microsoft.ContainerRegistry/registries@2025-04-01' existing = {
+resource registry 'Microsoft.ContainerRegistry/registries@2025-11-01' existing = {
   name: last(split(registryResourceId, '/'))
   scope: resourceGroup(split(registryResourceId, '/')[2], split(registryResourceId, '/')[4])
 }
@@ -256,6 +329,9 @@ resource brokerIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2024-1
   name: last(split(brokerIdentityResourceId, '/'))
   scope: resourceGroup(split(brokerIdentityResourceId, '/')[2], split(brokerIdentityResourceId, '/')[4])
 }
+var validatedBrokerIdentityPrincipalId = brokerIdentity.properties.principalId == brokerIdentityPrincipalId
+  ? brokerIdentityPrincipalId
+  : fail('brokerIdentityPrincipalId must match the server-returned managed identity principal ID')
 
 resource incidentReaderIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2024-11-30' existing = {
   name: last(split(incidentReaderIdentityResourceId, '/'))
@@ -660,16 +736,12 @@ resource registryWriter 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   }
 }
 
-resource guidanceActivationReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(guidanceActivation.id, guidanceActivationReaderIdentity.id, storageTableDataReaderRoleDefinitionId)
-  scope: guidanceActivation
-  properties: {
-    principalId: guidanceActivationReaderIdentity.properties.principalId
-    principalType: 'ServicePrincipal'
-    roleDefinitionId: subscriptionResourceId(
-      'Microsoft.Authorization/roleDefinitions',
-      storageTableDataReaderRoleDefinitionId
-    )
+module guidanceActivationMaterializerRbac 'modules/guidance-activation-materializer-rbac.bicep' = {
+  name: 'wc027-guidance-feed-materializer'
+  params: {
+    storageAccountName: replayStorage.name
+    tableName: guidanceActivation.name
+    identityResourceId: guidanceActivationReaderIdentity.id
   }
 }
 
@@ -888,8 +960,10 @@ module producerImagePull 'modules/acr-pull-rbac.bicep' = {
     split(registryResourceId, '/')[4]
   )
   params: {
-    registryName: registry.name
-    identityResourceId: brokerIdentity.id
+    registryResourceId: registryResourceId
+    identityPrincipalId: validatedBrokerIdentityPrincipalId
+    image: validatedProducerImage
+    registryRoleAssignmentMode: registryRoleAssignmentMode
   }
 }
 
@@ -931,6 +1005,7 @@ var runtimeConfiguration = {
     identityClientId: guidanceActivationReaderIdentity.properties.clientId
     identityResourceId: guidanceActivationReaderIdentity.id
   }
+  deliveryBudget: guidancePublicationDeliveryBudget
   deploymentBinding: {
     bindingEvidenceId: bindingEvidenceDigest
     attachedIdentityResourceIds: validatedAttachedIdentityResourceIds
@@ -1060,11 +1135,13 @@ var guidanceBindingKeyVerifierRoleId = extensionResourceId('/subscriptions/${spl
 var changeKeyVerifierRoleId = extensionResourceId('/subscriptions/${split(changeKeyResourceId, '/')[2]}/resourceGroups/${split(changeKeyResourceId, '/')[4]}', 'Microsoft.Authorization/roleDefinitions', guid(changeKey.id, 'athena-wc027-key-verifier'))
 var monitoringIntentKeyVerifierRoleId = extensionResourceId('/subscriptions/${split(monitoringIntentKeyResourceId, '/')[2]}/resourceGroups/${split(monitoringIntentKeyResourceId, '/')[4]}', 'Microsoft.Authorization/roleDefinitions', guid(monitoringIntentKey.id, 'athena-wc027-key-verifier'))
 var monitoringCollectorKeyVerifierRoleId = extensionResourceId('/subscriptions/${split(monitoringCollectorKeyResourceId, '/')[2]}/resourceGroups/${split(monitoringCollectorKeyResourceId, '/')[4]}', 'Microsoft.Authorization/roleDefinitions', guid(monitoringCollectorKey.id, 'athena-wc027-key-verifier'))
+var guidanceActivationMaterializerRoleId = extensionResourceId(resourceGroup().id, 'Microsoft.Authorization/roleDefinitions', guid(guidanceActivation.id, 'athena-wc027-feed-materializer'))
+var guidanceActivationMaterializerAssignmentId = extensionResourceId(guidanceActivation.id, 'Microsoft.Authorization/roleAssignments', guid(guidanceActivation.id, guidanceActivationReaderIdentity.id, guidanceActivationMaterializerRoleId))
 
 var coreRbacResourceIds = [
   triggerReceiver.id
   notificationSender.id
-  extensionResourceId(registry.id, 'Microsoft.Authorization/roleAssignments', guid(registry.id, brokerIdentity.id, acrPullRoleDefinitionId))
+  registryPullRoleAssignmentId
   feedV2WriterRole.id
   feedV2Writer.id
   feedV2ProducerReader.id
@@ -1076,7 +1153,8 @@ var coreRbacResourceIds = [
   extensionResourceId(monitoringIntentSourceContainer.id, 'Microsoft.Authorization/roleAssignments', guid(monitoringIntentSourceContainer.id, monitoringIntentReaderIdentity.id, storageBlobDataReaderRoleDefinitionId))
   extensionResourceId(guidanceAuthoritySourceContainer.id, 'Microsoft.Authorization/roleAssignments', guid(guidanceAuthoritySourceContainer.id, guidanceAuthorityReaderIdentity.id, storageBlobDataReaderRoleDefinitionId))
   registryWriter.id
-  guidanceActivationReader.id
+  guidanceActivationMaterializerRoleId
+  guidanceActivationMaterializerAssignmentId
   incidentKeyVerifierRoleId
   extensionResourceId(incidentKey.id, 'Microsoft.Authorization/roleAssignments', guid(incidentKey.id, trustReaderIdentity.id, incidentKeyVerifierRoleId))
   correlationBindingKeyVerifierRoleId
@@ -1131,12 +1209,13 @@ resource producerJob 'Microsoft.App/jobs@2025-01-01' = {
         scale: {
           minExecutions: 0
           maxExecutions: 1
-          pollingInterval: 30
+          pollingInterval: guidanceFeedKedaPollingIntervalSeconds
           rules: [
             {
               name: 'wc027-signed-binding'
               type: 'azure-servicebus'
               identity: brokerIdentity.id
+              auth: []
               metadata: {
                 namespace: serviceBusNamespaceName
                 queueName: triggerQueueName
@@ -1193,6 +1272,9 @@ resource producerJob 'Microsoft.App/jobs@2025-01-01' = {
 @description('Resource ID proving that the WC-027 producer Job/config was deployed.')
 output producerJobResourceId string = producerJob.id
 
+@description('Exact digest-pinned image deployed to the WC-027 producer Job.')
+output producerImage string = validatedProducerImage
+
 @description('Digest of the exact non-secret runtime configuration deployed to the Job.')
 output deployedRuntimeConfigurationDigest string = startsWith(runtimeConfigurationDigest, 'sha256:')
   ? runtimeConfigurationDigest
@@ -1215,6 +1297,54 @@ output feedV2ContainerName string = feedV2Container.name
 
 @description('Signed-binding trigger queue name.')
 output triggerQueueName string = triggerQueue.name
+
+@description('Existing Notification v2 outbox queue name used by the producer.')
+output notificationQueueName string = notificationQueue.name
+
+@description('Exact resource ID of the existing Notification v2 outbox queue.')
+output notificationQueueResourceId string = notificationQueue.id
+
+@description('Server-returned ACR resource ID guarded against the reviewed registry resource ID.')
+output registryResourceId string = producerImagePull.outputs.registryResourceId
+
+@description('Live ACR role-assignment permissions mode used for producer image pull.')
+output registryRoleAssignmentMode string = producerImagePull.outputs.roleAssignmentMode
+
+@description('Server-returned anonymous-pull posture; always false for accepted deployments.')
+output registryAnonymousPullEnabled bool = producerImagePull.outputs.anonymousPullEnabled
+
+@description('Exact ACR repository parsed from the reviewed producer image.')
+output registryRepositoryName string = producerImagePull.outputs.repositoryName
+
+@description('Mode-compatible ACR pull role definition resource ID.')
+output registryPullRoleDefinitionId string = producerImagePull.outputs.roleDefinitionResourceId
+
+@description('Deterministic producer ACR pull role assignment resource ID.')
+output registryPullRoleAssignmentResourceId string = producerImagePull.outputs.roleAssignmentResourceId
+
+@description('Server-returned managed-identity principal ID bound to the producer ACR pull assignment.')
+output registryPullPrincipalId string = validatedBrokerIdentityPrincipalId
+
+@description('Exact condition version on the producer ACR pull assignment, or null in legacy mode.')
+output registryPullConditionVersion string? = producerImagePull.outputs.?conditionVersion
+
+@description('Exact repository-scoped condition on the producer ACR pull assignment, or null in legacy mode.')
+output registryPullCondition string? = producerImagePull.outputs.?condition
+
+@description('Exact non-secret feed-producer ACR pull binding for root readiness verification.')
+output deployedRegistryPullBindingJson string = string({
+  schemaVersion: 'athena.wc027AcrPullBinding.v1'
+  registryResourceId: producerImagePull.outputs.registryResourceId
+  image: validatedProducerImage
+  principalId: validatedBrokerIdentityPrincipalId
+  roleAssignmentMode: producerImagePull.outputs.roleAssignmentMode
+  anonymousPullEnabled: producerImagePull.outputs.anonymousPullEnabled
+  repositoryName: producerImagePull.outputs.repositoryName
+  roleDefinitionId: registryPullRoleDefinitionGuid
+  roleAssignmentResourceId: producerImagePull.outputs.roleAssignmentResourceId
+  conditionVersion: producerImagePull.outputs.?conditionVersion
+  condition: producerImagePull.outputs.?condition
+})
 
 @description('Private Service Bus namespace host used by the runtime configuration.')
 output namespaceHostName string = serviceBusNamespaceHostName

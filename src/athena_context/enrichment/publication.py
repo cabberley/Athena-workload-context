@@ -201,6 +201,7 @@ class IncidentEnrichmentPublicationService:
         incident_publication: IncidentPublicationReceipt,
         verified_report: VerifiedCorrelationReport,
         guidance_binding: PublishedGuidanceAuthorityBinding,
+        before_irreversible_write: Callable[[], None] | None = None,
     ) -> IncidentEnrichmentPublicationReceipt:
         if type(incident_publication) is not IncidentPublicationReceipt:
             raise TypeError("incident_publication must be an exact IncidentPublicationReceipt")
@@ -338,14 +339,16 @@ class IncidentEnrichmentPublicationService:
                 _report_path(request, report),
                 report.canonical_bytes(),
                 maximum_bytes=MAX_PUBLISHED_CORRELATION_REPORT_BYTES,
-            )
+            ),
+            before_irreversible_write=before_irreversible_write,
         )
         report_attestation_reference = self._write_asset(
             _artifact_request(
                 _report_attestation_path(request, report),
                 report_attestation.canonical_bytes(),
                 maximum_bytes=MAX_INCIDENT_ENRICHMENT_ATTESTATION_BYTES,
-            )
+            ),
+            before_irreversible_write=before_irreversible_write,
         )
         report_asset = self._build_report_reference(
             request,
@@ -370,14 +373,16 @@ class IncidentEnrichmentPublicationService:
                 _guidance_path(guidance),
                 guidance_bytes,
                 maximum_bytes=MAX_INCIDENT_GUIDANCE_BYTES,
-            )
+            ),
+            before_irreversible_write=before_irreversible_write,
         )
         guidance_attestation_reference = self._write_asset(
             _artifact_request(
                 _guidance_attestation_path(guidance),
                 guidance_attestation.canonical_bytes(),
                 maximum_bytes=MAX_INCIDENT_ENRICHMENT_ATTESTATION_BYTES,
-            )
+            ),
+            before_irreversible_write=before_irreversible_write,
         )
         guidance_asset = self._build_guidance_reference(
             guidance,
@@ -412,14 +417,16 @@ class IncidentEnrichmentPublicationService:
                 _manifest_path(manifest),
                 manifest.canonical_bytes(),
                 maximum_bytes=MAX_INCIDENT_ENRICHMENT_MANIFEST_BYTES,
-            )
+            ),
+            before_irreversible_write=before_irreversible_write,
         )
         enrichment_attestation_reference = self._write_asset(
             _artifact_request(
                 _enrichment_attestation_path(manifest),
                 enrichment_attestation.canonical_bytes(),
                 maximum_bytes=MAX_INCIDENT_ENRICHMENT_ATTESTATION_BYTES,
-            )
+            ),
+            before_irreversible_write=before_irreversible_write,
         )
         enrichment_asset = self._build_enrichment_reference(
             manifest,
@@ -660,7 +667,11 @@ class IncidentEnrichmentPublicationService:
     def _write_asset(
         self,
         request: ArtifactWriteRequest,
+        *,
+        before_irreversible_write: Callable[[], None] | None = None,
     ) -> VersionPinnedBlobReference:
+        if before_irreversible_write is not None:
+            before_irreversible_write()
         reference = self.artifact_writer.create_or_recover(request)
         if (
             type(reference) is not VersionPinnedBlobReference

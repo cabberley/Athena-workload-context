@@ -142,12 +142,22 @@ class AzureBlobIncidentFeedIndexPublisher:
     def compare_and_swap(
         self,
         request: IncidentFeedIndexCommitRequest,
+        *,
+        before_irreversible_write: Callable[[], None] | None = None,
     ) -> IncidentFeedIndexSnapshot:
         if type(request) is not IncidentFeedIndexCommitRequest:
             raise TypeError("request must be an exact IncidentFeedIndexCommitRequest")
-        self._create_or_recover_attestation(request)
+        if before_irreversible_write is None:
+            self._create_or_recover_attestation(request)
+        else:
+            self._create_or_recover_attestation(
+                request,
+                before_irreversible_write=before_irreversible_write,
+            )
         blob = self._container.get_blob_client(FEED_V2_INDEX_BLOB_NAME)
         index_bytes = request.index.canonical_bytes()
+        if before_irreversible_write is not None:
+            before_irreversible_write()
         try:
             if request.expected_etag is None:
                 response = blob.upload_blob(
@@ -204,10 +214,14 @@ class AzureBlobIncidentFeedIndexPublisher:
     def _create_or_recover_attestation(
         self,
         request: IncidentFeedIndexCommitRequest,
+        *,
+        before_irreversible_write: Callable[[], None] | None = None,
     ) -> VersionPinnedBlobReference:
         attestation_bytes = request.attestation.canonical_bytes()
         blob_name = request.index.index_attestation_path.removeprefix("./")
         blob = self._container.get_blob_client(blob_name)
+        if before_irreversible_write is not None:
+            before_irreversible_write()
         try:
             response = blob.upload_blob(
                 attestation_bytes,

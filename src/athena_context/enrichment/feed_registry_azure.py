@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from itertools import islice
@@ -101,6 +101,7 @@ class AzureTableIncidentFeedRegistry:
         record: IncidentFeedRegistryRecord,
         *,
         authority: CurrentIncidentStateSnapshot,
+        before_irreversible_write: Callable[[], None] | None = None,
     ) -> None:
         if type(record) is not IncidentFeedRegistryRecord:
             raise TypeError("record must be an exact IncidentFeedRegistryRecord")
@@ -117,7 +118,7 @@ class AzureTableIncidentFeedRegistry:
             record,
             expected=expected_authority,
         )
-        snapshot = self._read_snapshot()
+        snapshot = self._read_snapshot(before_irreversible_write=before_irreversible_write)
         current = next(
             (
                 entity
@@ -162,6 +163,8 @@ class AzureTableIncidentFeedRegistry:
                     context="feed registry capacity entity",
                 )
                 retained_count = len(snapshot.records)
+                if before_irreversible_write is not None:
+                    before_irreversible_write()
                 self._table.submit_transaction(
                     [
                         ("create", entity),
@@ -177,6 +180,8 @@ class AzureTableIncidentFeedRegistry:
                     ]
                 )
             else:
+                if before_irreversible_write is not None:
+                    before_irreversible_write()
                 self._table.update_entity(
                     entity,
                     mode=UpdateMode.REPLACE,
@@ -209,6 +214,7 @@ class AzureTableIncidentFeedRegistry:
         self,
         *,
         as_of: UtcDateTime,
+        before_irreversible_write: Callable[[], None] | None = None,
     ) -> tuple[IncidentFeedRegistryRecord, ...]:
         if (
             not isinstance(as_of, datetime)
@@ -217,7 +223,7 @@ class AzureTableIncidentFeedRegistry:
             or as_of.microsecond % 1000
         ):
             raise ValueError("as_of must be a UTC timestamp with millisecond precision")
-        snapshot = self._read_snapshot()
+        snapshot = self._read_snapshot(before_irreversible_write=before_irreversible_write)
         return tuple(
             sorted(
                 (record for _entity, record in snapshot.records),
@@ -247,6 +253,8 @@ class AzureTableIncidentFeedRegistry:
     def prune_expired(
         self,
         plan: IncidentFeedRegistryPrunePlan,
+        *,
+        before_irreversible_write: Callable[[], None] | None = None,
     ) -> None:
         records, as_of = _validated_prune_plan(plan)
         if len(records) > MAX_FEED_V2_REGISTRY_RECORDS:
@@ -270,7 +278,7 @@ class AzureTableIncidentFeedRegistry:
                 "feed registry cleanup received duplicate incident records"
             )
         for _ in range(_MAX_CLEANUP_PASSES):
-            snapshot = self._read_snapshot()
+            snapshot = self._read_snapshot(before_irreversible_write=before_irreversible_write)
             current = {
                 record.entry.incident_id: (entity, record) for entity, record in snapshot.records
             }
@@ -291,6 +299,7 @@ class AzureTableIncidentFeedRegistry:
                 self._delete_expired_batch(
                     snapshot,
                     expired,
+                    before_irreversible_write=before_irreversible_write,
                 )
             except IncidentFeedRegistryConflictError:
                 continue
@@ -300,7 +309,11 @@ class AzureTableIncidentFeedRegistry:
             "feed registry expiry cleanup exceeded its safe pass bound"
         )
 
-    def _read_snapshot(self) -> _RegistrySnapshot:
+    def _read_snapshot(
+        self,
+        *,
+        before_irreversible_write: Callable[[], None] | None = None,
+    ) -> _RegistrySnapshot:
         for _ in range(3):
             entities = self._read_bounded_partition()
             capacity_entities = tuple(
@@ -310,7 +323,10 @@ class AzureTableIncidentFeedRegistry:
                 entity for entity in entities if entity.get("RowKey") != _CAPACITY_ROW_KEY
             )
             if not capacity_entities:
-                self._initialize_capacity_metadata(len(record_entities))
+                self._initialize_capacity_metadata(
+                    len(record_entities),
+                    before_irreversible_write=before_irreversible_write,
+                )
                 continue
             if len(capacity_entities) != 1:
                 raise IncidentFeedRegistryError(
@@ -356,11 +372,15 @@ class AzureTableIncidentFeedRegistry:
     def _initialize_capacity_metadata(
         self,
         retained_count: int,
+        *,
+        before_irreversible_write: Callable[[], None] | None = None,
     ) -> None:
         if retained_count > MAX_FEED_V2_REGISTRY_RECORDS:
             raise IncidentFeedRegistryCapacityError(
                 "feed registry exceeds its safe retained record bound"
             )
+        if before_irreversible_write is not None:
+            before_irreversible_write()
         try:
             self._table.create_entity(self._capacity_entity(retained_count))
         except ResourceExistsError:
@@ -377,6 +397,8 @@ class AzureTableIncidentFeedRegistry:
             tuple[Mapping[str, Any], IncidentFeedRegistryRecord],
             ...,
         ],
+        *,
+        before_irreversible_write: Callable[[], None] | None = None,
     ) -> None:
         retained_count = len(snapshot.records)
         capacity_etag = self._entity_etag(
@@ -420,6 +442,8 @@ class AzureTableIncidentFeedRegistry:
                 },
             )
         )
+        if before_irreversible_write is not None:
+            before_irreversible_write()
         try:
             self._table.submit_transaction(operations)
         except (ResourceNotFoundError, ResourceModifiedError) as exc:
