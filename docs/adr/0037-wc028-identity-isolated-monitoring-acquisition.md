@@ -238,9 +238,14 @@ The coordinator:
   rejects caller-supplied key substitutions, verifies the phase-one deployment ID, template hash,
   and complete contract-input binding ID, recomputes the canonical inventory digest, and
   cryptographically verifies the detached RS256 reviewer signature with the resolved
-  RSA-2048-or-stronger public key. Azure CLI standard Base64 JWK integers and the contract's
-  unpadded Base64URL integers are decoded before comparison. The v2 attestation domain is required
-  for inventory v6; the historical v1 domain remains valid only for historical inventory v4. The
+  public key. The contract stores only canonical minimal RFC 7518 Base64urlUInt values, while the
+  pinned Azure CLI boundary accepts only canonical padded-or-unpadded standard Base64 emitted by
+  `az keyvault key show`; both are decoded to bytes before comparison. Encoding aliases, padding
+  in the contract, leading-zero integers, even moduli, non-65537 exponents, and modulus sizes
+  outside exactly 2048, 3072, or 4096 bits fail closed. The v2 attestation domain is required for
+  inventory v6; the historical v1 domain remains valid only for historical inventory v4. This
+  validation tightening does not change the attestation JSON shape, digest algorithm, or signed
+  preimage fields. The
   verifier rejects a changed deployment, duplicate or out-of-scope targets, reused target/page
   digests or binding IDs, a reviewer that overlaps the runtime-support or any other runtime
   principal, same-vault reviewer and receipt-signing keys, incomplete principal or attachment

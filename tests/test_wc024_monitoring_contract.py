@@ -620,6 +620,13 @@ def _base64url_integer(value: int) -> str:
     return base64.urlsafe_b64encode(encoded).rstrip(b"=").decode("ascii")
 
 
+def _noncanonical_base64url_alias(value: str) -> str:
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+    trailing_index = alphabet.index(value[-1])
+    assert trailing_index % 16 == 0
+    return value[:-1] + alphabet[trailing_index + 1]
+
+
 def _rbac_inventory_reviewer_public_material(
     private_key: rsa.RSAPrivateKey = _RBAC_INVENTORY_REVIEWER_PRIVATE_KEY,
 ) -> tuple[str, str, str]:
@@ -4135,6 +4142,78 @@ def test_current_rbac_inventory_rejects_reviewer_signature_tampering() -> None:
         match="reviewer signature is invalid",
     ):
         MonitoringCollectorContract(**payload)
+
+
+@pytest.mark.parametrize("key_size", (2048, 3072, 4096))
+def test_effective_rbac_inventory_attestation_accepts_approved_rsa_sizes(
+    key_size: int,
+) -> None:
+    inventory = _acquisition_collector_contract().effective_rbac_inventory
+    assert inventory is not None
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=key_size)
+
+    attestation = _effective_rbac_inventory_attestation(
+        inventory,
+        private_key=private_key,
+    )
+
+    assert attestation.public_key_exponent == "AQAB"
+
+
+@pytest.mark.parametrize(
+    "modulus",
+    (
+        (1 << 2046) | 1,
+        (1 << 2049) | 1,
+        1 << 2047,
+    ),
+)
+def test_effective_rbac_inventory_attestation_rejects_unapproved_or_even_modulus(
+    modulus: int,
+) -> None:
+    contract = _acquisition_collector_contract()
+    attestation = contract.effective_rbac_inventory_attestation
+    assert attestation is not None
+    payload = attestation.model_dump(mode="python", by_alias=True)
+    payload["publicKeyModulus"] = _base64url_integer(modulus)
+
+    with pytest.raises(ValidationError, match="attestation key is invalid"):
+        MonitoringEffectiveRbacInventoryAttestation(**payload)
+
+
+@pytest.mark.parametrize("encoding_defect", ("alias", "leadingZero"))
+def test_effective_rbac_inventory_attestation_rejects_noncanonical_modulus(
+    encoding_defect: str,
+) -> None:
+    contract = _acquisition_collector_contract()
+    attestation = contract.effective_rbac_inventory_attestation
+    assert attestation is not None
+    payload = attestation.model_dump(mode="python", by_alias=True)
+    modulus = attestation.public_key_modulus
+    if encoding_defect == "alias":
+        payload["publicKeyModulus"] = _noncanonical_base64url_alias(modulus)
+    else:
+        decoded = base64.urlsafe_b64decode(modulus + "=" * (-len(modulus) % 4))
+        payload["publicKeyModulus"] = base64.urlsafe_b64encode(b"\x00" + decoded).rstrip(
+            b"="
+        ).decode("ascii")
+
+    with pytest.raises(ValidationError, match="attestation key is invalid"):
+        MonitoringEffectiveRbacInventoryAttestation(**payload)
+
+
+@pytest.mark.parametrize("exponent", ("AAEAAQ", "AQAB=", "AQAB=="))
+def test_effective_rbac_inventory_attestation_rejects_noncanonical_exponent(
+    exponent: str,
+) -> None:
+    contract = _acquisition_collector_contract()
+    attestation = contract.effective_rbac_inventory_attestation
+    assert attestation is not None
+    payload = attestation.model_dump(mode="python", by_alias=True)
+    payload["publicKeyExponent"] = exponent
+
+    with pytest.raises(ValidationError):
+        MonitoringEffectiveRbacInventoryAttestation(**payload)
 
 
 def test_current_rbac_inventory_requires_separately_governed_reviewer_vault() -> None:

@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.47.16.16243",
-      "templateHash": "5665448530898206674"
+      "templateHash": "8015993123491167071"
     },
     "name": "Athena WC-024 generic monitoring foundation",
     "description": "Deploys private generic Azure Monitor, VNet flow-log, and isolated evidence-collector foundations without workload-intent-derived thresholds or paths."
@@ -196,7 +196,7 @@
       "minLength": 342,
       "maxLength": 1024,
       "metadata": {
-        "description": "Base64url RSA modulus of the reviewed inventory-signing public key."
+        "description": "Canonical unpadded RFC 7518 Base64urlUInt RSA modulus for the reviewed inventory-signing public key. Allowed modulus sizes are 2048, 3072, and 4096 bits."
       }
     },
     "rbacInventoryReviewerPublicKeyExponent": {
@@ -205,7 +205,7 @@
         "AQAB"
       ],
       "metadata": {
-        "description": "Base64url RSA exponent of the reviewed inventory-signing public key."
+        "description": "Canonical unpadded RFC 7518 Base64urlUInt exponent. AQAB is the minimal encoding of 65537."
       }
     },
     "rbacInventoryReviewerPublicKeyFingerprint": {

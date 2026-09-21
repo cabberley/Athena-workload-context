@@ -44,6 +44,8 @@ _MAX_SAFE_INTEGER = 9_007_199_254_740_991
 _MAX_INVENTORY_JSON_BYTES = 62_000
 _ARM_TEMPLATE_GUID_NAMESPACE = UUID("11fb06fb-712d-4ddd-98c7-e71bbd588830")
 _TARGET_QUERY_MODE = "assignedToPrincipalIncludingInheritedGroupsAndDescendants"
+_ALLOWED_REVIEWER_RSA_MODULUS_BITS = frozenset({2048, 3072, 4096})
+_REVIEWER_RSA_EXPONENT_BYTES = b"\x01\x00\x01"
 
 
 def _fail(message: str) -> NoReturn:
@@ -158,40 +160,46 @@ def _arm_template_guid(*values: str) -> str:
     return str(uuid5(_ARM_TEMPLATE_GUID_NAMESPACE, "-".join(values)))
 
 
-def _base64url_decode_integer(value: str, *, field_name: str) -> int:
-    if _BASE64URL_PATTERN.fullmatch(value) is None:
-        _fail(f"{field_name} is not canonical base64url")
+def _base64url_decode_uint(value: str, *, field_name: str) -> bytes:
+    if (
+        not value
+        or len(value) % 4 == 1
+        or _BASE64URL_PATTERN.fullmatch(value) is None
+    ):
+        _fail(f"{field_name} is not canonical unpadded base64url")
     try:
-        decoded = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+        decoded = base64.b64decode(
+            value + "=" * (-len(value) % 4),
+            altchars=b"-_",
+            validate=True,
+        )
     except (binascii.Error, ValueError) as exc:
         raise ValueError(f"{field_name} is not valid base64url") from exc
     if not decoded:
         _fail(f"{field_name} is empty")
+    if decoded[0] == 0:
+        _fail(f"{field_name} is not a minimal unsigned integer")
     if base64.urlsafe_b64encode(decoded).decode("ascii").rstrip("=") != value:
-        _fail(f"{field_name} is not canonical base64url")
-    return int.from_bytes(decoded, "big")
+        _fail(f"{field_name} is not canonical unpadded base64url")
+    return decoded
 
 
-def _jwk_decode_integer(value: object, *, field_name: str) -> int:
+def _standard_base64_decode_uint(value: object, *, field_name: str) -> bytes:
     if not isinstance(value, str) or not value:
         _fail(f"{field_name} is missing or malformed")
+    if len(value) % 4 != 0 or _STANDARD_BASE64_PATTERN.fullmatch(value) is None:
+        _fail(f"{field_name} is not canonical standard base64")
     try:
-        if _BASE64URL_PATTERN.fullmatch(value) is not None:
-            decoded = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
-            if base64.urlsafe_b64encode(decoded).decode("ascii").rstrip("=") != value:
-                _fail(f"{field_name} is not canonical base64url")
-        elif _STANDARD_BASE64_PATTERN.fullmatch(value) is not None:
-            unpadded = value.rstrip("=")
-            decoded = base64.b64decode(value + "=" * (-len(value) % 4), validate=True)
-            if base64.b64encode(decoded).decode("ascii").rstrip("=") != unpadded:
-                _fail(f"{field_name} is not canonical base64")
-        else:
-            _fail(f"{field_name} is not valid base64 or base64url")
+        decoded = base64.b64decode(value, validate=True)
     except (binascii.Error, ValueError) as exc:
-        raise ValueError(f"{field_name} is not valid base64 or base64url") from exc
+        raise ValueError(f"{field_name} is not valid standard base64") from exc
     if not decoded:
         _fail(f"{field_name} is empty")
-    return int.from_bytes(decoded, "big")
+    if decoded[0] == 0:
+        _fail(f"{field_name} is not a minimal unsigned integer")
+    if base64.b64encode(decoded).decode("ascii") != value:
+        _fail(f"{field_name} is not canonical standard base64")
+    return decoded
 
 
 def _der_length(length: int) -> bytes:
@@ -513,26 +521,38 @@ def _validate() -> dict[str, object]:
     ):
         _fail("legacy collector RBAC cleanup binding is invalid")
 
-    modulus = _base64url_decode_integer(
+    modulus_bytes = _base64url_decode_uint(
         public_key_modulus,
         field_name="ATHENA_PUBLIC_KEY_MODULUS",
     )
-    exponent = _base64url_decode_integer(
+    exponent_bytes = _base64url_decode_uint(
         public_key_exponent,
         field_name="ATHENA_PUBLIC_KEY_EXPONENT",
     )
-    jwk_modulus = _jwk_decode_integer(
+    jwk_modulus_bytes = _standard_base64_decode_uint(
         reviewer_jwk.get("n"),
         field_name="reviewer JWK modulus",
     )
-    jwk_exponent = _jwk_decode_integer(
+    jwk_exponent_bytes = _standard_base64_decode_uint(
         reviewer_jwk.get("e"),
         field_name="reviewer JWK exponent",
     )
-    if jwk_modulus != modulus or jwk_exponent != exponent:
+    if not hmac.compare_digest(jwk_modulus_bytes, modulus_bytes) or not hmac.compare_digest(
+        jwk_exponent_bytes,
+        exponent_bytes,
+    ):
         _fail("reviewer public key does not match the exact versioned Key Vault key")
-    if modulus.bit_length() < 2048 or exponent != 65537:
-        _fail("reviewer key must be RSA-2048 or stronger with exponent 65537")
+    modulus = int.from_bytes(modulus_bytes, "big")
+    exponent = int.from_bytes(exponent_bytes, "big")
+    if (
+        modulus.bit_length() not in _ALLOWED_REVIEWER_RSA_MODULUS_BITS
+        or modulus % 2 == 0
+        or exponent_bytes != _REVIEWER_RSA_EXPONENT_BYTES
+    ):
+        _fail(
+            "reviewer key must use an odd RSA-2048, RSA-3072, or RSA-4096 modulus "
+            "with exponent 65537"
+        )
 
     subject_public_key_info = _subject_public_key_info(
         modulus=modulus,

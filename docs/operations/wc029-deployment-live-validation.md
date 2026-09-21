@@ -279,8 +279,12 @@ attachment, and a principal distinct from the reviewer and every runtime identit
 phase-two AzureCLI script resolve that Key Vault JWK; caller-supplied modulus/fingerprint values
 are not a trust root. The reviewer principal must be explicitly distinct from the
 runtime-support principal as well as the collector, context, attestor, and verifier principals.
-Compare Azure CLI standard Base64 JWK modulus/exponent values to the configured unpadded Base64URL
-values only after decoding both to the same integer representation.
+Treat the encodings as source-specific: Azure CLI `key show` output must be canonical standard
+Base64, while the configured contract must be canonical minimal RFC 7518 Base64urlUInt with no
+padding. Decode both to bytes before comparison; reject encoding aliases, whitespace, excess or
+missing standard padding, contract padding, leading-zero integers, an even modulus, modulus sizes
+other than exactly 2048, 3072, or 4096 bits, and any exponent other than the minimal `AQAB`
+encoding of 65537.
 `publish-monitoring-contract.bicep` must report
 `effectiveRbacCryptographicReviewVerified=true`; a caller-supplied digest without a valid detached
 signature is not acceptance evidence. Publication requires collector contract v10, effective

@@ -1213,6 +1213,14 @@ def test_wc024_phase_two_cryptographically_verifies_external_rbac_review() -> No
     assert "'${verifierIdentityResourceId}': {}" in (RBAC_INVENTORY_ATTESTATION_VALIDATION)
     assert "az keyvault key show --id" in RBAC_INVENTORY_ATTESTATION_VALIDATION
     assert "ATHENA_REVIEWER_JWK_JSON" in RBAC_INVENTORY_ATTESTATION_VALIDATION
+    assert "Canonical unpadded RFC 7518 Base64urlUInt" in MAIN
+    assert "Canonical unpadded RFC 7518 Base64urlUInt" in COLLECTOR_CONTRACT
+    assert "Canonical unpadded RFC 7518 Base64urlUInt" in (
+        RBAC_INVENTORY_ATTESTATION_VALIDATION
+    )
+    assert "'AQAB'" in MAIN
+    assert "'AQAB'" in COLLECTOR_CONTRACT
+    assert "'AQAB'" in RBAC_INVENTORY_ATTESTATION_VALIDATION
     assert "ATHENA_ATTESTATION_SCHEMA_VERSION" in (
         RBAC_INVENTORY_ATTESTATION_VALIDATION
     )
@@ -1227,16 +1235,21 @@ def test_wc024_phase_two_cryptographically_verifies_external_rbac_review() -> No
     assert "output validationDigest string" in RBAC_INVENTORY_ATTESTATION_VALIDATION
 
     assert 'digest_payload.pop("inventoryDigest", None)' in RBAC_INVENTORY_ATTESTATION_VERIFIER
-    assert "_jwk_decode_integer(" in RBAC_INVENTORY_ATTESTATION_VERIFIER
-    assert "jwk_modulus != modulus or jwk_exponent != exponent" in (
+    assert "_base64url_decode_uint(" in RBAC_INVENTORY_ATTESTATION_VERIFIER
+    assert "_standard_base64_decode_uint(" in RBAC_INVENTORY_ATTESTATION_VERIFIER
+    assert "hmac.compare_digest(jwk_modulus_bytes, modulus_bytes)" in (
         RBAC_INVENTORY_ATTESTATION_VERIFIER
     )
+    assert "_ALLOWED_REVIEWER_RSA_MODULUS_BITS" in RBAC_INVENTORY_ATTESTATION_VERIFIER
+    assert 'b"\\x01\\x00\\x01"' in RBAC_INVENTORY_ATTESTATION_VERIFIER
+    assert "_jwk_decode_integer(" not in RBAC_INVENTORY_ATTESTATION_VERIFIER
     assert 'reviewer_jwk.get("n") != public_key_modulus' not in (
         RBAC_INVENTORY_ATTESTATION_VERIFIER
     )
-    assert "modulus.bit_length() < 2048 or exponent != 65537" in (
+    assert "modulus.bit_length() not in _ALLOWED_REVIEWER_RSA_MODULUS_BITS" in (
         RBAC_INVENTORY_ATTESTATION_VERIFIER
     )
+    assert "modulus % 2 == 0" in RBAC_INVENTORY_ATTESTATION_VERIFIER
     assert 'signature_integer = int.from_bytes(signature, "big")' in (
         RBAC_INVENTORY_ATTESTATION_VERIFIER
     )

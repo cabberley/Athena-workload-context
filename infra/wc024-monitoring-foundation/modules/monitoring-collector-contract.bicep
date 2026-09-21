@@ -212,12 +212,12 @@ param rbacInventoryVerifierRoleAssignmentId string
 @description('Exact versioned reviewer key identifier.')
 param rbacInventoryReviewerKeyId string
 
-@description('Base64url RSA modulus for local reviewer-signature verification.')
+@description('Canonical unpadded RFC 7518 Base64urlUInt RSA modulus for local reviewer-signature verification. Allowed modulus sizes are 2048, 3072, and 4096 bits.')
 @minLength(342)
 @maxLength(1024)
 param rbacInventoryReviewerPublicKeyModulus string
 
-@description('Base64url RSA exponent for local reviewer-signature verification.')
+@description('Canonical unpadded RFC 7518 Base64urlUInt exponent. AQAB is the minimal encoding of 65537.')
 @allowed([
   'AQAB'
 ])

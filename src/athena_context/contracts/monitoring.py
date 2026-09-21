@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import re
 from datetime import UTC, datetime
@@ -225,6 +226,9 @@ _STORAGE_READBACK_READER_ROLE_NAME = "Athena WC028 Monitoring Storage Protection
 _KEY_VAULT_CRYPTO_USER_ROLE_NAME = "Key Vault Crypto User"
 _ALL_PRINCIPALS_ID = "00000000-0000-0000-0000-000000000000"
 _ARM_TEMPLATE_GUID_NAMESPACE = UUID("11fb06fb-712d-4ddd-98c7-e71bbd588830")
+_BASE64URL_UINT_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+_ALLOWED_REVIEWER_RSA_MODULUS_BITS = frozenset({2048, 3072, 4096})
+_REVIEWER_RSA_EXPONENT_BYTES = b"\x01\x00\x01"
 _EVIDENCE_WRITER_ROLE_GUID_SEED = "athena-wc028-monitoring-evidence-create-only"
 _STORAGE_READBACK_READER_ROLE_GUID_SEED = "athena-wc028-monitoring-storage-readback"
 _REVIEWER_KEY_VERIFIER_ROLE_GUID_SEED = "athena-wc028-rbac-reviewer-key-reader"
@@ -479,6 +483,30 @@ def _arm_template_guid(*values: str) -> str:
     if not values or any(not value for value in values):
         raise ValueError("ARM guid inputs must be non-empty strings")
     return str(uuid5(_ARM_TEMPLATE_GUID_NAMESPACE, "-".join(values)))
+
+
+def _decode_base64url_uint(value: str, *, field_name: str) -> bytes:
+    if (
+        not value
+        or len(value) % 4 == 1
+        or _BASE64URL_UINT_PATTERN.fullmatch(value) is None
+    ):
+        raise ValueError(f"{field_name} must be canonical unpadded Base64urlUInt")
+    try:
+        decoded = base64.b64decode(
+            value + "=" * (-len(value) % 4),
+            altchars=b"-_",
+            validate=True,
+        )
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError(f"{field_name} must be valid Base64urlUInt") from exc
+    if (
+        not decoded
+        or decoded[0] == 0
+        or base64.urlsafe_b64encode(decoded).decode("ascii").rstrip("=") != value
+    ):
+        raise ValueError(f"{field_name} must be canonical minimal Base64urlUInt")
+    return decoded
 
 
 def _canonical_rbac_scope(value: str) -> str:
@@ -3279,10 +3307,7 @@ class MonitoringEffectiveRbacInventoryAttestation(_StrictMonitoringContract):
         alias="publicKeyModulus",
         pattern=r"^[A-Za-z0-9_-]{342,1024}$",
     )
-    public_key_exponent: str = Field(
-        alias="publicKeyExponent",
-        pattern=r"^[A-Za-z0-9_-]{2,16}$",
-    )
+    public_key_exponent: Literal["AQAB"] = Field(alias="publicKeyExponent")
     public_key_fingerprint: Sha256Digest = Field(alias="publicKeyFingerprint")
     inventory_digest: Sha256Digest = Field(alias="inventoryDigest")
     source_manifest_digest: Sha256Digest = Field(alias="sourceManifestDigest")
@@ -3327,23 +3352,29 @@ class MonitoringEffectiveRbacInventoryAttestation(_StrictMonitoringContract):
                 "effective RBAC inventory attestation authority or cleanup binding is invalid"
             )
         try:
-            modulus = base64.urlsafe_b64decode(
-                self.public_key_modulus + "=" * (-len(self.public_key_modulus) % 4)
+            modulus_bytes = _decode_base64url_uint(
+                self.public_key_modulus,
+                field_name="publicKeyModulus",
             )
-            exponent = base64.urlsafe_b64decode(
-                self.public_key_exponent + "=" * (-len(self.public_key_exponent) % 4)
+            exponent_bytes = _decode_base64url_uint(
+                self.public_key_exponent,
+                field_name="publicKeyExponent",
             )
+            modulus = int.from_bytes(modulus_bytes, "big")
+            exponent = int.from_bytes(exponent_bytes, "big")
+            if (
+                modulus.bit_length() not in _ALLOWED_REVIEWER_RSA_MODULUS_BITS
+                or modulus % 2 == 0
+                or exponent_bytes != _REVIEWER_RSA_EXPONENT_BYTES
+            ):
+                raise ValueError("reviewer RSA key parameters are outside the approved policy")
             public_key = rsa.RSAPublicNumbers(
-                e=int.from_bytes(exponent, "big"),
-                n=int.from_bytes(modulus, "big"),
+                e=exponent,
+                n=modulus,
             ).public_key()
             signature = base64.b64decode(self.signature, validate=True)
         except (TypeError, ValueError) as exc:
             raise ValueError("effective RBAC inventory attestation key is invalid") from exc
-        if public_key.key_size < 2048 or int.from_bytes(exponent, "big") != 65537:
-            raise ValueError(
-                "effective RBAC inventory attestation requires RSA-2048 or stronger with e=65537"
-            )
         encoded_key = public_key.public_bytes(
             serialization.Encoding.DER,
             serialization.PublicFormat.SubjectPublicKeyInfo,
