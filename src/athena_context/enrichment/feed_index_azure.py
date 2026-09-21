@@ -46,7 +46,7 @@ class _BlobValue:
 
 
 class AzureBlobIncidentFeedIndexPublisher:
-    """Publish the signed feed-v2 head without enumerating incident blobs."""
+    """Publish the signed feed-v2 head in the isolated v2 container without listing."""
 
     def __init__(
         self,
@@ -60,8 +60,10 @@ class AzureBlobIncidentFeedIndexPublisher:
     ) -> None:
         _validate_blob_endpoint(blob_endpoint)
         _validate_container_name(container_name)
-        if container_name != "incident-assets":
-            raise ValueError("container_name must be exactly incident-assets")
+        if container_name != "wc027-enrichment-feed-v2":
+            raise ValueError(
+                "container_name must be exactly wc027-enrichment-feed-v2"
+            )
         credential = production_managed_identity_credential(
             managed_identity_client_id=managed_identity_client_id
         )

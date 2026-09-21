@@ -121,6 +121,49 @@ it never overwrites a newer winner. A same-timestamp, non-equivalent index fails
 5. Activate the browser and later switch notifications from v1 to v2. Never dual-send user-visible
    notifications.
 
+### Production-domain publication chain
+
+The domain integration boundary consumes only a successfully verified
+`IncidentEnrichmentPublicationReceipt`. Before any feed write it re-reads the authoritative v1
+current occurrence by incident ID and requires exact equality for the occurrence, transition,
+state result digest, current-pointer digest, lifecycle, update time, and enrichment binding.
+The verified receipt carries the actual report, guidance, and enrichment signing key IDs so feed
+key separation cannot be asserted from caller-supplied substitutes.
+
+It then:
+
+1. constructs and signs the immutable feed pointer with a feed key that is distinct from the
+   report, guidance, and enrichment signing authorities;
+2. creates or recovers the pointer and attestation at their exact derived names without Blob
+   enumeration;
+3. builds and validates the registry record, calls `IncidentFeedRegistryPort.put()`, and confirms
+   the exact record is durably readable, accepting an uncertain-write replay only when the retained
+   record is byte-equivalent; the Azure Table adapter translates transport-response loss into this
+   domain recovery path; and
+4. invokes `IncidentFeedIndexPublicationService.publish()` only after registry durability is
+   proven, returning success only when the exact pointer entry is present in the committed or
+   reconciled index.
+
+The immutable pointer timestamp is bound to the verified enrichment-publication receipt, while the
+mutable index publication timestamp is supplied for each index attempt. They have separate retry
+lifecycles, so a caller may retry with a fresher index timestamp without changing the pointer bytes.
+If a valid concurrent index winner omits a newly admitted resolved entry, the orchestrator keeps
+the already published pointer bytes and retries only the index with a timestamp strictly newer
+than that winner. A same-timestamp CAS conflict also advances only the index timestamp within the
+bounded retry loop.
+
+Registry admission orders successors by exact signed v1 current-occurrence authority, not by
+`IncidentState.updatedAt`. The adapter validates the incoming record against that authority, then
+ETag-conditionally replaces a retained row that no longer matches it. This permits valid
+active-to-resolved successors whose state update time is equal to or lower than the prior row while
+still rejecting stale replays and non-equivalent records claiming the same current authority. The
+Table adapter directly re-reads the known v1 current head before and after its conditional write;
+it never discovers authority through Blob enumeration.
+
+The chain emits no notification. Runtime wiring may enqueue Notification v2 only after receiving
+the successful domain receipt, so pointer-only, registry-only, and failed-index states remain
+undiscoverable and silent.
+
 Before v2 activation, v1 behavior remains unchanged. After activation, invalid, missing, stale, or
 unavailable v2 enrichment does not silently become successful v1 guidance. The UI may still show
 independently verified v1 lifecycle with an explicit guidance-unavailable state.

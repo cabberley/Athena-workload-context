@@ -13,7 +13,6 @@ var readerRoleDefinitionId = subscriptionResourceId(
   'Microsoft.Authorization/roleDefinitions',
   'acdd72a7-3385-48ef-bd42-f606fba81ae7'
 )
-
 resource networkWatcher 'Microsoft.Network/networkWatchers@2024-10-01' existing = {
   name: networkWatcherName
 }

@@ -37,9 +37,7 @@ from test_wc027_guidance_authority_contract import (
     _selected_runbook,
 )
 
-_BINDING_KEY_ID = (
-    "https://synthetic-wc027.vault.azure.net/keys/guidance-binding/0123456789abcdef0123456789abcdef"
-)
+_BINDING_KEY_ID = "synthetic-key://athena/wc027-guidance-binding-rs256-v2"
 _GUIDANCE_KEY_ID = (
     "https://synthetic-wc027.vault.azure.net/keys/guidance-signing/0123456789abcdef0123456789abcdef"
 )

@@ -53,6 +53,15 @@ class IncidentFeedIndexPublicationError(RuntimeError):
 class IncidentFeedIndexPublicationConflictError(IncidentFeedIndexPublicationError):
     """The stable feed-v2 head changed during a conditional publication."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        winner_published_at: UtcDateTime | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.winner_published_at = winner_published_at
+
 
 class VerifiedActiveIncidentIndexReaderPort(Protocol):
     def read_active_incident_index(self) -> ActiveIncidentIndexSnapshot | None: ...
@@ -329,7 +338,8 @@ class IncidentFeedIndexPublicationService:
                 return "accept"
             if current.index.published_at == candidate.published_at:
                 raise IncidentFeedIndexPublicationConflictError(
-                    "feed v2 authority has conflicting content at the same timestamp"
+                    "feed v2 authority has conflicting content at the same timestamp",
+                    winner_published_at=current.index.published_at,
                 )
             return "replace"
 

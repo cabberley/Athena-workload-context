@@ -79,6 +79,7 @@ class _CanonicalBytesModel(Protocol):
 @dataclass(frozen=True, slots=True)
 class NotificationV2Trust:
     lifecycle_key_id: str
+    lifecycle_key_vault_key_id: str
     lifecycle_key_fingerprint: str
     lifecycle_signature_verifier: SignatureVerifier
     feed_key_id: str
@@ -101,6 +102,13 @@ class NotificationV2Trust:
         )
         if any(type(value) is not str or not value for value in key_ids):
             raise ValueError("notification v2 trust key IDs must be non-empty")
+        if (
+            type(self.lifecycle_key_vault_key_id) is not str
+            or not self.lifecycle_key_vault_key_id
+        ):
+            raise ValueError(
+                "notification v2 lifecycle Key Vault key ID must be non-empty"
+            )
         if len(set(key_ids)) != len(key_ids):
             raise ValueError("notification v2 trust domains must use distinct keys")
 
@@ -306,7 +314,8 @@ class NotificationV2SourceVerifier:
             or index.published_at < verified_at - _MAX_FEED_AGE
             or index.published_at > verified_at + _MAX_CLOCK_SKEW
             or attestation.index_digest != sha256_hex(payload)
-            or attestation.key_vault_key_id != self.trust.lifecycle_key_id
+            or attestation.key_vault_key_id
+            != self.trust.lifecycle_key_vault_key_id
             or self.trust.lifecycle_signature_verifier(
                 payload,
                 attestation.detached_signature,
@@ -367,11 +376,12 @@ class NotificationV2SourceVerifier:
             occurrence.occurrence_digest != feed_pointer.occurrence_digest
             or state.result_digest != feed_pointer.state_result_digest
             or state.lifecycle != feed_pointer.lifecycle
-            or state_attestation.key_vault_key_id != self.trust.lifecycle_key_id
+            or state_attestation.key_vault_key_id
+            != self.trust.lifecycle_key_vault_key_id
             or pointer.key_id != self.trust.lifecycle_key_id
             or pointer.key_fingerprint != self.trust.lifecycle_key_fingerprint
             or pointer_attestation.key_vault_key_id
-            != self.trust.lifecycle_key_id
+            != self.trust.lifecycle_key_vault_key_id
             or self.trust.lifecycle_signature_verifier(
                 incident_state_signature_preimage(state),
                 state_attestation.detached_signature,

@@ -25,14 +25,94 @@ var readerRoleDefinitionId = subscriptionResourceId(
   'acdd72a7-3385-48ef-bd42-f606fba81ae7'
 )
 var signalReaderRoleDefinitionGuid = '2fda1d90-37da-55d9-8ac3-132fb7bdca5d'
+var resourceLogReaderRoleDefinitionGuid = 'f33a4363-5d9a-5d50-9871-c08582234978'
+var resourceLogAllowedOperations = [
+  'Microsoft.Insights/Logs/Heartbeat/Read'
+  'Microsoft.Insights/Logs/Perf/Read'
+  'Microsoft.Insights/Logs/InsightsMetrics/Read'
+  'Microsoft.Insights/Logs/Syslog/Read'
+  'Microsoft.Insights/Logs/VMConnection/Read'
+]
 var expectedSignalReaderActions = [
   'microsoft.compute/virtualmachines/instanceview/read'
   'microsoft.insights/metrics/read'
 ]
+var resourceGraphQueryRoleDefinitionGuid = '5687977f-aa06-5699-8e18-1a54a074b532'
+var resourceGraphQueryAllowedOperations = [
+  'Microsoft.ResourceGraph/resources/read'
+]
+var resourceHealthRoleDefinitionGuid = '0790d6f2-9553-5b63-84ac-56596b7e4072'
+var resourceHealthRoleAllowedOperations = [
+  'Microsoft.ResourceHealth/availabilityStatuses/read'
+]
+var resourceHealthAllowedOperations = concat(
+  resourceGraphQueryAllowedOperations,
+  resourceHealthRoleAllowedOperations
+)
 
 resource signalReaderRoleDefinition 'Microsoft.Authorization/roleDefinitions@2022-04-01' existing = {
   name: signalReaderRoleDefinitionGuid
   scope: subscription()
+}
+
+resource resourceGraphQueryRoleDefinition 'Microsoft.Authorization/roleDefinitions@2022-04-01' = {
+  name: resourceGraphQueryRoleDefinitionGuid
+  properties: {
+    roleName: 'Athena WC-028 Resource Graph Query Submitter'
+    description: 'Submit Azure Resource Graph queries for the approved workload resource group. Resource visibility remains independently limited by exact resource-provider read assignments.'
+    type: 'CustomRole'
+    permissions: [
+      {
+        actions: resourceGraphQueryAllowedOperations
+        notActions: []
+        dataActions: []
+        notDataActions: []
+      }
+    ]
+    assignableScopes: [
+      resourceGroup().id
+    ]
+  }
+}
+
+resource resourceLogReaderRoleDefinition 'Microsoft.Authorization/roleDefinitions@2022-04-01' = {
+  name: resourceLogReaderRoleDefinitionGuid
+  properties: {
+    roleName: 'Athena WC-028 VM Resource Log Reader'
+    description: 'Read only the five registered resource-context Log Analytics tables at exact approved workload VMs.'
+    type: 'CustomRole'
+    permissions: [
+      {
+        actions: resourceLogAllowedOperations
+        notActions: []
+        dataActions: []
+        notDataActions: []
+      }
+    ]
+    assignableScopes: [
+      resourceGroup().id
+    ]
+  }
+}
+
+resource resourceHealthRoleDefinition 'Microsoft.Authorization/roleDefinitions@2022-04-01' = {
+  name: resourceHealthRoleDefinitionGuid
+  properties: {
+    roleName: 'Athena WC-028 VM Resource Health Reader'
+    description: 'Read Resource Health availability status only for exact approved workload VMs. Azure Resource Graph query submission is authorized separately at workload resource-group scope.'
+    type: 'CustomRole'
+    permissions: [
+      {
+        actions: resourceHealthRoleAllowedOperations
+        notActions: []
+        dataActions: []
+        notDataActions: []
+      }
+    ]
+    assignableScopes: [
+      resourceGroup().id
+    ]
+  }
 }
 
 var signalReaderPermission = signalReaderRoleDefinition.properties.permissions[0]
@@ -77,6 +157,16 @@ resource dceAssociations 'Microsoft.Insights/dataCollectionRuleAssociations@2024
   }
 ]
 
+resource collectorResourceGraphQueryReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(resourceGroup().id, collectorPrincipalId, resourceGraphQueryRoleDefinition.id)
+  scope: resourceGroup()
+  properties: {
+    principalId: collectorPrincipalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: resourceGraphQueryRoleDefinition.id
+  }
+}
+
 resource collectorVmSignalReaders 'Microsoft.Authorization/roleAssignments@2022-04-01' = [
   for (vmName, index) in approvedVmNames: {
     name: guid(approvedVms[index].id, collectorPrincipalId, signalReaderRoleDefinition.id)
@@ -85,6 +175,30 @@ resource collectorVmSignalReaders 'Microsoft.Authorization/roleAssignments@2022-
       principalId: collectorPrincipalId
       principalType: 'ServicePrincipal'
       roleDefinitionId: validatedSignalReaderRoleDefinitionId
+    }
+  }
+]
+
+resource collectorVmResourceLogReaders 'Microsoft.Authorization/roleAssignments@2022-04-01' = [
+  for (vmName, index) in approvedVmNames: {
+    name: guid(approvedVms[index].id, collectorPrincipalId, resourceLogReaderRoleDefinition.id)
+    scope: approvedVms[index]
+    properties: {
+      principalId: collectorPrincipalId
+      principalType: 'ServicePrincipal'
+      roleDefinitionId: resourceLogReaderRoleDefinition.id
+    }
+  }
+]
+
+resource collectorVmResourceHealthReaders 'Microsoft.Authorization/roleAssignments@2022-04-01' = [
+  for (vmName, index) in approvedVmNames: {
+    name: guid(approvedVms[index].id, collectorPrincipalId, resourceHealthRoleDefinition.id)
+    scope: approvedVms[index]
+    properties: {
+      principalId: collectorPrincipalId
+      principalType: 'ServicePrincipal'
+      roleDefinitionId: resourceHealthRoleDefinition.id
     }
   }
 ]
@@ -115,6 +229,25 @@ resource collectorDceAssociationReaders 'Microsoft.Authorization/roleAssignments
 
 output readerRoleDefinitionId string = readerRoleDefinitionId
 output signalReaderRoleDefinitionId string = validatedSignalReaderRoleDefinitionId
+output signalReaderRoleName string = signalReaderRoleDefinition.properties.roleName
+output resourceLogReaderRoleDefinitionId string = resourceLogReaderRoleDefinition.id
+output resourceLogReaderRoleName string = resourceLogReaderRoleDefinition.properties.roleName
+output resourceLogAllowedOperations array = resourceLogAllowedOperations
+output resourceLogReadScopeIds array = map(
+  approvedVmNames,
+  vmName => resourceId('Microsoft.Compute/virtualMachines', vmName)
+)
+output resourceGraphQueryRoleDefinitionId string = resourceGraphQueryRoleDefinition.id
+output resourceGraphQueryRoleName string = resourceGraphQueryRoleDefinition.properties.roleName
+output resourceGraphQueryScopeId string = resourceGroup().id
+output resourceGraphQueryRoleAssignmentId string = collectorResourceGraphQueryReader.id
+output resourceHealthRoleDefinitionId string = resourceHealthRoleDefinition.id
+output resourceHealthRoleName string = resourceHealthRoleDefinition.properties.roleName
+output resourceHealthScopeIds array = map(
+  approvedVmNames,
+  vmName => resourceId('Microsoft.Compute/virtualMachines', vmName)
+)
+output resourceHealthAllowedOperations array = resourceHealthAllowedOperations
 output signalReadScopeIds array = map(
   approvedVmNames,
   vmName => resourceId('Microsoft.Compute/virtualMachines', vmName)

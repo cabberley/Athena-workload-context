@@ -1,0 +1,828 @@
+{
+  "activePimScheduleInstances": [],
+  "ancestorScopeCollectionComplete": true,
+  "assignmentCount": 65,
+  "athenaContextGrants": [],
+  "athenaContextPrincipalEvidence": {
+    "allPagesRetrieved": true,
+    "evidenceDigest": "sha256:1d88fa4c9c70d45ba42eb08dbfa679e6764903fa75b22af2782a98dda2e57797",
+    "firstTransitiveGroupRawPageDigests": [
+      "sha256:43c5c2b431ea59aef001805586dfedbddae1e20178b748d94897ba1cf9dca9ff"
+    ],
+    "principalId": "22222222-2222-2222-2222-222222222222",
+    "secondTransitiveGroupRawPageDigests": [
+      "sha256:43c5c2b431ea59aef001805586dfedbddae1e20178b748d94897ba1cf9dca9ff"
+    ],
+    "targetReadEvidence": [
+      {
+        "allPagesRetrieved": true,
+        "bindingId": "fca076ea-c33a-5d0a-a911-33ab0aadbb98",
+        "queryMode": "assignedToPrincipalIncludingInheritedGroupsAndDescendants",
+        "rawPageDigests": [
+          "sha256:6bc6481a344233c828f04d8598a975a192594dfa973940998e40e73bdd222d59"
+        ],
+        "readCount": 2,
+        "targetDigest": "sha256:c5d173f0f8b431c8999774744af9c2235c63f67cf8b1b58dbe97e3ca6010895b",
+        "targetScopeId": "/providers/microsoft.management/managementgroups/00000000-0000-0000-0000-000000000003"
+      },
+      {
+        "allPagesRetrieved": true,
+        "bindingId": "ae3261e1-d0fd-5077-8c23-27168c86dd8d",
+        "queryMode": "assignedToPrincipalIncludingInheritedGroupsAndDescendants",
+        "rawPageDigests": [
+          "sha256:b43e90262a46138fd82909d185baa78a262e1c4f1d5ebfe33e73a5a30fb46747"
+        ],
+        "readCount": 2,
+        "targetDigest": "sha256:368499da58d2a0a906a73f1042da2a14d75ecbd2fc3b2126fe3c9dfe8eea7c3b",
+        "targetScopeId": "/subscriptions/00000000-0000-0000-0000-000000000000"
+      }
+    ],
+    "transitiveGroupIds": []
+  },
+  "athenaContextPrincipalId": "22222222-2222-2222-2222-222222222222",
+  "athenaContextSecurityGroupIds": [],
+  "attestorClientId": "44444444-4444-4444-4444-444444444444",
+  "attestorIdentityResourceId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.managedidentity/userassignedidentities/athena-demo-monitoring-monitoring-rbac-attestor-id",
+  "attestorPrincipalId": "55555555-5555-5555-5555-555555555555",
+  "attestorTenantId": "00000000-0000-0000-0000-000000000003",
+  "collectedAt": "2026-09-10T01:55:00Z",
+  "collectionRunId": "monitoring-rbac-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "collectorGrants": [
+    {
+      "assignedPrincipalId": "11111111-1111-1111-1111-111111111111",
+      "assignedPrincipalType": "ServicePrincipal",
+      "assignmentScopeIds": [
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-client-01",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-ecp-01",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-ecp-02",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-ecp-03",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-iris-01",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-mid-01",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-mid-02",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-sqlvm-01",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-web-01",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-web-02",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-web-03"
+      ],
+      "effectivePrincipalId": "11111111-1111-1111-1111-111111111111",
+      "grantDigest": "sha256:2f6c17be1fb0581023cb9155d9f3b5d1acd2c71c2e10ee63a7fec723089f9122",
+      "groupDerived": false,
+      "inheritance": "direct",
+      "roleDefinitionId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.authorization/roledefinitions/f33a4363-5d9a-5d50-9871-c08582234978",
+      "roleDefinitionName": "Athena WC-028 VM Resource Log Reader"
+    },
+    {
+      "assignedPrincipalId": "11111111-1111-1111-1111-111111111111",
+      "assignedPrincipalType": "ServicePrincipal",
+      "assignmentScopeIds": [
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-client-01",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-ecp-01",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-ecp-02",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-ecp-03",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-iris-01",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-mid-01",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-mid-02",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-sqlvm-01",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-web-01",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-web-02",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-web-03"
+      ],
+      "effectivePrincipalId": "11111111-1111-1111-1111-111111111111",
+      "grantDigest": "sha256:43df68ba5202636ca7398eebcb9cb3c3e3758121c4cc90f85b6d54d7e3a9bb5b",
+      "groupDerived": false,
+      "inheritance": "direct",
+      "roleDefinitionId": "/subscriptions/00000000-0000-0000-0000-000000000000/providers/microsoft.authorization/roledefinitions/2fda1d90-37da-55d9-8ac3-132fb7bdca5d",
+      "roleDefinitionName": "Athena WC016 Approved Signal Reader synthetic00000"
+    },
+    {
+      "assignedPrincipalId": "11111111-1111-1111-1111-111111111111",
+      "assignedPrincipalType": "ServicePrincipal",
+      "assignmentScopeIds": [
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-client-01",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-ecp-01",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-ecp-02",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-ecp-03",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-iris-01",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-mid-01",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-mid-02",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-sqlvm-01",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-web-01",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-web-02",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-web-03"
+      ],
+      "effectivePrincipalId": "11111111-1111-1111-1111-111111111111",
+      "grantDigest": "sha256:5d937a3391fa5c2e69abcc7a443a69e82ab30ba0038db298c267292e2fcca7ef",
+      "groupDerived": false,
+      "inheritance": "direct",
+      "roleDefinitionId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.authorization/roledefinitions/0790d6f2-9553-5b63-84ac-56596b7e4072",
+      "roleDefinitionName": "Athena WC-028 VM Resource Health Reader"
+    },
+    {
+      "assignedPrincipalId": "11111111-1111-1111-1111-111111111111",
+      "assignedPrincipalType": "ServicePrincipal",
+      "assignmentScopeIds": [
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/networkwatcherrg/providers/microsoft.network/networkwatchers/networkwatcher_australiaeast/flowlogs/athena-hackathon-vnet-rg-athena-demo-workload-flowlog",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.insights/datacollectionendpoints/athena-hackathon-linux-dce",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.insights/datacollectionrules/athena-hackathon-linux-dcr",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.insights/privatelinkscopes/athena-demo-monitoring-collector-ampls",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.insights/privatelinkscopes/athena-demo-monitoring-workload-ampls",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-client-01/providers/microsoft.insights/datacollectionruleassociations/athena-linux-dcr",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-client-01/providers/microsoft.insights/datacollectionruleassociations/configurationaccessendpoint",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-ecp-01/providers/microsoft.insights/datacollectionruleassociations/athena-linux-dcr",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-ecp-01/providers/microsoft.insights/datacollectionruleassociations/configurationaccessendpoint",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-ecp-02/providers/microsoft.insights/datacollectionruleassociations/athena-linux-dcr",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-ecp-02/providers/microsoft.insights/datacollectionruleassociations/configurationaccessendpoint",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-ecp-03/providers/microsoft.insights/datacollectionruleassociations/athena-linux-dcr",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-ecp-03/providers/microsoft.insights/datacollectionruleassociations/configurationaccessendpoint",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-iris-01/providers/microsoft.insights/datacollectionruleassociations/athena-linux-dcr",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-iris-01/providers/microsoft.insights/datacollectionruleassociations/configurationaccessendpoint",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-mid-01/providers/microsoft.insights/datacollectionruleassociations/athena-linux-dcr",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-mid-01/providers/microsoft.insights/datacollectionruleassociations/configurationaccessendpoint",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-mid-02/providers/microsoft.insights/datacollectionruleassociations/athena-linux-dcr",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-mid-02/providers/microsoft.insights/datacollectionruleassociations/configurationaccessendpoint",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-sqlvm-01/providers/microsoft.insights/datacollectionruleassociations/athena-linux-dcr",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-sqlvm-01/providers/microsoft.insights/datacollectionruleassociations/configurationaccessendpoint",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-web-01/providers/microsoft.insights/datacollectionruleassociations/athena-linux-dcr",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-web-01/providers/microsoft.insights/datacollectionruleassociations/configurationaccessendpoint",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-web-02/providers/microsoft.insights/datacollectionruleassociations/athena-linux-dcr",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-web-02/providers/microsoft.insights/datacollectionruleassociations/configurationaccessendpoint",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-web-03/providers/microsoft.insights/datacollectionruleassociations/athena-linux-dcr",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-web-03/providers/microsoft.insights/datacollectionruleassociations/configurationaccessendpoint"
+      ],
+      "effectivePrincipalId": "11111111-1111-1111-1111-111111111111",
+      "grantDigest": "sha256:a587c15491c951fdcb16f03692514d79172232b5b339e64a42e4dcefa95dc4f3",
+      "groupDerived": false,
+      "inheritance": "direct",
+      "roleDefinitionId": "/subscriptions/00000000-0000-0000-0000-000000000000/providers/microsoft.authorization/roledefinitions/acdd72a7-3385-48ef-bd42-f606fba81ae7",
+      "roleDefinitionName": "Reader"
+    },
+    {
+      "assignedPrincipalId": "11111111-1111-1111-1111-111111111111",
+      "assignedPrincipalType": "ServicePrincipal",
+      "assignmentScopeIds": [
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload"
+      ],
+      "effectivePrincipalId": "11111111-1111-1111-1111-111111111111",
+      "grantDigest": "sha256:c56c825e9d3c8245b83c724dce5fdb80155f7f0203fbceceee2ddbe72351afcc",
+      "groupDerived": false,
+      "inheritance": "direct",
+      "roleDefinitionId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.authorization/roledefinitions/5687977f-aa06-5699-8e18-1a54a074b532",
+      "roleDefinitionName": "Athena WC-028 Resource Graph Query Submitter"
+    },
+    {
+      "assignedPrincipalId": "11111111-1111-1111-1111-111111111111",
+      "assignedPrincipalType": "ServicePrincipal",
+      "assignmentScopeIds": [
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.keyvault/vaults/athenademomonkv/keys/monitoring-evidence-signing"
+      ],
+      "effectivePrincipalId": "11111111-1111-1111-1111-111111111111",
+      "grantDigest": "sha256:d75f13d38ee4345dbe85723d3c6c86a6677e8a178c8da5109f7ab261a2da1a42",
+      "groupDerived": false,
+      "inheritance": "direct",
+      "roleDefinitionId": "/subscriptions/00000000-0000-0000-0000-000000000000/providers/microsoft.authorization/roledefinitions/12338af0-0e69-4776-bea7-57ae8d297424",
+      "roleDefinitionName": "Key Vault Crypto User"
+    },
+    {
+      "assignedPrincipalId": "11111111-1111-1111-1111-111111111111",
+      "assignedPrincipalType": "ServicePrincipal",
+      "assignmentScopeIds": [
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.storage/storageaccounts/athenademomonstore/blobservices/default/containers/monitoring-evidence"
+      ],
+      "condition": "(((!(ActionMatches{'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read'} AND NOT SubOperationMatches{'Blob.List'})) AND !(ActionMatches{'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action'})) OR (@Resource[Microsoft.Storage/storageAccounts/blobServices/containers:name] StringEquals 'monitoring-evidence' AND (@Resource[Microsoft.Storage/storageAccounts/blobServices/containers/blobs:path] StringLike 'wc024-monitoring/commits/*/manifest.json' OR @Resource[Microsoft.Storage/storageAccounts/blobServices/containers/blobs:path] StringLike 'wc024-monitoring/commits/*/recovery.json' OR @Resource[Microsoft.Storage/storageAccounts/blobServices/containers/blobs:path] StringLike 'wc024-monitoring/wc024-*/evidence.json'))) AND (!(ActionMatches{'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read'} AND SubOperationMatches{'Blob.List'})))",
+      "conditionVersion": "2.0",
+      "effectivePrincipalId": "11111111-1111-1111-1111-111111111111",
+      "grantDigest": "sha256:fe9852e33c93c4acd88d4934f1c4da71db85baad9c806443f2df7666674e1394",
+      "groupDerived": false,
+      "inheritance": "direct",
+      "roleDefinitionId": "/subscriptions/00000000-0000-0000-0000-000000000000/providers/microsoft.authorization/roledefinitions/930bcf3d-dc5f-5680-9568-e54e13e3acf4",
+      "roleDefinitionName": "Athena WC028 Monitoring Evidence Create-Only Writer"
+    }
+  ],
+  "collectorIdentityAttachmentEvidence": {
+    "allPagesRetrieved": true,
+    "associatedResourceConfigurationRequestPaths": [
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-wc013-live/providers/microsoft.app/jobs/athena-wc028-monitoring-acquisition?api-version=2025-01-01"
+    ],
+    "associatedResourceIdentityLifecycles": [
+      {
+        "identityResourceId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.managedidentity/userassignedidentities/athena-demo-monitoring-monitoring-collector-id",
+        "lifecycle": "All"
+      },
+      {
+        "identityResourceId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-wc013-live/providers/microsoft.managedidentity/userassignedidentities/athena-wc028-monitoring-acquisition-support-id",
+        "lifecycle": "None"
+      }
+    ],
+    "associatedResourceIdentityResourceIds": [
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.managedidentity/userassignedidentities/athena-demo-monitoring-monitoring-collector-id",
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-wc013-live/providers/microsoft.managedidentity/userassignedidentities/athena-wc028-monitoring-acquisition-support-id"
+    ],
+    "associatedResourceIds": [
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-wc013-live/providers/microsoft.app/jobs/athena-wc028-monitoring-acquisition"
+    ],
+    "associatedResourcesRequestPath": "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.managedidentity/userassignedidentities/athena-demo-monitoring-monitoring-collector-id/listAssociatedResources?api-version=2021-09-30-preview",
+    "evidenceDigest": "sha256:4c37205185b3249a10c7f331f1148d9bf6bd7636d88f03716a785976ab0cf8e0",
+    "federatedIdentityCredentialIds": [],
+    "federatedIdentityCredentialsRequestPath": "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.managedidentity/userassignedidentities/athena-demo-monitoring-monitoring-collector-id/federatedIdentityCredentials?api-version=2023-01-31",
+    "firstAssociatedResourceConfigurationDigests": [
+      "sha256:7b6a4d5d80678a71cecb7610fd44038b33e1c4a9bf546a2340c49d5a83f784ad"
+    ],
+    "firstAssociatedResourceRawPageDigests": [
+      "sha256:996d83079acf60c145463771a31d988379dce0572b72b1b3ab94c31bc848410b"
+    ],
+    "firstFederatedCredentialRawPageDigests": [
+      "sha256:3dda0cc4f30cb67f6c2877fee9c66b7cc65cacbe62a835d5f17cc615b64324d6"
+    ],
+    "firstReadCompletedAt": "2026-09-10T01:52:00Z",
+    "identityResourceId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.managedidentity/userassignedidentities/athena-demo-monitoring-monitoring-collector-id",
+    "secondAssociatedResourceConfigurationDigests": [
+      "sha256:7b6a4d5d80678a71cecb7610fd44038b33e1c4a9bf546a2340c49d5a83f784ad"
+    ],
+    "secondAssociatedResourceRawPageDigests": [
+      "sha256:996d83079acf60c145463771a31d988379dce0572b72b1b3ab94c31bc848410b"
+    ],
+    "secondFederatedCredentialRawPageDigests": [
+      "sha256:3dda0cc4f30cb67f6c2877fee9c66b7cc65cacbe62a835d5f17cc615b64324d6"
+    ],
+    "secondReadCompletedAt": "2026-09-10T01:53:00Z"
+  },
+  "collectorPrincipalEvidence": {
+    "allPagesRetrieved": true,
+    "evidenceDigest": "sha256:86506e01c18679a7271ed939e89ebcc153ef4bc391d0347e4b4508e7ea35e8cc",
+    "firstTransitiveGroupRawPageDigests": [
+      "sha256:8c41d5a42ef7a9e00541080bee87b59536d562bdbbd77935deaa1036adf35a01"
+    ],
+    "principalId": "11111111-1111-1111-1111-111111111111",
+    "secondTransitiveGroupRawPageDigests": [
+      "sha256:8c41d5a42ef7a9e00541080bee87b59536d562bdbbd77935deaa1036adf35a01"
+    ],
+    "targetReadEvidence": [
+      {
+        "allPagesRetrieved": true,
+        "bindingId": "dd3533ec-c65a-50b9-8c7a-aef22a495002",
+        "queryMode": "assignedToPrincipalIncludingInheritedGroupsAndDescendants",
+        "rawPageDigests": [
+          "sha256:d22be9ed9f51a6bb5ca7ddf18ed1ea937459cf9020e881934c009b61c1fe968b"
+        ],
+        "readCount": 2,
+        "targetDigest": "sha256:5689c42142259c396cfa032572807962d8daf0a8e8a42a8da26d41c3c115d04f",
+        "targetScopeId": "/providers/microsoft.management/managementgroups/00000000-0000-0000-0000-000000000003"
+      },
+      {
+        "allPagesRetrieved": true,
+        "bindingId": "ce7eeab8-fade-5255-a494-086acaed4106",
+        "queryMode": "assignedToPrincipalIncludingInheritedGroupsAndDescendants",
+        "rawPageDigests": [
+          "sha256:76f0c6a79ecce85a3d5a0ba5120fe120d481d8313ab77b738d9ef0408af26f9a"
+        ],
+        "readCount": 2,
+        "targetDigest": "sha256:06ea27d426677fb41f1f4b1ef5a35ce42a70ae331f63e6735f46ee5369a81bb5",
+        "targetScopeId": "/subscriptions/00000000-0000-0000-0000-000000000000"
+      }
+    ],
+    "transitiveGroupIds": []
+  },
+  "collectorPrincipalId": "11111111-1111-1111-1111-111111111111",
+  "collectorSecurityGroupIds": [],
+  "denyAssignmentCollectionComplete": true,
+  "denyAssignmentIncludeInherited": true,
+  "denyAssignments": [],
+  "exclusiveDataPlanePrincipalEvidence": {
+    "allPagesRetrieved": true,
+    "assignmentCollectionScopeId": "/subscriptions/00000000-0000-0000-0000-000000000000",
+    "evidenceBlobVersioningEnabled": true,
+    "evidenceContainerHasImmutabilityPolicy": true,
+    "evidenceContainerImmutabilityPeriodDays": 30,
+    "evidenceContainerImmutabilityPolicyState": "Unlocked",
+    "evidenceContainerProtectedAppendWritesAllEnabled": false,
+    "evidenceContainerProtectedAppendWritesEnabled": false,
+    "evidenceContainerPublicAccess": "None",
+    "evidenceDigest": "sha256:4a20c3e6063ca1c1116ddcf7e380f14aa008986fedd88452dd3f28eaf37bb5d2",
+    "evidenceStorageDefaultToOAuthAuthentication": true,
+    "evidenceStorageSharedKeyAccessEnabled": false,
+    "evidenceWriterAuthorizedPrincipalIds": [
+      "11111111-1111-1111-1111-111111111111"
+    ],
+    "firstRawPageDigests": [
+      "sha256:3c841911a57d3cdede966e711d8bfd6b6e12807a8dc69bdc884bdd7bfdd4c9ce"
+    ],
+    "firstReadCompletedAt": "2026-09-10T01:52:00Z",
+    "firstReadTargetDigests": [
+      "sha256:d214a310a41e748e1e80c3fd13520587ad8dbd6cf7c38876374a14faec9f9100"
+    ],
+    "firstResourceConfigurationDigests": [
+      "sha256:4f411d4b6e7efcd39d5a448a2257cb96064fbbe9f40b8d45ded4060feb05fcd9",
+      "sha256:9b7b67d1814e968278c6b8fb325534106e6847cf50274e832ea764f5ef760836",
+      "sha256:9b979e32c608ce3164e596763e9349845a7f9b97eafeb9a1fce931aad67f7d17",
+      "sha256:dc7b8e23600e27e6428501a3dc7ce016127770f06f9bf817a5c9873cf40f0d05",
+      "sha256:e6167739f93cd2e4c4a88ef52094191341aece5d3f8345bb0c8bfbe89ddaac86"
+    ],
+    "includeAllDescendantScopes": true,
+    "includeInherited": true,
+    "queryFilter": "none",
+    "scopeIds": [
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.keyvault/vaults/athenademomonkv",
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.keyvault/vaults/athenademomonkv/keys/monitoring-evidence-signing",
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.storage/storageaccounts/athenademomonstore",
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.storage/storageaccounts/athenademomonstore/blobservices/default",
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.storage/storageaccounts/athenademomonstore/blobservices/default/containers/monitoring-evidence",
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.storage/storageaccounts/athenademomonstore/blobservices/default/containers/monitoring-evidence/immutabilitypolicies/default"
+    ],
+    "secondRawPageDigests": [
+      "sha256:3c841911a57d3cdede966e711d8bfd6b6e12807a8dc69bdc884bdd7bfdd4c9ce"
+    ],
+    "secondReadCompletedAt": "2026-09-10T01:53:00Z",
+    "secondReadTargetDigests": [
+      "sha256:d214a310a41e748e1e80c3fd13520587ad8dbd6cf7c38876374a14faec9f9100"
+    ],
+    "secondResourceConfigurationDigests": [
+      "sha256:4f411d4b6e7efcd39d5a448a2257cb96064fbbe9f40b8d45ded4060feb05fcd9",
+      "sha256:9b7b67d1814e968278c6b8fb325534106e6847cf50274e832ea764f5ef760836",
+      "sha256:9b979e32c608ce3164e596763e9349845a7f9b97eafeb9a1fce931aad67f7d17",
+      "sha256:dc7b8e23600e27e6428501a3dc7ce016127770f06f9bf817a5c9873cf40f0d05",
+      "sha256:e6167739f93cd2e4c4a88ef52094191341aece5d3f8345bb0c8bfbe89ddaac86"
+    ],
+    "signingKeyAuthorizedPrincipalIds": [
+      "11111111-1111-1111-1111-111111111111"
+    ],
+    "signingKeyVaultAccessPolicyPrincipalIds": [],
+    "signingKeyVaultRbacAuthorizationEnabled": true
+  },
+  "expiresAt": "2026-09-10T02:10:00Z",
+  "firstDenyAssignmentRawPageDigests": [
+    "sha256:0594ae3648fdbbec62d39aba86a3ba20a849f088b70e92f13c367da9ee9bc95c"
+  ],
+  "firstPimScheduleInstanceRawPageDigests": [
+    "sha256:8959f9366f36fe82895ee188994b77fe18ec6cf00b06532747ed2462fb817320"
+  ],
+  "firstRawSnapshotDigest": "sha256:e5aa0b372aca306e7ff04fecdaa08c4b12a2a65a246352bef0c9590bd95301fa",
+  "firstReadCompletedAt": "2026-09-10T01:54:00Z",
+  "firstRoleDefinitionRawPageDigests": [
+    "sha256:9b08b1ce948dc2c7a96f9c74cc24bc616f0c30a5bd23a2781829267af47a55b4"
+  ],
+  "groupMembershipCollectionComplete": true,
+  "inventoryDigest": "sha256:4c1f71dc16e6cf62e1df8b33596858588943f551b9fe84c15005725a8f8b9293",
+  "managementGroupAncestry": [
+    "/providers/microsoft.management/managementgroups/00000000-0000-0000-0000-000000000003"
+  ],
+  "managementGroupHierarchyEvidence": {
+    "allPagesRetrieved": true,
+    "evidenceDigest": "sha256:477557fc7455716236370d2d352c9821f00dc7b5abf632efb2ac119c77cb4126",
+    "firstRawPageDigests": [
+      "sha256:eefc7807dbb9914a5fd5b94809b811ec4c3f74275ce215fc6c5966a6fbe84531"
+    ],
+    "firstReadCompletedAt": "2026-09-10T01:52:00Z",
+    "orderedAncestry": [
+      "/providers/microsoft.management/managementgroups/00000000-0000-0000-0000-000000000003"
+    ],
+    "parentEdges": [
+      {
+        "childScopeId": "/subscriptions/00000000-0000-0000-0000-000000000000",
+        "edgeDigest": "sha256:7e23a41319b24c65b5ede63dc107c08f6c920f9f5d4370b4fac1c97b57f89ff8",
+        "parentScopeId": "/providers/microsoft.management/managementgroups/00000000-0000-0000-0000-000000000003"
+      }
+    ],
+    "requestPath": "/providers/Microsoft.Management/getEntities?api-version=2020-05-01&$select=Name,Type,ParentNameChain",
+    "secondRawPageDigests": [
+      "sha256:eefc7807dbb9914a5fd5b94809b811ec4c3f74275ce215fc6c5966a6fbe84531"
+    ],
+    "secondReadCompletedAt": "2026-09-10T01:53:00Z",
+    "subscriptionScopeId": "/subscriptions/00000000-0000-0000-0000-000000000000"
+  },
+  "pimScheduleInstanceCollectionComplete": true,
+  "pimScheduleInstanceIncludeInherited": true,
+  "protectedScopeIds": [
+    "/providers/microsoft.management/managementgroups/00000000-0000-0000-0000-000000000003",
+    "/subscriptions/00000000-0000-0000-0000-000000000000",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/providers/microsoft.authorization/roledefinitions/c8033c79-2e00-5f19-aeef-04af709cc6d8",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/providers/microsoft.authorization/roledefinitions/eada5bed-cda9-5d00-98fa-45b461336ba3",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/networkwatcherrg",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/networkwatcherrg/providers/microsoft.network/networkwatchers/networkwatcher_australiaeast",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/networkwatcherrg/providers/microsoft.network/networkwatchers/networkwatcher_australiaeast/flowlogs/athena-hackathon-vnet-rg-athena-demo-workload-flowlog",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.app/jobs/athena-wc028-rbac-attestor",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.insights/datacollectionendpoints/athena-hackathon-linux-dce",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.insights/datacollectionrules/athena-hackathon-linux-dcr",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.insights/privatelinkscopes/athena-demo-monitoring-collector-ampls",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.insights/privatelinkscopes/athena-demo-monitoring-workload-ampls",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.keyvault/vaults/athenademomonkv",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.keyvault/vaults/athenademomonkv/keys/monitoring-evidence-signing",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.operationalinsights/workspaces/athena-hackathon-law",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.operationalinsights/workspaces/athena-hackathon-law/tables/heartbeat",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.operationalinsights/workspaces/athena-hackathon-law/tables/insightsmetrics",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.operationalinsights/workspaces/athena-hackathon-law/tables/ntanetanalytics",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.operationalinsights/workspaces/athena-hackathon-law/tables/nwconnectionmonitordestinationlistenerresult",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.operationalinsights/workspaces/athena-hackathon-law/tables/nwconnectionmonitordnsresult",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.operationalinsights/workspaces/athena-hackathon-law/tables/nwconnectionmonitorpathresult",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.operationalinsights/workspaces/athena-hackathon-law/tables/nwconnectionmonitortestresult",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.operationalinsights/workspaces/athena-hackathon-law/tables/perf",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.operationalinsights/workspaces/athena-hackathon-law/tables/syslog",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.operationalinsights/workspaces/athena-hackathon-law/tables/vmboundport",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.operationalinsights/workspaces/athena-hackathon-law/tables/vmcomputer",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.operationalinsights/workspaces/athena-hackathon-law/tables/vmconnection",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.operationalinsights/workspaces/athena-hackathon-law/tables/vmprocess",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.storage/storageaccounts/athenademomonstore",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.storage/storageaccounts/athenademomonstore/blobservices/default",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.storage/storageaccounts/athenademomonstore/blobservices/default/containers/monitoring-evidence",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.storage/storageaccounts/athenademomonstore/blobservices/default/containers/monitoring-evidence/immutabilitypolicies/default",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.storage/storageaccounts/athenademomonstore/providers/microsoft.authorization/roleassignments/443f9b6b-179c-5346-9585-067661eb4242",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-client-01",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-client-01/providers/microsoft.insights/datacollectionruleassociations/athena-linux-dcr",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-client-01/providers/microsoft.insights/datacollectionruleassociations/configurationaccessendpoint",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-ecp-01",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-ecp-01/providers/microsoft.insights/datacollectionruleassociations/athena-linux-dcr",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-ecp-01/providers/microsoft.insights/datacollectionruleassociations/configurationaccessendpoint",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-ecp-02",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-ecp-02/providers/microsoft.insights/datacollectionruleassociations/athena-linux-dcr",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-ecp-02/providers/microsoft.insights/datacollectionruleassociations/configurationaccessendpoint",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-ecp-03",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-ecp-03/providers/microsoft.insights/datacollectionruleassociations/athena-linux-dcr",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-ecp-03/providers/microsoft.insights/datacollectionruleassociations/configurationaccessendpoint",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-iris-01",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-iris-01/providers/microsoft.insights/datacollectionruleassociations/athena-linux-dcr",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-iris-01/providers/microsoft.insights/datacollectionruleassociations/configurationaccessendpoint",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-mid-01",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-mid-01/providers/microsoft.insights/datacollectionruleassociations/athena-linux-dcr",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-mid-01/providers/microsoft.insights/datacollectionruleassociations/configurationaccessendpoint",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-mid-02",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-mid-02/providers/microsoft.insights/datacollectionruleassociations/athena-linux-dcr",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-mid-02/providers/microsoft.insights/datacollectionruleassociations/configurationaccessendpoint",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-sqlvm-01",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-sqlvm-01/providers/microsoft.insights/datacollectionruleassociations/athena-linux-dcr",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-sqlvm-01/providers/microsoft.insights/datacollectionruleassociations/configurationaccessendpoint",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-web-01",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-web-01/providers/microsoft.insights/datacollectionruleassociations/athena-linux-dcr",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-web-01/providers/microsoft.insights/datacollectionruleassociations/configurationaccessendpoint",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-web-02",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-web-02/providers/microsoft.insights/datacollectionruleassociations/athena-linux-dcr",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-web-02/providers/microsoft.insights/datacollectionruleassociations/configurationaccessendpoint",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-web-03",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-web-03/providers/microsoft.insights/datacollectionruleassociations/athena-linux-dcr",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.compute/virtualmachines/athena-hackathon-web-03/providers/microsoft.insights/datacollectionruleassociations/configurationaccessendpoint",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.network/virtualnetworks/athena-hackathon-vnet",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-rbac-review/providers/microsoft.keyvault/vaults/athenarbacevidencekv",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-rbac-review/providers/microsoft.keyvault/vaults/athenarbacevidencekv/keys/monitoring-rbac-inventory-review",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-rbac-review/providers/microsoft.keyvault/vaults/athenarbacevidencekv/keys/monitoring-rbac-inventory-review/providers/microsoft.authorization/roleassignments/6c9ab2d1-462f-5cb1-934a-99b628941646",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-rbac-review/providers/microsoft.managedidentity/userassignedidentities/athena-wc028-rbac-review-verifier",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-wc013-live/providers/microsoft.app/jobs/athena-wc028-monitoring-acquisition",
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-wc013-live/providers/microsoft.managedidentity/userassignedidentities/athena-wc028-monitoring-acquisition-support-id"
+  ],
+  "rbacAttestorIdentityAttachmentEvidence": {
+    "allPagesRetrieved": true,
+    "associatedResourceConfigurationRequestPaths": [
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.app/jobs/athena-wc028-rbac-attestor?api-version=2025-01-01"
+    ],
+    "associatedResourceIdentityLifecycles": [
+      {
+        "identityResourceId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.managedidentity/userassignedidentities/athena-demo-monitoring-monitoring-rbac-attestor-id",
+        "lifecycle": "All"
+      }
+    ],
+    "associatedResourceIdentityResourceIds": [
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.managedidentity/userassignedidentities/athena-demo-monitoring-monitoring-rbac-attestor-id"
+    ],
+    "associatedResourceIds": [
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.app/jobs/athena-wc028-rbac-attestor"
+    ],
+    "associatedResourcesRequestPath": "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.managedidentity/userassignedidentities/athena-demo-monitoring-monitoring-rbac-attestor-id/listAssociatedResources?api-version=2021-09-30-preview",
+    "evidenceDigest": "sha256:b6cc26d6bb1901a97b1f1b8aac23aa90bfefe0a5a200385bdcf291f4b1b8099d",
+    "federatedIdentityCredentialIds": [],
+    "federatedIdentityCredentialsRequestPath": "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.managedidentity/userassignedidentities/athena-demo-monitoring-monitoring-rbac-attestor-id/federatedIdentityCredentials?api-version=2023-01-31",
+    "firstAssociatedResourceConfigurationDigests": [
+      "sha256:d4b8c75d5d1b8dc09732d9744ec147d46ca6b0e190a26d45ee8be1fa03a74b3a"
+    ],
+    "firstAssociatedResourceRawPageDigests": [
+      "sha256:c5516336bf33ff159503de14fd0d5d1db855dfafdbc080e48eef02ebd4150387"
+    ],
+    "firstFederatedCredentialRawPageDigests": [
+      "sha256:b161438f1a70574a3fcd4c46a9c9fe26453ece5ec4acd27b390810a78c504be9"
+    ],
+    "firstReadCompletedAt": "2026-09-10T01:52:00Z",
+    "identityResourceId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.managedidentity/userassignedidentities/athena-demo-monitoring-monitoring-rbac-attestor-id",
+    "secondAssociatedResourceConfigurationDigests": [
+      "sha256:d4b8c75d5d1b8dc09732d9744ec147d46ca6b0e190a26d45ee8be1fa03a74b3a"
+    ],
+    "secondAssociatedResourceRawPageDigests": [
+      "sha256:c5516336bf33ff159503de14fd0d5d1db855dfafdbc080e48eef02ebd4150387"
+    ],
+    "secondFederatedCredentialRawPageDigests": [
+      "sha256:b161438f1a70574a3fcd4c46a9c9fe26453ece5ec4acd27b390810a78c504be9"
+    ],
+    "secondReadCompletedAt": "2026-09-10T01:53:00Z"
+  },
+  "repeatedReadStable": true,
+  "resourceGraphQueryRoleActions": [
+    "microsoft.resourcegraph/resources/read"
+  ],
+  "resourceHealthRoleActions": [
+    "microsoft.resourcehealth/availabilitystatuses/read"
+  ],
+  "resourceLogReaderRoleActions": [
+    "microsoft.insights/logs/heartbeat/read",
+    "microsoft.insights/logs/insightsmetrics/read",
+    "microsoft.insights/logs/perf/read",
+    "microsoft.insights/logs/syslog/read",
+    "microsoft.insights/logs/vmconnection/read"
+  ],
+  "reviewerKeyVerifierEvidence": {
+    "allowedDataActions": [
+      "Microsoft.KeyVault/vaults/keys/read"
+    ],
+    "assignmentCount": 1,
+    "attachmentEvidence": {
+      "allPagesRetrieved": true,
+      "associatedResourceIds": [],
+      "associatedResourcesRequestPath": "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-rbac-review/providers/microsoft.managedidentity/userassignedidentities/athena-wc028-rbac-review-verifier/listAssociatedResources?api-version=2021-09-30-preview",
+      "evidenceDigest": "sha256:7640a452fdd0944742c5fa81358ec9988f693813bd3ee286490c36b6a0aae609",
+      "federatedIdentityCredentialIds": [],
+      "federatedIdentityCredentialsRequestPath": "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-rbac-review/providers/microsoft.managedidentity/userassignedidentities/athena-wc028-rbac-review-verifier/federatedIdentityCredentials?api-version=2023-01-31",
+      "firstAssociatedResourceRawPageDigests": [
+        "sha256:b44fe87539c7d34abb199a616fba506184476b03a5fcca994712176be687af9a"
+      ],
+      "firstFederatedCredentialRawPageDigests": [
+        "sha256:f21687753251dc28893a49dd4b998aa29422b9674aea928cd4ff6066a7752a2d"
+      ],
+      "firstReadCompletedAt": "2026-09-10T01:52:00Z",
+      "identityResourceId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-rbac-review/providers/microsoft.managedidentity/userassignedidentities/athena-wc028-rbac-review-verifier",
+      "secondAssociatedResourceRawPageDigests": [
+        "sha256:b44fe87539c7d34abb199a616fba506184476b03a5fcca994712176be687af9a"
+      ],
+      "secondFederatedCredentialRawPageDigests": [
+        "sha256:f21687753251dc28893a49dd4b998aa29422b9674aea928cd4ff6066a7752a2d"
+      ],
+      "secondReadCompletedAt": "2026-09-10T01:53:00Z"
+    },
+    "evidenceDigest": "sha256:03c22e66f685c97192aec8477d4aa10ae998494b036972eb8b99d84a4494fbbe",
+    "grant": {
+      "assignedPrincipalId": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+      "assignedPrincipalType": "ServicePrincipal",
+      "assignmentScopeIds": [
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-rbac-review/providers/microsoft.keyvault/vaults/athenarbacevidencekv/keys/monitoring-rbac-inventory-review"
+      ],
+      "effectivePrincipalId": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+      "grantDigest": "sha256:76d1a7ff6674aca5f930ee7d33e49702b1086da4cb7b49e4ab24f28b36802bfd",
+      "groupDerived": false,
+      "inheritance": "direct",
+      "roleDefinitionId": "/subscriptions/00000000-0000-0000-0000-000000000000/providers/microsoft.authorization/roledefinitions/eada5bed-cda9-5d00-98fa-45b461336ba3",
+      "roleDefinitionName": "Athena WC028 RBAC Reviewer Public Key Reader"
+    },
+    "identityClientId": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+    "identityPrincipalId": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+    "identityResourceId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-rbac-review/providers/microsoft.managedidentity/userassignedidentities/athena-wc028-rbac-review-verifier",
+    "identityTenantId": "00000000-0000-0000-0000-000000000003",
+    "principalEvidence": {
+      "allPagesRetrieved": true,
+      "evidenceDigest": "sha256:5688f85e7b2cf3771bcdb3a68fa30eaafa9ef2217f6a1b680bb1dd7fc614c235",
+      "firstTransitiveGroupRawPageDigests": [
+        "sha256:0e2a99aade0e182321f9fef500c687266388cc96f9db80a90d6a5331cd9ac36f"
+      ],
+      "principalId": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+      "secondTransitiveGroupRawPageDigests": [
+        "sha256:0e2a99aade0e182321f9fef500c687266388cc96f9db80a90d6a5331cd9ac36f"
+      ],
+      "targetReadEvidence": [
+        {
+          "allPagesRetrieved": true,
+          "bindingId": "6d4e9cd0-a1f0-5a88-b0d5-c770a69d3480",
+          "queryMode": "assignedToPrincipalIncludingInheritedGroupsAndDescendants",
+          "rawPageDigests": [
+            "sha256:f4633fccecc6125d5ff4ef25aa5e9bedc52802b5097cd4f38503b8a8c04368aa"
+          ],
+          "readCount": 2,
+          "targetDigest": "sha256:bce5fe2a7cdcbb20defffa283919358ec38eefccdbe2563faa575b7e56201060",
+          "targetScopeId": "/subscriptions/00000000-0000-0000-0000-000000000000"
+        }
+      ],
+      "transitiveGroupIds": []
+    },
+    "reviewerKeyArmResourceId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-rbac-review/providers/microsoft.keyvault/vaults/athenarbacevidencekv/keys/monitoring-rbac-inventory-review",
+    "roleAssignmentId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-rbac-review/providers/microsoft.keyvault/vaults/athenarbacevidencekv/keys/monitoring-rbac-inventory-review/providers/microsoft.authorization/roleassignments/6c9ab2d1-462f-5cb1-934a-99b628941646",
+    "roleDefinitionId": "/subscriptions/00000000-0000-0000-0000-000000000000/providers/microsoft.authorization/roledefinitions/eada5bed-cda9-5d00-98fa-45b461336ba3",
+    "roleDefinitionName": "Athena WC028 RBAC Reviewer Public Key Reader"
+  },
+  "roleDefinitionCollectionComplete": true,
+  "roleDefinitions": [
+    {
+      "actions": [],
+      "dataActions": [
+        "microsoft.keyvault/vaults/keys/read",
+        "microsoft.keyvault/vaults/keys/sign/action"
+      ],
+      "definitionDigest": "sha256:e61ade7fecac3820ee48dd2232e958acd6df272e1a9f3b07365e1a06fef393e5",
+      "notActions": [],
+      "notDataActions": [],
+      "rawDefinitionDigest": "sha256:8449335e523591ee69f78209b9abcc47a7905df72c257920a0563829de8297af",
+      "roleDefinitionId": "/subscriptions/00000000-0000-0000-0000-000000000000/providers/microsoft.authorization/roledefinitions/12338af0-0e69-4776-bea7-57ae8d297424",
+      "roleDefinitionName": "Key Vault Crypto User"
+    },
+    {
+      "actions": [
+        "microsoft.app/jobs/read",
+        "microsoft.authorization/denyassignments/read",
+        "microsoft.authorization/roleassignments/read",
+        "microsoft.authorization/roleassignmentscheduleinstances/read",
+        "microsoft.authorization/roledefinitions/read",
+        "microsoft.keyvault/vaults/read",
+        "microsoft.managedidentity/userassignedidentities/federatedidentitycredentials/read",
+        "microsoft.managedidentity/userassignedidentities/listassociatedresources/action",
+        "microsoft.managedidentity/userassignedidentities/read",
+        "microsoft.management/getentities/action",
+        "microsoft.storage/storageaccounts/blobservices/containers/immutabilitypolicies/read",
+        "microsoft.storage/storageaccounts/blobservices/containers/read",
+        "microsoft.storage/storageaccounts/blobservices/read",
+        "microsoft.storage/storageaccounts/read"
+      ],
+      "dataActions": [],
+      "definitionDigest": "sha256:6e372eefa422a0c5b12733f26b33fe55906edc66bfb5bd431115b29efc615838",
+      "notActions": [],
+      "notDataActions": [],
+      "rawDefinitionDigest": "sha256:d103f9618fedc9dddb8b590b1b9846a64596b3424b5d5183adddf104d712c486",
+      "roleDefinitionId": "/subscriptions/00000000-0000-0000-0000-000000000000/providers/microsoft.authorization/roledefinitions/2a8d9aea-2688-5841-a7e4-82f23d0f1bac",
+      "roleDefinitionName": "Athena WC-028 Effective RBAC Attestor"
+    },
+    {
+      "actions": [
+        "microsoft.compute/virtualmachines/instanceview/read",
+        "microsoft.insights/metrics/read"
+      ],
+      "dataActions": [],
+      "definitionDigest": "sha256:f67997d79be54f3820c11382941d86806206ebe93c28168b30ee274f7b717e72",
+      "notActions": [],
+      "notDataActions": [],
+      "rawDefinitionDigest": "sha256:4693bdd54260edcae4f038ab39b634d76c12f2437c20c123dfca9fda58ee79ff",
+      "roleDefinitionId": "/subscriptions/00000000-0000-0000-0000-000000000000/providers/microsoft.authorization/roledefinitions/2fda1d90-37da-55d9-8ac3-132fb7bdca5d",
+      "roleDefinitionName": "Athena WC016 Approved Signal Reader synthetic00000"
+    },
+    {
+      "actions": [],
+      "dataActions": [
+        "microsoft.storage/storageaccounts/blobservices/containers/blobs/add/action",
+        "microsoft.storage/storageaccounts/blobservices/containers/blobs/read"
+      ],
+      "definitionDigest": "sha256:aee8cc886f1922fae131bf04d7cb50f5888b798096351d54524f18d57d7b7990",
+      "notActions": [],
+      "notDataActions": [],
+      "rawDefinitionDigest": "sha256:d819a58da80c4e49a624c8f766a68f402fb6e8daccd5447f5e0148dcd809617c",
+      "roleDefinitionId": "/subscriptions/00000000-0000-0000-0000-000000000000/providers/microsoft.authorization/roledefinitions/930bcf3d-dc5f-5680-9568-e54e13e3acf4",
+      "roleDefinitionName": "Athena WC028 Monitoring Evidence Create-Only Writer"
+    },
+    {
+      "actions": [
+        "*/read"
+      ],
+      "dataActions": [],
+      "definitionDigest": "sha256:9f2441d073a2aa967a769aaaa314bb0da57032c941c02b23b4f9722f40fe3f56",
+      "notActions": [],
+      "notDataActions": [],
+      "rawDefinitionDigest": "sha256:ea8e0e755cc3aa396046149313f052209b1abb2f0bbb96266c998f375a7c0944",
+      "roleDefinitionId": "/subscriptions/00000000-0000-0000-0000-000000000000/providers/microsoft.authorization/roledefinitions/acdd72a7-3385-48ef-bd42-f606fba81ae7",
+      "roleDefinitionName": "Reader"
+    },
+    {
+      "actions": [
+        "microsoft.storage/storageaccounts/blobservices/containers/immutabilitypolicies/read",
+        "microsoft.storage/storageaccounts/blobservices/containers/read",
+        "microsoft.storage/storageaccounts/blobservices/read",
+        "microsoft.storage/storageaccounts/read"
+      ],
+      "dataActions": [],
+      "definitionDigest": "sha256:ebcf9b229bacf97e0a6dc60d0893c8927a7de50cd7b0f445636aff9125fd6d06",
+      "notActions": [],
+      "notDataActions": [],
+      "rawDefinitionDigest": "sha256:5f76a5876331940dd4edec0b7937c6cebf6ae551dfff98c461fec3fb84147b1f",
+      "roleDefinitionId": "/subscriptions/00000000-0000-0000-0000-000000000000/providers/microsoft.authorization/roledefinitions/c8033c79-2e00-5f19-aeef-04af709cc6d8",
+      "roleDefinitionName": "Athena WC028 Monitoring Storage Protection Reader"
+    },
+    {
+      "actions": [],
+      "dataActions": [
+        "microsoft.keyvault/vaults/keys/read"
+      ],
+      "definitionDigest": "sha256:3d1e3ee3ef7e8970262dcfb2300ef4df95c0052a850eb6238121beaa1a6e4f6c",
+      "notActions": [],
+      "notDataActions": [],
+      "rawDefinitionDigest": "sha256:de26cde902422d6d532d45ef617f9884dea62ee50d9a73325b4d31e762a12ab1",
+      "roleDefinitionId": "/subscriptions/00000000-0000-0000-0000-000000000000/providers/microsoft.authorization/roledefinitions/eada5bed-cda9-5d00-98fa-45b461336ba3",
+      "roleDefinitionName": "Athena WC028 RBAC Reviewer Public Key Reader"
+    },
+    {
+      "actions": [
+        "microsoft.resourcehealth/availabilitystatuses/read"
+      ],
+      "dataActions": [],
+      "definitionDigest": "sha256:b77e9b6f5c313605c3e37683d27ba8f187ddc1f49c49050f0d9bf96f4a825910",
+      "notActions": [],
+      "notDataActions": [],
+      "rawDefinitionDigest": "sha256:475b2bb9ce8794d5fcf6c58efef477a6e33fe62f5b4bdd573d0c4d24c50bdc98",
+      "roleDefinitionId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.authorization/roledefinitions/0790d6f2-9553-5b63-84ac-56596b7e4072",
+      "roleDefinitionName": "Athena WC-028 VM Resource Health Reader"
+    },
+    {
+      "actions": [
+        "microsoft.resourcegraph/resources/read"
+      ],
+      "dataActions": [],
+      "definitionDigest": "sha256:5e2778a573285fdd51997fd59409b28e9d2b6498c20b51ca9c09983d2960e25f",
+      "notActions": [],
+      "notDataActions": [],
+      "rawDefinitionDigest": "sha256:5058b1ded0886090dac151e9adc08e799a038ff9a3317384fbd69bbe6794e619",
+      "roleDefinitionId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.authorization/roledefinitions/5687977f-aa06-5699-8e18-1a54a074b532",
+      "roleDefinitionName": "Athena WC-028 Resource Graph Query Submitter"
+    },
+    {
+      "actions": [
+        "microsoft.insights/logs/heartbeat/read",
+        "microsoft.insights/logs/insightsmetrics/read",
+        "microsoft.insights/logs/perf/read",
+        "microsoft.insights/logs/syslog/read",
+        "microsoft.insights/logs/vmconnection/read"
+      ],
+      "dataActions": [],
+      "definitionDigest": "sha256:974d9576ff63ed091bccfeb63e7b5f48fcc200352b16c5a2f209a5f1cf5a4226",
+      "notActions": [],
+      "notDataActions": [],
+      "rawDefinitionDigest": "sha256:f60ba8abc35501251ef3afb66b05d8f5ba1ca228abc570f5035bcce6dd564f05",
+      "roleDefinitionId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-workload/providers/microsoft.authorization/roledefinitions/f33a4363-5d9a-5d50-9871-c08582234978",
+      "roleDefinitionName": "Athena WC-028 VM Resource Log Reader"
+    }
+  ],
+  "runtimeSupportGrants": [
+    {
+      "assignedPrincipalId": "66666666-6666-6666-6666-666666666670",
+      "assignedPrincipalType": "ServicePrincipal",
+      "assignmentScopeIds": [
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-athena-demo-monitoring/providers/microsoft.storage/storageaccounts/athenademomonstore"
+      ],
+      "effectivePrincipalId": "66666666-6666-6666-6666-666666666670",
+      "grantDigest": "sha256:f459bee5c25aea6bee5c53c3f2e780f4d8ee1fd91297e32f2776b76e911c7cc1",
+      "groupDerived": false,
+      "inheritance": "direct",
+      "roleDefinitionId": "/subscriptions/00000000-0000-0000-0000-000000000000/providers/microsoft.authorization/roledefinitions/c8033c79-2e00-5f19-aeef-04af709cc6d8",
+      "roleDefinitionName": "Athena WC028 Monitoring Storage Protection Reader"
+    }
+  ],
+  "runtimeSupportPrincipalEvidence": {
+    "allPagesRetrieved": true,
+    "evidenceDigest": "sha256:06290a8ed948164ddcef10eddb984cac99d4e89db805606b845d82171b46d036",
+    "firstTransitiveGroupRawPageDigests": [
+      "sha256:3c4bd36fbde1d9f682efe8a2e718dd6e5992099741718ac1f5e00884b816c2b2"
+    ],
+    "principalId": "66666666-6666-6666-6666-666666666670",
+    "secondTransitiveGroupRawPageDigests": [
+      "sha256:3c4bd36fbde1d9f682efe8a2e718dd6e5992099741718ac1f5e00884b816c2b2"
+    ],
+    "targetReadEvidence": [
+      {
+        "allPagesRetrieved": true,
+        "bindingId": "7f828d8c-a69d-5548-9763-2e724f6014f6",
+        "queryMode": "assignedToPrincipalIncludingInheritedGroupsAndDescendants",
+        "rawPageDigests": [
+          "sha256:05a6da2d4211051d966d743383adbcca02424532c64a66222357d3e1fec8ab6b"
+        ],
+        "readCount": 2,
+        "targetDigest": "sha256:653c3d4a57ad22072e48f71c4bbe9c284e1ba0f4a9ccff04fc80462c042ee86a",
+        "targetScopeId": "/providers/microsoft.management/managementgroups/00000000-0000-0000-0000-000000000003"
+      },
+      {
+        "allPagesRetrieved": true,
+        "bindingId": "46f8d808-9775-5585-be78-6661826ad70a",
+        "queryMode": "assignedToPrincipalIncludingInheritedGroupsAndDescendants",
+        "rawPageDigests": [
+          "sha256:71faa1002da099fd5196186ce000f9830625fbdd3e26af722ede2ff92b233826"
+        ],
+        "readCount": 2,
+        "targetDigest": "sha256:11a1b6e204c46a927bdda921fc3a011fcdcfb6a861c20eaeefb4d93106d5cd75",
+        "targetScopeId": "/subscriptions/00000000-0000-0000-0000-000000000000"
+      }
+    ],
+    "transitiveGroupIds": []
+  },
+  "runtimeSupportPrincipalId": "66666666-6666-6666-6666-666666666670",
+  "schemaVersion": "athena.wc028MonitoringEffectiveRbacInventory.v6",
+  "scopeCollectionMode": "subscriptionAssignedToAllInheritedAndUnfilteredWithProtectedScopes",
+  "secondDenyAssignmentRawPageDigests": [
+    "sha256:0594ae3648fdbbec62d39aba86a3ba20a849f088b70e92f13c367da9ee9bc95c"
+  ],
+  "secondPimScheduleInstanceRawPageDigests": [
+    "sha256:8959f9366f36fe82895ee188994b77fe18ec6cf00b06532747ed2462fb817320"
+  ],
+  "secondRawSnapshotDigest": "sha256:e5aa0b372aca306e7ff04fecdaa08c4b12a2a65a246352bef0c9590bd95301fa",
+  "secondReadCompletedAt": "2026-09-10T01:55:00Z",
+  "secondRoleDefinitionRawPageDigests": [
+    "sha256:9b08b1ce948dc2c7a96f9c74cc24bc616f0c30a5bd23a2781829267af47a55b4"
+  ],
+  "signalReaderRoleActions": [
+    "microsoft.compute/virtualmachines/instanceview/read",
+    "microsoft.insights/metrics/read"
+  ],
+  "sourceManifestDigest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  "sourceReference": {
+    "contentDigest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "name": "monitoring-rbac/monitoring-rbac-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/effective-rbac-inventory.json",
+    "version": "2026-09-10T01:55:00.0000000Z"
+  },
+  "subscriptionDescendantCollectionComplete": true,
+  "subscriptionId": "00000000-0000-0000-0000-000000000000",
+  "tenantId": "00000000-0000-0000-0000-000000000003"
+}

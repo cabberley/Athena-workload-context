@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
+from datetime import timedelta
 from typing import Annotated, Literal, cast
 from urllib.parse import urlsplit
 
@@ -24,6 +25,7 @@ from athena_context.contracts.correlation import (
     RootCauseCategory,
     validate_runtime_correlation_report,
 )
+from athena_context.contracts.eventing import IncidentOccurrenceReceipt
 from athena_context.contracts.models import AthenaBaseModel, Sha256Digest, UtcDateTime
 from athena_context.contracts.operational_phase import VersionPinnedBlobReference
 
@@ -109,6 +111,9 @@ type GuidanceRunbookLabelCode = Literal["approvedOperatorRunbook"]
 
 INCIDENT_GUIDANCE_ALGORITHM_ID = "athena.wc027.incident-guidance.v1"
 MAX_INCIDENT_GUIDANCE_BYTES = 64 * 1024
+MAX_GUIDANCE_AUTHORITY_PUBLICATION_REQUEST_BYTES = 8 * 1024 * 1024
+MAX_GUIDANCE_AUTHORITY_BINDING_BYTES = 8 * 1024 * 1024
+MAX_GUIDANCE_AUTHORITY_ACTIVATION_BYTES = 128 * 1024
 
 _CONFIDENCE_RANK: dict[ConfidenceLevel, int] = {
     "Unknown": 0,
@@ -529,7 +534,7 @@ class PublishedGuidanceAuthorityBindingAttestation(_StrictGuidanceModel):
         alias="schemaVersion"
     )
     signature_algorithm: Literal["RS256"] = Field(alias="signatureAlgorithm")
-    key_vault_key_id: str = Field(alias="keyVaultKeyId", min_length=1, max_length=512)
+    key_id: str = Field(alias="keyId", min_length=1, max_length=512)
     signed_preimage_digest: Sha256Digest = Field(alias="signedPreimageDigest")
     detached_signature: str = Field(
         alias="detachedSignature",
@@ -711,6 +716,245 @@ class PublishedGuidanceAuthorityBinding(_StrictGuidanceModel):
         if self.binding_id != f"guidance-binding-{expected.removeprefix('sha256:')[:32]}":
             raise ValueError("bindingId is not digest-bound")
         return self
+
+
+def guidance_authority_binding_signature_preimage(
+    binding: PublishedGuidanceAuthorityBinding,
+) -> bytes:
+    binding = PublishedGuidanceAuthorityBinding.model_validate_json(
+        binding.model_dump_json(by_alias=True)
+    )
+    return canonicalize_json(
+        binding.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=True,
+            exclude={
+                "binding_id",
+                "binding_digest",
+                "binding_attestation",
+            },
+        )
+    ).encode("utf-8")
+
+
+class GuidanceAuthorityPublicationRequestAttestation(_StrictGuidanceModel):
+    schema_version: Literal[
+        "athena.wc027GuidanceAuthorityPublicationRequestAttestation.v1"
+    ] = Field(alias="schemaVersion")
+    signature_algorithm: Literal["RS256"] = Field(alias="signatureAlgorithm")
+    key_id: str = Field(alias="keyId", min_length=1, max_length=512)
+    signed_preimage_digest: Sha256Digest = Field(alias="signedPreimageDigest")
+    detached_signature: str = Field(
+        alias="detachedSignature",
+        pattern=r"^[A-Za-z0-9_-]+$",
+        min_length=1,
+        max_length=8192,
+    )
+
+
+class GuidanceAuthorityPublicationRequest(_StrictGuidanceModel):
+    schema_version: Literal[
+        "athena.wc027GuidanceAuthorityPublicationRequest.v1"
+    ] = Field(alias="schemaVersion")
+    request_id: str = Field(
+        alias="requestId",
+        pattern=r"^guidance-publication-request-[a-f0-9]{32}$",
+    )
+    incident_bound_request: IncidentBoundCorrelationRequest = Field(
+        alias="incidentBoundRequest"
+    )
+    incident_occurrence: IncidentOccurrenceReceipt = Field(
+        alias="incidentOccurrence"
+    )
+    requested_actions: tuple[GuidanceActionKind, ...] = Field(
+        alias="requestedActions",
+        min_length=1,
+        max_length=16,
+    )
+    evaluated_at: UtcDateTime = Field(alias="evaluatedAt")
+    expires_at: UtcDateTime = Field(alias="expiresAt")
+    request_attestation: GuidanceAuthorityPublicationRequestAttestation = Field(
+        alias="requestAttestation"
+    )
+    request_digest: Sha256Digest = Field(alias="requestDigest")
+
+    @field_validator("requested_actions")
+    @classmethod
+    def validate_actions(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        return _sorted_unique(values, "requestedActions")
+
+    @model_validator(mode="after")
+    def validate_request(self) -> GuidanceAuthorityPublicationRequest:
+        correlation_request = self.incident_bound_request.correlation_request
+        subject = self.incident_bound_request.incident_subject
+        occurrence = self.incident_occurrence
+        if (
+            occurrence.incident_id != subject.incident_id
+            or occurrence.transition_id != subject.incident_transition_id
+            or occurrence.state_result_digest != subject.incident_state_digest
+            or occurrence.state_reference != subject.state_reference
+            or occurrence.state_attestation_reference
+            != subject.attestation_reference
+            or
+            self.evaluated_at < correlation_request.issued_at
+            or self.evaluated_at > correlation_request.expires_at
+            or self.expires_at <= self.evaluated_at
+            or self.expires_at > correlation_request.expires_at
+            or self.expires_at - self.evaluated_at > timedelta(minutes=5)
+        ):
+            raise ValueError(
+                "guidance publication request is outside its bounded validity window"
+            )
+        preimage = self.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=True,
+            exclude={
+                "request_id",
+                "request_digest",
+                "request_attestation",
+            },
+        )
+        if self.request_attestation.signed_preimage_digest != compute_artifact_digest(
+            preimage
+        ):
+            raise ValueError("guidance publication request attestation is invalid")
+        expected = _expected_digest(
+            self,
+            excluded_fields={"request_id", "request_digest"},
+        )
+        if self.request_digest != expected:
+            raise ValueError("requestDigest does not bind guidance publication")
+        if (
+            self.request_id
+            != f"guidance-publication-request-{expected.removeprefix('sha256:')[:32]}"
+        ):
+            raise ValueError("requestId is not digest-bound")
+        return self
+
+
+def guidance_authority_publication_request_signature_preimage(
+    request: GuidanceAuthorityPublicationRequest,
+) -> bytes:
+    request = GuidanceAuthorityPublicationRequest.model_validate_json(
+        request.model_dump_json(by_alias=True)
+    )
+    return canonicalize_json(
+        request.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=True,
+            exclude={
+                "request_id",
+                "request_digest",
+                "request_attestation",
+            },
+        )
+    ).encode("utf-8")
+
+
+class PublishedGuidanceAuthorityActivationAttestation(_StrictGuidanceModel):
+    schema_version: Literal[
+        "athena.wc027PublishedGuidanceAuthorityActivationAttestation.v1"
+    ] = Field(alias="schemaVersion")
+    signature_algorithm: Literal["RS256"] = Field(alias="signatureAlgorithm")
+    key_id: str = Field(alias="keyId", min_length=1, max_length=512)
+    signed_preimage_digest: Sha256Digest = Field(alias="signedPreimageDigest")
+    detached_signature: str = Field(
+        alias="detachedSignature",
+        pattern=r"^[A-Za-z0-9_-]+$",
+        min_length=1,
+        max_length=8192,
+    )
+
+
+class PublishedGuidanceAuthorityActivation(_StrictGuidanceModel):
+    schema_version: Literal[
+        "athena.wc027PublishedGuidanceAuthorityActivation.v1"
+    ] = Field(alias="schemaVersion")
+    activation_id: str = Field(
+        alias="activationId",
+        pattern=r"^guidance-activation-[a-f0-9]{32}$",
+    )
+    incident_id: str = Field(alias="incidentId", pattern=r"^inc-[a-f0-9]{12}$")
+    incident_state_digest: Sha256Digest = Field(alias="incidentStateDigest")
+    occurrence_digest: Sha256Digest = Field(alias="occurrenceDigest")
+    publication_request_id: str = Field(
+        alias="publicationRequestId",
+        pattern=r"^guidance-publication-request-[a-f0-9]{32}$",
+    )
+    publication_request_digest: Sha256Digest = Field(
+        alias="publicationRequestDigest"
+    )
+    binding_id: str = Field(
+        alias="bindingId",
+        pattern=r"^guidance-binding-[a-f0-9]{32}$",
+    )
+    binding_digest: Sha256Digest = Field(alias="bindingDigest")
+    binding_reference: VersionPinnedBlobReference = Field(alias="bindingReference")
+    activated_at: UtcDateTime = Field(alias="activatedAt")
+    expires_at: UtcDateTime = Field(alias="expiresAt")
+    activation_attestation: PublishedGuidanceAuthorityActivationAttestation = Field(
+        alias="activationAttestation"
+    )
+    activation_digest: Sha256Digest = Field(alias="activationDigest")
+
+    @model_validator(mode="after")
+    def validate_activation(self) -> PublishedGuidanceAuthorityActivation:
+        if (
+            self.binding_reference.name
+            != f"guidance-bindings/{self.binding_id}/binding.json"
+            or self.activated_at >= self.expires_at
+        ):
+            raise ValueError("guidance activation does not bind an eligible binding")
+        preimage = self.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=True,
+            exclude={
+                "activation_id",
+                "activation_digest",
+                "activation_attestation",
+            },
+        )
+        if (
+            self.activation_attestation.signed_preimage_digest
+            != compute_artifact_digest(preimage)
+        ):
+            raise ValueError("guidance activation attestation is invalid")
+        expected = _expected_digest(
+            self,
+            excluded_fields={"activation_id", "activation_digest"},
+        )
+        if self.activation_digest != expected:
+            raise ValueError("activationDigest does not bind guidance activation")
+        if (
+            self.activation_id
+            != f"guidance-activation-{expected.removeprefix('sha256:')[:32]}"
+        ):
+            raise ValueError("activationId is not digest-bound")
+        return self
+
+
+def guidance_authority_activation_signature_preimage(
+    activation: PublishedGuidanceAuthorityActivation,
+) -> bytes:
+    activation = PublishedGuidanceAuthorityActivation.model_validate_json(
+        activation.model_dump_json(by_alias=True)
+    )
+    return canonicalize_json(
+        activation.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=True,
+            exclude={
+                "activation_id",
+                "activation_digest",
+                "activation_attestation",
+            },
+        )
+    ).encode("utf-8")
 
 
 class IncidentGuidanceSourceBinding(_StrictGuidanceModel):
@@ -1558,7 +1802,7 @@ def validate_incident_guidance_binding(
     )
     binding_preimage_bytes = canonicalize_json(binding_preimage).encode("utf-8")
     if (
-        binding.binding_attestation.key_vault_key_id != trusted_binding_key_id
+        binding.binding_attestation.key_id != trusted_binding_key_id
         or binding.binding_attestation.signed_preimage_digest
         != compute_artifact_digest(binding_preimage)
         or binding_signature_verifier(
@@ -1760,6 +2004,8 @@ __all__ = [
     "GuidanceActionKind",
     "GuidanceAffectedRoleImpact",
     "GuidanceApplicability",
+    "GuidanceAuthorityPublicationRequest",
+    "GuidanceAuthorityPublicationRequestAttestation",
     "GuidanceControlHealth",
     "GuidanceControlProvenance",
     "GuidanceHypothesisSummary",
@@ -1785,16 +2031,24 @@ __all__ = [
     "IncidentGuidanceAssetReference",
     "IncidentGuidanceAttestation",
     "IncidentGuidanceSourceBinding",
+    "MAX_GUIDANCE_AUTHORITY_ACTIVATION_BYTES",
+    "MAX_GUIDANCE_AUTHORITY_BINDING_BYTES",
+    "MAX_GUIDANCE_AUTHORITY_PUBLICATION_REQUEST_BYTES",
     "MAX_INCIDENT_GUIDANCE_BYTES",
     "NoRunbookGuidanceSelection",
     "OpaqueGuidanceRunbookReference",
     "PublishedGuidanceAuthority",
+    "PublishedGuidanceAuthorityActivation",
+    "PublishedGuidanceAuthorityActivationAttestation",
     "PublishedGuidanceAuthorityBinding",
     "PublishedGuidanceAuthorityBindingAttestation",
     "PublishedRunbookGuidanceOption",
     "SelectedRunbookGuidanceSelection",
     "build_guidance_affected_role_impact",
     "build_incident_guidance_source_binding",
+    "guidance_authority_activation_signature_preimage",
+    "guidance_authority_binding_signature_preimage",
+    "guidance_authority_publication_request_signature_preimage",
     "guidance_timeline_kind_for_evidence",
     "build_guidance_legality",
     "project_guidance_hypotheses",

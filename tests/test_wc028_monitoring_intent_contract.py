@@ -479,8 +479,17 @@ def test_monitoring_signals_require_all_explicit_values() -> None:
         eventStatuses=("Active", "Resolved"),
         currentStatuses=("Available",),
         previousStatuses=("Unavailable",),
-        reasonTypes=("PlatformInitiated", "Unknown"),
+        reasonTypes=("Unknown",),
     )
+    historical_reason_signal = ResourceHealthMonitoringSignal(
+        signalKind="resourceHealth",
+        maximumEventAgeSeconds=900,
+        eventStatuses=("Active",),
+        currentStatuses=("Unavailable",),
+        previousStatuses=("Available",),
+        reasonTypes=("PlatformInitiated",),
+    )
+    assert historical_reason_signal.reason_types == ("PlatformInitiated",)
     with pytest.raises(ValidationError, match="Extra inputs"):
         ActivityLogMonitoringSignal(
             signalKind="activityLog",

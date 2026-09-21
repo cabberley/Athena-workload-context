@@ -188,6 +188,112 @@ Required separation:
 - notification dispatcher: exact v2 queue/table/Logic App rights only; and
 - no generic Contributor assignment for a runtime identity.
 
+Resource Health acquisition has two deliberately separate grants. Record and compare both before
+accepting the phase-one handoff:
+
+- `Athena WC-028 Resource Graph Query Submitter` is assigned directly once at
+  `/subscriptions/<subscription-id>/resourceGroups/rg-athena-demo-workload` and its full role
+  definition contains only
+  `Microsoft.ResourceGraph/resources/read`;
+- `Athena WC-028 VM Resource Health Reader` is assigned directly at each of the 11 reviewed VM
+  resource IDs and its full role definition contains only
+  `Microsoft.ResourceHealth/availabilityStatuses/read`;
+- the Resource Graph role has no Resource Health, generic VM, wildcard read, data, or write action;
+  the Resource Health role has no Resource Graph, generic VM, wildcard read, data, or write action;
+  and
+- no Resource Health assignment exists at resource-group, subscription, management-group, or
+  tenant scope, and no Resource Graph query assignment exists at subscription, management-group,
+  tenant, or individual-VM scope.
+
+The published v10 `resourceHealthAllowedOperations` field must contain exactly, in order,
+`Microsoft.ResourceGraph/resources/read` and
+`Microsoft.ResourceHealth/availabilityStatuses/read`. The `/current/read` variant is not accepted
+because this provider contract queries `HealthResources` and does not invoke the current-status
+endpoint.
+
+Fail the gate if either role, action, or assignment shape is absent or broader. Under the collector
+identity, execute the reviewed `HealthResources` query with one approved VM and one clearly
+synthetic unapproved peer VM in the KQL filter. The approved VM may be returned; the peer must not
+be returned. The production adapter must also reject the response if Azure returns any row whose
+`properties.targetResourceId` is outside the contract's exact approved VM list. KQL filtering is
+defense in depth and is not accepted as a substitute for the per-VM Resource Health assignments.
+Do not read or filter `properties.reasonType`: that field is not documented for this
+`HealthResources` projection. The normalized compatibility value is always `Unknown`, and the
+published v10 collector contract must contain
+`resourceHealthReasonAuthorityMode=availabilityStatusUnknownOnly` and
+`resourceHealthReasonEvidenceVersion=2`. Historical intent objects may still be parsed, but the
+current acquisition preflight must reject any non-`Unknown` reason filter before identity or
+source I/O. A current `Available` row carrying prior-event `context`, `reasonType`,
+`healthEventCause`, or `recentlyResolved` metadata must still emit `Unknown`, never Platform or
+User attribution. Do not combine Activity Log's channel-specific `properties.healthEventCause`,
+`properties.cause`, or `eventProperties.cause` paths into one assumed JSON contract; the current
+Activity Log path remains change evidence only.
+
+For flow coverage, both declared legacy table names, `NTANetAnalytics` and
+`AzureNetworkAnalytics_CL`, are unsupported under the same exact path, direction, and five-tuple
+scope. Either name must produce deterministic `unavailable` coverage without issuing a Log
+Analytics or IP Flow Verify request and without retaining a network-flow record.
+
+For the WC-028 monitoring collector, do not substitute the generic CLI listing above for the
+phase-two contract-publication evidence. Use the phase-one handoff's exact requests and perform
+two complete reads:
+
+- subscription-scope role-assignment reads for both the collector and Athena Context principals
+  with exact `--all --include-inherited --include-groups --assignee-object-id` semantics,
+  plus two complete `Microsoft.Management/getEntities` reads proving the subscription entity's
+  exact ordered parent edges through the tenant-root management group, and stable principal reads
+  at every proven ancestor. Inventory v6 represents each read as a `targetReadEvidence` item bound
+  to the exact target scope, canonical query mode, target digest, complete page-digest set,
+  `readCount=2`, `allPagesRetrieved=true`, and deterministic ARM `guid()` binding. Require the
+  exact subscription-plus-ancestor target set and reject duplicate target scopes, target digests,
+  page digests, or binding IDs;
+- an unfiltered `--all --include-inherited` role-assignment read from which every principal
+  capable of Blob evidence writes or Key Vault signing is derived;
+- exact unfiltered `listAssociatedResources` and federated-credential reads for the collector and
+  RBAC-attestor UAMIs;
+- Storage account, default Blob service, evidence container, immutability policy, and signing-vault
+  reads proving Shared Key is disabled, OAuth is the default, Blob versioning is enabled, the
+  container has the reviewed unlocked-or-human-locked retention policy with protected append
+  writes disabled, vault RBAC is enabled, and no access policy exists; and
+- protected-scope deny, full role-definition, active PIM, and Microsoft Graph transitive-membership
+  evidence.
+
+The collector and attestor must each be attached only to their contract-bound Container Apps Job
+and must have no federated credential. Read both Jobs and sign their complete UAMI maps: the
+collector Job may contain only the collector plus the explicitly contract-bound runtime-support
+UAMI, while the attestor Job may contain only the attestor. The Athena Context UAMI must be absent.
+The collector must be the sole evidence writer and signer.
+Before phase one, run the reviewed v3 exact cleanup and retain a non-zero
+`cleanupEvidenceDigest`; neither an all-zero placeholder nor an incremental template that leaves
+the old `Storage Blob Data Contributor` assignment is acceptable. The new grant must contain only known-name Blob read and `blobs/add/action`, with the exact
+condition that denies `Blob.List` and limits access to the reviewed manifest, recovery, and
+evidence path shapes, and no `blobs/write`, unrestricted read, overwrite, or delete capability.
+The runtime-support identity must separately have only the four management-plane reads needed to
+revalidate the exact storage account, Blob service, evidence container, and immutability policy.
+A separately governed reviewer principal must sign the canonical inventory and source-manifest
+digests, bootstrap handoff, and cleanup evidence with the exact versioned key in the fixed review
+vault. The signature must also cover the phase-one subscription deployment ID, server template
+hash, and complete contract-input binding ID. A separate verifier UAMI must have exactly one
+direct keys/get-only assignment at that key, no groups, PIM, federated credential, or persistent
+attachment, and a principal distinct from the reviewer and every runtime identity. It lets the
+phase-two AzureCLI script resolve that Key Vault JWK; caller-supplied modulus/fingerprint values
+are not a trust root. The reviewer principal must be explicitly distinct from the
+runtime-support principal as well as the collector, context, attestor, and verifier principals.
+Treat the encodings as source-specific: Azure CLI `key show` output must be canonical standard
+Base64, while the configured contract must be canonical minimal RFC 7518 Base64urlUInt with no
+padding. Azure CLI performs its key-output transformation before JMESPath `--query`, so projecting
+`key.n` and `key.e` does not bypass standard-Base64 conversion. Decode both to bytes before
+comparison; reject encoding aliases, whitespace, excess or missing standard padding, contract
+padding, leading-zero integers, an even modulus, modulus sizes other than exactly 2048, 3072, or
+4096 bits, and any exponent other than the minimal `AQAB` encoding of 65537.
+`publish-monitoring-contract.bicep` must report
+`effectiveRbacCryptographicReviewVerified=true`; a caller-supplied digest without a valid detached
+signature is not acceptance evidence. Publication requires collector contract v10, effective
+RBAC inventory v6, and effective-RBAC inventory attestation v2. Inventory v5 is the historical
+unbound-target shape; v9/v4 artifacts are also historical parse-only evidence. The canonical inventory
+must remain at or below 62,000 bytes, and the complete deployment-script environment payload must
+remain at or below 64,000 characters.
+
 ## Phase 4: deploy
 
 Deployment is an explicit operator action. The approved command, commit SHA, image digests,
@@ -198,7 +304,9 @@ After deployment:
 1. record deployment outputs and provisioning state;
 2. repeat RBAC checks;
 3. verify all Container Apps revisions use the reviewed image digests;
-4. verify Storage shared-key and public access remain disabled where required;
+4. verify Storage shared-key and public access remain disabled where required, Blob versioning and
+   the evidence immutability policy still match the published v10 contract, and the cleanup digest
+   is non-zero;
 5. verify monitoring/runtime workspace isolation;
 6. verify exact key versions and trusted fingerprints; and
 7. run signed feed/report/guidance/enrichment readback before any fault injection.
@@ -313,7 +421,8 @@ manifest, missing recovery evidence, or a renderer-generated instruction.
 WC-029 is complete only when:
 
 1. all reviewed deployments succeeded with no unintended delete or public exposure;
-2. effective RBAC matches the separation policy;
+2. effective RBAC matches the separation policy and the WC-028 publication handoff records a
+   successful canonical-digest and reviewer-signature verification;
 3. every enabled scenario met its declared incident-producing or correlation-only acceptance
    criteria;
 4. each incident-producing scenario rendered verified guidance from closed templates;

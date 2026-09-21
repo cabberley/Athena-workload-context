@@ -85,6 +85,8 @@ resource monitoringEvidenceImmutability 'Microsoft.Storage/storageAccounts/blobS
   name: 'default'
   properties: {
     immutabilityPeriodSinceCreationInDays: retentionDays
+    allowProtectedAppendWrites: false
+    allowProtectedAppendWritesAll: false
   }
 }
 
@@ -131,4 +133,13 @@ resource lifecyclePolicy 'Microsoft.Storage/storageAccounts/managementPolicies@2
 }
 
 output storageAccountResourceId string = storageAccount.id
+output blobServiceResourceId string = blobService.id
+output blobVersioningEnabled bool = blobService.properties.isVersioningEnabled == true
 output monitoringEvidenceContainerResourceId string = monitoringEvidenceContainer.id
+output monitoringEvidenceContainerPublicAccess string = monitoringEvidenceContainer.properties.publicAccess
+output monitoringEvidenceContainerHasImmutabilityPolicy bool = monitoringEvidenceContainer.properties.hasImmutabilityPolicy == true
+output monitoringEvidenceImmutabilityPolicyResourceId string = monitoringEvidenceImmutability.id
+output monitoringEvidenceImmutabilityPolicyState string = monitoringEvidenceImmutability.properties.state
+output monitoringEvidenceImmutabilityPeriodDays int = monitoringEvidenceImmutability.properties.immutabilityPeriodSinceCreationInDays
+output monitoringEvidenceProtectedAppendWritesEnabled bool = monitoringEvidenceImmutability.properties.allowProtectedAppendWrites == true
+output monitoringEvidenceProtectedAppendWritesAllEnabled bool = monitoringEvidenceImmutability.properties.allowProtectedAppendWritesAll == true
