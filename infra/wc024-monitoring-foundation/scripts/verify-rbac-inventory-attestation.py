@@ -178,6 +178,8 @@ def _jwk_decode_integer(value: object, *, field_name: str) -> int:
     try:
         if _BASE64URL_PATTERN.fullmatch(value) is not None:
             decoded = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+            if base64.urlsafe_b64encode(decoded).decode("ascii").rstrip("=") != value:
+                _fail(f"{field_name} is not canonical base64url")
         elif _STANDARD_BASE64_PATTERN.fullmatch(value) is not None:
             unpadded = value.rstrip("=")
             decoded = base64.b64decode(value + "=" * (-len(value) % 4), validate=True)

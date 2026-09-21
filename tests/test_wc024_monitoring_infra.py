@@ -896,9 +896,25 @@ def test_wc024_collector_contract_is_signed_handoff_ready_and_generic_only() -> 
     assert "signingKeyVaultConfigurationRequestPath" in MAIN
     assert "legacyCollectorRbacCleanupDigest" in MAIN
     assert "reviewAuthoritySeparationEnforced" in MAIN
-    assert "toLower(runtimeSupportIdentity.properties.principalId)" in MAIN
-    assert "collectorContractInputs.runtimeSupportIdentityPrincipalId" in RBAC_BOOTSTRAP_HANDOFF
-    assert "contractInputs.runtimeSupportIdentityPrincipalId" in PUBLISH_CONTRACT
+    main_review_separation = MAIN[
+        MAIN.index("var reviewAuthoritySeparation =") : MAIN.index(
+            "var resourceReadScopeIds ="
+        )
+    ]
+    publish_review_separation = PUBLISH_CONTRACT[
+        PUBLISH_CONTRACT.index("var reviewAuthorityIsSeparated =") : PUBLISH_CONTRACT.index(
+            "var expectedCollectorAssociatedResourcesRequestPath ="
+        )
+    ]
+    assert "toLower(runtimeSupportIdentity.properties.principalId)" in main_review_separation
+    assert (
+        "toLower(contractInputs.runtimeSupportIdentityPrincipalId)"
+        in publish_review_separation
+    )
+    assert (
+        "toLower(collectorContractInputs.runtimeSupportIdentityPrincipalId)"
+        in RBAC_BOOTSTRAP_HANDOFF
+    )
     assert "validatedRbacInventoryReviewAuthority" in MAIN
     assert "reviewedRbacInventoryReviewerVaultHost" in MAIN
     assert "athenarbacevidencekv.${environment().suffixes.keyvaultDns}" in MAIN
@@ -1202,6 +1218,13 @@ def test_wc024_phase_two_cryptographically_verifies_external_rbac_review() -> No
     assert "output validationDigest string" in RBAC_INVENTORY_ATTESTATION_VALIDATION
 
     assert 'digest_payload.pop("inventoryDigest", None)' in RBAC_INVENTORY_ATTESTATION_VERIFIER
+    assert "_jwk_decode_integer(" in RBAC_INVENTORY_ATTESTATION_VERIFIER
+    assert "jwk_modulus != modulus or jwk_exponent != exponent" in (
+        RBAC_INVENTORY_ATTESTATION_VERIFIER
+    )
+    assert 'reviewer_jwk.get("n") != public_key_modulus' not in (
+        RBAC_INVENTORY_ATTESTATION_VERIFIER
+    )
     assert "modulus.bit_length() < 2048 or exponent != 65537" in (
         RBAC_INVENTORY_ATTESTATION_VERIFIER
     )

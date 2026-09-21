@@ -37,6 +37,23 @@ def _base64url_integer(value: int) -> str:
     return base64.urlsafe_b64encode(encoded).rstrip(b"=").decode("ascii")
 
 
+def _standard_base64_integer(value: int) -> str:
+    encoded = value.to_bytes((value.bit_length() + 7) // 8, "big")
+    return base64.b64encode(encoded).decode("ascii")
+
+
+def _with_noncanonical_trailing_bits(value: str, *, alphabet: str) -> str:
+    padding = len(value) - len(value.rstrip("="))
+    unpadded = value.rstrip("=")
+    trailing_index = alphabet.index(unpadded[-1])
+    assert trailing_index % 16 == 0
+    return (
+        unpadded[:-1]
+        + alphabet[trailing_index + 1]
+        + ("=" * padding)
+    )
+
+
 def _target_read_evidence(
     *,
     principal_id: str,
@@ -328,10 +345,12 @@ def test_deployment_verifier_accepts_exact_canonical_inventory_signature(
     assert outputs["validationDigest"].startswith("sha256:")
 
 
+@pytest.mark.parametrize("key_size", (2048, 3072))
 def test_deployment_verifier_accepts_azure_cli_standard_base64_jwk(
     tmp_path: Path,
+    key_size: int,
 ) -> None:
-    environment, _ = _reviewed_payload()
+    environment, _ = _reviewed_payload(key_size=key_size)
     reviewer_jwk = json.loads(environment["ATHENA_REVIEWER_JWK_JSON"])
     for field, environment_name in (
         ("n", "ATHENA_PUBLIC_KEY_MODULUS"),
@@ -350,6 +369,74 @@ def test_deployment_verifier_accepts_azure_cli_standard_base64_jwk(
 
     assert result.returncode == 0, result.stderr
     assert json.loads(output_path.read_text(encoding="utf-8"))["validated"] is True
+
+
+@pytest.mark.parametrize(
+    ("jwk_field", "environment_name"),
+    (
+        ("n", "ATHENA_PUBLIC_KEY_MODULUS"),
+        ("e", "ATHENA_PUBLIC_KEY_EXPONENT"),
+    ),
+)
+def test_deployment_verifier_rejects_changed_standard_base64_jwk_integer(
+    tmp_path: Path,
+    jwk_field: str,
+    environment_name: str,
+) -> None:
+    environment, _ = _reviewed_payload()
+    reviewer_jwk = json.loads(environment["ATHENA_REVIEWER_JWK_JSON"])
+    configured = environment[environment_name]
+    configured_integer = int.from_bytes(
+        base64.urlsafe_b64decode(configured + "=" * (-len(configured) % 4)),
+        "big",
+    )
+    reviewer_jwk[jwk_field] = _standard_base64_integer(configured_integer + 2)
+    environment["ATHENA_REVIEWER_JWK_JSON"] = json.dumps(
+        reviewer_jwk,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+    result, output_path = _run_verifier(tmp_path, environment)
+
+    assert result.returncode == 1
+    assert "does not match the exact versioned Key Vault key" in result.stderr
+    assert not output_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("encoding", "alphabet"),
+    (
+        ("base64url", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"),
+        ("base64", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"),
+    ),
+)
+def test_deployment_verifier_rejects_noncanonical_jwk_integer_encoding(
+    tmp_path: Path,
+    encoding: str,
+    alphabet: str,
+) -> None:
+    environment, _ = _reviewed_payload()
+    reviewer_jwk = json.loads(environment["ATHENA_REVIEWER_JWK_JSON"])
+    canonical = environment["ATHENA_PUBLIC_KEY_MODULUS"]
+    if encoding == "base64":
+        decoded = base64.urlsafe_b64decode(canonical + "=" * (-len(canonical) % 4))
+        canonical = base64.b64encode(decoded).decode("ascii")
+    reviewer_jwk["n"] = _with_noncanonical_trailing_bits(
+        canonical,
+        alphabet=alphabet,
+    )
+    environment["ATHENA_REVIEWER_JWK_JSON"] = json.dumps(
+        reviewer_jwk,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+    result, output_path = _run_verifier(tmp_path, environment)
+
+    assert result.returncode == 1
+    assert "not valid base64 or base64url" in result.stderr
+    assert not output_path.exists()
 
 
 def test_deployment_verifier_rejects_previous_attestation_schema(

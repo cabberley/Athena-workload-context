@@ -2326,15 +2326,20 @@ def test_resource_health_previous_status_filter_cannot_replace_prior_evidence() 
         )
 
 
-def test_flow_table_control_is_unavailable_without_log_or_ip_flow_calls() -> None:
+@pytest.mark.parametrize("flow_table", ("NTANetAnalytics", "AzureNetworkAnalytics_CL"))
+def test_flow_table_control_is_unavailable_without_log_or_ip_flow_calls(
+    flow_table: str,
+) -> None:
+    controls = _controls(flow_table=flow_table)
+    authority = _authority(controls)
     port = _AcquisitionPort(mismatched_ip_flow=True)
-    outcome, commit, _ = _execute(port)
+    outcome, commit, _ = _execute(port, authority=authority)
 
     flow_coverage = next(item for item in outcome.batch.coverage if item.family == "networkFlow")
     assert commit.calls == 1
     assert port.ip_flow_calls == 0
     assert not any(
-        isinstance(item, LogAnalyticsQueryRequest) and item.table == "NTANetAnalytics"
+        isinstance(item, LogAnalyticsQueryRequest) and item.table == flow_table
         for item in port.requests
     )
     assert flow_coverage.status == "unavailable"
@@ -3666,10 +3671,22 @@ def test_production_bundle_requires_persisted_log_permission_evidence() -> None:
         tampered_bundle.validate_bundle()
 
 
-def test_ip_flow_result_variations_cannot_change_unsupported_flow_evidence() -> None:
-    denied, _, _ = _execute(_AcquisitionPort(ip_flow_access="Deny"))
-    allowed, _, _ = _execute(_AcquisitionPort(ip_flow_access="Allow"))
+@pytest.mark.parametrize("flow_table", ("NTANetAnalytics", "AzureNetworkAnalytics_CL"))
+def test_ip_flow_result_variations_cannot_change_unsupported_flow_evidence(
+    flow_table: str,
+) -> None:
+    authority = _authority(_controls(flow_table=flow_table))
+    denied_port = _AcquisitionPort(ip_flow_access="Deny")
+    allowed_port = _AcquisitionPort(ip_flow_access="Allow")
+    denied, _, _ = _execute(denied_port, authority=authority)
+    allowed, _, _ = _execute(allowed_port, authority=authority)
 
+    assert denied_port.ip_flow_calls == allowed_port.ip_flow_calls == 0
+    assert not any(
+        isinstance(item, LogAnalyticsQueryRequest) and item.table == flow_table
+        for port in (denied_port, allowed_port)
+        for item in port.requests
+    )
     assert denied.batch.canonical_bytes() == allowed.batch.canonical_bytes()
     assert (
         denied.prepared.monitoring_bundle.compute_normalized_evidence_digest_value()

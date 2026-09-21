@@ -3764,6 +3764,28 @@ def test_current_rbac_attestation_rejects_incorrect_target_binding_id() -> None:
         MonitoringCollectorContract(**payload)
 
 
+def test_current_rbac_attestation_rejects_reordered_target_reads() -> None:
+    payload = _acquisition_collector_contract().model_dump(
+        mode="python",
+        by_alias=True,
+    )
+    inventory = payload["effectiveRbacInventory"]
+    assert isinstance(inventory, dict)
+    evidence = inventory["collectorPrincipalEvidence"]
+    assert isinstance(evidence, dict)
+    evidence["targetReadEvidence"] = tuple(
+        reversed(tuple(evidence["targetReadEvidence"]))
+    )
+    _recompute_principal_evidence(evidence)
+    _recompute_effective_rbac_inventory(inventory)
+
+    with pytest.raises(
+        ValidationError,
+        match="uniquely bind target, query mode, and page evidence",
+    ):
+        MonitoringCollectorContract(**payload)
+
+
 @pytest.mark.parametrize("scope_mutation", ("missing", "extra"))
 def test_current_rbac_attestation_requires_exact_principal_target_set(
     scope_mutation: str,
