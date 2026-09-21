@@ -290,6 +290,14 @@ _SERVICE_BUS_NAMESPACE_RESOURCE_ID_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+_WINDOWS_DIRECTORY_ATTRIBUTE = getattr(stat, "FILE_ATTRIBUTE_DIRECTORY", 0x10)
+_WINDOWS_SECURITY_RELEVANT_FILE_ATTRIBUTE_MASK = (
+    getattr(stat, "FILE_ATTRIBUTE_READONLY", 0x1)
+    | getattr(stat, "FILE_ATTRIBUTE_DEVICE", 0x40)
+    | getattr(stat, "FILE_ATTRIBUTE_ENCRYPTED", 0x4000)
+    | getattr(stat, "FILE_ATTRIBUTE_INTEGRITY_STREAM", 0x8000)
+    | getattr(stat, "FILE_ATTRIBUTE_NO_SCRUB_DATA", 0x20000)
+)
 _ZERO_DIGEST = "sha256:" + ("0" * 64)
 _PREFLIGHT_IMPLEMENTATION = Path(__file__).with_name("wc029_preflight.py")
 
@@ -4797,6 +4805,48 @@ class _PathIdentity:
         )
 
 
+def _windows_pinned_file_attributes_match(
+    expected: int,
+    observed: int,
+) -> bool:
+    forbidden = _REPARSE_POINT | _WINDOWS_DIRECTORY_ATTRIBUTE
+    return (
+        not ((expected | observed) & forbidden)
+        and (expected & _WINDOWS_SECURITY_RELEVANT_FILE_ATTRIBUTE_MASK)
+        == (observed & _WINDOWS_SECURITY_RELEVANT_FILE_ATTRIBUTE_MASK)
+    )
+
+
+def _pinned_file_identity_matches(
+    expected: _PathIdentity,
+    observed: _PathIdentity,
+    *,
+    required_link_count: int,
+    windows_semantics: bool | None = None,
+) -> bool:
+    use_windows_semantics = os.name == "nt" if windows_semantics is None else windows_semantics
+    if not use_windows_semantics:
+        return (
+            observed == expected
+            and stat.S_ISREG(observed.mode)
+            and observed.link_count == required_link_count
+        )
+    return (
+        expected.device == observed.device
+        and expected.inode == observed.inode
+        and stat.S_ISREG(expected.mode)
+        and stat.S_ISREG(observed.mode)
+        and stat.S_IFMT(expected.mode) == stat.S_IFMT(observed.mode)
+        and expected.size == observed.size
+        and expected.link_count == required_link_count
+        and observed.link_count == required_link_count
+        and _windows_pinned_file_attributes_match(
+            expected.file_attributes,
+            observed.file_attributes,
+        )
+    )
+
+
 @dataclass(slots=True)
 class _PinnedDirectoryHandle:
     path: Path
@@ -5045,7 +5095,7 @@ def _open_pinned_directory(
                     or link_count != expected.link_count
                     or attributes != expected.file_attributes
                     or attributes & _REPARSE_POINT
-                    or not attributes & 0x10
+                    or not attributes & _WINDOWS_DIRECTORY_ATTRIBUTE
                 ):
                     raise Wc029AcceptanceEvidenceError(
                         "directory handle identity does not match its validated path"
@@ -5278,7 +5328,7 @@ def _stable_regular_file_identity(
     if (
         not stat.S_ISREG(identity.mode)
         or stat.S_ISLNK(identity.mode)
-        or identity.file_attributes & _REPARSE_POINT
+        or identity.file_attributes & (_REPARSE_POINT | _WINDOWS_DIRECTORY_ATTRIBUTE)
         or identity.link_count != required_link_count
     ):
         raise Wc029AcceptanceEvidenceError(
@@ -5331,9 +5381,10 @@ def _open_pinned_file(
                 if (
                     inode != expected.inode
                     or link_count != required_link_count
-                    or attributes != expected.file_attributes
-                    or attributes & _REPARSE_POINT
-                    or attributes & 0x10
+                    or not _windows_pinned_file_attributes_match(
+                        expected.file_attributes,
+                        attributes,
+                    )
                 ):
                     raise Wc029AcceptanceEvidenceError(
                         f"{label} stable file handle identity is invalid"
@@ -5355,10 +5406,10 @@ def _open_pinned_file(
         with ExitStack() as descriptor_cleanup:
             descriptor_cleanup.callback(os.close, descriptor)
             opened = _pinned_file_identity(descriptor)
-            if (
-                opened != expected
-                or not stat.S_ISREG(opened.mode)
-                or opened.link_count != required_link_count
+            if not _pinned_file_identity_matches(
+                expected,
+                opened,
+                required_link_count=required_link_count,
             ):
                 raise Wc029AcceptanceEvidenceError(
                     f"{label} changed before all file handles were pinned"
@@ -5403,7 +5454,11 @@ def _read_pinned_file(
             chunks.append(chunk)
             consumed += len(chunk)
         content = b"".join(chunks)
-        if _pinned_file_identity(descriptor) != pinned.identity:
+        if not _pinned_file_identity_matches(
+            pinned.identity,
+            _pinned_file_identity(descriptor),
+            required_link_count=pinned.identity.link_count,
+        ):
             raise Wc029AcceptanceEvidenceError(f"{label} changed while its pinned handle was read")
         if not content or len(content) > maximum_bytes:
             raise Wc029AcceptanceEvidenceError(f"{label} is empty or oversized")
@@ -5502,7 +5557,12 @@ def _capture_bundle_snapshot(
                     "evidence directory changed while the private snapshot was captured"
                 )
             if any(
-                _pinned_file_identity(pin.descriptor) != pin.identity for pin in file_pins.values()
+                not _pinned_file_identity_matches(
+                    pin.identity,
+                    _pinned_file_identity(pin.descriptor),
+                    required_link_count=pin.identity.link_count,
+                )
+                for pin in file_pins.values()
             ):
                 raise Wc029AcceptanceEvidenceError(
                     "evidence file identity changed before snapshot verification completed"
@@ -9826,7 +9886,8 @@ def _create_pinned_staging_file(
             if (
                 not stat.S_ISREG(identity.mode)
                 or stat.S_ISLNK(identity.mode)
-                or identity.file_attributes & _REPARSE_POINT
+                or identity.file_attributes
+                & (_REPARSE_POINT | _WINDOWS_DIRECTORY_ATTRIBUTE)
                 or identity.link_count != 1
                 or identity.size != len(payload)
             ):
@@ -9979,7 +10040,11 @@ def write_acceptance_record(
                     required_link_count=2,
                 )
                 pinned_identity = _pinned_file_identity(staging_pin.descriptor)
-                if output_identity != pinned_identity or output_identity.link_count != 2:
+                if not _pinned_file_identity_matches(
+                    output_identity,
+                    pinned_identity,
+                    required_link_count=2,
+                ):
                     raise Wc029AcceptanceEvidenceError(
                         "published acceptance record is not the held verified staging inode"
                     )

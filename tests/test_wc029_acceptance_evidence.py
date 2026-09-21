@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import stat
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from functools import lru_cache
@@ -7384,6 +7385,331 @@ def test_scan_to_pin_os_errors_close_all_partial_handles(
     assert all(pin.descriptor is None and pin.windows_handle is None for pin in directory_pins)
 
 
+def _synthetic_file_identity(
+    *,
+    file_attributes: int = 0,
+) -> acceptance._PathIdentity:
+    return acceptance._PathIdentity(
+        device=17,
+        inode=23,
+        mode=stat.S_IFREG | 0o600,
+        link_count=1,
+        size=128,
+        modified_ns=101,
+        changed_ns=103,
+        file_attributes=file_attributes,
+    )
+
+
+def test_windows_pinned_identity_accepts_only_volatile_metadata_changes() -> None:
+    archive = getattr(stat, "FILE_ATTRIBUTE_ARCHIVE", 0x20)
+    readonly = getattr(stat, "FILE_ATTRIBUTE_READONLY", 0x1)
+    expected = _synthetic_file_identity(
+        file_attributes=archive | readonly,
+    )
+    timestamp_only = replace(
+        expected,
+        modified_ns=expected.modified_ns + 10,
+        changed_ns=expected.changed_ns + 20,
+    )
+    archive_only = replace(
+        timestamp_only,
+        file_attributes=readonly,
+    )
+
+    assert expected != timestamp_only
+    assert acceptance._pinned_file_identity_matches(
+        expected,
+        timestamp_only,
+        required_link_count=1,
+        windows_semantics=True,
+    )
+    assert acceptance._pinned_file_identity_matches(
+        expected,
+        archive_only,
+        required_link_count=1,
+        windows_semantics=True,
+    )
+    assert not acceptance._pinned_file_identity_matches(
+        expected,
+        replace(timestamp_only, file_attributes=archive),
+        required_link_count=1,
+        windows_semantics=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "observed",
+    [
+        replace(
+            _synthetic_file_identity(),
+            file_attributes=acceptance._REPARSE_POINT,
+        ),
+        replace(
+            _synthetic_file_identity(),
+            file_attributes=acceptance._WINDOWS_DIRECTORY_ATTRIBUTE,
+        ),
+        replace(_synthetic_file_identity(), device=18),
+        replace(_synthetic_file_identity(), inode=24),
+        replace(_synthetic_file_identity(), link_count=2),
+        replace(_synthetic_file_identity(), size=129),
+        replace(_synthetic_file_identity(), mode=stat.S_IFDIR | 0o700),
+    ],
+    ids=[
+        "reparse",
+        "directory-attribute",
+        "device",
+        "file-index",
+        "link-count",
+        "size",
+        "mode-type",
+    ],
+)
+def test_windows_pinned_identity_rejects_security_relevant_drift(
+    observed: acceptance._PathIdentity,
+) -> None:
+    assert not acceptance._pinned_file_identity_matches(
+        _synthetic_file_identity(),
+        observed,
+        required_link_count=1,
+        windows_semantics=True,
+    )
+
+
+def test_posix_pinned_identity_comparison_remains_full_metadata_equality() -> None:
+    expected = _synthetic_file_identity()
+
+    assert acceptance._pinned_file_identity_matches(
+        expected,
+        expected,
+        required_link_count=1,
+        windows_semantics=False,
+    )
+    assert not acceptance._pinned_file_identity_matches(
+        expected,
+        replace(expected, modified_ns=expected.modified_ns + 1),
+        required_link_count=1,
+        windows_semantics=False,
+    )
+    assert not acceptance._pinned_file_identity_matches(
+        expected,
+        replace(expected, changed_ns=expected.changed_ns + 1),
+        required_link_count=1,
+        windows_semantics=False,
+    )
+
+
+def test_injected_windows_handle_stays_bound_across_path_replacement() -> None:
+    held_identity = _synthetic_file_identity()
+    observed_handle = replace(
+        held_identity,
+        modified_ns=held_identity.modified_ns + 1,
+        changed_ns=held_identity.changed_ns + 1,
+    )
+    replacement_path_identity = replace(
+        held_identity,
+        inode=held_identity.inode + 1,
+    )
+
+    assert acceptance._pinned_file_identity_matches(
+        held_identity,
+        observed_handle,
+        required_link_count=1,
+        windows_semantics=True,
+    )
+    assert not acceptance._pinned_file_identity_matches(
+        replacement_path_identity,
+        observed_handle,
+        required_link_count=1,
+        windows_semantics=True,
+    )
+
+
+def test_injected_windows_open_accepts_timestamp_only_handle_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "pinned.json"
+    path.write_bytes(b'{"trusted":true}\n')
+    stable_root, root_identity = acceptance._stable_directory_path(
+        tmp_path,
+        label="synthetic root",
+    )
+    parent = acceptance._open_pinned_directory(
+        stable_root,
+        root_identity,
+    )
+    expected = acceptance._stable_regular_file_identity(
+        path,
+        label="synthetic pinned file",
+        required_link_count=1,
+    )
+    real_identity = acceptance._pinned_file_identity
+    real_comparator = acceptance._pinned_file_identity_matches
+
+    def timestamp_shifted_identity(descriptor: int) -> acceptance._PathIdentity:
+        identity = real_identity(descriptor)
+        return replace(
+            identity,
+            modified_ns=identity.modified_ns + 1,
+            changed_ns=identity.changed_ns + 1,
+        )
+
+    def windows_comparator(
+        expected_identity: acceptance._PathIdentity,
+        observed: acceptance._PathIdentity,
+        *,
+        required_link_count: int,
+        windows_semantics: bool | None = None,
+    ) -> bool:
+        del windows_semantics
+        return real_comparator(
+            expected_identity,
+            observed,
+            required_link_count=required_link_count,
+            windows_semantics=True,
+        )
+
+    monkeypatch.setattr(
+        acceptance,
+        "_pinned_file_identity",
+        timestamp_shifted_identity,
+    )
+    monkeypatch.setattr(
+        acceptance,
+        "_pinned_file_identity_matches",
+        windows_comparator,
+    )
+
+    pinned: acceptance._PinnedFileHandle | None = None
+    try:
+        pinned = acceptance._open_pinned_file(
+            path,
+            expected,
+            parent=parent,
+            label="synthetic pinned file",
+        )
+        assert pinned.identity == expected
+    finally:
+        if pinned is not None:
+            pinned.close()
+        parent.close()
+
+
+def test_injected_windows_pinned_read_accepts_timestamp_only_handle_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "pinned.json"
+    payload = b'{"trusted":true}\n'
+    path.write_bytes(payload)
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        identity = acceptance._pinned_file_identity(descriptor)
+        pinned = acceptance._PinnedFileHandle(
+            path=path,
+            identity=identity,
+            descriptor=descriptor,
+        )
+        observed = replace(
+            identity,
+            modified_ns=identity.modified_ns + 1,
+            changed_ns=identity.changed_ns + 1,
+        )
+        real_comparator = acceptance._pinned_file_identity_matches
+
+        monkeypatch.setattr(
+            acceptance,
+            "_pinned_file_identity",
+            lambda _descriptor: observed,
+        )
+
+        def windows_comparator(
+            expected: acceptance._PathIdentity,
+            current: acceptance._PathIdentity,
+            *,
+            required_link_count: int,
+            windows_semantics: bool | None = None,
+        ) -> bool:
+            del windows_semantics
+            return real_comparator(
+                expected,
+                current,
+                required_link_count=required_link_count,
+                windows_semantics=True,
+            )
+
+        monkeypatch.setattr(
+            acceptance,
+            "_pinned_file_identity_matches",
+            windows_comparator,
+        )
+
+        assert (
+            acceptance._read_pinned_file(
+                pinned,
+                maximum_bytes=len(payload),
+                label="synthetic pinned file",
+            )
+            == payload
+        )
+    finally:
+        os.close(descriptor)
+
+
+def test_injected_windows_snapshot_final_handle_accepts_timestamp_only_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle = _build_bundle(tmp_path)
+    real_identity = acceptance._pinned_file_identity
+    real_comparator = acceptance._pinned_file_identity_matches
+    identity_reads: dict[int, int] = {}
+
+    def drift_only_on_final_handle_check(
+        descriptor: int,
+    ) -> acceptance._PathIdentity:
+        identity_reads[descriptor] = identity_reads.get(descriptor, 0) + 1
+        identity = real_identity(descriptor)
+        if identity_reads[descriptor] == 3:
+            return replace(
+                identity,
+                modified_ns=identity.modified_ns + 1,
+                changed_ns=identity.changed_ns + 1,
+            )
+        return identity
+
+    def windows_comparator(
+        expected: acceptance._PathIdentity,
+        observed: acceptance._PathIdentity,
+        *,
+        required_link_count: int,
+        windows_semantics: bool | None = None,
+    ) -> bool:
+        del windows_semantics
+        return real_comparator(
+            expected,
+            observed,
+            required_link_count=required_link_count,
+            windows_semantics=True,
+        )
+
+    monkeypatch.setattr(
+        acceptance,
+        "_pinned_file_identity",
+        drift_only_on_final_handle_check,
+    )
+    monkeypatch.setattr(
+        acceptance,
+        "_pinned_file_identity_matches",
+        windows_comparator,
+    )
+
+    assert _aggregate(bundle).evidence_status == "complete"
+    assert identity_reads
+    assert set(identity_reads.values()) == {3}
+
+
 def test_identity_permission_error_closes_partial_file_descriptor(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -7602,6 +7928,111 @@ def test_publication_links_the_held_staging_inode_across_path_replacement_race(
         assert not replacement_blocked
         assert list(bundle.output.iterdir()) == []
     assert race_attempted
+
+
+def test_injected_windows_post_publication_accepts_timestamp_only_handle_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle = _build_bundle(tmp_path)
+    record = _aggregate(bundle)
+    real_identity = acceptance._stable_regular_file_identity
+    real_comparator = acceptance._pinned_file_identity_matches
+
+    def timestamp_shifted_output_identity(
+        path: Path,
+        *,
+        label: str,
+        required_link_count: int,
+    ) -> acceptance._PathIdentity:
+        identity = real_identity(
+            path,
+            label=label,
+            required_link_count=required_link_count,
+        )
+        if label == "published acceptance record":
+            return replace(
+                identity,
+                modified_ns=identity.modified_ns + 1,
+                changed_ns=identity.changed_ns + 1,
+            )
+        return identity
+
+    def windows_comparator(
+        expected: acceptance._PathIdentity,
+        observed: acceptance._PathIdentity,
+        *,
+        required_link_count: int,
+        windows_semantics: bool | None = None,
+    ) -> bool:
+        del windows_semantics
+        return real_comparator(
+            expected,
+            observed,
+            required_link_count=required_link_count,
+            windows_semantics=True,
+        )
+
+    monkeypatch.setattr(
+        acceptance,
+        "_stable_regular_file_identity",
+        timestamp_shifted_output_identity,
+    )
+    monkeypatch.setattr(
+        acceptance,
+        "_pinned_file_identity_matches",
+        windows_comparator,
+    )
+
+    output = acceptance.write_acceptance_record(
+        record,
+        output_directory=bundle.output,
+        evidence_root=bundle.root,
+    )
+
+    assert output.read_bytes() == record.canonical_bytes()
+
+
+def test_post_publication_rejects_same_size_content_substitution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle = _build_bundle(tmp_path)
+    record = _aggregate(bundle)
+    real_read = acceptance._read_pinned_file
+
+    def substituted_content(
+        pinned: acceptance._PinnedFileHandle,
+        *,
+        maximum_bytes: int,
+        label: str,
+    ) -> bytes:
+        content = real_read(
+            pinned,
+            maximum_bytes=maximum_bytes,
+            label=label,
+        )
+        if label == "published acceptance record":
+            return bytes([content[0] ^ 1]) + content[1:]
+        return content
+
+    monkeypatch.setattr(
+        acceptance,
+        "_read_pinned_file",
+        substituted_content,
+    )
+
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="not the held verified staging inode",
+    ):
+        acceptance.write_acceptance_record(
+            record,
+            output_directory=bundle.output,
+            evidence_root=bundle.root,
+        )
+
+    assert list(bundle.output.iterdir()) == []
 
 
 def test_failed_final_inode_verification_removes_poisoned_publication(
@@ -10618,6 +11049,40 @@ def test_private_snapshot_detects_parent_directory_identity_drift(
             directories["."] = replace(
                 directories["."],
                 modified_ns=directories["."].modified_ns + 1,
+            )
+        return directories, files
+
+    monkeypatch.setattr(acceptance, "_scan_bundle_tree", drifting_scan)
+    with pytest.raises(
+        acceptance.Wc029AcceptanceEvidenceError,
+        match="changed while the private snapshot",
+    ):
+        _aggregate(bundle)
+
+
+def test_private_snapshot_preserves_full_file_metadata_drift_detection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle = _build_bundle(tmp_path)
+    real_scan = acceptance._scan_bundle_tree
+    calls = 0
+
+    def drifting_scan(
+        root: Path,
+    ) -> tuple[
+        dict[str, acceptance._PathIdentity],
+        dict[str, acceptance._PathIdentity],
+    ]:
+        nonlocal calls
+        calls += 1
+        directories, files = real_scan(root)
+        if calls == 2:
+            files = dict(files)
+            victim = next(iter(sorted(files)))
+            files[victim] = replace(
+                files[victim],
+                modified_ns=files[victim].modified_ns + 1,
             )
         return directories, files
 
