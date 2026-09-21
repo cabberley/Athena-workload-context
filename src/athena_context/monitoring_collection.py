@@ -440,7 +440,9 @@ class ResourceHealthRecord(_WindowedCollectionRecord):
     previous_status: Literal["Available", "Degraded", "Unavailable", "Unknown"] = Field(
         alias="previousStatus"
     )
-    reason_type: Literal["Unknown"] = Field(alias="reasonType")
+    reason_type: Literal["PlatformInitiated", "UserInitiated", "Unknown"] = Field(
+        alias="reasonType"
+    )
 
 
 class ResourceChangeRecord(_CollectionRecord):

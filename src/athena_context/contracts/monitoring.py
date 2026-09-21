@@ -3886,6 +3886,16 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
             max_length=len(_EXPECTED_RESOURCE_HEALTH_OPERATIONS),
         )
     )
+    resource_health_reason_authority_mode: (
+        Literal["availabilityStatusUnknownOnly"] | None
+    ) = Field(
+        default=None,
+        alias="resourceHealthReasonAuthorityMode",
+    )
+    resource_health_reason_evidence_version: Literal[2] | None = Field(
+        default=None,
+        alias="resourceHealthReasonEvidenceVersion",
+    )
     log_analytics_allowed_tables: tuple[MonitoringLogTable, ...] = Field(
         alias="logAnalyticsAllowedTables",
         min_length=len(_EXPECTED_LOG_TABLES),
@@ -4650,13 +4660,29 @@ class MonitoringCollectorContract(_StrictMonitoringContract):
             raise ValueError(
                 "collector contracts v8-v9 require their exact historical Resource Graph policy"
             )
-        if self.schema_version == MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION and (
-            any(item is None for item in (*resource_health_fields, *resource_graph_query_fields))
-            or self.resource_health_allowed_operations != _EXPECTED_RESOURCE_HEALTH_OPERATIONS
+        if self.schema_version == MONITORING_ACQUISITION_COLLECTOR_CONTRACT_SCHEMA_VERSION:
+            if (
+                any(
+                    item is None
+                    for item in (*resource_health_fields, *resource_graph_query_fields)
+                )
+                or self.resource_health_allowed_operations != _EXPECTED_RESOURCE_HEALTH_OPERATIONS
+                or self.resource_health_reason_authority_mode
+                != "availabilityStatusUnknownOnly"
+                or self.resource_health_reason_evidence_version != 2
+            ):
+                raise ValueError(
+                    "current collector contract requires separate exact Resource Graph query and "
+                    "Resource Health availability policies with versioned Unknown-only reason "
+                    "authority"
+                )
+        elif (
+            self.resource_health_reason_authority_mode is not None
+            or self.resource_health_reason_evidence_version is not None
         ):
             raise ValueError(
-                "current collector contract requires separate exact Resource Graph query and "
-                "Resource Health availability policies"
+                "legacy collector contracts cannot contain current Resource Health reason "
+                "authority policy"
             )
         legacy_measured_fields = (
             *measured_rbac_common_fields,

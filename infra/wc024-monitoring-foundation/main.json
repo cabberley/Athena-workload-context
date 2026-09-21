@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.47.16.16243",
-      "templateHash": "7389550219917076575"
+      "templateHash": "5665448530898206674"
     },
     "name": "Athena WC-024 generic monitoring foundation",
     "description": "Deploys private generic Azure Monitor, VNet flow-log, and isolated evidence-collector foundations without workload-intent-derived thresholds or paths."
@@ -4370,6 +4370,8 @@
               "resourceHealthRoleName": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments'), '2025-04-01').outputs.resourceHealthRoleName.value]",
               "resourceHealthScopeIds": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments'), '2025-04-01').outputs.resourceHealthScopeIds.value]",
               "resourceHealthAllowedOperations": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments'), '2025-04-01').outputs.resourceHealthAllowedOperations.value]",
+              "resourceHealthReasonAuthorityMode": "availabilityStatusUnknownOnly",
+              "resourceHealthReasonEvidenceVersion": 2,
               "logAnalyticsAllowedTables": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-reader-assignments'), '2025-04-01').outputs.allowedLogTableNames.value]",
               "logAnalyticsAccessCondition": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-reader-assignments'), '2025-04-01').outputs.logAnalyticsAccessCondition.value]",
               "resourceReadScopeIds": "[concat(reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('monitoringResourceGroupName')), 'Microsoft.Resources/deployments', 'monitoring-evidence-reader-assignments'), '2025-04-01').outputs.resourceReadScopeIds.value, reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('workloadResourceGroupName')), 'Microsoft.Resources/deployments', 'workload-monitoring-evidence-reader-assignments'), '2025-04-01').outputs.resourceReadScopeIds.value, reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('networkWatcherResourceGroupName')), 'Microsoft.Resources/deployments', 'network-watcher-monitoring-evidence-reader-assignment'), '2025-04-01').outputs.resourceReadScopeIds.value)]",

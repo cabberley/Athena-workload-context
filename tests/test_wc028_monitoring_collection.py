@@ -305,22 +305,23 @@ def _five_tuple_digest() -> str:
     )
 
 
-def test_resource_health_record_rejects_unsupported_reason_value() -> None:
+def test_resource_health_record_keeps_legacy_reason_parseable() -> None:
     controls = _controls()
 
-    with pytest.raises(ValidationError):
-        ResourceHealthRecord(
-            recordKind="resourceHealth",
-            controlId=controls["health"].control_id,
-            sourceRecordId="unsupported-resource-health-reason",
-            resourceId=WEB_ID,
-            observedStart=NOW - timedelta(minutes=5),
-            observedEnd=NOW,
-            eventStatus="Active",
-            currentStatus="Unavailable",
-            previousStatus="Available",
-            reasonType="UserInitiated",
-        )
+    record = ResourceHealthRecord(
+        recordKind="resourceHealth",
+        controlId=controls["health"].control_id,
+        sourceRecordId="legacy-resource-health-reason",
+        resourceId=WEB_ID,
+        observedStart=NOW - timedelta(minutes=5),
+        observedEnd=NOW,
+        eventStatus="Active",
+        currentStatus="Unavailable",
+        previousStatus="Available",
+        reasonType="UserInitiated",
+    )
+
+    assert record.reason_type == "UserInitiated"
 
 
 def _coverage_scope_digest(

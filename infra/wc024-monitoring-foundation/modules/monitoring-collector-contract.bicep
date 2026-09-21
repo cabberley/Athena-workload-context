@@ -121,6 +121,18 @@ param resourceHealthScopeIds array
 @maxLength(2)
 param resourceHealthAllowedOperations array
 
+@description('Reason authority exposed by the selected Resource Health provider contract.')
+@allowed([
+  'availabilityStatusUnknownOnly'
+])
+param resourceHealthReasonAuthorityMode string
+
+@description('Version of the Resource Health reason-evidence semantics.')
+@allowed([
+  2
+])
+param resourceHealthReasonEvidenceVersion int
+
 @description('Resource ID of the isolated effective RBAC attestor identity.')
 param rbacAttestorIdentityResourceId string
 
@@ -520,6 +532,8 @@ output acquisitionCollectorContract object = union(collectorContract, {
   resourceHealthRoleName: resourceHealthRoleName
   resourceHealthScopeIds: resourceHealthScopeIds
   resourceHealthAllowedOperations: validatedResourceHealthAllowedOperations
+  resourceHealthReasonAuthorityMode: resourceHealthReasonAuthorityMode
+  resourceHealthReasonEvidenceVersion: resourceHealthReasonEvidenceVersion
   signingKeyArmResourceId: signingKeyArmResourceId
   signingKeyCryptoUserRoleDefinitionId: signingKeyCryptoUserRoleDefinitionId
   evidenceBlobServiceResourceId: evidenceBlobServiceResourceId

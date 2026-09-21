@@ -950,6 +950,15 @@ def test_wc024_collector_contract_is_signed_handoff_ready_and_generic_only() -> 
     assert "resourceHealthRoleActions" in PUBLISH_CONTRACT
     assert "resourceGraphQueryScopeIsExact" in PUBLISH_CONTRACT
     assert "resourceHealthOperationTupleIsExact" in PUBLISH_CONTRACT
+    assert "resourceHealthReasonAuthorityIsExact" in PUBLISH_CONTRACT
+    assert "resourceHealthReasonAuthorityMode: 'availabilityStatusUnknownOnly'" in MAIN
+    assert "resourceHealthReasonEvidenceVersion: 2" in MAIN
+    assert "resourceHealthReasonAuthorityMode: resourceHealthReasonAuthorityMode" in (
+        COLLECTOR_CONTRACT
+    )
+    assert "resourceHealthReasonEvidenceVersion: resourceHealthReasonEvidenceVersion" in (
+        COLLECTOR_CONTRACT
+    )
     assert "contractInputs.resourceHealthAllowedOperations[0]" in PUBLISH_CONTRACT
     assert "contractInputs.resourceHealthAllowedOperations[1]" in PUBLISH_CONTRACT
     assert "length(normalizedResourceHealthScopeIds) + 5" in PUBLISH_CONTRACT

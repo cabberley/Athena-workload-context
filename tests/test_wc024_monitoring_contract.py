@@ -322,6 +322,8 @@ V10_ONLY_CONTRACT_FIELDS = (
     "resourceGraphQueryRoleDefinitionId",
     "resourceGraphQueryRoleName",
     "resourceGraphQueryScopeId",
+    "resourceHealthReasonAuthorityMode",
+    "resourceHealthReasonEvidenceVersion",
 )
 V8_ONLY_CONTRACT_FIELDS = (
     "workspaceResourceContextAccessEnabled",
@@ -2434,6 +2436,8 @@ def _acquisition_collector_contract() -> MonitoringCollectorContract:
             "resourceHealthRoleName": RESOURCE_HEALTH_ROLE_NAME,
             "resourceHealthScopeIds": SIGNAL_READ_SCOPE_IDS,
             "resourceHealthAllowedOperations": RESOURCE_HEALTH_OPERATIONS,
+            "resourceHealthReasonAuthorityMode": "availabilityStatusUnknownOnly",
+            "resourceHealthReasonEvidenceVersion": 2,
             "allowedReadOperations": (
                 *(
                     operation
@@ -2597,6 +2601,11 @@ def test_acquisition_collector_contract_authorizes_receipt_handoff() -> None:
     assert contract.resource_graph_query_scope_id == RESOURCE_GRAPH_QUERY_SCOPE_ID.casefold()
     assert contract.resource_health_scope_ids == SIGNAL_READ_SCOPE_IDS
     assert contract.resource_health_allowed_operations == RESOURCE_HEALTH_OPERATIONS
+    assert (
+        contract.resource_health_reason_authority_mode
+        == "availabilityStatusUnknownOnly"
+    )
+    assert contract.resource_health_reason_evidence_version == 2
     assert "resourceGraphQueryAllowedOperations" not in contract.model_dump(
         mode="python",
         by_alias=True,
@@ -3266,6 +3275,8 @@ def test_receipt_verifier_rejects_v9_contract_before_receipt_evaluation() -> Non
             RESOURCE_GRAPH_QUERY_OPERATIONS,
         ),
         ("resourceHealthAllowedOperations", ("Microsoft.ResourceHealth/events/read",)),
+        ("resourceHealthReasonAuthorityMode", None),
+        ("resourceHealthReasonEvidenceVersion", None),
         ("workspaceAccessControlMode", "workspaceOnly"),
         ("workspaceResourceContextAccessEnabled", None),
         ("workspaceSkuName", None),

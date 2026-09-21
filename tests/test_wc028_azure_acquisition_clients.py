@@ -745,20 +745,36 @@ def test_resource_health_client_rejects_unapproved_peer_row() -> None:
         client.query_resource_health(request)
 
 
-def test_resource_health_missing_reason_normalizes_to_unknown() -> None:
+@pytest.mark.parametrize(
+    ("include_reason", "source_reason"),
+    (
+        (False, None),
+        (True, None),
+        (True, ""),
+        (True, "Unplanned"),
+        (True, "Planned"),
+        (True, "UserInitiated"),
+        (True, "PlatformInitiated"),
+        (True, "synthetic-unrecognized"),
+    ),
+)
+def test_resource_health_source_reason_never_infers_cause(
+    include_reason: bool,
+    source_reason: object,
+) -> None:
     request = _resource_health_request(reason_types=("Unknown",))
+    row: dict[str, object] = {
+        "resourceId": PRODUCTION_WEB_ID,
+        "occurredAt": (NOW - timedelta(minutes=2)).isoformat(),
+        "previousStatus": "Available",
+        "currentStatus": "Unavailable",
+    }
+    if include_reason:
+        row["reasonType"] = source_reason
     transport = _MockTransport(
         _ResponseSpec(
             {
-                "data": [
-                    {
-                        "resourceId": PRODUCTION_WEB_ID,
-                        "occurredAt": (NOW - timedelta(minutes=2)).isoformat(),
-                        "previousStatus": "Available",
-                        "currentStatus": "Unavailable",
-                        "reasonType": "",
-                    }
-                ],
+                "data": [row],
                 "resultTruncated": False,
             }
         )
@@ -775,22 +791,38 @@ def test_resource_health_missing_reason_normalizes_to_unknown() -> None:
     assert result.rows[0].reason_type == "Unknown"
 
 
-def test_resource_health_request_rejects_unsupported_reason_filter() -> None:
-    with pytest.raises(ValidationError):
-        _resource_health_request(reason_types=("PlatformInitiated",))
+def test_resource_health_request_rejects_unsupported_reason_filter_before_io() -> None:
+    request = _resource_health_request(reason_types=("PlatformInitiated",))
+    credential = _Credential()
+    transport = _MockTransport()
+    client = AzureResourceHealthAcquisitionClient(
+        credential=credential,
+        reviewed_contract=_acquisition_collector_contract(),
+        _transport=transport,
+    )
+
+    with pytest.raises(
+        MonitoringAcquisitionError,
+        match="versioned Unknown-only reason authority",
+    ):
+        client.query_resource_health(request)
+
+    assert credential.scopes == []
+    assert transport.requests == []
 
 
-def test_resource_health_result_row_rejects_unsupported_reason_value() -> None:
-    with pytest.raises(ValidationError):
-        ResourceHealthRow(
-            resourceId=PRODUCTION_WEB_ID,
-            eventStatus="Active",
-            currentStatus="Unavailable",
-            previousStatus="Available",
-            reasonType="PlatformInitiated",
-            observedStart=NOW - timedelta(minutes=2),
-            observedEnd=NOW,
-        )
+def test_resource_health_result_row_keeps_legacy_reason_parseable() -> None:
+    row = ResourceHealthRow(
+        resourceId=PRODUCTION_WEB_ID,
+        eventStatus="Active",
+        currentStatus="Unavailable",
+        previousStatus="Available",
+        reasonType="PlatformInitiated",
+        observedStart=NOW - timedelta(minutes=2),
+        observedEnd=NOW,
+    )
+
+    assert row.reason_type == "PlatformInitiated"
 
 
 def test_resource_health_graph_retains_resolved_transition() -> None:

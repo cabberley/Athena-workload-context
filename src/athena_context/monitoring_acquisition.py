@@ -1041,11 +1041,10 @@ class ResourceHealthQueryRequest(_AcquisitionRequest):
         min_length=1,
         max_length=4,
     )
-    reason_types: tuple[Literal["Unknown"], ...] = Field(
-        alias="reasonTypes",
-        min_length=1,
-        max_length=1,
-    )
+    reason_types: tuple[
+        Literal["PlatformInitiated", "UserInitiated", "Unknown"],
+        ...,
+    ] = Field(alias="reasonTypes", min_length=1, max_length=3)
     expected_columns: tuple[str, ...] = Field(alias="expectedColumns")
 
     @field_validator("resource_ids")
@@ -1355,7 +1354,9 @@ class ResourceHealthRow(_WindowedRow):
     previous_status: Literal["Available", "Degraded", "Unavailable", "Unknown"] = Field(
         alias="previousStatus"
     )
-    reason_type: Literal["Unknown"] = Field(alias="reasonType")
+    reason_type: Literal["PlatformInitiated", "UserInitiated", "Unknown"] = Field(
+        alias="reasonType"
+    )
 
     @field_validator("resource_id")
     @classmethod
@@ -2790,6 +2791,15 @@ class AzureResourceHealthAcquisitionClient(_AzureAcquisitionClientBase):
     ) -> ResourceHealthQueryResult:
         if type(request) is not ResourceHealthQueryRequest:
             raise TypeError("Azure Resource Health requires an exact query request")
+        if (
+            self._reviewed_contract.resource_health_reason_authority_mode
+            != "availabilityStatusUnknownOnly"
+            or self._reviewed_contract.resource_health_reason_evidence_version != 2
+            or request.reason_types != ("Unknown",)
+        ):
+            raise MonitoringAcquisitionError(
+                "Resource Health request requires versioned Unknown-only reason authority"
+            )
         self._require_request_contract(request)
         approved_resources = {
             item.casefold().rstrip("/")
@@ -3883,6 +3893,16 @@ def _required_control_authority_scope(
                     "change control is outside the reviewed workload scope"
                 )
         elif isinstance(signal, ResourceHealthMonitoringSignal):
+            if (
+                contract.resource_health_reason_authority_mode
+                != "availabilityStatusUnknownOnly"
+                or contract.resource_health_reason_evidence_version != 2
+                or signal.reason_types != ("Unknown",)
+            ):
+                raise MonitoringAcquisitionError(
+                    "current Resource Health acquisition requires versioned Unknown-only "
+                    "reason authority"
+                )
             required_sources.add("resourceHealth")
             if set(control.scope.resource_ids) - health_scopes:
                 raise MonitoringAcquisitionError(

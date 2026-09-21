@@ -2326,6 +2326,34 @@ def test_resource_health_previous_status_filter_cannot_replace_prior_evidence() 
         )
 
 
+def test_unsupported_resource_health_reason_fails_before_identity_or_source_io() -> None:
+    controls = _controls()
+    controls["health"] = _control(
+        source_clause="/controls/resource-health",
+        resources=(WEB_ID,),
+        signal=ResourceHealthMonitoringSignal(
+            signalKind="resourceHealth",
+            maximumEventAgeSeconds=900,
+            eventStatuses=("Active",),
+            currentStatuses=("Unavailable",),
+            previousStatuses=("Available",),
+            reasonTypes=("PlatformInitiated",),
+        ),
+    )
+    authority = _authority(controls)
+    port = _AcquisitionPort()
+
+    with pytest.raises(
+        MonitoringAcquisitionError,
+        match="versioned Unknown-only reason authority",
+    ):
+        _execute(port, authority=authority)
+
+    assert port.azure_client_credentials == []
+    assert port.requests == []
+    assert port.ip_flow_calls == 0
+
+
 @pytest.mark.parametrize("flow_table", ("NTANetAnalytics", "AzureNetworkAnalytics_CL"))
 def test_flow_table_control_is_unavailable_without_log_or_ip_flow_calls(
     flow_table: str,

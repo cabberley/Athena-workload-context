@@ -186,9 +186,12 @@ The coordinator:
   `availabilityState`, and `occurredTime`. `HealthResources` does not expose a documented
   `properties.reasonType` field for this projection, so the query never reads or filters that
   property. The compatibility `reasonType` evidence field is always normalized to `Unknown`, and
-  the signed monitoring control accepts only `Unknown`; platform- or user-initiated reason filters
-  fail closed. Built-in Reader remains limited to the already reviewed DCR/DCE-association and
-  flow-log child resources.
+  collector contract v10 explicitly binds
+  `resourceHealthReasonAuthorityMode=availabilityStatusUnknownOnly` and
+  `resourceHealthReasonEvidenceVersion=2`. Historical v2 monitoring intents remain parseable, but
+  a current execution preflight accepts only the exact `Unknown` reason filter before credential
+  or source I/O; platform- or user-initiated filters fail closed. Built-in Reader remains limited
+  to the already reviewed DCR/DCE-association and flow-log child resources.
 - provisions a separate WC-028 resource-log role with only
   `Microsoft.Insights/Logs/Heartbeat/Read`, `Perf/Read`, `InsightsMetrics/Read`, `Syslog/Read`, and
   `VMConnection/Read`, assigns it only at the 11 exact approved VMs, and includes no invented NTA

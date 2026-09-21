@@ -824,6 +824,8 @@ var collectorContractInputs = {
   resourceHealthRoleName: workloadEvidenceReaderAssignments.outputs.resourceHealthRoleName
   resourceHealthScopeIds: workloadEvidenceReaderAssignments.outputs.resourceHealthScopeIds
   resourceHealthAllowedOperations: workloadEvidenceReaderAssignments.outputs.resourceHealthAllowedOperations
+  resourceHealthReasonAuthorityMode: 'availabilityStatusUnknownOnly'
+  resourceHealthReasonEvidenceVersion: 2
   logAnalyticsAllowedTables: monitoringEvidenceReaderAssignments.outputs.allowedLogTableNames
   logAnalyticsAccessCondition: monitoringEvidenceReaderAssignments.outputs.logAnalyticsAccessCondition
   resourceReadScopeIds: resourceReadScopeIds

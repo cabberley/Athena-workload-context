@@ -69,7 +69,11 @@ grant, or a deny assignment that removes either required action. The bounded que
 only approved VM IDs, and the client rejects any returned peer or otherwise unapproved VM row.
 The selected `HealthResources` projection does not expose a documented
 `properties.reasonType`; the query therefore projects the compatibility reason as `Unknown`, the
-control accepts only `Unknown`, and platform- or user-initiated reason filters fail closed.
+current collector contract binds
+`resourceHealthReasonAuthorityMode=availabilityStatusUnknownOnly` and
+`resourceHealthReasonEvidenceVersion=2`, and platform- or user-initiated reason filters fail
+before credential or source I/O. Historical intent and evidence objects remain parseable, but
+their unsupported reason values cannot execute under collector contract v10.
 
 Adding the extra exact grant and role definition increases the canonical inventory size. The
 inventory remains bounded to 62,000 bytes and the complete deployment-script environment payload

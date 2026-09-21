@@ -219,7 +219,11 @@ be returned. The production adapter must also reject the response if Azure retur
 defense in depth and is not accepted as a substitute for the per-VM Resource Health assignments.
 Do not read or filter `properties.reasonType`: that field is not documented for this
 `HealthResources` projection. The normalized compatibility value is always `Unknown`, and the
-signed Resource Health control must reject any other reason filter.
+published v10 collector contract must contain
+`resourceHealthReasonAuthorityMode=availabilityStatusUnknownOnly` and
+`resourceHealthReasonEvidenceVersion=2`. Historical intent objects may still be parsed, but the
+current acquisition preflight must reject any non-`Unknown` reason filter before identity or
+source I/O.
 
 For flow coverage, both declared legacy table names, `NTANetAnalytics` and
 `AzureNetworkAnalytics_CL`, are unsupported under the same exact path, direction, and five-tuple
