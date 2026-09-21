@@ -2162,6 +2162,34 @@ def test_evidence_bundle_fsyncs_generation_and_commit_parent(
     assert paths.commit_manifest_path.exists()
 
 
+def test_evidence_reader_rejects_cross_generation_pair(tmp_path: Path) -> None:
+    first = orchestration._new_evidence_bundle_paths(
+        tmp_path / "first",
+        stem="producer-synthetic",
+    )
+    second = orchestration._new_evidence_bundle_paths(
+        tmp_path / "second",
+        stem="producer-synthetic",
+    )
+    for paths in (first, second):
+        orchestration._publish_evidence_bundle(
+            paths=paths,
+            handoff_raw_bytes=orchestration._canonical_json_file_bytes(
+                {"evidence": paths.generation_id}
+            ),
+            receipt_raw_bytes=orchestration._canonical_json_file_bytes(
+                {"handoffSha256": paths.generation_id}
+            ),
+        )
+    with pytest.raises(orchestration.OrchestrationError, match="one immutable generation"):
+        orchestration._capture_committed_evidence_pair(
+            handoff_path=first.handoff_path,
+            receipt_path=second.receipt_path,
+            artifact_reader=orchestration._ArtifactReader(),
+            field="synthetic cross-generation evidence",
+        )
+
+
 def test_resume_rejects_uncommitted_partial_handoff(
     tmp_path: Path,
 ) -> None:
