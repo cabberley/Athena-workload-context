@@ -237,17 +237,41 @@ Authorization provider at subscription scope with `$filter=principalId eq '<obje
 boundedly follows every trusted `nextLink` and merges, by exact resource ID:
 
 - classic `roleAssignments@2022-04-01`;
-- current or upcoming `roleAssignmentScheduleInstances@2020-10-01`; and
-- `roleEligibilityScheduleInstances@2020-10-01`, because latent activation is prohibited for
-  these governed runtime identities.
+- current `roleAssignmentScheduleInstances@2020-10-01`;
+- current standing `roleEligibilityScheduleInstances@2020-10-01`;
+- current and future `roleAssignmentSchedules@2020-10-01` and
+  `roleEligibilitySchedules@2020-10-01`; and
+- `roleAssignmentScheduleRequests@2020-10-01` and
+  `roleEligibilityScheduleRequests@2020-10-01` that can still create, activate, update, extend, or
+  renew a grant.
 
-One shared page and item budget covers all three resource types and every transitive group in one
-effective-assignment scan. Active, pending, and future-start schedules remain relevant until their
-end time. Expired or explicitly terminal schedules do not grant current or future authority.
-Unknown status, assignment type, membership type, timestamp, principal, role, scope, resource ID,
-continuation, duplicate, or over-budget evidence fails closed. Every server-provided continuation
-must preserve the exact ARM host, collection path, API version, and filter and include one
-non-empty `$skipToken`; a cursorless repeated first page is never accepted as complete evidence.
+Schedule-instance presence is current authority; it is not filtered down to only
+`status=Provisioned`. Assignment instances with either `assignmentType=Activated` or
+`assignmentType=Assigned`, and instance `memberType` values `Direct`, `Group`, or `Inherited`, are
+all security-relevant. Because schedule instances do not prove future absence, the corresponding
+schedule collections are queried separately. Eligibility instances and schedules are retained
+because latent activation is prohibited for these governed runtime identities. Expired or
+terminal-negative schedules are ignored; terminal status does not suppress a returned schedule
+instance because instance presence is the authoritative current-state signal.
+
+Instance scans also use the documented
+`assignedTo('<service-principal-id>') and atScope()` filter at every governed scope, while explicit
+Microsoft Graph group resolution remains in place. Schedule and request scans use the documented
+`principalId` or unqualified `atScope()` filters; request enumeration never relies on the
+undocumented `assignedTo` behavior.
+
+Requests are workflow/history evidence, not a replacement for instances or schedules. An assign,
+activate, update, extend, or renew request in a pending, accepted, granted, approved,
+provisioning-started, schedule-created, or provisioned state with a future or unbounded window
+blocks readiness. Canceled, denied, failed, invalid, timed-out, revoked, or expired requests are
+ignored. An `AdminRemove` or `SelfDeactivate` request never subtracts a current instance or
+schedule; only authoritative absence from those collections proves removal.
+
+One shared page and item budget covers every Authorization resource type and every resolved
+principal/group in one effective-assignment scan. Each raw `az rest` call retrieves exactly one
+page. `nextLink` is treated as an opaque continuation after validating HTTPS and the current ARM
+host; cycles, foreign hosts, malformed JSON or `value`, nonzero responses, and a remaining
+continuation at the page/item bound fail closed.
 
 Required separation:
 
@@ -263,13 +287,19 @@ Without separate reviewed management-group hierarchy evidence, treat every assig
 the principal-filtered query at a management-group scope as applying to every governed
 subscription resource and reject it unless that exact assignment is explicitly reviewed.
 
-The dedicated producer trigger queue also receives a separate `$filter=atScope()` scan across the
-same three Authorization resource types. It accepts only the exact current classic assignments and
-the bounded reviewed transition set. Active/upcoming PIM assignments, activatable eligibility,
-unknown exact-scope assignments, and inherited queue send/receive or RBAC-escalation grants fail
-closed. Roles that can create classic assignments, create or activate assignment/eligibility
-schedules, alter custom roles, or weaken role-management policy are schedule-administration
-authority and are not treated as harmless inherited access. Inherited Service Bus namespace
+The dedicated producer trigger queue also receives a separate `$filter=atScope()` scan across all
+seven classic/PIM Authorization resource types. It accepts only the exact current classic
+assignments and the bounded reviewed transition set. Active/current instances, future schedules,
+activatable eligibility, pending grant-like requests, unknown exact-scope assignments, and
+inherited queue send/receive or RBAC-escalation grants fail closed. Roles that can create classic
+assignments, create or activate assignment/eligibility schedules, cancel schedule requests, alter
+custom roles, or weaken role-management policy are schedule-administration authority and are not
+treated as harmless inherited access. Azure publishes schedule administration through
+`roleAssignmentScheduleRequests/{write,cancel/action}`,
+`roleEligibilityScheduleRequests/{write,cancel/action}`,
+`roleEligibilityScheduleRequests/whenApprovalRequired/write`,
+`roleManagementPolicies/write`, and `roleManagementPolicies/approvalRule/action`; the
+orchestrator does not invent a `validate/action` permission. Inherited Service Bus namespace
 mutation, authorization-rule creation/update, connection-string/key listing, and key-regeneration
 permissions are likewise queue-access escalation because they can re-enable local authentication
 or mint SAS access without a Service Bus data-role assignment.

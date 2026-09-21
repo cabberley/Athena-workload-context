@@ -6955,8 +6955,10 @@ AUTHORIZATION_ESCALATION_ACTIONS = frozenset(
     {
         "Microsoft.Authorization/elevateAccess/action",
         "Microsoft.Authorization/roleAssignments/write",
+        "Microsoft.Authorization/roleAssignmentScheduleRequests/cancel/action",
         "Microsoft.Authorization/roleAssignmentScheduleRequests/write",
         "Microsoft.Authorization/roleDefinitions/write",
+        "Microsoft.Authorization/roleEligibilityScheduleRequests/cancel/action",
         "Microsoft.Authorization/roleEligibilityScheduleRequests/write",
         "Microsoft.Authorization/roleEligibilityScheduleRequests/whenApprovalRequired/write",
         "Microsoft.Authorization/roleManagementPolicies/write",
@@ -7008,7 +7010,11 @@ PIM_SCHEDULE_INSTANCES_API_VERSION = "2020-10-01"
 AUTHORIZATION_RESOURCE_API_VERSIONS = {
     "roleAssignments": ROLE_ASSIGNMENTS_API_VERSION,
     "roleAssignmentScheduleInstances": PIM_SCHEDULE_INSTANCES_API_VERSION,
+    "roleAssignmentSchedules": PIM_SCHEDULE_INSTANCES_API_VERSION,
+    "roleAssignmentScheduleRequests": PIM_SCHEDULE_INSTANCES_API_VERSION,
     "roleEligibilityScheduleInstances": PIM_SCHEDULE_INSTANCES_API_VERSION,
+    "roleEligibilitySchedules": PIM_SCHEDULE_INSTANCES_API_VERSION,
+    "roleEligibilityScheduleRequests": PIM_SCHEDULE_INSTANCES_API_VERSION,
 }
 AUTHORIZATION_SCHEDULE_STATUSES = frozenset(
     {
@@ -7036,16 +7042,66 @@ AUTHORIZATION_SCHEDULE_STATUSES = frozenset(
         "pendingexternalprovisioning",
     }
 )
-INACTIVE_AUTHORIZATION_SCHEDULE_STATUSES = frozenset(
+PIM_INSTANCE_RESOURCE_TYPES = frozenset(
+    {
+        "roleAssignmentScheduleInstances",
+        "roleEligibilityScheduleInstances",
+    }
+)
+PIM_SCHEDULE_RESOURCE_TYPES = frozenset(
+    {
+        "roleAssignmentSchedules",
+        "roleEligibilitySchedules",
+    }
+)
+PIM_REQUEST_RESOURCE_TYPES = frozenset(
+    {
+        "roleAssignmentScheduleRequests",
+        "roleEligibilityScheduleRequests",
+    }
+)
+PIM_ASSIGNMENT_RESOURCE_TYPES = frozenset(
+    {
+        *PIM_INSTANCE_RESOURCE_TYPES,
+        *PIM_SCHEDULE_RESOURCE_TYPES,
+    }
+)
+EFFECTIVE_AUTHORIZATION_RESOURCE_TYPES = (
+    "roleAssignments",
+    "roleAssignmentScheduleInstances",
+    "roleAssignmentSchedules",
+    "roleEligibilityScheduleInstances",
+    "roleEligibilitySchedules",
+    "roleAssignmentScheduleRequests",
+    "roleEligibilityScheduleRequests",
+)
+PIM_GRANT_REQUEST_TYPES = frozenset(
+    {
+        "AdminAssign",
+        "AdminUpdate",
+        "AdminExtend",
+        "AdminRenew",
+        "SelfActivate",
+        "SelfExtend",
+        "SelfRenew",
+    }
+)
+PIM_REMOVAL_REQUEST_TYPES = frozenset(
+    {
+        "AdminRemove",
+        "SelfDeactivate",
+    }
+)
+PIM_TERMINAL_NEGATIVE_REQUEST_STATUSES = frozenset(
     {
         "denied",
-        "revoked",
+        "admindenied",
         "canceled",
         "failed",
         "failedasresourceislocked",
-        "admindenied",
         "timedout",
         "invalid",
+        "revoked",
     }
 )
 DENY_ASSIGNMENTS_API_VERSION = "2022-04-01"
@@ -8850,6 +8906,11 @@ def _verify_exact_pull_capable_assignments(
         raise OrchestrationError(
             f"{field} expected ACR assignments contain an ungoverned principal"
         )
+    governed_scopes = {
+        _role_assignment_scope(assignment_id)
+        for assignment_ids in expected_by_principal.values()
+        for assignment_id in assignment_ids
+    }
     role_definitions: dict[str, dict[str, Any]] = {}
     budget = (
         _AuthorizationScanBudget.bounded() if effective_assignments_by_principal is None else None
@@ -8864,6 +8925,7 @@ def _verify_exact_pull_capable_assignments(
                 field=f"{field} for {principal_id}",
                 budget=budget,
                 as_of=as_of,
+                governed_scopes=governed_scopes,
             )
             if effective_assignments_by_principal is None
             else effective_assignments_by_principal.get(principal_id)
@@ -9776,7 +9838,6 @@ def _verify_complete_trigger_queue_assignment_set(
         trigger_queue_scope,
         subscription_id=subscription_id,
         field="complete trigger-queue authorization assignments",
-        include_eligibility=True,
     )
     role_definitions: dict[str, dict[str, Any]] = {}
     scoped_assignments: list[dict[str, Any]] = []
@@ -10635,11 +10696,57 @@ def _canonical_authorization_assignment_scope(
     if scope != scope.strip() or scope.endswith("/"):
         raise OrchestrationError(f"{field} must be one canonical Azure scope")
     if scope.casefold().startswith("/subscriptions/"):
-        return _canonical_subscription_resource_id(
-            scope,
-            subscription_id=subscription_id,
-            field=field,
-        )
+        segments = scope.split("/")
+        if len(segments) < 3 or segments[0] != "" or segments[1].casefold() != "subscriptions":
+            raise OrchestrationError(f"{field} must begin with one subscription scope")
+        if (
+            _canonical_subscription_id(
+                segments[2],
+                field=f"{field} subscription",
+            )
+            != subscription_id
+        ):
+            raise OrchestrationError(f"{field} is outside the governed deployment subscription")
+        if len(segments) == 3:
+            return scope
+        index = 3
+        if segments[index].casefold() == "resourcegroups":
+            if len(segments) < 5:
+                raise OrchestrationError(f"{field} has an incomplete resource-group scope")
+            _validate_resource_id_segment(
+                segments[4],
+                field=f"{field} resource group",
+            )
+            index = 5
+            if index == len(segments):
+                return scope
+        if index >= len(segments) or segments[index].casefold() != "providers":
+            raise OrchestrationError(f"{field} has a noncanonical provider boundary")
+        while index < len(segments):
+            if segments[index].casefold() != "providers" or index + 3 >= len(segments):
+                raise OrchestrationError(f"{field} has an incomplete provider resource path")
+            _validate_resource_id_segment(
+                segments[index + 1],
+                field=f"{field} provider namespace",
+            )
+            index += 2
+            resource_pairs = 0
+            while index < len(segments) and segments[index].casefold() != "providers":
+                if index + 1 >= len(segments):
+                    raise OrchestrationError(f"{field} has an unmatched resource type/name segment")
+                _validate_resource_id_segment(
+                    segments[index],
+                    field=f"{field} resource type",
+                )
+                _validate_resource_id_segment(
+                    segments[index + 1],
+                    field=f"{field} resource name",
+                )
+                resource_pairs += 1
+                index += 2
+            if resource_pairs == 0:
+                raise OrchestrationError(f"{field} has no resource type/name pair")
+        return scope
     segments = scope.split("/")
     if (
         len(segments) != 5
@@ -10676,21 +10783,25 @@ def _parse_authorization_schedule_time(
     return parsed.astimezone(UTC)
 
 
-def _active_or_upcoming_authorization_schedule(
+def _authorization_schedule_status(
     properties: Mapping[str, object],
     *,
     field: str,
-    as_of: datetime,
-) -> bool:
-    if as_of.tzinfo is None:
-        raise OrchestrationError(f"{field} evaluation time must include a UTC offset")
-    as_of = as_of.astimezone(UTC)
+) -> str:
     status = _string(
         properties.get("status"),
         field=f"{field} status",
     )
     if status != status.strip() or status.casefold() not in AUTHORIZATION_SCHEDULE_STATUSES:
         raise OrchestrationError(f"{field} status is unknown")
+    return status
+
+
+def _authorization_schedule_interval(
+    properties: Mapping[str, object],
+    *,
+    field: str,
+) -> tuple[datetime, datetime | None]:
     start = _parse_authorization_schedule_time(
         properties.get("startDateTime"),
         field=f"{field} startDateTime",
@@ -10705,9 +10816,98 @@ def _active_or_upcoming_authorization_schedule(
         raise OrchestrationError(f"{field} startDateTime is missing")
     if end is not None and end <= start:
         raise OrchestrationError(f"{field} schedule interval is invalid")
-    if status.casefold() in INACTIVE_AUTHORIZATION_SCHEDULE_STATUSES:
+    return start, end
+
+
+def _authorization_duration(value: object, *, field: str) -> timedelta:
+    duration = _string(value, field=field)
+    if duration != duration.strip() or len(duration) > 128:
+        raise OrchestrationError(f"{field} must be one bounded ISO-8601 duration")
+    match = re.fullmatch(
+        r"P(?:(?P<days>\d+)D)?"
+        r"(?:T(?:(?P<hours>\d+)H)?(?:(?P<minutes>\d+)M)?"
+        r"(?:(?P<seconds>\d+(?:\.\d+)?)S)?)?",
+        duration,
+    )
+    if match is None or not any(match.groupdict().values()):
+        raise OrchestrationError(f"{field} must be one ISO-8601 day/time duration")
+    try:
+        result = timedelta(
+            days=int(match.group("days") or 0),
+            hours=int(match.group("hours") or 0),
+            minutes=int(match.group("minutes") or 0),
+            seconds=float(match.group("seconds") or 0),
+        )
+    except (OverflowError, ValueError) as exc:
+        raise OrchestrationError(f"{field} exceeds the supported duration range") from exc
+    if result <= timedelta(0):
+        raise OrchestrationError(f"{field} must be greater than zero")
+    return result
+
+
+def _pim_request_blocks_future_privilege(
+    properties: Mapping[str, object],
+    *,
+    field: str,
+    as_of: datetime,
+) -> bool:
+    request_type = _string(
+        properties.get("requestType"),
+        field=f"{field} requestType",
+    )
+    if request_type not in PIM_GRANT_REQUEST_TYPES | PIM_REMOVAL_REQUEST_TYPES:
+        raise OrchestrationError(f"{field} requestType is unknown")
+    status = _authorization_schedule_status(properties, field=field)
+    if (
+        request_type in PIM_REMOVAL_REQUEST_TYPES
+        or status.casefold() in PIM_TERMINAL_NEGATIVE_REQUEST_STATUSES
+    ):
         return False
-    return end is None or end > as_of
+    schedule_value = properties.get("scheduleInfo")
+    if schedule_value is None:
+        return True
+    schedule = _mapping(
+        schedule_value,
+        field=f"{field} scheduleInfo",
+    )
+    start = _parse_authorization_schedule_time(
+        schedule.get("startDateTime"),
+        field=f"{field} scheduleInfo startDateTime",
+        required=False,
+    )
+    expiration_value = schedule.get("expiration")
+    if expiration_value is None:
+        return True
+    expiration = _mapping(
+        expiration_value,
+        field=f"{field} scheduleInfo expiration",
+    )
+    expiration_type = _string(
+        expiration.get("type"),
+        field=f"{field} scheduleInfo expiration type",
+    )
+    if expiration_type == "NoExpiration":
+        return True
+    if expiration_type == "AfterDateTime":
+        end = _parse_authorization_schedule_time(
+            expiration.get("endDateTime"),
+            field=f"{field} scheduleInfo expiration endDateTime",
+            required=True,
+        )
+        if end is None:
+            raise OrchestrationError(f"{field} request endDateTime is missing")
+        if start is not None and end <= start:
+            raise OrchestrationError(f"{field} request schedule interval is invalid")
+        return end > as_of
+    if expiration_type == "AfterDuration":
+        duration = _authorization_duration(
+            expiration.get("duration"),
+            field=f"{field} scheduleInfo expiration duration",
+        )
+        if start is None:
+            return True
+        return start + duration > as_of
+    raise OrchestrationError(f"{field} scheduleInfo expiration type is unknown")
 
 
 def _authorization_assignment_from_resource(
@@ -10769,21 +10969,32 @@ def _authorization_assignment_from_resource(
         or any(character in role_definition_id for character in ("\\", "?", "#"))
     ):
         raise OrchestrationError(f"{field} role definition ID is not canonical")
-    if resource_type != "roleAssignments":
+    if resource_type in PIM_ASSIGNMENT_RESOURCE_TYPES:
         member_type = _string(
             properties.get("memberType"),
             field=f"{field} memberType",
         )
         if member_type not in {"Direct", "Group", "Inherited"}:
             raise OrchestrationError(f"{field} memberType is unknown")
-        if resource_type == "roleAssignmentScheduleInstances":
+        if resource_type in {
+            "roleAssignmentScheduleInstances",
+            "roleAssignmentSchedules",
+        }:
             assignment_type = _string(
                 properties.get("assignmentType"),
                 field=f"{field} assignmentType",
             )
             if assignment_type not in {"Activated", "Assigned"}:
                 raise OrchestrationError(f"{field} assignmentType is unknown")
-        if not _active_or_upcoming_authorization_schedule(
+        status = _authorization_schedule_status(properties, field=field)
+        _, end = _authorization_schedule_interval(properties, field=field)
+        if resource_type in PIM_SCHEDULE_RESOURCE_TYPES:
+            if status.casefold() in PIM_TERMINAL_NEGATIVE_REQUEST_STATUSES:
+                return None
+            if end is not None and end <= as_of:
+                return None
+    elif resource_type in PIM_REQUEST_RESOURCE_TYPES:
+        if not _pim_request_blocks_future_privilege(
             properties,
             field=field,
             as_of=as_of,
@@ -10820,6 +11031,8 @@ def _authorization_assignment_from_resource(
         "endDateTime",
         "memberType",
         "assignmentType",
+        "requestType",
+        "scheduleInfo",
     ):
         if property_name in properties:
             normalized[property_name] = properties[property_name]
@@ -10857,34 +11070,35 @@ def _validate_authorization_assignment_url(
             "authorization assignment pagination returned an oversized continuation URL"
         )
     parsed = urlparse(url)
+    if (
+        parsed.scheme != "https"
+        or parsed.netloc.casefold() != ARM_HOST
+        or not parsed.path.startswith("/")
+        or parsed.fragment
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise OrchestrationError(
+            "authorization assignment pagination returned an untrusted continuation URL"
+        )
+    if is_continuation:
+        return
     expected_path = f"{scope.rstrip('/')}/providers/Microsoft.Authorization/{resource_type}"
     raw_query = parse_qs(parsed.query, keep_blank_values=True)
     query: dict[str, list[str]] = {}
     for key, values in raw_query.items():
         normalized_key = key.casefold()
         if normalized_key in query:
-            raise OrchestrationError(
-                "authorization assignment pagination returned duplicate query fields"
-            )
+            raise OrchestrationError("authorization assignment query contains duplicate fields")
         query[normalized_key] = values
     api_version = AUTHORIZATION_RESOURCE_API_VERSIONS[resource_type]
     if (
-        parsed.scheme != "https"
-        or parsed.netloc.casefold() != ARM_HOST
-        or parsed.path.casefold() != expected_path.casefold()
-        or parsed.fragment
-        or parsed.username is not None
-        or parsed.password is not None
+        parsed.path.casefold() != expected_path.casefold()
         or query.get("api-version") != [api_version]
-        or any(key not in {"api-version", "$filter", "$skiptoken"} for key in query)
-        or any(len(values) != 1 for values in query.values())
-        or ("$filter" in query and query["$filter"] != [filter_value])
-        or ("$skiptoken" in query and not query["$skiptoken"][0])
-        or is_continuation != ("$skiptoken" in query)
+        or query.get("$filter") != [filter_value]
+        or set(query) != {"api-version", "$filter"}
     ):
-        raise OrchestrationError(
-            "authorization assignment pagination returned an untrusted continuation URL"
-        )
+        raise OrchestrationError("authorization assignment initial query is not canonical")
 
 
 def _authorization_assignment_pages(
@@ -10985,16 +11199,16 @@ def _authorization_assignments(
     filter_value: str,
     subscription_id: str,
     field: str,
-    include_eligibility: bool,
+    resource_types: Sequence[str],
     budget: _AuthorizationScanBudget,
     as_of: datetime,
 ) -> list[dict[str, Any]]:
-    resource_types = [
-        "roleAssignments",
-        "roleAssignmentScheduleInstances",
-    ]
-    if include_eligibility:
-        resource_types.append("roleEligibilityScheduleInstances")
+    if not resource_types or any(
+        resource_type not in AUTHORIZATION_RESOURCE_API_VERSIONS for resource_type in resource_types
+    ):
+        raise OrchestrationError("authorization scan contains an unsupported resource type")
+    if len(set(resource_types)) != len(resource_types):
+        raise OrchestrationError("authorization scan resource types must be distinct")
     return _merge_effective_role_assignment_documents(
         [
             _authorization_assignment_pages(
@@ -11047,6 +11261,8 @@ def _merge_effective_role_assignment_documents(
                 "endDateTime",
                 "memberType",
                 "assignmentType",
+                "requestType",
+                "scheduleInfo",
             ):
                 existing_value = existing.get(property_name)
                 incoming_value = assignment.get(property_name)
@@ -11105,7 +11321,6 @@ def _effective_role_assignments(
     *,
     subscription_id: str,
     field: str,
-    include_eligibility: bool = True,
     budget: _AuthorizationScanBudget | None = None,
     as_of: datetime | None = None,
 ) -> list[dict[str, Any]]:
@@ -11121,7 +11336,7 @@ def _effective_role_assignments(
         filter_value=f"principalId eq '{canonical_principal_id}'",
         subscription_id=subscription_id,
         field=field,
-        include_eligibility=include_eligibility,
+        resource_types=EFFECTIVE_AUTHORIZATION_RESOURCE_TYPES,
         budget=scan_budget,
         as_of=observed_at,
     )
@@ -11137,12 +11352,69 @@ def _effective_role_assignments(
     return assignments
 
 
+def _assigned_instance_role_assignments(
+    principal_id: str,
+    *,
+    principal_ids: set[str],
+    governed_scopes: set[str],
+    subscription_id: str,
+    field: str,
+    budget: _AuthorizationScanBudget,
+    as_of: datetime,
+) -> list[dict[str, Any]]:
+    canonical_principal_id = _canonical_directory_object_id(
+        principal_id,
+        field=f"{field} assignedTo principal ID",
+    )
+    allowed_principal_ids = {
+        _canonical_directory_object_id(
+            value,
+            field=f"{field} effective principal ID",
+        )
+        for value in principal_ids
+    }
+    if canonical_principal_id not in allowed_principal_ids:
+        raise OrchestrationError(
+            f"{field} assignedTo principal is outside the resolved principal set"
+        )
+    scopes = governed_scopes or {f"/subscriptions/{subscription_id}"}
+    documents: list[object] = []
+    for scope in sorted(scopes, key=str.casefold):
+        canonical_scope = _canonical_authorization_assignment_scope(
+            scope,
+            subscription_id=subscription_id,
+            field=f"{field} assignedTo governed scope",
+        )
+        documents.append(
+            _authorization_assignments(
+                scope=canonical_scope,
+                filter_value=f"assignedTo('{canonical_principal_id}') and atScope()",
+                subscription_id=subscription_id,
+                field=f"{field} assignedTo {canonical_scope}",
+                resource_types=tuple(sorted(PIM_INSTANCE_RESOURCE_TYPES)),
+                budget=budget,
+                as_of=as_of,
+            )
+        )
+    assignments = _merge_effective_role_assignment_documents(
+        documents,
+        field=field,
+    )
+    for assignment in assignments:
+        assignment_principal_id = _canonical_directory_object_id(
+            assignment.get("principalId"),
+            field=f"{field} assignedTo returned principal ID",
+        )
+        if assignment_principal_id not in allowed_principal_ids:
+            raise OrchestrationError(f"{field} assignedTo returned an unresolved principal")
+    return assignments
+
+
 def _authorization_assignments_at_or_above_scope(
     scope: str,
     *,
     subscription_id: str,
     field: str,
-    include_eligibility: bool = True,
 ) -> list[dict[str, Any]]:
     canonical_scope = _canonical_subscription_resource_id(
         scope,
@@ -11154,7 +11426,7 @@ def _authorization_assignments_at_or_above_scope(
         filter_value="atScope()",
         subscription_id=subscription_id,
         field=field,
-        include_eligibility=include_eligibility,
+        resource_types=EFFECTIVE_AUTHORIZATION_RESOURCE_TYPES,
         budget=_AuthorizationScanBudget.bounded(),
         as_of=datetime.now(UTC),
     )
@@ -11167,9 +11439,15 @@ def _resolved_effective_role_assignments(
     field: str,
     budget: _AuthorizationScanBudget | None = None,
     as_of: datetime | None = None,
+    governed_scopes: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     scan_budget = _AuthorizationScanBudget.bounded() if budget is None else budget
     observed_at = datetime.now(UTC) if as_of is None else as_of.astimezone(UTC)
+    group_ids = _transitive_group_ids(principal_id)
+    all_principal_ids = {
+        principal_id.casefold(),
+        *(group_id.casefold() for group_id in group_ids),
+    }
     documents: list[object] = [
         _effective_role_assignments(
             principal_id,
@@ -11179,12 +11457,24 @@ def _resolved_effective_role_assignments(
             as_of=observed_at,
         )
     ]
-    for group_id in sorted(_transitive_group_ids(principal_id)):
+    for group_id in sorted(group_ids):
         documents.append(
             _effective_role_assignments(
                 group_id,
                 subscription_id=subscription_id,
                 field=f"{field} for transitive group {group_id}",
+                budget=scan_budget,
+                as_of=observed_at,
+            )
+        )
+    if governed_scopes is not None:
+        documents.append(
+            _assigned_instance_role_assignments(
+                principal_id,
+                principal_ids=all_principal_ids,
+                governed_scopes=governed_scopes,
+                subscription_id=subscription_id,
+                field=f"{field} assigned instance evidence",
                 budget=scan_budget,
                 as_of=observed_at,
             )
@@ -11199,6 +11489,7 @@ def _verify_no_broad_effective_assignments(
     principal_ids: set[str],
     *,
     subscription_id: str,
+    governed_scopes: set[str] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     assignments_by_principal: dict[str, list[dict[str, Any]]] = {}
     budget = _AuthorizationScanBudget.bounded()
@@ -11210,6 +11501,7 @@ def _verify_no_broad_effective_assignments(
             field=f"effective role assignments for {principal_id}",
             budget=budget,
             as_of=as_of,
+            governed_scopes=governed_scopes,
         )
         assignments_by_principal[principal_id.casefold()] = assignments
         violations = evaluate_role_assignments(assignments)
@@ -11220,7 +11512,7 @@ def _verify_no_broad_effective_assignments(
 
 
 def _governed_rbac_scopes(assignment_ids: set[str]) -> set[str]:
-    return {_role_assignment_scope(resource_id).casefold() for resource_id in assignment_ids}
+    return {_role_assignment_scope(resource_id) for resource_id in assignment_ids}
 
 
 def _scopes_overlap(first: str, second: str) -> bool:
@@ -11924,6 +12216,7 @@ def _verify_exact_effective_assignments(
                 field=f"exact role assignments for {principal_id}",
                 budget=budget,
                 as_of=as_of,
+                governed_scopes=governed_scopes,
             )
             if effective_assignments_by_principal is None
             else effective_assignments_by_principal.get(principal_id.casefold())
@@ -11979,9 +12272,21 @@ def _verify_publisher_effective_assignments(
         *(principal_id.casefold() for principal_id in publisher_principal_ids),
         *(principal_id.casefold() for principal_id in producer_assignment_ids_by_principal),
     }
+    governed_scopes = _governed_rbac_scopes(
+        {
+            assignment_id.casefold()
+            for assignments_by_principal in (
+                producer_assignment_ids_by_principal,
+                publisher_assignment_ids_by_principal,
+            )
+            for assignment_ids in assignments_by_principal.values()
+            for assignment_id in assignment_ids
+        }
+    )
     effective_assignments_by_principal = _verify_no_broad_effective_assignments(
         required_principal_ids,
         subscription_id=subscription_id,
+        governed_scopes=governed_scopes,
     )
     _verify_exact_effective_assignments(
         publisher_assignment_ids_by_principal,
@@ -13363,6 +13668,13 @@ def _verify_producer_resources(
     effective_assignments_by_principal = _verify_no_broad_effective_assignments(
         allowed_principal_ids,
         subscription_id=subscription_id,
+        governed_scopes={
+            expected.scope
+            for expected in (
+                *expected_assignments.values(),
+                *prospective_publisher_sender.values(),
+            )
+        },
     )
     _verify_exact_effective_assignments(
         assignment_ids_by_principal,
